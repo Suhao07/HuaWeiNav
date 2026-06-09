@@ -17,7 +17,11 @@ import os
 from mapping_utils.representation import *
 import cv2
 from cv_utils.image_perceiver import *
+from instruction_adapter.constraints import ConstraintEvaluator
 from instruction_adapter.ontology import normalize_term
+from instruction_adapter.relation_verifier import DynamicRelationService
+from instruction_adapter.spatial_graph import InstructionSpatialGraph
+from instruction_adapter.verifier import VerificationLedger, candidate_from_object
 from llm_utils.nav_prompt_room import *
 from llm_utils.cognav_llm_adapter import get_client_and_model
 
@@ -74,6 +78,15 @@ class Instruct_Mapper:
         self.target_aliases = []
         self.instruction_plan = None
         self.instruction_spec = None
+        self.verification_ledger = VerificationLedger()
+        self.instruction_execution_state = None
+        self.instruction_spatial_graph = InstructionSpatialGraph()
+        self.instruction_relation_service = DynamicRelationService(vlm=vlm)
+        self.instruction_constraint_evaluator = ConstraintEvaluator(
+            spatial_graph=self.instruction_spatial_graph,
+            relation_service=self.instruction_relation_service,
+            save_dir=save_dir,
+        )
 
         self.vlm = vlm
         self.frontier_thres = 6
@@ -156,6 +169,10 @@ class Instruct_Mapper:
         self.target_aliases = []
         self.instruction_plan = None
         self.instruction_spec = None
+        self.verification_ledger.reset()
+        self.instruction_execution_state = None
+        self.instruction_spatial_graph.reset()
+        self.instruction_relation_service.reset()
 
         self.room_nodes = []
 
@@ -229,7 +246,13 @@ class Instruct_Mapper:
         plan = getattr(self, "instruction_plan", None)
         if plan is not None:
             try:
-                terms.extend(list(plan.target_match_terms))
+                state = getattr(self, "instruction_execution_state", None)
+                if state is not None and getattr(plan.execution, "ordered", False):
+                    active = state.active_target(plan)
+                    if active is not None:
+                        terms.extend(list(active.match_terms))
+                else:
+                    terms.extend(list(plan.target_match_terms))
             except Exception:
                 pass
         return {normalize_term(x) for x in terms if str(x or "").strip()}
@@ -243,6 +266,22 @@ class Instruct_Mapper:
         """
 
         return normalize_term(tag) in self._target_match_terms()
+
+    def _raw_instruction_for_verifier(self):
+        plan = getattr(self, "instruction_plan", None)
+        if plan is not None:
+            return str(getattr(plan, "raw_instruction", "") or self.target)
+        spec = getattr(self, "instruction_spec", None)
+        if spec is not None:
+            return str(getattr(spec, "raw_instruction", "") or self.target)
+        return str(self.target or "")
+
+    def _is_verifier_rejected(self, obj, step=None):
+        candidate = candidate_from_object(obj, canonical_label=self.target, step=step)
+        return self.verification_ledger.is_hard_rejected(
+            self._raw_instruction_for_verifier(),
+            candidate.uid,
+        )
 
     def add_node(self, position, pcd=None, has_frontier=False, frontier_idxs=np.array([]), block_current=False):
 
@@ -2882,6 +2921,21 @@ class Instruct_Mapper:
         return answer.flag, obj_final
 
     def object_found_no_gpt(self, instruct_goal, idx=None, step=None):
+        plan = getattr(self, "instruction_plan", None)
+        if plan is not None:
+            self.instruction_constraint_evaluator.register_mapper_objects(
+                mapper=self,
+                step=step,
+                current_node_idx=getattr(self, "current_node_idx", None),
+            )
+            state = self.instruction_constraint_evaluator.ensure_state(self, plan)
+            active = state.active_target(plan)
+            if active is not None and getattr(plan.execution, "ordered", False):
+                # 中文说明：sequence 模式只允许当前子目标触发 stop。
+                # 后续目标即使被 detector 看见，也不能提前终止。
+                self.target_list = list(active.detector_terms or [active.name])
+                self.target_aliases = list(active.match_terms)
+                self.target = active.name
         json_dict = self.to_json_wo_some_class()
         #transfer this dict to string
         json_str = json.dumps(json_dict)
@@ -2897,15 +2951,23 @@ class Instruct_Mapper:
             f.write(f'\n')
 
         target_objs = []
+        skipped_objs = []
         for obj in self.objects:
             tag = obj.tag
             if self._is_target_tag(tag):
+                if self._is_verifier_rejected(obj, step=step):
+                    # 中文说明：verifier 拒绝的是这个对象实例，不是整个类别。
+                    # 例如蓝色椅子不满足“红色椅子”，但其它 chair 仍可继续验证。
+                    skipped_objs.append(candidate_from_object(obj, canonical_label=self.target, step=step).as_dict())
+                    continue
                 target_objs.append(obj)
         if len(target_objs) == 0:
             answer = f"No target object '{self.target}' found; accepted aliases: {sorted(self._target_match_terms())}"
             with open(f'{self.save_dir}/episode-{idx}/no_gpt_obj/answer_{step}.txt', 'w') as f:
                 f.write(f'Input: {prompt_info}\n')
                 f.write(f'Answer: {answer}\n')
+                if skipped_objs:
+                    f.write(f'Skipped by final verifier: {json.dumps(skipped_objs, ensure_ascii=False)}\n')
                 f.write(f'\n')
                 f.write(f'\n')
             return False, None
@@ -2920,6 +2982,8 @@ class Instruct_Mapper:
         with open(f'{self.save_dir}/episode-{idx}/no_gpt_obj/answer_{step}.txt', 'w') as f:
             f.write(f'Input: {prompt_info}\n')
             f.write(f'Answer: {answer}\n')
+            if skipped_objs:
+                f.write(f'Skipped by final verifier: {json.dumps(skipped_objs, ensure_ascii=False)}\n')
             f.write(f'\n')
             f.write(f'\n')
 

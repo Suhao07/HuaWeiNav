@@ -113,7 +113,7 @@ class DynamicSemanticEdgeVerifier:
         cache: SemanticEdgeCache | None = None,
         *,
         max_near_distance: float = 1.5,
-        vertical_axis: int = 1,
+        vertical_axis: int = 2,
     ):
         self.cache = cache or SemanticEdgeCache()
         self.max_near_distance = max_near_distance
@@ -177,16 +177,33 @@ class DynamicSemanticEdgeVerifier:
         if relation in ("near", "with"):
             return _distance(subject_center, object_center) <= self.max_near_distance
 
+        subject_min = _point(subject, ("min_bound",))
+        subject_max = _point(subject, ("max_bound",))
+        object_min = _point(object_, ("min_bound",))
+        object_max = _point(object_, ("max_bound",))
         vertical_delta = subject_center[self.vertical_axis] - object_center[self.vertical_axis]
         horizontal_axes = [idx for idx in range(3) if idx != self.vertical_axis]
         horizontal_dist = math.sqrt(
             sum((subject_center[idx] - object_center[idx]) ** 2 for idx in horizontal_axes)
         )
+        xy_overlap = True
+        if subject_min and subject_max and object_min and object_max:
+            overlaps = []
+            for axis in horizontal_axes:
+                overlaps.append(subject_min[axis] <= object_max[axis] and subject_max[axis] >= object_min[axis])
+            xy_overlap = all(overlaps)
         if relation == "under":
+            if subject_max and object_min:
+                return subject_max[self.vertical_axis] <= object_min[self.vertical_axis] + 0.2 and xy_overlap
             return vertical_delta < 0 and horizontal_dist <= self.max_near_distance
         if relation == "on":
+            if subject_min and object_max:
+                vertical_gap = subject_min[self.vertical_axis] - object_max[self.vertical_axis]
+                return -0.15 <= vertical_gap <= 0.35 and xy_overlap
             return vertical_delta > 0 and horizontal_dist <= self.max_near_distance
         if relation == "inside":
+            if subject_center and object_min and object_max:
+                return all(object_min[idx] - 0.1 <= subject_center[idx] <= object_max[idx] + 0.1 for idx in range(3))
             return horizontal_dist <= self.max_near_distance
         return True
 

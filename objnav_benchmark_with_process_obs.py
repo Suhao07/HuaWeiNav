@@ -284,6 +284,8 @@ if __name__ == "__main__":
             instruction_spec = instruction_plan.to_legacy_spec()
             habitat_mapper.instruction_plan = instruction_plan
             habitat_mapper.instruction_spec = instruction_spec
+            habitat_mapper.instruction_execution_state = None
+            habitat_mapper.instruction_constraint_evaluator.ensure_state(habitat_mapper, instruction_plan)
             habitat_mapper.target_list = list(
                 instruction_spec.target_detector_prompts
                 or [instruction_spec.canonical_target or dataset_target]
@@ -301,6 +303,7 @@ if __name__ == "__main__":
         else:
             habitat_mapper.instruction_plan = None
             habitat_mapper.instruction_spec = None
+            habitat_mapper.instruction_execution_state = None
             habitat_mapper.target = dataset_target
 
             # 先用 LLM 扩展目标同义/相关类别，再初始化 GroundingDINO+SAM 的文本提示。

@@ -92,6 +92,14 @@ cv_utils/
   sam.py                             # GroundingDINO + SAM 目标感知封装
 llm_utils/
   cognav_llm_adapter.py              # CogNav LLMClient 适配 OpenAI parse 接口
+instruction_adapter/
+  contracts.py                       # InstructionPlan / TargetQuery / Constraint schema
+  execution.py                       # count / any-success / sequence 执行状态
+  constraints.py                     # room / attribute / relation 运行时约束评估
+  spatial_graph.py                   # object-view 共视索引
+  semantic_edges.py                  # 动态语义边几何预筛和缓存
+  relation_verifier.py               # CogNav VLM relation verifier
+  verifier.py                        # 原始指令 final verifier 和实例级 ledger
 ```
 
 ## 4. 端到端数据流
@@ -142,6 +150,20 @@ found_goal 或 episode_over 或 step >= 500
 ```
 
 `found_goal` 不是“图像里出现了目标”这么简单。流程会先把 2D 检测结果变成 3D 对象，再用 `target_list` 做目标别名匹配，随后寻找可达停止点并做可视性检查。举例：任务目标是 `tv` 时，视觉模型可能输出 `tv_monitor`，需要归一成 `tv` 后才能触发目标确认。
+
+启用 instruction adapter 后，终止链路增加一层原始指令验证：
+
+```text
+mapper.object_found_no_gpt()
+  -> instance-level ledger 过滤已拒绝候选
+  -> ConstraintEvaluator 检查 room/attribute/relation/count/sequence 运行状态
+  -> agent.check_again() 优化视角复核 detector 目标
+  -> FinalInstructionVerifier 判断原始自然语言是否满足
+  -> InstructionExecutionState 判断 count/sequence 是否完成
+  -> stop 或继续探索
+```
+
+普通 HM3D benchmark 不启用 `InstructionPlan` 时，这条链路完全旁路，保持原始 STRIVE 行为。
 
 ## 5. 核心输入输出
 
@@ -241,6 +263,26 @@ STRIVE_LLM_FALLBACK=1
 ```
 
 当 LLM 返回空内容或非 JSON 时，会返回保守默认结构，只用于 smoke 测试。
+
+### 5.5 指令约束输出
+
+启用 `--enable_instruction_adapter` 或 `--custom_instruction` 后，每个 episode 会额外输出：
+
+```text
+instruction_adapter/plan.json          # canonical InstructionPlan
+instruction_adapter/spec.json          # STRIVE legacy spec
+instruction_adapter/runtime_state_*.json
+final_verifier/evidence_*.json
+final_verifier/result_*.json
+```
+
+`runtime_state_*.json` 中包含：
+
+```text
+execution_state: active target、已接受实例、已拒绝实例、count/sequence 进度
+spatial_graph: ObjectNodeRecord / ViewNode / 共视索引
+semantic_edges: on/near/inside/under 等动态关系验证缓存
+```
 
 ## 6. 核心几何和模型公式
 
@@ -398,9 +440,65 @@ metrics.mp4  # top-down map + 指标
 
 `save_trajectory()` 会把不同阶段产生的 frame 统一 resize 到首帧尺寸，避免 `imageio` 写 mp4 时因为尺寸不同失败。
 
-## 10. 可替换模块
+## 10. 终止验证数据流
 
-### 10.1 替换 LLM
+STRIVE 的最终停止现在由三层共同决定：
+
+```text
+候选目标实例
+  -> check_again: bbox 视觉复核目标类别
+  -> final_check: 几何可见性检查
+  -> FinalInstructionVerifier: 原始自然语言指令满足度检查
+```
+
+`FinalInstructionVerifier` 复用 CogNav 风格 LLM client。它的输入是：
+
+```text
+raw_instruction
+InstructionPlan
+CandidateInstance
+当前视角 bbox 图
+目标 crop 图
+bbox 几何事实
+附近对象摘要
+预留空间关系证据
+```
+
+输出是结构化 `VerificationResult`：
+
+```text
+accept: 可以 stop
+reject_candidate: 当前实例不是目标，写入 VerificationLedger 并继续探索
+need_better_view: 复用 STRIVE 视角优化再验证一次
+need_relation_check: 预留给动态语义边 verifier
+uncertain: 不终止，按 soft rejection 继续
+```
+
+关键原则是“屏蔽实例，不屏蔽类别”。例如找红色椅子时，蓝色椅子被 verifier 拒绝后，只跳过该椅子实例；检测器后续发现其它 `chair` 实例仍会继续验证。
+
+日志位置：
+
+```text
+logs/<save_dir>/episode-*/final_verifier/
+  evidence_<step>.json
+  result_<step>.json
+  current_bbox_<step>.jpg
+  object_crop_<step>.jpg
+```
+
+开关：
+
+```bash
+export STRIVE_FINAL_VERIFIER=auto  # 默认：仅在指令模式存在 InstructionPlan/InstructionSpec 时介入
+export STRIVE_FINAL_VERIFIER=1     # 强制开启，要求调用侧传入 instruction plan
+export STRIVE_FINAL_VERIFIER=0     # 关闭，恢复旧停止行为
+```
+
+普通 benchmark 模式不传 `--enable_instruction_adapter` / `--custom_instruction` 时没有 `InstructionPlan`，final verifier 在 agent 层直接旁路，不额外调用 VLM，也不改变原始 STRIVE 停止条件。
+
+## 11. 可替换模块
+
+### 11.1 替换 LLM
 
 入口：
 
@@ -415,7 +513,7 @@ cv_utils/gpt_utils.py
 client.beta.chat.completions.parse(...)
 ```
 
-### 10.2 替换检测/分割模型
+### 11.2 替换检测/分割模型
 
 入口：
 
@@ -433,7 +531,7 @@ labels
 scores
 ```
 
-### 10.3 替换数据集
+### 11.3 替换数据集
 
 入口：
 
@@ -452,7 +550,7 @@ sensor config
 measurements
 ```
 
-## 11. 当前已验证路径
+## 12. 当前已验证路径
 
 已验证：
 

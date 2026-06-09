@@ -1,4 +1,5 @@
 import os
+import json
 
 import cv2
 import habitat
@@ -17,6 +18,7 @@ from cv_utils.gpt_utils import (ask_gpt_object_in_box,
 from cv_utils.stitch import combine_image, image_stitch_and_crop
 from cv_utils.visualizer import visualize_mask
 from mapper_with_process_obs import Instruct_Mapper
+from instruction_adapter.verifier import FinalInstructionVerifier, VerificationResult, candidate_from_object
 from mapping_utils.geometry import (gpu_cluster_filter, gpu_merge_pointcloud,
                                     gpu_pointcloud_from_array, pointcloud_distance,
                                     project_to_camera)
@@ -49,6 +51,9 @@ class HM3D_Objnav_Agent:
         self.success_distance = 1.0
         self.stop_criterion = 0.7
         self.vlm = vlm
+        self.final_instruction_verifier = FinalInstructionVerifier(vlm=vlm)
+        self.final_verifier_retry_counts = {}
+        self.last_check_again_image_path = ""
 
     def translate_objnav(self, object_goal):
         if object_goal.lower() == 'plant':
@@ -113,6 +118,8 @@ class HM3D_Objnav_Agent:
 
         self.current_node_idx = 0
         self.update_trajectory()
+        self.final_verifier_retry_counts = {}
+        self.last_check_again_image_path = ""
 
     def rotate_panoramic(self, rotate_times=12):
         self.temporary_pcd = []
@@ -1052,7 +1059,7 @@ class HM3D_Objnav_Agent:
 
         self.mapper.get_nodes_process(node, idx=idx, step=step, path_idx=path_idx)
 
-    def check_again(self, episode_step):
+    def _project_object_bbox_on_current_view(self):
         current_depth = self.obs['depth'].copy()
         camera_points = project_to_camera(self.object_final.pcd, self.mapper.camera_intrinsic,
                                           self.mapper.current_position,
@@ -1072,20 +1079,39 @@ class HM3D_Objnav_Agent:
         camera_points = camera_points[depth_flag]
 
         if len(camera_points) == 0:
-            logger.info(f"Abort check again due to visibility.")
-            return True
+            return None, {}
 
         bbox = np.array([np.min(camera_points, axis=0), np.max(camera_points, axis=0)])
         # x1 y1 x2 y2
-        bbox = np.array([bbox[0][0], bbox[0][1], bbox[1][0], bbox[1][1]])
-        bbox = torch.tensor(bbox).unsqueeze(0)
+        bbox_np = np.array([bbox[0][0], bbox[0][1], bbox[1][0], bbox[1][1]], dtype=np.float32)
+        width = max(1.0, float(bbox_np[2] - bbox_np[0]))
+        height = max(1.0, float(bbox_np[3] - bbox_np[1]))
+        geometry = {
+            "bbox_xyxy": [float(x) for x in bbox_np.tolist()],
+            "bbox_center_norm": [
+                float(((bbox_np[0] + bbox_np[2]) / 2.0) / 640.0),
+                float(((bbox_np[1] + bbox_np[3]) / 2.0) / 480.0),
+            ],
+            "bbox_area_ratio": float((width * height) / (640.0 * 480.0)),
+            "visible_projected_points": int(len(camera_points)),
+        }
+        return torch.tensor(bbox_np).unsqueeze(0), geometry
+
+    def check_again(self, episode_step):
+        bbox, _geometry = self._project_object_bbox_on_current_view()
+        if bbox is None:
+            logger.info(f"Abort check again due to visibility.")
+            return True
 
         img = self.rgb_trajectory[-1].copy()
 
         img_vis = visualize_mask(img, bbox)
         os.makedirs(f'{self.save_dir}/episode-{self.episode_samples-1}/check_again', exist_ok=True)
+        self.last_check_again_image_path = (
+            f'{self.save_dir}/episode-{self.episode_samples-1}/check_again/rgb_{episode_step}.jpg'
+        )
         cv2.imwrite(
-            f'{self.save_dir}/episode-{self.episode_samples-1}/check_again/rgb_{episode_step}.jpg',
+            self.last_check_again_image_path,
             img_vis)
         return check_again_object_in_bbox(
             img_vis=img_vis,
@@ -1095,6 +1121,262 @@ class HM3D_Objnav_Agent:
             episode_step=episode_step,
             vlm=self.vlm,
         )
+
+    def _raw_instruction_for_verifier(self):
+        plan = getattr(self.mapper, "instruction_plan", None)
+        if plan is not None:
+            return str(getattr(plan, "raw_instruction", "") or self.mapper.target)
+        spec = getattr(self.mapper, "instruction_spec", None)
+        if spec is not None:
+            return str(getattr(spec, "raw_instruction", "") or self.mapper.target)
+        return str(self.instruct_goal or self.mapper.target or "")
+
+    def _build_final_verifier_evidence(self, candidate, bbox, geometry):
+        episode_idx = self.episode_samples - 1
+        out_dir = f'{self.save_dir}/episode-{episode_idx}/final_verifier'
+        os.makedirs(out_dir, exist_ok=True)
+
+        img = self.rgb_trajectory[-1].copy()
+        img_vis = visualize_mask(img, bbox)
+        current_path = os.path.join(out_dir, f'current_bbox_{self.episode_steps}.jpg')
+        cv2.imwrite(current_path, img_vis)
+
+        bbox_np = bbox.squeeze(0).cpu().numpy().astype(int)
+        x1, y1, x2, y2 = bbox_np.tolist()
+        pad = max(8, int(max(x2 - x1, y2 - y1) * 0.25))
+        x1 = max(0, x1 - pad)
+        y1 = max(0, y1 - pad)
+        x2 = min(img.shape[1] - 1, x2 + pad)
+        y2 = min(img.shape[0] - 1, y2 + pad)
+        crop_path = ""
+        if x2 > x1 and y2 > y1:
+            crop = img[y1:y2, x1:x2]
+            crop_path = os.path.join(out_dir, f'object_crop_{self.episode_steps}.jpg')
+            cv2.imwrite(crop_path, crop)
+
+        positions = self.object_final.pcd.point.positions.cpu().numpy()
+        distance = float(np.min(np.linalg.norm(positions[:, :2] - self.mapper.current_position[:2], axis=1)))
+        geometry = dict(geometry or {})
+        geometry["distance_to_object"] = distance
+
+        nearby_objects = []
+        for obj in getattr(self.mapper, "objects", []) or []:
+            if obj is self.object_final:
+                continue
+            try:
+                dist = float(np.linalg.norm(np.array(obj.position[:2]) - np.array(self.object_final.position[:2])))
+            except Exception:
+                continue
+            if dist <= 2.0:
+                nearby_objects.append({
+                    "label": str(getattr(obj, "tag", "")),
+                    "distance_to_candidate": round(dist, 3),
+                    "position": [float(x) for x in np.array(getattr(obj, "position", []), dtype=float).reshape(-1)[:3].tolist()],
+                })
+        nearby_objects = sorted(nearby_objects, key=lambda x: x["distance_to_candidate"])[:8]
+
+        evidence = {
+            "current_rgb_with_bbox_path": current_path,
+            "object_crop_path": crop_path,
+            "centered_view_path": current_path,
+            "geometry": geometry,
+            "nearby_objects": nearby_objects,
+            "room_context": None,
+            "relation_evidence_paths": [],
+        }
+        with open(os.path.join(out_dir, f'evidence_{self.episode_steps}.json'), 'w', encoding='utf-8') as f:
+            json.dump({
+                "candidate": candidate.as_dict(),
+                "raw_instruction": self._raw_instruction_for_verifier(),
+                "evidence": evidence,
+            }, f, ensure_ascii=False, indent=2, sort_keys=True)
+        return evidence
+
+    def final_instruction_check(self):
+        plan = getattr(self.mapper, "instruction_plan", None)
+        spec = getattr(self.mapper, "instruction_spec", None)
+        if plan is None and spec is None:
+            # 中文说明：普通 HM3D ObjectNav benchmark 不启用指令解析层。
+            # 此时 final verifier 完全旁路，保持 STRIVE 原始 stop 行为。
+            return True
+
+        raw_instruction = self._raw_instruction_for_verifier()
+        candidate = candidate_from_object(
+            self.object_final,
+            canonical_label=getattr(self.mapper, "target", ""),
+            step=self.episode_steps,
+        )
+        target_for_candidate = None
+        if plan is not None:
+            target_for_candidate = self.mapper.instruction_constraint_evaluator.target_for_candidate(
+                self.mapper,
+                plan,
+                candidate,
+            )
+        if self.mapper.verification_ledger.is_hard_rejected(raw_instruction, candidate.uid):
+            logger.info("Final verifier skips hard-rejected candidate: {}", candidate.uid)
+            return False
+
+        bbox, geometry = self._project_object_bbox_on_current_view()
+        constraint_eval = None
+        if bbox is None:
+            # 中文说明：final stop 姿态可能看不到点云投影，但 check_again
+            # 刚刚保存过 VLM 复核图。此时继续用 check_again 图做原始指令
+            # 满足度判断，而不是直接让控制流重新 stop。
+            fallback_path = self.last_check_again_image_path
+            evidence = {
+                "current_rgb_with_bbox_path": fallback_path,
+                "object_crop_path": "",
+                "centered_view_path": fallback_path,
+                "geometry": {
+                    "projection_failed_in_final_view": True,
+                },
+                "nearby_objects": [],
+                "room_context": None,
+                "relation_evidence_paths": [],
+            }
+            if fallback_path and os.path.exists(fallback_path):
+                if plan is not None and target_for_candidate is not None:
+                    constraint_eval = self.mapper.instruction_constraint_evaluator.evaluate_before_final_verifier(
+                        mapper=self.mapper,
+                        plan=plan,
+                        target=target_for_candidate,
+                        candidate=candidate,
+                        candidate_obj=self.object_final,
+                        evidence=evidence,
+                        step=self.episode_steps,
+                    )
+                    evidence = constraint_eval.evidence
+                    if not constraint_eval.satisfied:
+                        result = VerificationResult(
+                            satisfied=False,
+                            decision="need_relation_check" if constraint_eval.decision == "need_relation_check" else "uncertain",
+                            confidence=constraint_eval.confidence,
+                            satisfied_constraints=constraint_eval.satisfied_constraints,
+                            failed_constraints=constraint_eval.failed_constraints,
+                            reason=constraint_eval.reason,
+                            diagnostics={"constraint_eval": constraint_eval.as_dict()},
+                        )
+                        evidence_paths = [fallback_path]
+                    else:
+                        result = self.final_instruction_verifier.verify(
+                            raw_instruction=raw_instruction,
+                            instruction_plan=plan,
+                            candidate=candidate,
+                            evidence=evidence,
+                        )
+                        evidence_paths = [fallback_path]
+                else:
+                    result = self.final_instruction_verifier.verify(
+                        raw_instruction=raw_instruction,
+                        instruction_plan=plan,
+                        candidate=candidate,
+                        evidence=evidence,
+                    )
+                    evidence_paths = [fallback_path]
+            else:
+                result = self.final_instruction_verifier._fallback("object_not_projected_in_current_view")
+                result.satisfied = False
+                result.decision = "need_better_view"
+                result.reason = "The candidate object is not visible in the current camera view."
+                evidence_paths = []
+        else:
+            evidence = self._build_final_verifier_evidence(candidate, bbox, geometry)
+            if plan is not None and target_for_candidate is not None:
+                constraint_eval = self.mapper.instruction_constraint_evaluator.evaluate_before_final_verifier(
+                    mapper=self.mapper,
+                    plan=plan,
+                    target=target_for_candidate,
+                    candidate=candidate,
+                    candidate_obj=self.object_final,
+                    evidence=evidence,
+                    step=self.episode_steps,
+                )
+                evidence = constraint_eval.evidence
+            if constraint_eval is not None and not constraint_eval.satisfied:
+                result = VerificationResult(
+                    satisfied=False,
+                    decision="need_relation_check" if constraint_eval.decision == "need_relation_check" else "uncertain",
+                    confidence=constraint_eval.confidence,
+                    satisfied_constraints=constraint_eval.satisfied_constraints,
+                    failed_constraints=constraint_eval.failed_constraints,
+                    reason=constraint_eval.reason,
+                    diagnostics={"constraint_eval": constraint_eval.as_dict()},
+                )
+            else:
+                result = self.final_instruction_verifier.verify(
+                    raw_instruction=raw_instruction,
+                    instruction_plan=plan,
+                    candidate=candidate,
+                    evidence=evidence,
+                )
+            evidence_paths = [
+                path for path in [
+                    evidence.get("current_rgb_with_bbox_path"),
+                    evidence.get("object_crop_path"),
+                    evidence.get("centered_view_path"),
+                ] if path
+            ]
+
+        record = self.mapper.verification_ledger.put(
+            raw_instruction,
+            candidate.uid,
+            result,
+            step=self.episode_steps,
+            evidence_paths=evidence_paths,
+        )
+        out_dir = f'{self.save_dir}/episode-{self.episode_samples - 1}/final_verifier'
+        os.makedirs(out_dir, exist_ok=True)
+        with open(os.path.join(out_dir, f'result_{self.episode_steps}.json'), 'w', encoding='utf-8') as f:
+            json.dump({
+                "candidate": candidate.as_dict(),
+                "constraint_eval": constraint_eval.as_dict() if constraint_eval is not None else None,
+                "record": record.as_dict(),
+                "result": result.as_dict(),
+                "ledger": self.mapper.verification_ledger.as_dict(),
+            }, f, ensure_ascii=False, indent=2, sort_keys=True)
+        self.mapper.instruction_constraint_evaluator.dump_state(
+            mapper=self.mapper,
+            episode_idx=self.episode_samples - 1,
+            step=self.episode_steps,
+        )
+
+        logger.info("Final instruction verifier decision: {}", result.as_dict())
+        if result.satisfied and result.decision == "accept":
+            if plan is not None:
+                task_done = self.mapper.instruction_constraint_evaluator.apply_final_result(
+                    mapper=self.mapper,
+                    plan=plan,
+                    target=target_for_candidate,
+                    candidate=candidate,
+                    result=result,
+                )
+                if not task_done:
+                    logger.info("Instruction subgoal accepted but full task is not complete yet.")
+                    return False
+            return True
+
+        if plan is not None:
+            self.mapper.instruction_constraint_evaluator.apply_final_result(
+                mapper=self.mapper,
+                plan=plan,
+                target=target_for_candidate,
+                candidate=candidate,
+                result=result,
+            )
+
+        if result.decision == "need_better_view":
+            retries = self.final_verifier_retry_counts.get(candidate.uid, 0)
+            if retries < 1:
+                self.final_verifier_retry_counts[candidate.uid] = retries + 1
+                self.whether_to_check_again()
+                self.waypoint = self.check_again_postion.copy()
+                self.waypoint[2] = self.mapper.current_position[2]
+                self.path = np.array([self.waypoint])
+                self.path_index = 0
+                return False
+
+        return False
 
     def step_mod(self, idx):
         if self.episode_steps == 499:
@@ -1235,7 +1517,27 @@ class HM3D_Objnav_Agent:
         if not self.env.episode_over:
             if self.found_goal and act == 0:
                 final_check_flag = self.final_check()
-                if not final_check_flag:
+                if final_check_flag:
+                    final_instruction_flag = self.final_instruction_check()
+                    if not final_instruction_flag:
+                        if self.need_check_again:
+                            pid_waypoint = self.waypoint + self.mapper.initial_position
+                            pid_waypoint = np.array(
+                                [pid_waypoint[0],
+                                 self.env.sim.get_agent_state().position[1], pid_waypoint[1]])
+                            act = self.planner.get_next_action(pid_waypoint)
+                            if act == 0:
+                                # 已经没有可移动的更好视角时，不能把 act=0 当成成功 stop。
+                                self.need_check_again = False
+                                self.after_check_again()
+                        else:
+                            self.after_check_again()
+                        pid_waypoint = self.waypoint + self.mapper.initial_position
+                        pid_waypoint = np.array(
+                            [pid_waypoint[0],
+                             self.env.sim.get_agent_state().position[1], pid_waypoint[1]])
+                        act = self.planner.get_next_action(pid_waypoint)
+                else:
                     pid_waypoint = self.waypoint + self.mapper.initial_position
                     pid_waypoint = np.array(
                         [pid_waypoint[0],
@@ -1421,6 +1723,11 @@ class HM3D_Objnav_Agent:
             #     return False
 
     def after_check_again(self):
+        # 中文说明：任何复核失败都必须退出“已找到目标”状态。
+        # 否则 STRIVE 的 stop 分支会在后续 step 继续围绕同一候选触发，
+        # 即使 final verifier 已经把该实例 hard-reject。
+        self.found_goal = False
+        self.need_check_again = False
         self.object_final.tag = "nothing"
         self.object_final.confidence = torch.tensor(1.0)
         self.object_final.conf_list = {"nothing": self.object_final.confidence}

@@ -33,6 +33,85 @@ def _target_id(name: str, index: int) -> str:
     return f"t{index}_{base}"
 
 
+def _constraints_from_complex(value: Any) -> list[Constraint]:
+    """Best-effort adapter for dataset-provided structured constraints.
+
+    不在这里写指令常识，只把 episode.info/contract 已经给出的结构化字段
+    转成统一 Constraint。未知字段保留在 diagnostics，避免 parser 变成规则库。
+    """
+
+    constraints: list[Constraint] = []
+    if not isinstance(value, dict):
+        return constraints
+
+    relation_items = value.get("relations") or value.get("spatial_relations") or value.get("object_relations") or []
+    for item in _as_list(relation_items):
+        if not isinstance(item, dict):
+            continue
+        relation = normalize_term(item.get("relation") or item.get("predicate") or item.get("type"))
+        subject = normalize_term(item.get("subject") or item.get("target") or item.get("source"))
+        obj = normalize_term(item.get("object") or item.get("anchor") or item.get("reference"))
+        if relation and (subject or obj):
+            constraints.append(
+                Constraint(
+                    type="spatial",
+                    subject=subject,
+                    relation=relation,
+                    object=obj,
+                    value={k: v for k, v in item.items() if k not in ("subject", "target", "source", "relation", "predicate", "object", "anchor", "reference")},
+                    hardness=normalize_term(item.get("hardness")) or "hard",
+                    verifier=normalize_term(item.get("verifier")) or "vlm",
+                    source="episode_info.complex_constraints",
+                )
+            )
+
+    attribute_items = value.get("attributes") or value.get("attribute_constraints") or []
+    if isinstance(attribute_items, dict):
+        attribute_items = [
+            {"subject": key, "value": attrs}
+            for key, attrs in attribute_items.items()
+        ]
+    for item in _as_list(attribute_items):
+        if not isinstance(item, dict):
+            continue
+        subject = normalize_term(item.get("subject") or item.get("target") or item.get("object"))
+        attrs = item.get("attributes", item.get("value", {}))
+        if subject or attrs:
+            constraints.append(
+                Constraint(
+                    type="attribute",
+                    subject=subject,
+                    relation="has",
+                    value=attrs,
+                    hardness=normalize_term(item.get("hardness")) or "hard",
+                    verifier=normalize_term(item.get("verifier")) or "vlm",
+                    source="episode_info.complex_constraints",
+                )
+            )
+
+    room_items = value.get("rooms") or value.get("room_constraints") or []
+    for item in _as_list(room_items):
+        if isinstance(item, dict):
+            subject = normalize_term(item.get("subject") or item.get("target") or item.get("object"))
+            room = normalize_term(item.get("room") or item.get("value") or item.get("name"))
+        else:
+            subject = ""
+            room = normalize_term(item)
+        if room:
+            constraints.append(
+                Constraint(
+                    type="room",
+                    subject=subject,
+                    relation="in",
+                    value=room,
+                    hardness="hard" if subject else "soft",
+                    verifier="planner",
+                    source="episode_info.complex_constraints",
+                )
+            )
+    return constraints
+
+
 def plan_from_episode_info(
     raw_instruction: str,
     dataset_target: str = "",
@@ -40,7 +119,7 @@ def plan_from_episode_info(
 ) -> InstructionPlan | None:
     """Compile CogNav/Habitat episode metadata into InstructionPlan.
 
-    中文说明：CogNav 的 instruction benchmark 已经在 episode.info 中保存了
+    instruction benchmark 已经在 episode.info 中保存了
     结构化语义。这里优先复用这些字段，避免用手写规则重新猜指令含义。
     """
 
@@ -170,6 +249,9 @@ def plan_from_episode_info(
                     source="episode_info",
                 )
             )
+
+    constraints.extend(_constraints_from_complex(info.get("complex_constraints", {})))
+    constraints.extend(_constraints_from_complex(contract.get("complex_constraints", {})))
 
     terminal_targets = [target for target in targets if target.terminal]
     if len(terminal_targets) > 1 and execution.ordered:
