@@ -36,7 +36,7 @@ class HM3D_Objnav_Agent:
                  do_seg=True,
                  relocate=False,
                  gpt_relocate=True,
-                 vlm='gemini'):
+                 vlm='cognav'):
         self.env = env
         self.mapper = mapper
         self.episode_samples = 0
@@ -406,6 +406,14 @@ class HM3D_Objnav_Agent:
 
             if res not in self.mapper.object_perceiver.classes:
                 res = refine_tag_with_target_obj_list(res, self.mapper.target, self.save_dir, self.episode_samples-1, self.episode_steps, i, self.vlm)
+
+            # 任务目标和检测类别存在同义词差异，例如目标是 tv，
+            # GroundingDINO/LLM 可能返回 tv_monitor。这里统一成主目标名，
+            # 否则后续 object_found_no_gpt 的目标确认会被精确字符串匹配卡住。
+            target_aliases = {self.mapper.target}
+            target_aliases.update(getattr(self.mapper, "target_list", []) or [])
+            if res in target_aliases:
+                res = self.mapper.target
 
             obj.num_list[res] = obj.num_list.pop(obj.tag)
             obj.conf_list[res] = obj.conf_list.pop(obj.tag)

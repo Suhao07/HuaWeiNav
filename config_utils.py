@@ -79,6 +79,10 @@ def _write_context(cfg):
 
 
 def _legacy_hm3d_data_path(data_path: str, stage: str) -> str:
+    override = os.getenv("HM3D_DATASET_PATH")
+    if override:
+        return override
+
     # CogNav 和不同 Habitat 发行版的 ObjectNav episode 路径命名不完全一致。
     # 按本机实际存在的文件优先选择，保证同一脚本可复用多个数据布局。
     candidates = [

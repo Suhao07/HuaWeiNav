@@ -117,6 +117,7 @@ RUN_ARGS=(
   -e "TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE:-1}"
   -e "HABITAT_LAB_PATH=/workspace/CogNav_ObjNav"
   -e "HM3D_DATA_PATH=/workspace/CogNav_ObjNav/data"
+  -e "HM3D_DATASET_PATH=${HM3D_DATASET_PATH:-}"
   -e "MP3D_DATA_PATH=/workspace/CogNav_ObjNav/data"
   -e "SAM_CHECKPOINT=/weights/sam_vit_h_4b8939.pth"
   -e "GROUNDING_DINO_PATH=/opt/mmdetection"

@@ -124,6 +124,7 @@ RGB-D observation
   -> SAM 根据 boxes 产生 masks
   -> depth + camera intrinsic 反投影为局部 3D 点
   -> agent pose 将局部点变换到世界/地图坐标
+  -> 将检测类别按 target_list 归一到任务目标，例如 tv_monitor -> tv
   -> mapper 更新点云、障碍、对象实例、节点、房间、前沿
   -> LLM 根据目标、房间、对象、距离选择候选房间/目标
   -> planner 计算下一动作
@@ -139,6 +140,8 @@ found_goal 或 episode_over 或 step >= 500
   -> 保存点云 debug 文件
   -> 写入 metrics.csv
 ```
+
+`found_goal` 不是“图像里出现了目标”这么简单。流程会先把 2D 检测结果变成 3D 对象，再用 `target_list` 做目标别名匹配，随后寻找可达停止点并做可视性检查。举例：任务目标是 `tv` 时，视觉模型可能输出 `tv_monitor`，需要归一成 `tv` 后才能触发目标确认。
 
 ## 5. 核心输入输出
 

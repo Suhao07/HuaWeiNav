@@ -49,7 +49,7 @@ class Instruct_Mapper:
                  no_gpt_seg=False,
                  device='cuda:0',
                  env=None,
-                 vlm='gemini'):
+                 vlm='cognav'):
         self.device = device
         self.pcd_device = o3d.core.Device(device.upper())
 
@@ -2642,6 +2642,8 @@ class Instruct_Mapper:
                     response_format=Reasoning,
                 )
             except Exception as e:
+                if self.vlm != 'gemini':
+                    raise
                 logger.error(f'Gemini limit: {e}')
                 client, _ = get_client_and_model(self.vlm)
 
@@ -2790,10 +2792,10 @@ class Instruct_Mapper:
             final_object: int
 
         if self.vlm in ('gemini', 'cognav'):
-            client, _ = get_client_and_model(self.vlm)
+            client, model_name = get_client_and_model(self.vlm)
 
             completion = client.beta.chat.completions.parse(
-                model="gemini-2.0-flash",
+                model=model_name,
                 messages=[{
                     "role": "system",
                     "content": OBJECT_PROMPT
@@ -2855,13 +2857,18 @@ class Instruct_Mapper:
             f.write(f'\n')
             f.write(f'\n')
 
+        # 视觉检测和 LLM 可能返回目标的同义类，例如任务目标是 tv，
+        # 但检测类别是 tv_monitor。确认目标时必须使用 target_list 做别名匹配。
+        target_aliases = {self.target}
+        target_aliases.update(getattr(self, "target_list", []) or [])
+
         target_objs = []
         for obj in self.objects:
             tag = obj.tag
-            if tag == self.target:
+            if tag in target_aliases:
                 target_objs.append(obj)
         if len(target_objs) == 0:
-            answer = f"No target object '{self.target}' found"
+            answer = f"No target object '{self.target}' found; accepted aliases: {sorted(target_aliases)}"
             with open(f'{self.save_dir}/episode-{idx}/no_gpt_obj/answer_{step}.txt', 'w') as f:
                 f.write(f'Input: {prompt_info}\n')
                 f.write(f'Answer: {answer}\n')
@@ -2871,6 +2878,9 @@ class Instruct_Mapper:
         # choose the object with the highest confidence
         target_objs = sorted(target_objs, key=lambda x: x.confidence.numpy().item(), reverse=True)
         target_obj = target_objs[0]
+        if target_obj.tag != self.target:
+            target_obj.tag = self.target
+            target_obj.conf_list[self.target] = target_obj.confidence
 
         answer = f"Choose Obj '{target_obj.tag}' at position {target_obj.position} with confidence {target_obj.confidence.numpy().item()}."
         with open(f'{self.save_dir}/episode-{idx}/no_gpt_obj/answer_{step}.txt', 'w') as f:
@@ -2922,10 +2932,10 @@ class Instruct_Mapper:
             reason: str
 
         if self.vlm in ('gemini', 'cognav'):
-            client, _ = get_client_and_model(self.vlm)
+            client, model_name = get_client_and_model(self.vlm)
 
             completion = client.beta.chat.completions.parse(
-                model="gemini-2.0-flash",
+                model=model_name,
                 messages=[{
                     "role": "system",
                     "content": RELOCATE_PROMPT

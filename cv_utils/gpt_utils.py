@@ -260,7 +260,7 @@ def refine_tag_with_target_obj_list(res, target, save_dir, episode_idx, episode_
     return res
 
 
-def ask_gpt_similar_objects(obj_list, target, vlm="gemini"):
+def ask_gpt_similar_objects(obj_list, target, vlm="cognav"):
     obj_str = ", ".join(obj_list)
 
     prompt = f"""

@@ -207,6 +207,33 @@ bash docker/run_hm3d_baseline.sh \
   --vlm cognav
 ```
 
+### 5.3 指定场景和目标物导航
+
+推荐使用专门入口，不需要手工改 dataset 或 `HM3D_DATASET_PATH`：
+
+```bash
+bash docker/run_scene_object_nav.sh \
+  --scene_id wcojb4TFT35 \
+  --object_category tv \
+  --save_dir hm3d_wcojb4TFT35_tv_real_llm \
+  --vlm cognav
+```
+
+这个脚本会在容器内自动完成：
+
+- 从 CogNav 数据目录查找 `wcojb4TFT35.json.gz`。
+- 筛出 `object_category=tv` 的 episode。
+- 生成单 episode 文件到 `logs/datasets/wcojb4TFT35_tv_rank0.json.gz`。
+- 将 `HM3D_DATASET_PATH` 指向这个临时 dataset，再启动 benchmark。
+
+可选参数：
+
+```bash
+--episode_rank 1
+```
+
+用于选择同一场景和目标物下的第 N 个匹配 episode。`--scene_id_contains` 和 `--object_category` 仍可直接传给 `run_hm3d_baseline.sh`，但精确跑单个场景/物体时推荐 `run_scene_object_nav.sh`，因为它不依赖 Habitat iterator 的内部采样顺序。
+
 ## 6. 输出结果
 
 输出目录在：

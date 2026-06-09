@@ -1,8 +1,10 @@
 import argparse
 import csv
+import gzip
 import json
 import os
 import sys
+from pathlib import Path
 
 import habitat
 from loguru import logger
@@ -19,6 +21,10 @@ from objnav_agent_with_process_obs import HM3D_Objnav_Agent
 os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 os.environ["MAGNUM_LOG"] = "quiet"
 os.environ["HABITAT_SIM_LOG"] = "quiet"
+
+
+def _safe_name(value):
+    return "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in value)
 
 
 def write_metrics(metrics, path="objnav_hm3d.csv"):
@@ -48,10 +54,141 @@ def _set_next_episode_by_index(env, index):
         iterator._prev_scene_id = None
 
 
+def _filter_episodes(env, scene_id_contains=None, object_category=None):
+    if not scene_id_contains and not object_category:
+        return
+
+    iterator = env.episode_iterator
+    episodes = list(iterator.episodes)
+    filtered = []
+    for episode in episodes:
+        scene_id = str(getattr(episode, "scene_id", ""))
+        category = str(getattr(episode, "object_category", ""))
+        if scene_id_contains and scene_id_contains not in scene_id:
+            continue
+        if object_category and category.lower() != object_category.lower():
+            continue
+        filtered.append(episode)
+
+    if not filtered:
+        raise ValueError(
+            f"No episodes matched scene_id_contains={scene_id_contains!r}, "
+            f"object_category={object_category!r}."
+        )
+
+    # 直接替换 iterator 的 episode 列表，比依赖不同 Habitat 版本的 index 语义更稳定。
+    iterator.episodes = filtered
+    if hasattr(iterator, "_iterator"):
+        iterator._iterator = iter(iterator.episodes)
+    if hasattr(iterator, "_prev_scene_id"):
+        iterator._prev_scene_id = None
+    logger.info(
+        "Filtered episodes: {} matched scene_id_contains={!r}, object_category={!r}",
+        len(filtered),
+        scene_id_contains,
+        object_category,
+    )
+
+
+def _candidate_content_files(data_root, stage, scene_id):
+    scene_file = f"{scene_id}.json.gz"
+    explicit = os.getenv("STRIVE_SCENE_OBJECT_DATASET")
+    if explicit:
+        yield Path(explicit)
+
+    preferred = [
+        f"datasets/objectnav/hm3d_ovon/v1/val_seen_complex_balanced_2k/content/{scene_file}",
+        f"datasets/objectnav/hm3d_ovon/v1/val_seen_complex_instruction/content/{scene_file}",
+        f"datasets/objectnav/hm3d_ovon/v1/val_seen_instruction_balanced_3k/content/{scene_file}",
+        f"datasets/objectnav/hm3d_ovon/v1/val_seen_instruction_2k/content/{scene_file}",
+        f"datasets/objectnav/hm3d/v1/{stage}_instruction/content/{scene_file}",
+        f"objectgoal_hm3d_ovon/val_seen/content/{scene_file}",
+        f"objectgoal_hm3d/{stage}/content/{scene_file}",
+        f"objectgoal_hm3d_custom/{stage}/content/{scene_file}",
+        f"objectgoal_hm3d/{stage}_mini/content/{scene_file}",
+    ]
+    for rel in preferred:
+        yield Path(data_root) / rel
+
+
+def _episode_category(episode):
+    return str(episode.get("object_category", episode.get("object_category_name", ""))).lower()
+
+
+def _prepare_scene_object_dataset(args, stage="val"):
+    if not args.scene_id or not args.object_category:
+        return
+
+    data_root = os.getenv("HM3D_DATA_PATH")
+    if not data_root:
+        raise ValueError("HM3D_DATA_PATH is not set; cannot locate scene content files.")
+
+    matched_source = None
+    matched_episodes = None
+    target_category = args.object_category.lower()
+    for path in _candidate_content_files(data_root, stage, args.scene_id):
+        if not path.exists():
+            continue
+        with gzip.open(path, "rt", encoding="utf-8") as f:
+            dataset = json.load(f)
+        episodes = [
+            episode for episode in dataset.get("episodes", [])
+            if _episode_category(episode) == target_category
+        ]
+        if episodes:
+            matched_source = path
+            matched_episodes = episodes
+            break
+
+    if not matched_episodes:
+        searched = [str(path) for path in _candidate_content_files(data_root, stage, args.scene_id)]
+        raise ValueError(
+            f"No episode matched scene_id={args.scene_id!r}, object_category={args.object_category!r}. "
+            f"Searched: {searched}"
+        )
+
+    if args.episode_rank < 0 or args.episode_rank >= len(matched_episodes):
+        raise IndexError(
+            f"episode_rank={args.episode_rank} is out of range; "
+            f"{len(matched_episodes)} matched episodes are available."
+        )
+
+    with gzip.open(matched_source, "rt", encoding="utf-8") as f:
+        filtered_dataset = json.load(f)
+    filtered_dataset["episodes"] = [matched_episodes[args.episode_rank]]
+
+    output_dir = Path(args.filtered_dataset_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / (
+        f"{_safe_name(args.scene_id)}_{_safe_name(args.object_category)}_rank{args.episode_rank}.json.gz"
+    )
+    with gzip.open(output_path, "wt", encoding="utf-8") as f:
+        json.dump(filtered_dataset, f)
+
+    os.environ["HM3D_DATASET_PATH"] = str(output_path.resolve())
+    args.dataset_episodes = 1
+    args.eval_episodes = 1
+    args.start_episode = 0
+    logger.info(
+        "Prepared filtered dataset: source={}, output={}, matched_count={}, episode_id={}",
+        matched_source,
+        output_path,
+        len(matched_episodes),
+        filtered_dataset["episodes"][0].get("episode_id"),
+    )
+
+
 def get_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--eval_episodes", type=int, default=1000)
     parser.add_argument("--start_episode", type=int, default=0)
+    parser.add_argument("--dataset_episodes", type=int, default=None)
+    parser.add_argument("--scene_id", type=str, default=None)
+    parser.add_argument("--scene_id_contains", type=str, default=None)
+    parser.add_argument("--object_category", type=str, default=None)
+    parser.add_argument("--episode_rank", type=int, default=0)
+    parser.add_argument("--filtered_dataset_dir", type=str, default="logs/datasets")
+    parser.add_argument("--max_steps", type=int, default=500)
     parser.add_argument("--mapper_resolution", type=float, default=0.05)
     parser.add_argument("--grid_resolution", type=float, default=0.1)
     parser.add_argument("--grid_size", type=int, default=500)
@@ -61,7 +198,7 @@ def get_args():
     parser.add_argument("--no_gpt_seg", default=True, action="store_false")
     parser.add_argument("--relocate", default=False, action="store_true")
     parser.add_argument("--no_gpt_relocate", default=False, action="store_true")
-    parser.add_argument("--vlm", type=str, default="gemini")
+    parser.add_argument("--vlm", type=str, default="cognav")
     return parser.parse_known_args()[0]
 
 
@@ -71,8 +208,14 @@ if __name__ == "__main__":
     args.save_dir = "logs/" + args.save_dir
     os.makedirs(args.save_dir, exist_ok=True)
 
-    habitat_config = hm3d_config(stage='val', episodes=args.eval_episodes)
+    # 通过 scene_id/object_category 指定任务时，先生成单 episode 数据集。
+    # 这样 Habitat 只会看到一个 episode，避免不同版本 iterator 的采样顺序差异。
+    _prepare_scene_object_dataset(args, stage="val")
+
+    dataset_episodes = args.dataset_episodes or max(args.eval_episodes, args.start_episode + 1)
+    habitat_config = hm3d_config(stage='val', episodes=dataset_episodes)
     habitat_env = habitat.Env(habitat_config)
+    _filter_episodes(habitat_env, args.scene_id_contains, args.object_category)
     habitat_mapper = Instruct_Mapper(
         habitat_camera_intrinsic(habitat_config),
         pcd_resolution=args.mapper_resolution,
@@ -129,7 +272,7 @@ if __name__ == "__main__":
             habitat_agent.make_plan_mod_no_relocate(idx=i)
 
         flag = True
-        while flag and not habitat_env.episode_over and habitat_agent.episode_steps < 500:
+        while flag and not habitat_env.episode_over and habitat_agent.episode_steps < args.max_steps:
             flag = habitat_agent.step_mod(idx=i)
 
         habitat_agent.save_trajectory(f"./{args.save_dir}/episode-{i}/")

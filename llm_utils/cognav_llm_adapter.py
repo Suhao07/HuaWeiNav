@@ -5,9 +5,13 @@ import sys
 from types import SimpleNamespace
 from typing import Any, get_origin
 
-from openai import OpenAI
+from constants import COGNAV_MODEL_NAME, DEFAULT_VLM, GEMINI_MODEL_NAME, require_gemini_key
 
-from constants import GEMINI_API_KEY, MODEL_NAME
+
+def _openai_client_class():
+    from openai import OpenAI
+
+    return OpenAI
 
 
 def _add_cognav_to_path() -> None:
@@ -72,6 +76,12 @@ class _CogNavParsedChat:
     def parse(self, model, messages, response_format, **kwargs):
         # CogNav LLMClient 不原生支持 OpenAI beta.parse。
         # 因此把 Pydantic schema 注入 system prompt，再把返回 JSON 校验回同一 schema。
+        if os.getenv("LLM_OFFLINE", "0") in ("1", "true", "True"):
+            parsed = response_format.model_validate(_fallback_payload(response_format))
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(parsed=parsed, content=""))]
+            )
+
         schema = response_format.model_json_schema()
         schema_prompt = (
             "Return only one JSON object that conforms to this JSON schema. "
@@ -122,25 +132,22 @@ class CogNavOpenAICompatibleClient:
 
 
 def get_client_and_model(vlm: str):
-    # 统一 LLM 入口：上层仍使用 OpenAI-compatible client，
-    # cognav 分支实际复用 CogNav_ObjNav 的 LLMClient。
-    if vlm == "cognav" or os.getenv("STRIVE_LLM_CLIENT", "").lower() == "cognav":
-        model = (
-            os.getenv("VLM_MODEL")
-            or os.getenv("LLM_MODEL")
-            or os.getenv("ARK_MODEL")
-            or "doubao-seed-2-0-pro-260215"
-        )
-        return CogNavOpenAICompatibleClient(), model
+    # 统一 LLM 入口：STRIVE 上层仍使用 OpenAI-compatible parse 形式，
+    # 实际请求由 CogNav_ObjNav/utils/llm_client.py 负责处理 Ark/OpenAI/离线模式。
+    backend = (vlm or DEFAULT_VLM or "cognav").lower()
+    if backend == "cognav":
+        return CogNavOpenAICompatibleClient(), COGNAV_MODEL_NAME
 
-    if vlm == "gemini":
+    if backend == "gemini":
+        OpenAI = _openai_client_class()
         return (
             OpenAI(
-                api_key=GEMINI_API_KEY,
+                api_key=require_gemini_key(),
                 base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
             ),
-            MODEL_NAME,
+            GEMINI_MODEL_NAME,
         )
-    if vlm == "openai":
+    if backend == "openai":
+        OpenAI = _openai_client_class()
         return OpenAI(), "gpt-4o"
     raise ValueError(f"Invalid VLM: {vlm}")
