@@ -14,6 +14,12 @@ from tqdm import tqdm
 from config_utils import hm3d_config, mp3d_config
 from constants import *
 from cv_utils.gpt_utils import ask_gpt_similar_objects
+#指令解析模块
+from instruction_adapter import (
+    StriveInstructionParser,
+    extract_dataset_target,
+    render_instruction_context,
+)
 from mapper_with_process_obs import Instruct_Mapper
 from mapping_utils.transform import habitat_camera_intrinsic
 from objnav_agent_with_process_obs import HM3D_Objnav_Agent
@@ -199,6 +205,10 @@ def get_args():
     parser.add_argument("--relocate", default=False, action="store_true")
     parser.add_argument("--no_gpt_relocate", default=False, action="store_true")
     parser.add_argument("--vlm", type=str, default="cognav")
+    parser.add_argument("--custom_instruction", type=str, default="")
+    parser.add_argument("--enable_instruction_adapter", default=False, action="store_true")
+    parser.add_argument("--instruction_adapter_backend", type=str, default="llm")
+    parser.add_argument("--instruction_adapter_strict_classes", default=False, action="store_true")
     return parser.parse_known_args()[0]
 
 
@@ -234,6 +244,11 @@ if __name__ == "__main__":
                                       gpt_relocate=not args.no_gpt_relocate,
                                       vlm=args.vlm)
     evaluation_metrics = []
+    instruction_parser = StriveInstructionParser(
+        backend=args.instruction_adapter_backend,
+        strict_available_classes=args.instruction_adapter_strict_classes,
+        vlm=args.vlm,
+    )
 
     start_idx = args.start_episode
     if hasattr(habitat_agent.env.episode_iterator, "set_next_episode_by_index"):
@@ -250,19 +265,56 @@ if __name__ == "__main__":
         habitat_agent.reset(i)
 
         target = habitat_agent.instruct_goal
-        start = target.find("<") + 1
-        end = target.find(">")
-        habitat_mapper.target = target[start:end]
+        dataset_target = extract_dataset_target(target)
+        if args.enable_instruction_adapter or str(args.custom_instruction or "").strip():
+            current_episode = getattr(habitat_agent.env, "current_episode", None)
+            custom_instruction = str(args.custom_instruction or "").strip()
+            episode_info = {} if custom_instruction else (getattr(current_episode, "info", None) or {})
+            raw_instruction = (
+                custom_instruction
+                or str(episode_info.get("instruction", "")).strip()
+                or target
+            )
+            instruction_plan = instruction_parser.parse_plan(
+                raw_instruction=raw_instruction,
+                dataset_target=dataset_target,
+                available_classes=habitat_mapper.object_perceiver.classes,
+                episode_info=episode_info,
+            )
+            instruction_spec = instruction_plan.to_legacy_spec()
+            habitat_mapper.instruction_plan = instruction_plan
+            habitat_mapper.instruction_spec = instruction_spec
+            habitat_mapper.target_list = list(
+                instruction_spec.target_detector_prompts
+                or [instruction_spec.canonical_target or dataset_target]
+            )
+            habitat_mapper.target = instruction_spec.canonical_target or habitat_mapper.target_list[0]
+            habitat_mapper.target_aliases = list(instruction_spec.target_match_terms)
+            habitat_agent.instruct_goal = render_instruction_context(instruction_plan)
 
-        # 先用 LLM 扩展目标同义/相关类别，再初始化 GroundingDINO+SAM 的文本提示。
-        habitat_mapper.target_list = ask_gpt_similar_objects(
-            habitat_mapper.object_perceiver.classes,
-            habitat_mapper.target,
-            args.vlm
-        )
+            instruction_dir = os.path.join(args.save_dir, f"episode-{i}", "instruction_adapter")
+            os.makedirs(instruction_dir, exist_ok=True)
+            with open(os.path.join(instruction_dir, "plan.json"), "w", encoding="utf-8") as f:
+                json.dump(instruction_plan.as_dict(), f, ensure_ascii=False, indent=2, sort_keys=True)
+            with open(os.path.join(instruction_dir, "spec.json"), "w", encoding="utf-8") as f:
+                json.dump(instruction_spec.as_dict(), f, ensure_ascii=False, indent=2, sort_keys=True)
+        else:
+            habitat_mapper.instruction_plan = None
+            habitat_mapper.instruction_spec = None
+            habitat_mapper.target = dataset_target
+
+            # 先用 LLM 扩展目标同义/相关类别，再初始化 GroundingDINO+SAM 的文本提示。
+            habitat_mapper.target_list = ask_gpt_similar_objects(
+                habitat_mapper.object_perceiver.classes,
+                habitat_mapper.target,
+                args.vlm
+            )
+            habitat_mapper.target_aliases = list(habitat_mapper.target_list)
 
         logger.info(f"Target: {habitat_mapper.target}")
         logger.info(f"Target list: {habitat_mapper.target_list}")
+        if habitat_mapper.instruction_spec is not None:
+            logger.info(f"Instruction spec: {habitat_mapper.instruction_spec.as_dict()}")
 
         habitat_mapper.object_perceiver.sam.initialize(habitat_mapper.target)
 

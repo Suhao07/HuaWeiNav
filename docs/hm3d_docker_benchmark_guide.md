@@ -1,4 +1,4 @@
-# STRIVE HM3D Docker Benchmark 指令文档
+# Docker Benchmark 指令文档
 
 本文档记录从零创建本地 Docker 镜像、复用 CogNav_ObjNav 数据和 LLM client、配置权重、运行 HM3D ObjectNav baseline benchmark 的完整流程。
 
@@ -29,7 +29,7 @@ export COGNAV_ROOT=/home/ubuntu/WorkSpace/research/code/Navigation/CogNav_ObjNav
 - HM3D 场景数据：`$COGNAV_ROOT/data/scene_datasets/hm3d_v0.2`
 - ObjectNav episode 数据：`$COGNAV_ROOT/data/objectgoal_hm3d/val/val.json.gz` 或 `$COGNAV_ROOT/data/objectnav_hm3d_v2/val/val.json.gz`
 
-## 2. 从零构建 STRIVE 镜像
+## 2. 从零构建镜像
 
 默认构建镜像名为 `strive-hm3d:local`：
 
@@ -233,6 +233,101 @@ bash docker/run_scene_object_nav.sh \
 ```
 
 用于选择同一场景和目标物下的第 N 个匹配 episode。`--scene_id_contains` 和 `--object_category` 仍可直接传给 `run_hm3d_baseline.sh`，但精确跑单个场景/物体时推荐 `run_scene_object_nav.sh`，因为它不依赖 Habitat iterator 的内部采样顺序。
+
+### 5.4 启用自然语言指令适配器
+
+默认 ObjectNav 仍按数据集目标运行。需要让 agent 接收自然语言或 CogNav instruction metadata 时，打开 adapter：
+
+```bash
+bash docker/run_scene_object_nav.sh \
+  --scene_id wcojb4TFT35 \
+  --object_category tv \
+  --save_dir hm3d_wcojb4TFT35_tv_instruction \
+  --vlm cognav \
+  --enable_instruction_adapter \
+  --custom_instruction "find the television in the scene"
+```
+
+adapter 的默认 backend 是 `llm`：
+
+```text
+CogNav episode.info -> LLM structured parse -> dataset target fallback
+```
+
+如果只想复用数据集目标、不调用 LLM，可显式传：
+
+```bash
+--instruction_adapter_backend rules
+```
+
+注意这里的 `rules` 只是兼容 fallback 名称，不再使用目标常识硬编码表。解析结果会保存到：
+
+```text
+logs/<save_dir>/episode-*/instruction_adapter/plan.json
+logs/<save_dir>/episode-*/instruction_adapter/spec.json
+```
+
+### 5.5 CogNav 指令模式自治 Benchmark
+
+CogNav 已生成的 instruction benchmark 是 Habitat-compatible ObjectNav split，episode 仍由 Habitat 驱动，指令语义在 `episode.info` 中。STRIVE 运行时打开 `--enable_instruction_adapter` 后，会优先从 `episode.info` 编译 `InstructionPlan`，再交给 mapper/agent 自治导航。
+
+运行前建议先导出真实 LLM 配置。metadata 足够时解析不需要调用 LLM，但导航过程中的 room/viewpoint 选择仍可能使用 CogNav LLM client：
+
+```bash
+export LLM_PROVIDER=ark
+export ARK_API_KEY="<your-ark-api-key>"
+export LLM_MODEL=doubao-seed-2-0-lite-260428
+export LLM_API_BASE_URL=https://ark.cn-beijing.volces.com/api/v3
+```
+
+Demand instruction benchmark：
+
+```bash
+HM3D_DATASET_PATH=/home/ubuntu/WorkSpace/research/code/Navigation/CogNav_ObjNav/data/datasets/objectnav/hm3d_ovon/v1/val_seen_instruction_balanced_3k \
+bash docker/run_hm3d_baseline.sh \
+  --eval_episodes 10 \
+  --start_episode 0 \
+  --save_dir hm3d_instruction_adapter_10ep \
+  --vlm cognav \
+  --enable_instruction_adapter \
+  --instruction_adapter_backend llm
+```
+
+Complex instruction benchmark：
+
+```bash
+HM3D_DATASET_PATH=/home/ubuntu/WorkSpace/research/code/Navigation/CogNav_ObjNav/data/datasets/objectnav/hm3d_ovon/v1/val_seen_complex_balanced_2k \
+bash docker/run_hm3d_baseline.sh \
+  --eval_episodes 10 \
+  --start_episode 0 \
+  --save_dir hm3d_complex_instruction_adapter_10ep \
+  --vlm cognav \
+  --enable_instruction_adapter \
+  --instruction_adapter_backend llm
+```
+
+常用调整：
+
+```bash
+--eval_episodes 1      # 快速 smoke
+--eval_episodes 100    # 扩大评测
+--start_episode 50     # 从指定 episode 继续
+--max_steps 150        # 限制单 episode 最大步数
+```
+
+输出目录：
+
+```text
+logs/hm3d_instruction_adapter_10ep/
+logs/hm3d_complex_instruction_adapter_10ep/
+```
+
+每个 episode 的指令解析结果：
+
+```text
+logs/<save_dir>/episode-*/instruction_adapter/plan.json
+logs/<save_dir>/episode-*/instruction_adapter/spec.json
+```
 
 ## 6. 输出结果
 

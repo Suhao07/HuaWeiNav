@@ -17,6 +17,7 @@ import os
 from mapping_utils.representation import *
 import cv2
 from cv_utils.image_perceiver import *
+from instruction_adapter.ontology import normalize_term
 from llm_utils.nav_prompt_room import *
 from llm_utils.cognav_llm_adapter import get_client_and_model
 
@@ -70,6 +71,9 @@ class Instruct_Mapper:
         self.obj_number = 2
         self.target = ""
         self.target_list = []
+        self.target_aliases = []
+        self.instruction_plan = None
+        self.instruction_spec = None
 
         self.vlm = vlm
         self.frontier_thres = 6
@@ -149,6 +153,9 @@ class Instruct_Mapper:
 
         self.target = ""
         self.target_list = []
+        self.target_aliases = []
+        self.instruction_plan = None
+        self.instruction_spec = None
 
         self.room_nodes = []
 
@@ -208,6 +215,34 @@ class Instruct_Mapper:
             self.trav_map.fill_(0.)
 
         init_map_and_pose()
+
+    def _target_match_terms(self):
+        terms = [self.target]
+        terms.extend(list(self.target_list or []))
+        terms.extend(list(self.target_aliases or []))
+        spec = getattr(self, "instruction_spec", None)
+        if spec is not None:
+            try:
+                terms.extend(list(spec.target_match_terms))
+            except Exception:
+                pass
+        plan = getattr(self, "instruction_plan", None)
+        if plan is not None:
+            try:
+                terms.extend(list(plan.target_match_terms))
+            except Exception:
+                pass
+        return {normalize_term(x) for x in terms if str(x or "").strip()}
+
+    def _is_target_tag(self, tag):
+        """Return whether a mapped object tag may satisfy the task target.
+
+        中文说明：这里严格只使用 adapter 输出的 target aliases / detector
+        prompts。support objects 只服务房间搜索，不能在这里通过，否则
+        "watch movie" 会把 couch/sofa 误判成可停止目标。
+        """
+
+        return normalize_term(tag) in self._target_match_terms()
 
     def add_node(self, position, pcd=None, has_frontier=False, frontier_idxs=np.array([]), block_current=False):
 
@@ -1017,7 +1052,7 @@ class Instruct_Mapper:
                 entity_indices.append(len(ref_entities) - 1)
             else:
                 # target class
-                if entity.tag == self.target:
+                if self._is_target_tag(entity.tag):
                     argmax_entity = ref_entities[arg_overlap_index]
                     print(argmax_entity.tag)
                     if argmax_entity.tag == 'nothing':
@@ -1030,12 +1065,16 @@ class Instruct_Mapper:
                         if overlap_score > 0.85 and overlap_score1 > 0.85 and overlap_score2 > 0.85:
                             argmax_entity.num_list.pop(argmax_entity.tag)
                             argmax_entity.conf_list.pop(argmax_entity.tag)
+                            source_tag = entity.tag if entity.tag in entity.num_list else self.target
                             argmax_entity.tag = self.target
                             argmax_entity.pcd = eval_pcd
                             argmax_entity.position = entity.position
                             argmax_entity.confidence = entity.confidence
-                            argmax_entity.num_list[self.target] = entity.num_list[self.target]
-                            argmax_entity.conf_list[self.target] = entity.conf_list[self.target]
+                            argmax_entity.num_list[self.target] = entity.num_list.get(source_tag, 1)
+                            argmax_entity.conf_list[self.target] = entity.conf_list.get(
+                                source_tag,
+                                [entity.confidence],
+                            )
                         else:
                             entity.pcd = eval_pcd
                             ref_entities.append(entity)
@@ -2857,18 +2896,13 @@ class Instruct_Mapper:
             f.write(f'\n')
             f.write(f'\n')
 
-        # 视觉检测和 LLM 可能返回目标的同义类，例如任务目标是 tv，
-        # 但检测类别是 tv_monitor。确认目标时必须使用 target_list 做别名匹配。
-        target_aliases = {self.target}
-        target_aliases.update(getattr(self, "target_list", []) or [])
-
         target_objs = []
         for obj in self.objects:
             tag = obj.tag
-            if tag in target_aliases:
+            if self._is_target_tag(tag):
                 target_objs.append(obj)
         if len(target_objs) == 0:
-            answer = f"No target object '{self.target}' found; accepted aliases: {sorted(target_aliases)}"
+            answer = f"No target object '{self.target}' found; accepted aliases: {sorted(self._target_match_terms())}"
             with open(f'{self.save_dir}/episode-{idx}/no_gpt_obj/answer_{step}.txt', 'w') as f:
                 f.write(f'Input: {prompt_info}\n')
                 f.write(f'Answer: {answer}\n')

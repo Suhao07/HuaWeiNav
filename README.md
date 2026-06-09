@@ -1,36 +1,3 @@
-# STRIVE: Structured Representation Integrating VLM Reasoning for Efficient Object Navigation
-
-[![arXiv](https://img.shields.io/badge/arXiv-2505.06729-b31b1b.svg)](https://arxiv.org/abs/2505.06729)
-[![Conference](https://img.shields.io/badge/ICRA-2026-blue.svg)](https://arxiv.org/abs/2505.06729)
-[![Python](https://img.shields.io/badge/Python-3.12-3776AB.svg)](https://www.python.org/)
-
-> **STRIVE** is a two-stage object-navigation framework that couples an incrementally built, multi-layer environment representation with selective VLM reasoning — achieving state-of-the-art success rate and navigation efficiency across four simulated benchmarks and on a real robot.
-
----
-
-## Overview
-
-Vision-Language Models (VLMs) bring rich priors and strong reasoning to object navigation, but two challenges limit their practical use:
-
-1. **Parsing and structuring** complex environment information on the fly.
-2. Deciding **when and how** to query a VLM — querying at every step causes unnecessary backtracking and wasted compute, especially in large continuous environments.
-
-STRIVE addresses both by incrementally constructing a multi-layer representation of **viewpoints**, **object nodes**, and **room nodes** during navigation:
-
-- Viewpoints and object nodes drive **intra-room exploration** and accurate target localization.
-- Room nodes support **efficient inter-room planning**.
-
-On top of this representation, a two-stage policy combines **high-level planning guided by VLM reasoning** with **low-level VLM-assisted exploration** to locate the goal object efficiently and reliably.
-
-**Results.** STRIVE achieves state-of-the-art performance on HM3D v1, HM3D v2, RoboTHOR, and MP3D, improving success rate by **+13.1% SR** and navigation efficiency by **+6.2% SPL**. Real-robot validation across **120 episodes in 10 indoor environments** further demonstrates its robustness.
-
-See the paper for full details: [STRIVE: Structured Representation Integrating VLM Reasoning for Efficient Object Navigation](https://arxiv.org/abs/2505.06729).
-
-### News
-
-- **2026-01-31** — Paper accepted to **ICRA 2026**.
-
----
 
 ## Installation
 
@@ -123,19 +90,3 @@ python objnav_benchmark_with_process_obs.py
 ```
 
 ---
-
-## Citation
-
-If you find STRIVE useful in your research, please consider citing:
-
-```bibtex
-@misc{zhu2025strivestructuredrepresentationintegrating,
-      title={STRIVE: Structured Representation Integrating VLM Reasoning for Efficient Object Navigation},
-      author={Haokun Zhu and Zongtai Li and Zhixuan Liu and Wenshan Wang and Ji Zhang and Jonathan Francis and Jean Oh},
-      year={2025},
-      eprint={2505.06729},
-      archivePrefix={arXiv},
-      primaryClass={cs.RO},
-      url={https://arxiv.org/abs/2505.06729},
-}
-```
