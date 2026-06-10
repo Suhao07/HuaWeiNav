@@ -110,6 +110,14 @@ class RelationPairLedger:
         reason: str = "",
         evidence_view_ids: list[str] | None = None,
     ) -> RelationPairRecord:
+        key = (str(instruction_hash), str(subject_id), normalize_relation(relation), str(object_id))
+        existing = self.records.get(key)
+        if (
+            existing is not None
+            and existing.status == "accepted_relation"
+            and status == "rejected_relation"
+        ):
+            return existing
         record = RelationPairRecord(
             instruction_hash=str(instruction_hash),
             subject_id=str(subject_id),
@@ -139,6 +147,24 @@ class SemanticEdgeCache:
 
     def put(self, edge: SemanticEdge) -> SemanticEdge:
         query = RelationQuery(edge.subject_id, edge.relation, edge.object_id)
+        existing = self._edges.get(query.key)
+        if (
+            existing is not None
+            and existing.verified
+            and not edge.verified
+            and edge.source in ("geometry", "geometry_prefilter")
+        ):
+            # 已有强视觉证据确认的动态语义边不能被后续点云/投影噪声降级。
+            # 几何仍可阻止新 pair 进入 VLM，但不能覆盖 accepted VLM edge。
+            return existing
+        if existing is not None and existing.verified and edge.verified:
+            merged_ids = list(dict.fromkeys(list(existing.evidence_view_ids) + list(edge.evidence_view_ids)))
+            if edge.confidence >= existing.confidence:
+                edge.evidence_view_ids = merged_ids
+                self._edges[query.key] = edge
+                return edge
+            existing.evidence_view_ids = merged_ids
+            return existing
         self._edges[query.key] = edge
         return edge
 

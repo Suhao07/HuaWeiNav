@@ -77,6 +77,8 @@ class InstructionExecutionState:
         self.plan_hash = _constraint_key(plan.as_dict() if hasattr(plan, "as_dict") else plan)
         self.active_target_index = 0
         self.completed = False
+        self.mode = "search"
+        self.pending_verified_pair: dict[str, Any] = {}
         self.target_progress: dict[str, TargetProgress] = {}
         self.constraint_status: dict[str, ConstraintStatus] = {}
         if plan is not None:
@@ -126,12 +128,57 @@ class InstructionExecutionState:
         if target is not None and target.id in self.target_progress:
             self.target_progress[target.id].mark_rejected(candidate_uid)
 
+    def start_better_view_for_verified_pair(
+        self,
+        *,
+        target: TargetQuery | None,
+        candidate_uid: str,
+        relation_context: dict[str, Any] | None,
+        result: Any,
+        evidence: dict[str, Any] | None = None,
+    ) -> None:
+        """Pin a semantically verified pair while the controller improves view.
+
+        `need_better_view` means the instruction semantics are already plausible
+        or verified, but the final stop image is not strong enough. Treating that
+        as a rejected candidate makes the planner rediscover other objects and
+        causes repeated LVLM calls. This state promotes the verified semantic
+        pair to an execution objective until it is accepted or explicitly
+        rejected by semantic evidence.
+        """
+
+        edge = dict((relation_context or {}).get("edge") or {})
+        self.mode = "better_view_for_verified_pair"
+        self.pending_verified_pair = {
+            "target_id": getattr(target, "id", "") if target is not None else "",
+            "candidate_uid": str(candidate_uid or edge.get("subject_id", "")),
+            "relation_context": dict(relation_context or {}),
+            "edge": edge,
+            "decision": getattr(result, "decision", ""),
+            "confidence": float(getattr(result, "confidence", 0.0) or 0.0),
+            "reason": getattr(result, "reason", ""),
+            "view_objective": dict(getattr(result, "view_objective", {}) or {}),
+            "evidence": {
+                "current_rgb_with_bbox_path": (evidence or {}).get("current_rgb_with_bbox_path", ""),
+                "centered_view_path": (evidence or {}).get("centered_view_path", ""),
+                "view_quality_facts": dict((evidence or {}).get("view_quality_facts") or {}),
+            },
+        }
+
+    def clear_pending_verified_pair(self) -> None:
+        self.mode = "search"
+        self.pending_verified_pair = {}
+
+    def pending_pair_candidate_uid(self) -> str:
+        return str((self.pending_verified_pair or {}).get("candidate_uid", ""))
+
     def mark_candidate_accepted(self, plan: InstructionPlan, target: TargetQuery, candidate_uid: str) -> bool:
         """Record an accepted instance and return whether the full task is done."""
 
         self.bind_plan(plan)
         progress = self.target_progress[target.id]
         progress.mark_accepted(candidate_uid)
+        self.clear_pending_verified_pair()
 
         if getattr(plan.execution, "ordered", False):
             if progress.complete and self.active_target_index < len(plan.terminal_targets) - 1:
@@ -158,6 +205,8 @@ class InstructionExecutionState:
             "plan_hash": self.plan_hash,
             "active_target_index": self.active_target_index,
             "completed": self.completed,
+            "mode": self.mode,
+            "pending_verified_pair": self.pending_verified_pair,
             "target_progress": {
                 key: value.as_dict() for key, value in self.target_progress.items()
             },

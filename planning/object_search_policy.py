@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Any
 
 from instruction_adapter.verifier import candidate_from_object
+from instruction_adapter.ontology import normalize_term
 from planning.mode_policy import is_anchor_first_relation_search
 
 
@@ -27,6 +29,10 @@ class InstructionObjectSearchPolicy:
 
     def select(self, mapper: Any, *, plan: Any, step: int | None = None) -> ObjectSearchResult:
         raw_instruction = mapper._raw_instruction_for_verifier()
+        pinned = self._select_pending_verified_pair(mapper, plan, step)
+        if pinned is not None:
+            return pinned
+
         terminal_match_records = self._match_terminal_concepts(mapper, plan, raw_instruction, step)
         target_objs: list[Any] = []
         skipped_objs: list[dict[str, Any]] = []
@@ -93,6 +99,66 @@ class InstructionObjectSearchPolicy:
             answer=f"No target object '{mapper.target}' found; accepted aliases: {sorted(mapper._target_match_terms())}",
             skipped_objs=skipped_objs,
             concept_debug=concept_debug,
+        )
+
+    def _select_pending_verified_pair(self, mapper: Any, plan: Any, step: int | None) -> ObjectSearchResult | None:
+        state = getattr(mapper, "instruction_execution_state", None)
+        pending = dict(getattr(state, "pending_verified_pair", {}) or {})
+        if getattr(state, "mode", "") != "better_view_for_verified_pair" or not pending:
+            return None
+
+        target = None
+        target_id = str(pending.get("target_id", ""))
+        for item in getattr(plan, "terminal_targets", []) or []:
+            if item.id == target_id:
+                target = item
+                break
+        if target is None and getattr(plan, "terminal_targets", None):
+            target = plan.terminal_targets[0]
+
+        candidate_uid = str(pending.get("candidate_uid", ""))
+        best_obj = None
+        best_distance = float("inf")
+        desired_label = normalize_term(candidate_uid.split(":", 1)[0]) if ":" in candidate_uid else ""
+        subject_record = dict((pending.get("relation_context") or {}).get("subject_record") or {})
+        center = subject_record.get("center") or subject_record.get("centroid") or subject_record.get("position") or []
+
+        for obj in getattr(mapper, "objects", []) or []:
+            candidate = candidate_from_object(
+                obj,
+                canonical_label=getattr(target, "name", getattr(mapper, "target", "")),
+                step=step,
+            )
+            if candidate.uid == candidate_uid:
+                best_obj = obj
+                best_distance = 0.0
+                break
+            if desired_label and normalize_term(getattr(obj, "tag", "")) != desired_label:
+                continue
+            dist = _distance3(candidate.centroid, center)
+            if dist < best_distance:
+                best_distance = dist
+                best_obj = obj
+
+        if best_obj is None:
+            return None
+        if best_distance > _pending_pair_association_radius():
+            return None
+
+        # 中文说明：pending verified pair 已经由 VLM 证明语义成立。
+        # 此处只把同一实例/同一局部簇重新交给 view-control，不重新启动
+        # 全图搜索，也不把 anchor 当成终止目标。
+        if target is not None:
+            best_obj.tag = target.name
+            best_obj.conf_list[target.name] = best_obj.confidence
+        return ObjectSearchResult(
+            found=True,
+            obj=best_obj,
+            answer=(
+                "Continue better-view control for pinned verified semantic pair "
+                f"{candidate_uid}; avoid rediscovering unrelated candidates."
+            ),
+            concept_debug=[{"source": "pending_verified_pair", **pending}],
         )
 
     def _match_terminal_concepts(self, mapper: Any, plan: Any, raw_instruction: str, step: int | None) -> dict[tuple[str, str], Any]:
@@ -168,3 +234,21 @@ class InstructionObjectSearchPolicy:
             concept_debug=concept_debug,
             anchor_record=anchor_record.as_dict(),
         )
+
+
+def _distance3(a: Any, b: Any) -> float:
+    try:
+        av = [float(x) for x in list(a or [])[:3]]
+        bv = [float(x) for x in list(b or [])[:3]]
+        if len(av) < 3 or len(bv) < 3:
+            return float("inf")
+        return sum((av[idx] - bv[idx]) ** 2 for idx in range(3)) ** 0.5
+    except Exception:
+        return float("inf")
+
+
+def _pending_pair_association_radius() -> float:
+    try:
+        return max(0.1, float(os.getenv("STRIVE_PENDING_PAIR_ASSOC_RADIUS", "0.75")))
+    except Exception:
+        return 0.75

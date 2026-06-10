@@ -149,7 +149,7 @@ class RuntimeConceptMatcher:
             obj=obj,
         )
         self.records[key] = record
-        if record.source == "exact":
+        if _should_cache_label_match(record):
             self.label_cache[label_key] = record
         return record
 
@@ -437,6 +437,8 @@ class RuntimeConceptMatcher:
                         reason=str(item.reason or ""),
                     )
                 self.records[(inst_hash, concept.id, object_uid)] = record
+                if _should_cache_label_match(record):
+                    self.label_cache[(inst_hash, concept.id, observed_label)] = record
                 records.append(record)
             return records
         except Exception as exc:
@@ -553,6 +555,26 @@ def _concept_match_batch_limit() -> int:
         return max(0, int(os.getenv("STRIVE_CONCEPT_MATCH_MAX_BATCH", "16")))
     except ValueError:
         return 16
+
+
+def _should_cache_label_match(record: ConceptMatchRecord) -> bool:
+    """Cache confident prompt results at role-aware label granularity.
+
+    The cache key includes instruction hash and concept id, so this does not
+    become a global synonym table. It only prevents repeated LVLM calls when
+    mapper uid churn creates multiple instances with the same observed label
+    under the same instruction concept.
+    """
+
+    if not record.observed_label:
+        return False
+    try:
+        threshold = float(os.getenv("STRIVE_CONCEPT_LABEL_CACHE_CONF", "0.75"))
+    except Exception:
+        threshold = 0.75
+    if record.source not in ("llm", "llm_batch", "exact"):
+        return False
+    return float(record.confidence or 0.0) >= threshold
 
 
 def _object_image_blocks(obj: Any) -> list[dict[str, Any]]:

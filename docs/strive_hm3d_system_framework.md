@@ -573,8 +573,31 @@ better-view 子目标会 pin 已验证的 `DynamicSemanticEdge`。例如
 从零开始。若 mapper 在近距离把同一书架区域切成新的 book uid，约束层会通过
 `pinned_relation_context` 把它视为同一已接受语义区域的证据更新。
 
+当前实现进一步把该 pair 提升为 `InstructionExecutionState` 的一等状态：
+
+```text
+semantic_satisfied=true + need_better_view
+  -> mode = better_view_for_verified_pair
+  -> pending_verified_pair = {candidate_uid, relation_context, edge, view_objective}
+```
+
+这条状态有两个不变量：
+
+```text
+1. pending candidate 不写入 rejected_candidate_uids；
+2. object search 优先返回 pending pair 的目标实例或同一局部几何簇，
+   不重新启动全图 terminal/anchor grounding。
+```
+
+因此“语义已经确认但视角不足”会形成闭环视角控制，而不是被误当成失败后继续寻找
+新的 book / shelf。
+
 对 `check_again` 产生的强视觉证据，关系几何预筛失败不再直接 hard reject；系统会允许
 VLM relation verifier 覆盖几何不确定性，并在缓存层绕过旧的 geometry failure。
+
+动态语义边缓存遵守单调性：VLM confirmed edge 不会被后续纯 geometry reject 覆盖，
+`RelationPairLedger` 中的 `accepted_relation` 也不会被降级为
+`rejected_relation`。几何仍是新 pair 的预筛，但不能删除已经被视觉证据确认的关系。
 
 关键原则是“屏蔽实例，不屏蔽类别”。例如找红色椅子时，蓝色椅子被 verifier 拒绝后，只跳过该椅子实例；检测器后续发现其它 `chair` 实例仍会继续验证。
 
@@ -590,6 +613,9 @@ ConceptQuery:
 ConceptMatchRecord:
   RuntimeConceptMatcher 判断 mapper object 是否满足某个 ConceptQuery。
   非精确匹配由 LLM/VLM 决定，并按 instruction/concept/object 缓存。
+  高置信 batch 结果还会写入 instruction/concept/label 粒度缓存，
+  用于抵抗 mapper uid 漂移；该缓存仍带 instruction hash 和 concept id，
+  不是全局同义词表。
   多对象场景使用 `match_many()` 批量询问，避免每个 object 单独调用 LVLM。
 
 AnchorSearchLedger:

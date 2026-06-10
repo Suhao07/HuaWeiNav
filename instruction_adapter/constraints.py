@@ -259,6 +259,7 @@ class ConstraintEvaluator:
         target: TargetQuery | None,
         candidate: CandidateInstance,
         result: VerificationResult,
+        evidence: dict[str, Any] | None = None,
     ) -> bool:
         state = self.ensure_state(mapper, plan)
         if target is None:
@@ -266,6 +267,20 @@ class ConstraintEvaluator:
         if target is None:
             return bool(result.satisfied and result.decision == "accept")
         if not (result.satisfied and result.decision == "accept"):
+            if result.decision == "need_better_view" and bool(result.semantic_satisfied):
+                state.start_better_view_for_verified_pair(
+                    target=target,
+                    candidate_uid=candidate.uid,
+                    relation_context=(evidence or {}).get("verified_relation_context") or {},
+                    result=result,
+                    evidence=evidence,
+                )
+                return False
+            if state.pending_pair_candidate_uid() == candidate.uid and result.decision in (
+                "reject_candidate",
+                "reject_relation",
+            ):
+                state.clear_pending_verified_pair()
             state.mark_candidate_rejected(target, candidate.uid)
             return False
         return state.mark_candidate_accepted(plan, target, candidate.uid)

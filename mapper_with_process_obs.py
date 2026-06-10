@@ -2035,8 +2035,6 @@ class Instruct_Mapper:
                              grid_resolution=0.1,
                              closest_distance=1.6):
 
-
-
         grid_map_new = np.zeros((self.voxel_dimension[0], self.voxel_dimension[1]))
 
         frontier_map, frontiers = project_frontier(obstacle_pcd, navigable_pcd, obstacle_height, self.grid_resolution, self.voxel_dimension)
@@ -2938,6 +2936,13 @@ class Instruct_Mapper:
         # room_dimension[1] *= (self.grid_resolution // room_resolution)
 
         room_dimension = np.asarray([1000,1000,20])
+        nodes_positions = translate_point_to_grid(
+            self.get_nodes_positions(),
+            grid_resolution=room_resolution,
+            voxel_dimension=room_dimension,
+        )[:, :2]
+        nodes_positions[:, 0] = np.clip(nodes_positions[:, 0], 0, room_dimension[0] - 1)
+        nodes_positions[:, 1] = np.clip(nodes_positions[:, 1], 0, room_dimension[1] - 1)
 
         hist = project_room(pcd_2d,grid_resolution=room_resolution,voxel_dimension=room_dimension)
         if save_intermediate_results:
@@ -3022,6 +3027,10 @@ class Instruct_Mapper:
         # get the components
         num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
             outside_boundary_tmp, connectivity=8)
+        if num_labels <= 1:
+            logger.warning("Room segmentation found no connected free-space component at step {}.", step_idx)
+            self._fallback_single_room(nodes_positions)
+            return
         # get the largest component
         max_label = np.argmax(stats[1:, cv2.CC_STAT_AREA]) + 1
         outside_boundary_tmp = np.zeros_like(outside_boundary_tmp)
@@ -3040,13 +3049,24 @@ class Instruct_Mapper:
             cv2.imwrite(os.path.join(tmp_floor_path, "full_map4.png"), outside_boundary_tmp)
             #
 
+        free_mask = (outside_boundary_tmp > 0).astype(np.uint8) * 255
+        num_regions, markers, region_stats, _ = cv2.connectedComponentsWithStats(
+            free_mask, connectivity=8
+        )
+        if num_regions <= 1:
+            logger.warning("Room segmentation produced no region markers at step {}.", step_idx)
+            self._fallback_single_room(nodes_positions)
+            return
+
         # 遍历每个唯一的 region_id，并创建 mask
         unique_regions = np.unique(markers)
         region_masks = {}
         position_worlds = {}
         position_maps = {}
         for region_id in unique_regions:
-            if region_id in [-1, 0, unique_regions[-1]]:  # 跳过 watershed 线和背景
+            if region_id in [-1, 0]:  # 跳过 watershed 线和背景
+                continue
+            if region_stats[int(region_id), cv2.CC_STAT_AREA] <= 10:
                 continue
             mask = (markers == region_id).astype(np.uint8) * 255
             region_masks[region_id] = mask  # 存储每个区域的 mask
@@ -3087,6 +3107,9 @@ class Instruct_Mapper:
                     distance = np.linalg.norm(np.array(positions).T - current_position, axis=1)
                     distance_min = np.min(distance)
                     node_distance_to_mask[region_id] = distance_min
+                if not node_distance_to_mask:
+                    self._fallback_single_room(nodes_positions)
+                    return
                 closest_region_id = min(node_distance_to_mask, key=node_distance_to_mask.get)
                 node.room_idx = closest_region_id
 
@@ -3143,6 +3166,32 @@ class Instruct_Mapper:
             else:
                 self.grid_map[frontier_idxs[:, 0], frontier_idxs[:, 1]] = 2
 
+    def _fallback_single_room(self, nodes_positions=None):
+        """Fallback room partition when watershed/connected components are empty.
+
+        早期探索阶段点云和墙体骨架可能还不足以切出稳定房间。此时不能让
+        relocation 崩溃，先把已有 viewpoint 归为一个临时 room；后续地图更完整
+        时 `segment_room()` 会重新生成更细的 room nodes。
+        """
+
+        if len(self.nodes) == 0:
+            self.room_nodes = []
+            return
+        position_world = np.asarray(self.get_nodes_positions(), dtype=float).reshape(-1, 3)
+        position_map = translate_point_to_grid(
+            position_world,
+            grid_resolution=self.grid_resolution,
+            voxel_dimension=self.voxel_dimension,
+        )[:, :2]
+        position_map[:, 0] = np.clip(position_map[:, 0], 0, self.voxel_dimension[0] - 1)
+        position_map[:, 1] = np.clip(position_map[:, 1], 0, self.voxel_dimension[1] - 1)
+        room_node = Room_node(list(self.nodes), position_world, position_map, len(self.room_nodes))
+        for node in self.nodes:
+            node.room_idx = room_node.room_id
+        closet_node = self.find_closet_viewpoint_in_room(room_node)
+        if closet_node is not None:
+            room_node.distance = self.get_path_length(closet_node)
+        self.room_nodes.append(room_node)
 
     def find_closet_viewpoint_in_room(self, room_node):
         nodes = [node for node in room_node.nodes if node.state == 0 and node.has_frontier is True]

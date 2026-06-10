@@ -1178,6 +1178,20 @@ class HM3D_Objnav_Agent:
             context["candidate_uid_matches_current"] = self.view_control_state.candidate_uid == candidate.uid
             context["current_candidate_uid"] = candidate.uid
             evidence["view_control"] = context
+        else:
+            state = getattr(self.mapper, "instruction_execution_state", None)
+            pending = dict(getattr(state, "pending_verified_pair", {}) or {})
+            if getattr(state, "mode", "") == "better_view_for_verified_pair" and pending:
+                evidence["view_control"] = {
+                    "active": True,
+                    "source": "execution_pending_verified_pair",
+                    "candidate_uid": pending.get("candidate_uid", ""),
+                    "candidate_uid_matches_current": pending.get("candidate_uid", "") == candidate.uid,
+                    "current_candidate_uid": candidate.uid,
+                    "pinned_relation_context": pending.get("relation_context", {}),
+                    "objective": pending.get("view_objective", {}),
+                    "exhausted": False,
+                }
         return evidence
 
     def _pin_verified_relation_from_evidence(self, evidence):
@@ -1565,6 +1579,7 @@ class HM3D_Objnav_Agent:
                     target=target_for_candidate,
                     candidate=candidate,
                     result=result,
+                    evidence=evidence,
                 )
                 if not task_done:
                     logger.info("Instruction subgoal accepted but full task is not complete yet.")
@@ -1583,6 +1598,7 @@ class HM3D_Objnav_Agent:
                 target=target_for_candidate,
                 candidate=candidate,
                 result=result,
+                evidence=evidence,
             )
 
         if result.decision == "need_better_view":
@@ -1857,9 +1873,14 @@ class HM3D_Objnav_Agent:
             canonical_label=getattr(self.mapper, "target", ""),
             step=self.episode_steps,
         )
-        if (
-            getattr(self.view_control_state, "active", False)
-            and self.view_control_state.candidate_uid == current_candidate.uid
+        state = getattr(self.mapper, "instruction_execution_state", None)
+        pending_pair_active = (
+            getattr(state, "mode", "") == "better_view_for_verified_pair"
+            and bool(getattr(state, "pending_verified_pair", {}) or {})
+        )
+        if getattr(self.view_control_state, "active", False) and (
+            self.view_control_state.candidate_uid == current_candidate.uid
+            or pending_pair_active
         ):
             self.view_control_state.set_proposals(proposals)
             proposal = self.view_control_state.next_proposal()

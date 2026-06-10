@@ -225,6 +225,55 @@ planning/
   final verifier 处理原始自然语言、关系和视角充足性
 ```
 
+### Verified Pair View-Control 闭环
+
+复杂指令中的 `need_better_view` 不是失败状态。若 final verifier 返回：
+
+```text
+semantic_satisfied = true
+decision = need_better_view
+verified_relation_context exists
+```
+
+运行时会进入：
+
+```text
+InstructionExecutionState.mode = better_view_for_verified_pair
+```
+
+并保存：
+
+```text
+pending_verified_pair:
+  candidate_uid
+  relation_context
+  dynamic semantic edge
+  view_objective
+  baseline view quality
+```
+
+之后 `InstructionObjectSearchPolicy` 优先返回该 verified pair 对应的目标实例或同一
+局部几何簇，不再先做全图 terminal/anchor grounding。这样 step N 已确认
+`book on shelf` 但视角不足时，后续只围绕这条已验证语义边做视角优化，而不是重新
+搜索新的 book / shelf。
+
+该闭环只固定运行时证据，不写对象常识规则。若 mapper 近距离更新导致 uid 漂移，
+policy 使用同标签和局部几何距离做实例关联；语义是否满足仍由 final verifier 和
+dynamic semantic edge 负责。
+
+### Dynamic Edge 单调性
+
+`SemanticEdgeCache` 和 `RelationPairLedger` 遵守单调规则：
+
+```text
+VLM verified edge 不会被后续 geometry reject 覆盖
+accepted_relation 不会被 rejected_relation 降级
+```
+
+几何仍作为新 pair 的硬预筛，避免无证据地调用 VLM；但一旦 check-again / final
+verifier 提供了强视觉证据，后续点云高度、投影或 bbox 抖动只能作为弱负证据，不能
+静默删除已验证语义边。
+
 ## Phase4：删除废代码
 
 本阶段只做删除和收口，不引入 cup/support-region 新能力：

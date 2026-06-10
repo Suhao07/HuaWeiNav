@@ -54,6 +54,16 @@
 
 ### Fixed
 
+- `need_better_view` 且 `semantic_satisfied=true` 时不再把 candidate 写入
+  rejected 列表，而是进入 `better_view_for_verified_pair` 执行状态。
+- `InstructionObjectSearchPolicy` 在 pending verified pair 存在时优先返回该
+  pair 的目标实例或同一局部几何簇，避免语义已确认后重新全图搜索新候选。
+- `SemanticEdgeCache` / `RelationPairLedger` 增加单调保护：
+  - VLM verified dynamic semantic edge 不会被后续 geometry reject 覆盖；
+  - accepted relation pair 不会被 rejected relation pair 降级。
+- `RuntimeConceptMatcher` 将高置信 LLM batch 结果缓存到
+  instruction/concept/label 粒度，降低 mapper uid 漂移造成的重复 concept
+  grounding 调用。
 - 修复 `instruction_adapter/constraints.py` 中一处中文注释误改。
 
 ## 2026-06-09
