@@ -88,10 +88,14 @@ objnav_agent_with_process_obs.py     # 导航 agent、规划、轨迹保存
 mapper_with_process_obs.py           # 语义建图、节点/房间/前沿管理
 mapping_utils/transform.py           # 相机内参、坐标变换
 cv_utils/
-  gpt_utils.py                       # LLM 问答工具函数
+  gpt_utils.py                       # 图像裁剪、bbox 缓存和 VLM 工具函数
   sam.py                             # GroundingDINO + SAM 目标感知封装
 llm_utils/
   cognav_llm_adapter.py              # CogNav LLMClient 适配 OpenAI parse 接口
+prompting/
+  templates.py                       # prompt 文本集中维护
+  schemas.py                         # LLM/VLM response schema
+  registry.py                        # prompt id / trace label / schema name
 instruction_adapter/
   contracts.py                       # InstructionPlan / ConceptQuery / TargetQuery / Constraint schema
   grounding.py                       # 编译期 target/anchor concept grounding

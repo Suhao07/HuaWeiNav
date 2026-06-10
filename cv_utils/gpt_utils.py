@@ -4,12 +4,32 @@ import json
 import os
 
 import cv2
-from pydantic import BaseModel
 
 from constants import DETECT_OBJECTS
 from cv_utils.visualizer import visualize_mask
 from llm_utils.cognav_llm_adapter import get_client_and_model
 from llm_utils.lvlm_call_tracker import record_cache_hit
+from prompting.registry import (
+    BBOX_OBJECT_LABEL,
+    CHECK_AGAIN_BBOX,
+    SIMILAR_OBJECTS,
+    TAG_REFINE,
+    TAG_REFINE_OBJECT_LIST,
+)
+from prompting.schemas import (
+    BBoxObjectLabelResponse,
+    CheckAgainBBoxResponse,
+    SimilarObjectsResponse,
+    TagRefineResponse,
+    TagRefineWithObjectListResponse,
+)
+from prompting.templates import (
+    BBOX_OBJECT_LABEL_PROMPT,
+    CHECK_AGAIN_BBOX_PROMPT,
+    SIMILAR_OBJECTS_PROMPT,
+    TAG_REFINE_PROMPT,
+    TAG_REFINE_WITH_OBJECT_LIST_PROMPT,
+)
 
 
 def _get_client_and_model(vlm: str):
@@ -86,27 +106,7 @@ def ask_gpt_object_in_box(img, boxes, save_dir, episode_idx, episode_step, ind, 
             f.write(f"Answer: {label}\n")
         return label
 
-    class Step(BaseModel):
-        explanation: str
-        output: str
-
-    class DetResult(BaseModel):
-        steps: list[Step]
-        res: str
-
-    PROMPT = f"""
-    I will provide you an image with one bounding box drawn on it and the cropped image inside the bounding box. For this bounding box, I want you to reason step-by-step and consider surrounding context to determine what object is inside this bounding box.
-
-    Details:
-    - The image is input as a base64 string. The bounding box is visually drawn on the image.
-
-    Your goal:
-    - Choose the most appropriate label from the following predefined object list for the object inside the bounding box.
-    - If you are unsure, respond with `"unknown"`.
-    - Output a JSON object **without markdown**.
-
-    Pre-defined object list: {DETECT_OBJECTS}
-    """
+    PROMPT = BBOX_OBJECT_LABEL_PROMPT.format(detect_objects=DETECT_OBJECTS)
 
     prompt_info = f'box: {boxes[0].tolist()}'
 
@@ -152,8 +152,8 @@ def ask_gpt_object_in_box(img, boxes, save_dir, episode_idx, episode_step, ind, 
                 },
             ]
         }],
-        response_format=DetResult,
-        trace_label="bbox_object_in_box",
+        response_format=BBoxObjectLabelResponse,
+        trace_label=BBOX_OBJECT_LABEL.trace_label,
     )
 
     answer = completion.choices[0].message.parsed
@@ -188,10 +188,7 @@ def ask_gpt_object_in_box(img, boxes, save_dir, episode_idx, episode_step, ind, 
 def refine_tag_with_target(res, target, save_dir, episode_idx, episode_step, ind, vlm):
     tags = [item.tag for item in res]
 
-    class Result(BaseModel):
-        res: list[str]
-
-    PROMPT = f"Here is a list of words and a target word. For each word in the list, if it has the same meaning as the target, please replace it with the target. Otherwise, keep it unchanged."
+    PROMPT = TAG_REFINE_PROMPT
     INPUT = f"List: {tags}\nTarget: {target}\n"
 
     step_dir = _step_dir(save_dir, episode_idx, episode_step)
@@ -215,8 +212,8 @@ def refine_tag_with_target(res, target, save_dir, episode_idx, episode_step, ind
                 "content": INPUT
             },
         ],
-        response_format=Result,
-        trace_label="refine_tag_with_target",
+        response_format=TagRefineResponse,
+        trace_label=TAG_REFINE.trace_label,
     )
 
     ans = completion.choices[0].message.parsed
@@ -240,22 +237,11 @@ def refine_tag_with_target(res, target, save_dir, episode_idx, episode_step, ind
 def refine_tag_with_target_obj_list(res, target, save_dir, episode_idx, episode_step, ind,
                                     vlm):
 
-    class Step(BaseModel):
-        explanation: str
-        output: str
-
-    class Result(BaseModel):
-        steps: list[Step]
-        output: str
-
     object_list = list(DETECT_OBJECTS)
     if target not in object_list:
         object_list.append(target)
 
-    PROMPT = f"""
-              Here is a predefined object list: {object_list}.
-              You will be given one tag. You need to find the object in the list that has the closest meaning to this tag. If you find the object, please output the object. Otherwise, output "unknown". If you are not sure, please output "unknown".
-             """
+    PROMPT = TAG_REFINE_WITH_OBJECT_LIST_PROMPT.format(object_list=object_list)
 
     INPUT = f"""
             tag1: {res}
@@ -284,8 +270,8 @@ def refine_tag_with_target_obj_list(res, target, save_dir, episode_idx, episode_
                 "content": INPUT
             },
         ],
-        response_format=Result,
-        trace_label="refine_tag_with_target_obj_list",
+        response_format=TagRefineWithObjectListResponse,
+        trace_label=TAG_REFINE_OBJECT_LIST.trace_label,
     )
     ans = completion.choices[0].message.parsed
     if ans is None:
@@ -306,26 +292,11 @@ def refine_tag_with_target_obj_list(res, target, save_dir, episode_idx, episode_
 def ask_gpt_similar_objects(obj_list, target, vlm="cognav"):
     obj_str = ", ".join(obj_list)
 
-    prompt = f"""
-    Here is a predefined object list: {obj_str}.
-
-    You are given a target object. Your task is to identify all objects in the object list that have the same meaning as the target object.
-
-    Your response should include:
-    - `object_list`: a list of objects that have the same meaning with target object. Follow the python list format, e.g., ['object1', 'object2', 'object3'].
-    """
+    prompt = SIMILAR_OBJECTS_PROMPT.format(object_list=obj_str)
 
     user_input = f"""
     Target object: {target}
     """
-
-    class Step(BaseModel):
-        explanation: str
-        output: str
-
-    class Result(BaseModel):
-        steps: list[Step]
-        object_list: list[str]
 
     client, model_name = _get_client_and_model(vlm)
     completion = client.beta.chat.completions.parse(
@@ -334,8 +305,8 @@ def ask_gpt_similar_objects(obj_list, target, vlm="cognav"):
             {"role": "system", "content": prompt},
             {"role": "user", "content": user_input},
         ],
-        response_format=Result,
-        trace_label="similar_objects",
+        response_format=SimilarObjectsResponse,
+        trace_label=SIMILAR_OBJECTS.trace_label,
     )
 
     answer = completion.choices[0].message.parsed
@@ -352,29 +323,7 @@ def check_again_object_in_bbox(img_vis, target, save_dir, episode_idx, episode_s
     check_dir = f"{save_dir}/episode-{episode_idx}/check_again"
     os.makedirs(check_dir, exist_ok=True)
 
-    class Step(BaseModel):
-        explanation: str
-        output: str
-
-    class Result(BaseModel):
-        steps: list[Step]
-        flag: bool
-
-    prompt = """
-    I will give you an image with a bbox drawn on it and an object class label. Your task is to determine whether the object within the bbox is the given object class.
-
-    The image is input as a base64 string. Please notice that the bbox may only cover part of the object. You should use common-sense reasoning to determine whether the main object in the bbox is the given class.
-
-    Instructions:
-    1. Carefully examine the RGB image and the region specified by the bbox.
-    2. Use visual cues and common-sense reasoning to assess whether the object matches the given class.
-    3. Consider the surrounding context of the image and the object class label.
-    4. Make your decision through step-by-step observation and reasoning.
-
-    Your response should include:
-    - 'steps': the process of chain of thought reasoning.
-    - `flag`: a boolean value. If the object in the bbox is the given class, output True. If the object is not the given class, output False.
-    """
+    prompt = CHECK_AGAIN_BBOX_PROMPT
 
     prompt_info = (
         f"Whether the object within the bbox in the above image is {target}? "
@@ -410,8 +359,8 @@ def check_again_object_in_bbox(img_vis, target, save_dir, episode_idx, episode_s
         completion = client.beta.chat.completions.parse(
             model=model_name,
             messages=messages,
-            response_format=Result,
-            trace_label="check_again_object_in_bbox",
+            response_format=CheckAgainBBoxResponse,
+            trace_label=CHECK_AGAIN_BBOX.trace_label,
         )
     except Exception:
         if vlm != "gemini":
@@ -419,8 +368,8 @@ def check_again_object_in_bbox(img_vis, target, save_dir, episode_idx, episode_s
         completion = client.beta.chat.completions.parse(
             model="gemini-2.0-flash",
             messages=messages,
-            response_format=Result,
-            trace_label="check_again_object_in_bbox_retry",
+            response_format=CheckAgainBBoxResponse,
+            trace_label=f"{CHECK_AGAIN_BBOX.trace_label}_retry",
         )
 
     answer = completion.choices[0].message.parsed

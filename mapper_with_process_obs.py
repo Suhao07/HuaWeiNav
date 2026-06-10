@@ -24,11 +24,11 @@ from instruction_adapter.relation_verifier import DynamicRelationService
 from instruction_adapter.semantic_edges import RelationPairLedger
 from instruction_adapter.spatial_graph import InstructionSpatialGraph
 from instruction_adapter.verifier import VerificationLedger, candidate_from_object
-from llm_utils.nav_prompt_room import *
 from llm_utils.cognav_llm_adapter import get_client_and_model
 from planning.mode_policy import is_ordered_execution
 from planning.object_search_policy import InstructionObjectSearchPolicy
 from planning.room_policy import select_nearest_frontier_room
+from prompting.templates import OBJECT_PROMPT, RELOCATE_PROMPT, ROOM_PROMPT
 
 from pydantic import BaseModel
 

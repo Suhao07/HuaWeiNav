@@ -9,60 +9,14 @@ from typing import Any
 import cv2
 import numpy as np
 
-try:
-    from pydantic import BaseModel, Field
-    HAS_PYDANTIC = True
-except ModuleNotFoundError:
-    HAS_PYDANTIC = False
-
-    class BaseModel:
-        def __init__(self, **kwargs):
-            for key in getattr(self, "__annotations__", {}):
-                default = getattr(type(self), key, None)
-                if isinstance(default, (list, dict, set)):
-                    default = default.copy()
-                setattr(self, key, kwargs.get(key, default))
-
-    def Field(default=None, default_factory=None, **_kwargs):
-        return default_factory() if default_factory is not None else default
-
 from llm_utils.cognav_llm_adapter import get_client_and_model
+from prompting.registry import CONCEPT_MATCH_BATCH, CONCEPT_MATCH_SINGLE
+from prompting.schemas import HAS_PYDANTIC, ParsedBatchConceptMatch, ParsedConceptMatch
+from prompting.templates import CONCEPT_MATCH_PROMPT
 
 from .contracts import ConceptQuery
 from .ontology import normalize_term
 from .verifier import candidate_from_object, instruction_hash
-
-
-CONCEPT_MATCH_PROMPT = """
-You decide whether a mapped object instance satisfies an instruction concept.
-
-Use the concept role carefully:
-- terminal concepts may satisfy the final goal.
-- anchor/support concepts are only reference objects for search or relation
-  verification and must never be treated as final goal success.
-
-Do not rely on hard-coded synonym tables. Judge whether the observed object can
-play the requested role for this specific instruction. Return strict JSON.
-"""
-
-
-class _ParsedConceptMatch(BaseModel):
-    matches_concept: bool = False
-    confidence: float = 0.0
-    terminal_eligible: bool = False
-    reason: str = ""
-
-
-class _ParsedBatchConceptItem(BaseModel):
-    uid: str = ""
-    matches_concept: bool = False
-    confidence: float = 0.0
-    terminal_eligible: bool = False
-    reason: str = ""
-
-
-class _ParsedBatchConceptMatch(BaseModel):
-    matches: list[_ParsedBatchConceptItem] = Field(default_factory=list)
 
 
 @dataclass
@@ -316,10 +270,10 @@ class RuntimeConceptMatcher:
                     {"role": "system", "content": CONCEPT_MATCH_PROMPT},
                     {"role": "user", "content": content},
                 ],
-                response_format=_ParsedConceptMatch,
-                trace_label="concept_match_single",
+                response_format=ParsedConceptMatch,
+                trace_label=CONCEPT_MATCH_SINGLE.trace_label,
             )
-            parsed = completion.choices[0].message.parsed or _ParsedConceptMatch()
+            parsed = completion.choices[0].message.parsed or ParsedConceptMatch()
             return ConceptMatchRecord(
                 instruction_hash=inst_hash,
                 concept_id=concept.id,
@@ -407,10 +361,10 @@ class RuntimeConceptMatcher:
                     {"role": "system", "content": CONCEPT_MATCH_PROMPT},
                     {"role": "user", "content": [{"type": "text", "text": json.dumps(payload, ensure_ascii=False, indent=2)}]},
                 ],
-                response_format=_ParsedBatchConceptMatch,
-                trace_label="concept_match_batch",
+                response_format=ParsedBatchConceptMatch,
+                trace_label=CONCEPT_MATCH_BATCH.trace_label,
             )
-            parsed = completion.choices[0].message.parsed or _ParsedBatchConceptMatch()
+            parsed = completion.choices[0].message.parsed or ParsedBatchConceptMatch()
             by_uid = {str(item.uid): item for item in list(getattr(parsed, "matches", []) or [])}
             records = []
             for _obj, _candidate, observed_label, object_uid in pending:

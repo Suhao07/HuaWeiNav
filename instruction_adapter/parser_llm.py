@@ -1,88 +1,14 @@
 from __future__ import annotations
 
 import os
-from typing import Any
-
-try:
-    from pydantic import BaseModel, Field
-    HAS_PYDANTIC = True
-except ModuleNotFoundError:
-    HAS_PYDANTIC = False
-
-    class BaseModel:
-        def __init__(self, **kwargs):
-            for key in getattr(self, "__annotations__", {}):
-                default = getattr(type(self), key, None)
-                if isinstance(default, (list, dict, set)):
-                    default = default.copy()
-                setattr(self, key, kwargs.get(key, default))
-
-    def Field(default=None, default_factory=None, **_kwargs):
-        return default_factory() if default_factory is not None else default
 
 from llm_utils.cognav_llm_adapter import get_client_and_model
+from prompting.registry import INSTRUCTION_PARSE
+from prompting.schemas import HAS_PYDANTIC, ParsedConstraint, ParsedInstruction, ParsedTarget
+from prompting.templates import INSTRUCTION_PARSE_PROMPT
 
 from .contracts import Constraint, ExecutionPolicy, InstructionPlan, SearchPriors, TargetQuery
 from .ontology import dedupe_terms, normalize_term
-
-
-class ParsedTarget(BaseModel):
-    name: str = ""
-    role: str = Field(default="primary", description="primary, secondary, anchor, or support")
-    aliases: list[str] = Field(default_factory=list)
-    attributes: dict[str, Any] = Field(default_factory=dict)
-    min_count: int = 1
-    terminal: bool = True
-
-
-class ParsedConstraint(BaseModel):
-    type: str = ""
-    subject: str = ""
-    relation: str = ""
-    object: str = ""
-    value: Any = None
-    hardness: str = "soft"
-    verifier: str = "planner"
-
-
-class ParsedInstruction(BaseModel):
-    task_type: str = "object_goal"
-    eval_mode: str = "any_target_success"
-    targets: list[ParsedTarget] = Field(default_factory=list)
-    constraints: list[ParsedConstraint] = Field(default_factory=list)
-    room_hints: list[str] = Field(default_factory=list)
-    support_objects: list[str] = Field(default_factory=list)
-    affordances: list[str] = Field(default_factory=list)
-    requires_runtime_relation: bool = False
-
-
-INSTRUCTION_PARSE_PROMPT = """
-You are a semantic compiler for indoor object navigation instructions.
-
-Return only structured JSON matching the schema. Do not solve navigation and do
-not invent scene-specific facts. Extract what the user asks for:
-- targets: object concepts mentioned or implied by the instruction.
-- terminal=true only for objects that may satisfy the final goal.
-- anchors/support objects must be terminal=false.
-- constraints: room, spatial, sequence, count, area, attribute, co_occurrence.
-- Use hard constraints for explicit requirements in the instruction.
-- Use soft constraints only for hints explicitly present in the instruction.
-- Do not encode common-sense priors such as "TV is in living room" unless the
-  room or context is explicitly stated by the instruction.
-
-Examples:
-Instruction: "Find a cup on the table in the kitchen."
-targets: cup terminal true; table role anchor terminal false.
-constraints: room cup in kitchen hard; spatial cup on table hard verifier vlm.
-
-Instruction: "I need somewhere to sit."
-targets: object or affordance concept "seat" terminal true, with affordance sitting.
-Do not choose chair/sofa by hard-coded prior; detector grounding will map it.
-
-Instruction: "First find the bed, then locate the towel."
-targets: bed terminal true; towel terminal true.
-constraints: sequence bed before towel hard.
-"""
 
 
 def _target_id(name: str, index: int) -> str:
@@ -142,7 +68,7 @@ def parse_instruction_with_llm(
                 },
             ],
             response_format=ParsedInstruction,
-            trace_label="instruction_parser",
+            trace_label=INSTRUCTION_PARSE.trace_label,
         )
         parsed = completion.choices[0].message.parsed
     except Exception as exc:

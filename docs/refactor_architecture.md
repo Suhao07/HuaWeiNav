@@ -212,6 +212,56 @@ planning/
   -> object/search/room/viewpoint policy wrappers
 ```
 
+## Phase5：Prompting 层
+
+新增目录：
+
+```text
+prompting/
+  templates.py
+  schemas.py
+  registry.py
+```
+
+职责：
+
+```text
+templates.py
+  只维护 prompt 文本和 legacy prompt 兼容入口；
+  不读取 mapper/agent 状态，不调用 LLM/VLM。
+
+schemas.py
+  集中维护 Pydantic response schema；
+  instruction parser、concept grounding、relation verifier、final verifier
+  和 bbox VLM 复核共用这里的 schema。
+
+registry.py
+  维护 prompt_id、trace_label、schema_name 和模板版本；
+  调用点不再散落裸 trace_label 字符串。
+```
+
+本阶段保持行为不变：
+
+```text
+消息结构不变；
+trace label 的字符串值不变；
+LLM/VLM client 入口不变；
+日志路径不变；
+prompt 文本只迁移，不重新调参。
+```
+
+已迁移入口：
+
+```text
+instruction_adapter/parser_llm.py
+instruction_adapter/grounding.py
+instruction_adapter/concept_matcher.py
+instruction_adapter/relation_verifier.py
+instruction_adapter/verifier.py
+cv_utils/gpt_utils.py
+mapper_with_process_obs.py legacy room/object/relocate prompt import
+```
+
 这次重构没有改变普通 benchmark 的开关条件：
 
 ```text

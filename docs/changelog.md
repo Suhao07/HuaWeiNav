@@ -24,6 +24,10 @@
   - 本地 py_compile 检查核心入口、adapter、planning 和 core 模块。
 - 新增 `docs/refactor_architecture.md`：
   - 记录 Phase0-3 重构边界、模块输入输出、后续拆分路线。
+- 新增 `prompting/`：
+  - `templates.py` 集中维护 prompt 文本；
+  - `schemas.py` 集中维护 LLM/VLM response schema；
+  - `registry.py` 维护 prompt id、trace label、schema name 和模板版本。
 
 ### Changed
 
@@ -38,6 +42,8 @@
 - 关闭 LLM relocation 时，mapper 改为调用
   `get_candidate_room_fully_explored_by_distance()`，日志写入 `room_policy/`，
   不再复用 `gpt_room/` 命名。
+- instruction adapter、bbox VLM 复核和 mapper legacy room/object/relocate prompt
+  改为从 `prompting` 层导入 prompt/schema/trace label，调用行为保持不变。
 
 ### Removed
 

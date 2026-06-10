@@ -6,48 +6,12 @@ import os
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
-try:
-    from pydantic import BaseModel, Field
-    HAS_PYDANTIC = True
-except ModuleNotFoundError:
-    HAS_PYDANTIC = False
-
-    class BaseModel:
-        def __init__(self, **kwargs):
-            for key in getattr(self, "__annotations__", {}):
-                default = getattr(type(self), key, None)
-                if isinstance(default, (list, dict, set)):
-                    default = default.copy()
-                setattr(self, key, kwargs.get(key, default))
-
-    def Field(default=None, default_factory=None, **_kwargs):
-        return default_factory() if default_factory is not None else default
-
 from llm_utils.cognav_llm_adapter import get_client_and_model
+from prompting.registry import RELATION_VERIFY
+from prompting.schemas import HAS_PYDANTIC, ParsedRelationResult
+from prompting.templates import RELATION_VERIFIER_PROMPT
 
 from .semantic_edges import DynamicSemanticEdgeVerifier, SemanticEdge
-
-
-RELATION_VERIFIER_PROMPT = """
-You verify one spatial/semantic relation for an indoor navigation robot.
-
-Use only the provided object records, geometry hints, and images. If the
-relation is not visible or cannot be inferred from geometry, return verified
-false or need_better_view true. Do not use generic common-sense priors.
-
-Return strict JSON:
-- verified: true only when the requested relation clearly holds.
-- confidence: number in [0, 1].
-- need_better_view: true if the pair is plausible but visual evidence is weak.
-- reason: concise visual/geometric explanation.
-"""
-
-
-class _ParsedRelationResult(BaseModel):
-    verified: bool = False
-    confidence: float = 0.0
-    need_better_view: bool = False
-    reason: str = ""
 
 
 @dataclass
@@ -116,8 +80,8 @@ class VLMRelationVerifier:
                     {"role": "system", "content": RELATION_VERIFIER_PROMPT},
                     {"role": "user", "content": content},
                 ],
-                response_format=_ParsedRelationResult,
-                trace_label="relation_verifier",
+                response_format=ParsedRelationResult,
+                trace_label=RELATION_VERIFY.trace_label,
             )
             parsed = completion.choices[0].message.parsed
             return {

@@ -4,65 +4,13 @@ import os
 from dataclasses import replace
 from typing import Iterable
 
-try:
-    from pydantic import BaseModel, Field
-    HAS_PYDANTIC = True
-except ModuleNotFoundError:
-    HAS_PYDANTIC = False
-
-    class BaseModel:
-        def __init__(self, **kwargs):
-            for key in getattr(self, "__annotations__", {}):
-                default = getattr(type(self), key, None)
-                if isinstance(default, (list, dict, set)):
-                    default = default.copy()
-                setattr(self, key, kwargs.get(key, default))
-
-    def Field(default=None, default_factory=None, **_kwargs):
-        return default_factory() if default_factory is not None else default
-
 from llm_utils.cognav_llm_adapter import get_client_and_model
+from prompting.registry import CONCEPT_GROUNDING, EXECUTION_STRATEGY
+from prompting.schemas import HAS_PYDANTIC, ExecutionStrategyResult, GroundingResult
+from prompting.templates import CONCEPT_GROUNDING_PROMPT, EXECUTION_STRATEGY_PROMPT
 
 from .contracts import ConceptQuery, Constraint, ExecutionPolicy, InstructionPlan, TargetQuery
 from .ontology import dedupe_terms, filter_terms_to_available, normalize_term
-
-
-class GroundingResult(BaseModel):
-    detector_terms: list[str] = Field(default_factory=list)
-    aliases: list[str] = Field(default_factory=list)
-    description: str = ""
-    negative_terms: list[str] = Field(default_factory=list)
-    reason: str = ""
-
-
-class ExecutionStrategyResult(BaseModel):
-    mode: str = "any_target_success"
-    use_anchor_first: bool = False
-    anchor_concept_ids: list[str] = Field(default_factory=list)
-    reason: str = ""
-
-
-GROUNDING_PROMPT = """
-You map an instruction target concept to detector vocabulary for open-vocabulary
-object navigation.
-
-Return JSON only. Choose detector_terms from the provided available classes when
-possible. Include aliases only if they are plausible names for the same target
-concept, not nearby/support objects. Do not include room names or support
-objects as detector terms.
-Also provide a concise semantic description and negative_terms that distinguish
-this concept from related but different concepts.
-"""
-
-
-EXECUTION_STRATEGY_PROMPT = """
-You choose an execution strategy for an indoor navigation instruction.
-
-Return JSON only. Use anchor_first only when the instruction contains a
-non-terminal reference/anchor object that can guide search for a harder terminal
-target. The anchor itself must not satisfy the final goal.
-Do not use object-name rules; reason from the structured plan.
-"""
 
 
 def _llm_offline() -> bool:
@@ -91,7 +39,7 @@ def _llm_ground_terms(concept: ConceptQuery, available_classes: Iterable[str], v
         completion = client.beta.chat.completions.parse(
             model=model,
             messages=[
-                {"role": "system", "content": GROUNDING_PROMPT},
+                {"role": "system", "content": CONCEPT_GROUNDING_PROMPT},
                 {
                     "role": "user",
                     "content": (
@@ -104,7 +52,7 @@ def _llm_ground_terms(concept: ConceptQuery, available_classes: Iterable[str], v
                 },
             ],
             response_format=GroundingResult,
-            trace_label="concept_grounding",
+            trace_label=CONCEPT_GROUNDING.trace_label,
         )
         return completion.choices[0].message.parsed or GroundingResult()
     except Exception:
@@ -239,7 +187,7 @@ def _choose_execution_strategy(plan: InstructionPlan, vlm: str) -> ExecutionPoli
                 {"role": "user", "content": str(plan.as_dict())},
             ],
             response_format=ExecutionStrategyResult,
-            trace_label="execution_strategy",
+            trace_label=EXECUTION_STRATEGY.trace_label,
         )
         parsed = completion.choices[0].message.parsed or ExecutionStrategyResult()
     except Exception:

@@ -9,79 +9,12 @@ from typing import Any
 
 import numpy as np
 
-try:
-    from pydantic import BaseModel, Field
-    HAS_PYDANTIC = True
-except ModuleNotFoundError:
-    HAS_PYDANTIC = False
-
-    class BaseModel:
-        def __init__(self, **kwargs):
-            for key in getattr(self, "__annotations__", {}):
-                default = getattr(type(self), key, None)
-                if isinstance(default, (list, dict, set)):
-                    default = default.copy()
-                setattr(self, key, kwargs.get(key, default))
-
-    def Field(default=None, default_factory=None, **_kwargs):
-        return default_factory() if default_factory is not None else default
-
 from llm_utils.cognav_llm_adapter import get_client_and_model
+from prompting.registry import FINAL_VERIFY
+from prompting.schemas import HAS_PYDANTIC, ParsedVerification
+from prompting.templates import FINAL_VERIFIER_PROMPT
 
 from .ontology import normalize_term
-
-
-FINAL_VERIFIER_PROMPT = """
-You are the final instruction-satisfaction verifier for an indoor navigation robot.
-
-Decide whether stopping at the current candidate object satisfies the original
-natural-language instruction. Use the visual evidence and factual geometry only.
-Do not invent room/object facts that are not visible or provided. If a required
-condition cannot be determined from the evidence, do not accept.
-
-Return strict JSON:
-- satisfied: true only if the robot may stop for the original instruction from
-  the current evidence.
-- semantic_satisfied: true if the candidate and explicit instruction constraints
-  are satisfied, even if the current camera view is not yet sufficient to stop.
-- view_sufficient_for_stop: true if the current view is good enough for final
-  stopping evidence. Consider whether the target/relation are clearly visible,
-  the target is not clipped or too close to image borders, and the evidence is
-  not too weak. Use the provided geometry facts as factual cues, not as rigid
-  thresholds. A view can be semantically correct but still insufficient for
-  stopping if a clearer, more centered, less clipped, or closer view is needed.
-- decision:
-  - accept: all explicit requirements are satisfied.
-  - reject_candidate: the candidate is clearly the wrong instance or violates a hard requirement.
-  - need_better_view: the candidate may be correct but the evidence is too weak.
-  - need_relation_check: a spatial/semantic relation must be checked with additional evidence.
-  - uncertain: evidence is insufficient and no specific next check is obvious.
-- confidence: number in [0, 1].
-- satisfied_constraints: short strings.
-- failed_constraints: short strings.
-- view_feedback: concise feedback for the navigation controller if a better
-  view is needed.
-- preferred_view_goal: a short natural-language view goal, e.g. keep both the
-  candidate and relation anchor visible while making the candidate more central.
-- view_objective: an optional JSON object for the geometry controller when
-  decision=need_better_view. It may include keep_visible_roles, improve_goals,
-  minimum_expected_improvement, accept_if_no_better_view, and reason.
-- reason: concise explanation grounded in the evidence.
-
-Important:
-- accept requires satisfied=true, semantic_satisfied=true, and
-  view_sufficient_for_stop=true.
-- If the candidate appears to satisfy the instruction but the target is near
-  the image border, very small, clipped, mostly low/outside the useful camera
-  area, or relation evidence is not jointly visible enough, return
-  decision=need_better_view with semantic_satisfied=true.
-- Do not reject a candidate only because the view is poor; use
-  need_better_view unless the candidate clearly violates the instruction.
-- If view_control history is provided, use it. If there are remaining feasible
-  proposals and previous attempts did not substantially improve the evidence,
-  prefer need_better_view over accept. If no better view remains, decide whether
-  limited-view acceptance is justified by the instruction and evidence.
-"""
 
 
 @dataclass
@@ -138,20 +71,6 @@ class VerificationResult:
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
-
-
-class _ParsedVerification(BaseModel):
-    satisfied: bool = False
-    semantic_satisfied: bool = False
-    view_sufficient_for_stop: bool = True
-    decision: str = "uncertain"
-    confidence: float = 0.0
-    satisfied_constraints: list[str] = Field(default_factory=list)
-    failed_constraints: list[str] = Field(default_factory=list)
-    view_feedback: str = ""
-    preferred_view_goal: str = ""
-    view_objective: dict[str, Any] = Field(default_factory=dict)
-    reason: str = ""
 
 
 def instruction_hash(raw_instruction: str) -> str:
@@ -406,8 +325,8 @@ class FinalInstructionVerifier:
                     {"role": "system", "content": FINAL_VERIFIER_PROMPT},
                     {"role": "user", "content": content},
                 ],
-                response_format=_ParsedVerification,
-                trace_label="final_instruction_verifier",
+                response_format=ParsedVerification,
+                trace_label=FINAL_VERIFY.trace_label,
             )
             parsed = completion.choices[0].message.parsed
         except Exception as exc:
