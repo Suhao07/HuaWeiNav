@@ -1,3 +1,10 @@
+"""Instruction-mode object selection policy.
+
+The policy chooses the next terminal candidate or anchor reference from mapper
+memory. It does not decide final success; verification remains in the
+instruction verifier and relation verifier.
+"""
+
 from __future__ import annotations
 
 import os
@@ -102,6 +109,8 @@ class InstructionObjectSearchPolicy:
         )
 
     def _select_pending_verified_pair(self, mapper: Any, plan: Any, step: int | None) -> ObjectSearchResult | None:
+        """Resume view control around a verified semantic pair when one is pinned."""
+
         state = getattr(mapper, "instruction_execution_state", None)
         pending = dict(getattr(state, "pending_verified_pair", {}) or {})
         if getattr(state, "mode", "") != "better_view_for_verified_pair" or not pending:
@@ -145,7 +154,7 @@ class InstructionObjectSearchPolicy:
         if best_distance > _pending_pair_association_radius():
             return None
 
-        # 中文说明：pending verified pair 已经由 VLM 证明语义成立。
+        # pending verified pair 已经由 VLM 证明语义成立。
         # 此处只把同一实例/同一局部簇重新交给 view-control，不重新启动
         # 全图搜索，也不把 anchor 当成终止目标。
         if target is not None:

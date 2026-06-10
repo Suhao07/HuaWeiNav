@@ -5,30 +5,53 @@ import cv2
 import habitat
 import numpy as np
 import open3d as o3d
-import quaternion
 import torch
 from habitat.tasks.nav.shortest_path_follower import ShortestPathFollower
 from habitat.utils.visualizations.maps import \
     colorize_draw_agent_and_fit_to_height
 from loguru import logger
 
-from cv_utils.gpt_utils import (ask_gpt_object_in_box,
-                                check_again_object_in_bbox,
-                                refine_tag_with_target_obj_list)
-from cv_utils.stitch import combine_image, image_stitch_and_crop
+from cv_utils.gpt_utils import check_again_object_in_bbox
 from cv_utils.visualizer import visualize_mask
 from mapper_with_process_obs import Instruct_Mapper
 from instruction_adapter.verifier import FinalInstructionVerifier, VerificationResult, candidate_from_object
 from instruction_adapter.view_control import ViewControlState
 from mapping_utils.geometry import (gpu_cluster_filter, gpu_merge_pointcloud,
-                                    gpu_pointcloud_from_array, pointcloud_distance,
                                     project_to_camera)
 from mapping_utils.path_planning import path_planning
 from mapping_utils.projection import (bresenham_3d, translate_grid_to_point,
                                       translate_point_to_grid,
                                       translate_single_point_to_grid)
-from mapping_utils.transform import habitat_rotation
-from planning.viewpoint_policy import build_check_again_viewpoints
+from navigation.action_controller import (
+    geodesic_distance_to_waypoint,
+    habitat_waypoint,
+    next_action_to_waypoint,
+)
+from navigation.bbox_refinement import apply_refined_tag, refine_bbox_tag
+from navigation.detection_artifacts import (
+    detection_step_dir,
+    save_candidate_object_pointclouds,
+    save_combined_view,
+    save_detection_overlay,
+    save_object_view,
+    save_real_object_pointcloud,
+)
+from navigation.goal_approach_controller import (
+    action_after_instruction_reject,
+    distance_to_object,
+    rotate_toward_object_for_recheck,
+)
+from navigation.object_cluster_merger import merge_candidate_objects, sort_target_objects_last
+from navigation.object_view_projector import project_object_view
+from navigation.observation_pipeline import (
+    collect_panoramic_observations,
+    merge_temporary_pointclouds,
+    save_observation_pointcloud,
+)
+from navigation.panoramic_detection import build_triplet, filter_center_panel, pose_triplet
+from navigation.path_progress import action_after_replan
+from navigation.planner_loop import run_observation_mapping_cycle
+from navigation.view_verification_controller import select_check_again_viewpoint
 
 
 class HM3D_Objnav_Agent:
@@ -138,37 +161,14 @@ class HM3D_Objnav_Agent:
         self.accepted_relation_edge = {}
 
     def rotate_panoramic(self, rotate_times=12):
-        self.temporary_pcd = []
-        temporary_images = []
-        temporary_positions, temporary_rotations = [], []
-        self.angles = []
-        q_identity = quaternion.quaternion(1, 0, 0, 0)
-        self.mapper.current_obj_indices = []
+        """Collect a panoramic sweep and run segmentation on the collected views."""
 
-        self.B_classes, self.B_boxes, self.B_masks, self.B_confidences, self.B_visualization, \
-            self.C_boxes, self.C_masks, self.C_confidences, self.C_visualization = \
-                [], [], [], [], [], [], [], [], []
-
-        for i in range(rotate_times):
-            if self.env.episode_over:
-                logger.info(f'Step: {self.env._elapsed_steps}')
-                logger.info(f'Time: {self.env._elapsed_seconds}')
-                return
-
-            if self.mapper.current_navigable_pcd is None and self.mapper.current_pcd is None:
-                temporary_pcd = gpu_pointcloud_from_array(np.zeros((0, 3)), np.zeros((0, 3)), self.mapper.pcd_device)
-            else:
-                temporary_pcd = gpu_merge_pointcloud(self.mapper.current_navigable_pcd,
-                                                     self.mapper.current_pcd).voxel_down_sample(self.mapper.pcd_resolution)
-
-            self.temporary_pcd.append(temporary_pcd)
-            temporary_images.append(self.rgb_trajectory[-1])
-            temporary_positions.append(self.mapper.current_position)
-            temporary_rotations.append(self.mapper.current_rotation)
-
-            self.angles.append(2 * np.arccos((q_identity.inverse() * self.rotation).w))
-            self.obs = self.env.step(3)
-            self.update_trajectory()
+        temporary_images, temporary_positions, temporary_rotations = collect_panoramic_observations(
+            self,
+            rotate_times=rotate_times,
+        )
+        if self.env.episode_over:
+            return
 
         temp_depths = self.temporary_depths[-13:-1]
         if self.episode_steps == 13:
@@ -186,298 +186,103 @@ class HM3D_Objnav_Agent:
         logger.info(self.mapper.current_obj_indices)
 
     def rotate_segmentation(self, images, depths, positions, rotations):
-        h, w, _ = images[0].shape
-        C_objs = []
-        os.makedirs(f'{self.save_dir}/episode-{self.episode_samples-1}/detection/step_{self.episode_steps}',
-                    exist_ok=True)
-        for i in range(12):
-            prev = (i - 1) if i > 0 else 11
-            nxt = (i + 1) if i < 11 else 0
+        """Run panoramic object detection and update mapper object memory.
 
-            comb_img = combine_image(images[prev], images[i], images[nxt],
-                                     self.mapper.camera_intrinsic)
-            comb_depth = combine_image(depths[prev], depths[i], depths[nxt],
-                                       self.mapper.camera_intrinsic)
-            depth_vis = np.clip((comb_depth / 5.0 * 255.0), 0, 255).astype(np.uint8)
+        Parameters are the twelve RGB/depth/pose buffers collected by
+        ``rotate_panoramic``. The method keeps the high-level orchestration in
+        the agent, while detector slicing, artifact writing, instance merging,
+        view projection, and bbox tag refinement live in dedicated modules.
+        """
+
+        _, w, _ = images[0].shape
+        C_objs = []
+        step_dir = detection_step_dir(self)
+
+        for i in range(12):
+            triplet = build_triplet(images, depths, i, self.mapper.camera_intrinsic)
             B_classes, B_boxes, B_masks, B_confidences, \
                 C_classes, C_boxes, C_masks, C_confidences = \
                     self.mapper.object_perceiver.perceive(
-                        comb_img,
+                        triplet.image,
                         target=self.mapper.target,
                         target_list=getattr(self.mapper, "perception_target_list", None) or self.mapper.target_list,
                         save_dir=self.save_dir,
                         episode_idx=self.episode_samples - 1,
                         episode_step=self.episode_steps,
                     )
+            save_combined_view(step_dir, i, triplet.image, triplet.depth_vis)
 
-            cv2.imwrite(
-                f'{self.save_dir}/episode-{self.episode_samples-1}/detection/step_{self.episode_steps}/comb_img_{i}.jpg',
-                comb_img)
-            cv2.imwrite(
-                f'{self.save_dir}/episode-{self.episode_samples-1}/detection/step_{self.episode_steps}/comb_depth_{i}.jpg',
-                depth_vis)
+            current_pos, current_rot, depths_list = pose_triplet(positions, rotations, depths, triplet)
+            B_detection = filter_center_panel(
+                B_classes,
+                B_boxes,
+                B_masks,
+                B_confidences,
+                image_width=w,
+            )
+            if B_detection.has_boxes:
+                save_detection_overlay(step_dir, "B", i, triplet.image, B_detection)
+                B_objs = self.mapper.get_object_entities_pano(
+                    triplet.depth,
+                    triplet.image,
+                    current_pos,
+                    current_rot,
+                    B_detection.classes,
+                    B_detection.boxes,
+                    B_detection.masks,
+                    B_detection.confidences,
+                    depths_list,
+                )
+                self.mapper.objects, obj_indices = self.mapper.associate_object_entities(
+                    self.mapper.objects,
+                    B_objs,
+                )
+                self.mapper.current_obj_indices += obj_indices
+                self.mapper.object_pcd = self.mapper.update_object_pcd()
 
-            current_pos = [positions[prev], positions[i], positions[nxt]]
-            current_rot = [rotations[prev], rotations[i], rotations[nxt]]
-            depths_list = [depths[prev], depths[i], depths[nxt]]
-
-            if not (B_boxes is None or B_boxes.shape[0] == 0):
-
-                B_centers = (B_boxes[:, :2] + B_boxes[:, 2:]) * 0.5
-                flag = (B_centers[:, 0] >= w) & (B_centers[:, 0] < 2 * w)
-                B_classes = B_classes[flag.cpu().numpy()]
-                B_centers = B_centers[flag]
-                B_boxes = B_boxes[flag]
-                B_masks = B_masks[flag]
-
-                if not (B_boxes is None or B_boxes.shape[0] == 0):
-
-                    B_confidences = B_confidences[flag]
-                    B_visualization = visualize_mask(comb_img, B_boxes, B_confidences, B_classes, B_masks)
-
-                    cv2.imwrite(
-                        f'{self.save_dir}/episode-{self.episode_samples-1}/detection/step_{self.episode_steps}/B_dino_result_{i}.jpg',
-                        B_visualization)
-
-                    B_objs = self.mapper.get_object_entities_pano(comb_depth, comb_img,
-                        current_pos, current_rot, B_classes, B_boxes, B_masks, B_confidences,
-                        depths_list)
-
-                    self.mapper.objects, obj_indices = self.mapper.associate_object_entities(
-                        self.mapper.objects, B_objs)
-                    self.mapper.current_obj_indices += obj_indices
-                    self.mapper.object_pcd = self.mapper.update_object_pcd()
-
-            if C_boxes is None or C_boxes.shape[0] == 0:
+            C_detection = filter_center_panel(
+                C_classes,
+                C_boxes,
+                C_masks,
+                C_confidences,
+                image_width=w,
+            )
+            if not C_detection.has_boxes:
                 continue
 
-            C_centers = (C_boxes[:, :2] + C_boxes[:, 2:]) * 0.5
-            flag = (C_centers[:, 0] >= w) & (C_centers[:, 0] < 2 * w)
-            C_classes = C_classes[flag.cpu().numpy()]
-            C_centers = C_centers[flag]
-            C_boxes = C_boxes[flag]
-            C_masks = C_masks[flag]
+            save_detection_overlay(step_dir, "C", i, triplet.image, C_detection)
+            C_objs.append(self.mapper.get_object_entities_pano(
+                triplet.depth,
+                triplet.image,
+                current_pos,
+                current_rot,
+                C_detection.classes,
+                C_detection.boxes,
+                C_detection.masks,
+                C_detection.confidences,
+                depths_list,
+            ))
 
-            if C_boxes is None or C_boxes.shape[0] == 0:
-                continue
+        save_candidate_object_pointclouds(step_dir, C_objs)
 
-            C_confidences = C_confidences[flag]
-            C_visualization = visualize_mask(comb_img, C_boxes, C_confidences, C_classes, C_masks)
-
-            cv2.imwrite(
-                f'{self.save_dir}/episode-{self.episode_samples-1}/detection/step_{self.episode_steps}/C_dino_result_{i}.jpg',
-                C_visualization)
-
-            C_objs.append(self.mapper.get_object_entities_pano(comb_depth, comb_img,
-                current_pos, current_rot, C_classes, C_boxes, C_masks, C_confidences,
-                depths_list))
-
-        # save pc
-        obj_pcd = o3d.geometry.PointCloud()
-        for i in range(len(C_objs)):
-            for obj in C_objs[i]:
-                points = obj.pcd_all.point.positions.cpu().numpy()
-                colors = obj.pcd_all.point.colors.cpu().numpy()
-                new_pcd = o3d.geometry.PointCloud()
-                new_pcd.points = o3d.utility.Vector3dVector(points)
-                new_pcd.colors = o3d.utility.Vector3dVector(colors)
-                o3d.io.write_point_cloud(f'{self.save_dir}/episode-{self.episode_samples-1}/detection/step_{self.episode_steps}/C_dino_pcd_{i}.ply', new_pcd)
-                obj_pcd = obj_pcd + new_pcd
-        if len(obj_pcd.points) > 0:
-            o3d.io.write_point_cloud(f'{self.save_dir}/episode-{self.episode_samples-1}/detection/step_{self.episode_steps}/C_dino_pcd.ply', obj_pcd)
-        # original C objs (all)
-
-        # combine the C_objs
-        real_C_objs = []
-        for i in range(len(C_objs)):
-            for obj in C_objs[i]:
-                overlap_score = []
-                eval_pcd = obj.pcd
-                eval_pcd_all = obj.pcd_all
-                for prev_obj in real_C_objs:
-                    prev_obj_pcd = prev_obj.pcd
-                    prev_obj_pcd_all = prev_obj.pcd_all
-                    cdist1 = pointcloud_distance(eval_pcd_all, prev_obj_pcd_all)
-                    cdist2 = pointcloud_distance(prev_obj_pcd_all, eval_pcd_all)
-                    cdist_all = torch.cat([cdist1, cdist2], dim=0)
-                    overlap_condition = (cdist_all < 0.1)
-                    overlap_condition1 = (cdist1 < 0.1)
-                    overlap_condition2 = (cdist2 < 0.1)
-                    overlap_score_tmp = (overlap_condition.sum() /
-                                          (overlap_condition.shape[0] + 1e-6)).cpu().numpy().item()
-                    overlap_score_tmp1 = (overlap_condition1.sum() /
-                                            (overlap_condition1.shape[0] + 1e-6)).cpu().numpy().item()
-                    overlap_score_tmp2 = (overlap_condition2.sum() /
-                                            (overlap_condition2.shape[0] + 1e-6)).cpu().numpy().item()
-                    if (overlap_score_tmp1 > 0.85 and overlap_score_tmp2 < 0.85) or (overlap_score_tmp1 < 0.85 and overlap_score_tmp2 > 0.85):
-                        overlap_score_tmp = -1.0
-                    # print(f'!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! overlap score: {overlap_score_tmp}, {overlap_score_tmp1}, {overlap_score_tmp2}')
-                    overlap_score.append(overlap_score_tmp)
-                overlap_flag = [score > 0.25 for score in overlap_score]
-                for j in range(len(overlap_flag)):
-                    if overlap_flag[j]:
-                        eval_pcd = gpu_merge_pointcloud(eval_pcd, real_C_objs[j].pcd)
-                        eval_pcd_all = gpu_merge_pointcloud(eval_pcd_all, real_C_objs[j].pcd_all)
-                        obj.confidence = max(obj.confidence, real_C_objs[j].confidence)
-                obj.pcd = eval_pcd
-                obj.pcd_all = eval_pcd_all
-
-                need_to_move = []
-                for j in range(len(overlap_flag)):
-                    if overlap_flag[j]:
-                        need_to_move.append(j)
-
-                real_C_objs = [
-                    obj_ for idx, obj_ in enumerate(real_C_objs) if idx not in need_to_move
-                ]
-
-                real_C_objs.append(obj)
-
-        # save pc
-        obj_pcd = o3d.geometry.PointCloud()
-        iii = 0
-        for obj in real_C_objs:
+        # C 类对象来自多视角候选，先按几何 overlap 合成物理实例，
+        # 再进入 bbox 视觉复核；这样 VLM 不会对重复实例反复调用。
+        real_C_objs = merge_candidate_objects(C_objs)
+        for i, obj in enumerate(real_C_objs):
             obj.pcd = gpu_cluster_filter(obj.pcd)
+            save_real_object_pointcloud(step_dir, obj, i)
 
-            points = obj.pcd.point.positions.cpu().numpy()
-            colors = obj.pcd.point.colors.cpu().numpy()
-            new_pcd = o3d.geometry.PointCloud()
-            new_pcd.points = o3d.utility.Vector3dVector(points)
-            new_pcd.colors = o3d.utility.Vector3dVector(colors)
-            obj_pcd = obj_pcd + new_pcd
+        for i, obj in enumerate(real_C_objs):
+            evidence = project_object_view(self, obj, images, rotations, torch)
+            if evidence is None:
+                continue
+            save_object_view(step_dir, i, evidence.image, evidence.bbox_xyxy)
+            refined_tag = refine_bbox_tag(self, evidence.image, evidence.bbox_tensor, i)
+            apply_refined_tag(self, obj, refined_tag, evidence.image)
+            if evidence.bbox_real_xyxy is not None:
+                obj.bbox = evidence.bbox_real_xyxy
 
-            o3d.io.write_point_cloud(
-                f'{self.save_dir}/episode-{self.episode_samples-1}/detection/step_{self.episode_steps}/real_C_objs_{iii}.ply',
-                new_pcd)
-            iii += 1
-
-        current_pos = self.mapper.current_position[:2]
-        nw_ori = self.rotation
-        nw_ori = habitat_rotation(nw_ori)
-        nw_ori = np.array([-nw_ori[0, 2], -nw_ori[1, 2]])
-        for (i, obj) in enumerate(real_C_objs):
-            obj.position = np.mean(obj.pcd.point.positions.cpu().numpy(), axis=0)
-            center_pos = obj.position[:2]
-
-            # calculate angle
-            center_pos = center_pos - current_pos
-            nw_ori = nw_ori / np.linalg.norm(nw_ori)
-            center_pos = center_pos / np.linalg.norm(center_pos)
-            dot_product = np.clip(np.dot(nw_ori, center_pos), -1.0, 1.0)
-            angle_rad = np.arccos(dot_product)
-            angle = np.degrees(angle_rad)
-
-            cross_product = np.cross(nw_ori, center_pos)
-            if cross_product < 0:
-                angle = 360 - angle
-
-            angle = angle + 7.5
-            if angle >= 360:
-                angle -= 360
-            image_ind = int(angle / 15)
-            final_img = None
-            final_box = None
-            final_position = self.mapper.current_position
-            final_rotation = None
-            if image_ind % 2 == 0:
-                image_ind = int(image_ind / 2)
-                final_img = images[image_ind]
-                final_rotation = rotations[image_ind]
-            else:
-                image_ind = int(image_ind / 2)
-                nxt_ind = image_ind + 1
-                if nxt_ind == 12:
-                    nxt_ind = 0
-                final_img = image_stitch_and_crop(images[image_ind],
-                                                  images[nxt_ind],
-                                                  self.mapper.camera_intrinsic)
-
-                final_rotation = rotations[image_ind]
-                deg = np.arccos(final_rotation[0][0])
-                if final_rotation[0][2] > 0:
-                    deg = np.pi * 2 - deg
-                deg += (15 / 180) * np.pi
-                final_rotation = np.array([[np.cos(deg), 0, -np.sin(deg)],
-                                           [np.sin(deg), 0, np.cos(deg)], [0, 1, 0]])
-            cv2.imwrite(
-                f"{self.save_dir}/episode-{self.episode_samples-1}/detection/step_{self.episode_steps}/real_C_obj_image_{i}.jpg",
-                final_img)
-
-            camera_points = project_to_camera(obj.pcd_all, self.mapper.camera_intrinsic, final_position,
-                                              final_rotation)
-            camera_points = np.array(camera_points)
-            camera_points = camera_points.T
-            camera_points = np.array(camera_points[:, :2], dtype=np.int32)
-            flag = (camera_points[:, 0] >= 0) & (camera_points[:, 0] < 640) & \
-                     (camera_points[:, 1] >= 0) & (camera_points[:, 1] < 480)
-            camera_points = camera_points[flag]
-
-            bbox = np.array([np.min(camera_points, axis=0), np.max(camera_points, axis=0)])
-            bbox[0] = np.maximum(bbox[0] - 3, 0)
-            bbox[1] = np.minimum(bbox[1] + 3, [639, 479])
-            final_box = np.array([bbox[0][0], bbox[0][1], bbox[1][0], bbox[1][1]])
-            # save img
-            img = final_img.copy()
-            cv2.rectangle(img, (bbox[0][0], bbox[0][1]), (bbox[1][0], bbox[1][1]), (0, 255, 0), 2)
-            cv2.imwrite(
-                f"{self.save_dir}/episode-{self.episode_samples-1}/detection/step_{self.episode_steps}/real_C_obj_image_bbox_{i}.jpg",
-                img)
-
-            final_box = torch.tensor(final_box).unsqueeze(0)
-
-            res = ask_gpt_object_in_box(final_img, final_box, self.save_dir, self.episode_samples-1, self.episode_steps, i, self.vlm)
-
-            if res not in self.mapper.object_perceiver.classes:
-                res = refine_tag_with_target_obj_list(res, self.mapper.target, self.save_dir, self.episode_samples-1, self.episode_steps, i, self.vlm)
-
-            # 任务目标和检测类别存在同义词差异，例如目标是 tv，
-            # GroundingDINO/LLM 可能返回 tv_monitor。这里统一成主目标名，
-            # 否则后续 object_found_no_gpt 的目标确认会被精确字符串匹配卡住。
-            target_aliases = {self.mapper.target}
-            target_aliases.update(getattr(self.mapper, "target_aliases", []) or [])
-            if res in target_aliases:
-                res = self.mapper.target
-
-            obj.num_list[res] = obj.num_list.pop(obj.tag)
-            obj.conf_list[res] = obj.conf_list.pop(obj.tag)
-            obj.tag = res
-
-            if res == self.mapper.target:
-                obj.confidence = (0.9 * 2 + obj.confidence) / 3
-            else:
-                obj.confidence = 0.9 / (0.9 + obj.confidence)
-            if res == "unknown":
-                obj.confidence = 0.0
-
-            if not isinstance(obj.confidence, torch.Tensor):
-                obj.confidence = torch.tensor(obj.confidence)
-            obj.rgb = final_img
-            obj.conf_list[obj.tag] = obj.confidence
-
-            camera_points_real = project_to_camera(obj.pcd, self.mapper.camera_intrinsic, final_position,
-                                              final_rotation)
-            camera_points_real = np.array(camera_points_real)
-            camera_points_real = camera_points_real.T
-            camera_points_real = np.array(camera_points_real[:, :2], dtype=np.int32)
-            flag = (camera_points_real[:, 0] >= 0) & (camera_points_real[:, 0] < 640) & \
-                     (camera_points_real[:, 1] >= 0) & (camera_points_real[:, 1] < 480)
-            camera_points_real = camera_points_real[flag]
-
-            if camera_points_real.shape[0] != 0:
-                bbox_real = np.array([np.min(camera_points_real, axis=0), np.max(camera_points_real, axis=0)])
-                bbox_real = np.array([bbox_real[0][0], bbox_real[0][1], bbox_real[1][0], bbox_real[1][1]])
-                obj.bbox = bbox_real
-
-        # move all self.mapper.target_objects to the end
-        real_C_objs_sorted = []
-        target_objs = []
-        for obj in real_C_objs:
-            if obj.tag == self.mapper.target:
-                target_objs.append(obj)
-            else:
-                real_C_objs_sorted.append(obj)
-        real_C_objs_sorted += target_objs
-        real_C_objs = real_C_objs_sorted
+        real_C_objs = sort_target_objects_last(real_C_objs, self.mapper.target)
 
         self.mapper.objects, obj_indices = self.mapper.associate_object_entities(
             self.mapper.objects, real_C_objs)
@@ -694,21 +499,14 @@ class HM3D_Objnav_Agent:
             self.update_trajectory()
 
     def _merge_temporary_pointclouds(self):
-        merged_pcd = o3d.t.geometry.PointCloud(self.mapper.pcd_device)
-        for pcd in self.temporary_pcd:
-            merged_pcd = gpu_merge_pointcloud(merged_pcd, pcd)
-        return merged_pcd
+        """Merge panoramic point-cloud buffers for the current planning cycle."""
+
+        return merge_temporary_pointclouds(self)
 
     def _save_obs_pointcloud(self, pcd, idx, step, path_idx=None):
-        save_pcd = o3d.geometry.PointCloud()
-        save_pcd.points = o3d.utility.Vector3dVector(pcd.point.positions.cpu().numpy())
-        save_pcd.colors = o3d.utility.Vector3dVector(pcd.point.colors.cpu().numpy())
-        os.makedirs(f'{self.save_dir}/episode-{idx}/obs', exist_ok=True)
-        if path_idx is None:
-            file_path = f'{self.save_dir}/episode-{idx}/obs/obs_{step}.ply'
-        else:
-            file_path = f'{self.save_dir}/episode-{idx}/obs/obs_{step}_{path_idx}.ply'
-        o3d.io.write_point_cloud(file_path, save_pcd)
+        """Persist the merged observation point cloud for debug inspection."""
+
+        return save_observation_pointcloud(self, pcd, episode_idx=idx, step=step, path_idx=path_idx)
 
     def _log_mapper_state_before_after_get_nodes(self, step, node, idx):
         logger.info("\n \n --------------------------------------------------")
@@ -727,22 +525,22 @@ class HM3D_Objnav_Agent:
                                   node=None,
                                   idx=None,
                                   use_gpt_relocate=None):
+        """Build the next waypoint without using the relocation variant."""
+
         self.on_node_flag = True
         if use_gpt_relocate is None:
             use_gpt_relocate = self.gpt_relocate
 
-        self.rotate_panoramic()
-        if self.env.episode_over:
+        # 每个规划周期先做一次全景感知和地图更新。planner_loop 只负责
+        # observation->mapping 前缀；目标选择和探索状态机仍在这里显式维护。
+        cycle = run_observation_mapping_cycle(self, node=node, episode_idx=idx)
+        if cycle.episode_over:
             return False, False
-
-        self.current_pcd = self._merge_temporary_pointclouds()
-        step = self.episode_steps
-        self._save_obs_pointcloud(self.current_pcd, idx=idx, step=step)
-
-        self._log_mapper_state_before_after_get_nodes(step, node, idx)
-        self.mapper.update_obj(self.current_node_idx, self.mapper.current_obj_indices)
+        step = cycle.step
 
         logger.info("-------------------Check Whether The Object is Found-------------------")
+        # mapper 只返回“值得靠近/复核”的候选；是否真正 stop 还要经过
+        # check_again 和 instruction final verifier。
         self.found_goal, self.object_final = self.mapper.object_found_no_gpt(self.instruct_goal,
                                                                              idx=idx,
                                                                              step=step)
@@ -758,6 +556,8 @@ class HM3D_Objnav_Agent:
 
         current_node = self.mapper.nodes[self.current_node_idx]
         room_node = self.mapper.room_nodes[current_node.room_idx]
+        # 优先在当前 room 内推进 frontier，避免频繁跨房间导致局部区域
+        # 没有被充分扫描。
         self.waypoint = self.mapper.explore_in_room(room_node)
         if self.waypoint is not None:
             self.current_node_idx = self.waypoint.idx
@@ -781,6 +581,8 @@ class HM3D_Objnav_Agent:
                 logger.info("Fully Explored, Visit unvisited nodes!")
                 self.waypoint = self.mapper.explore_after_fully_explored()
             elif use_gpt_relocate:
+                # LLM room policy 只在当前 room 没有 frontier 时介入，用于
+                # 选择下一个未探索 room，不参与最终目标确认。
                 self.room_final = self.mapper.get_candidate_room_fully_explored(self.instruct_goal,
                                                                                 idx=idx,
                                                                                 step=step)
@@ -826,19 +628,13 @@ class HM3D_Objnav_Agent:
                                   idx=None):
         self.on_node_flag = True
 
-        self.rotate_panoramic()
-        if self.env.episode_over:
+        # relocate 版本复用相同的感知/建图前缀，只在后半段选择不同探索策略。
+        cycle = run_observation_mapping_cycle(self, node=node, episode_idx=idx)
+        if cycle.episode_over:
             return False, False
-
-        self.current_pcd = self._merge_temporary_pointclouds()
-        step = self.episode_steps
-        self._save_obs_pointcloud(self.current_pcd, idx=idx, step=step)
-
-        self._log_mapper_state_before_after_get_nodes(step, node, idx)
-        self.mapper.update_obj(self.current_node_idx, self.mapper.current_obj_indices)
+        step = cycle.step
 
         logger.info("-------------------Check Whether The Object is Found-------------------")
-        # self.found_goal, self.object_final = self.mapper.object_found(self.instruct_goal, idx=idx, step=step)
         self.found_goal, self.object_final = self.mapper.object_found_no_gpt(self.instruct_goal,
                                                                              idx=idx,
                                                                              step=step)
@@ -846,11 +642,6 @@ class HM3D_Objnav_Agent:
             self.found_goal_position = self.mapper.current_position
             self.find_final_waypoint()
             self.whether_to_check_again()
-
-            # self.waypoint = self.object_final.find_closest(self.found_goal_position)
-            # self.waypoint[2] = self.found_goal_position[2]
-            # self.path = np.array([self.waypoint])
-            # self.path_index = 0
 
             self.path[:, 2] = self.mapper.current_position[2]
             self.waypoint_final = None
@@ -884,8 +675,6 @@ class HM3D_Objnav_Agent:
 
         if self.waypoint is None:
             logger.info("----------------Relocate----------------")
-            # ----------------relocate----------------
-            # self.waypoint_final, self.object_final, found_goal = self.mapper.get_candidate_node(self.instruct_goal, idx=idx, step=step)
             room_state = [room_node.state for room_node in self.mapper.room_nodes]
             if 0 not in room_state:
                 logger.info("Fully Explored, Visit unvisited nodes!")
@@ -983,6 +772,8 @@ class HM3D_Objnav_Agent:
 
     @staticmethod
     def _view_quality_facts(geometry):
+        """Summarize geometric evidence quality for VLM view feedback."""
+
         geometry = dict(geometry or {})
         center = geometry.get("bbox_center_norm") or []
         area = geometry.get("bbox_area_ratio")
@@ -1051,7 +842,7 @@ class HM3D_Objnav_Agent:
             or getattr(self.mapper, "instruction_spec", None) is not None
         )
         if instruction_mode:
-            # 中文说明：指令模式下不再用独立的类别复核作为语义结论。
+            # 指令模式下不再用独立的类别复核作为语义结论。
             # check_again 只采集更清晰证据；candidate 是否是目标、关系是否
             # 成立、当前视角是否足够 stop，统一交给 final verifier 判断。
             flag = True
@@ -1126,6 +917,8 @@ class HM3D_Objnav_Agent:
         return sorted(nearby_objects, key=lambda x: x["distance_to_candidate"])[:8]
 
     def _build_final_verifier_evidence(self, candidate, bbox, geometry):
+        """Persist the image and geometry packet consumed by the final verifier."""
+
         episode_idx = self.episode_samples - 1
         out_dir = f'{self.save_dir}/episode-{episode_idx}/final_verifier'
         os.makedirs(out_dir, exist_ok=True)
@@ -1172,6 +965,8 @@ class HM3D_Objnav_Agent:
         return evidence
 
     def _attach_view_control_context(self, evidence, candidate):
+        """Attach pinned view-control state to final-verifier evidence."""
+
         evidence = dict(evidence or {})
         if getattr(self.view_control_state, "active", False):
             context = self.view_control_state.as_context()
@@ -1195,11 +990,15 @@ class HM3D_Objnav_Agent:
         return evidence
 
     def _pin_verified_relation_from_evidence(self, evidence):
+        """Keep a verified relation edge fixed during better-view control."""
+
         context = dict((evidence or {}).get("verified_relation_context") or {})
         if context and getattr(self.view_control_state, "active", False):
             self.view_control_state.pin_relation_context(context)
 
     def _view_control_override_if_needed(self, candidate, evidence, result):
+        """Prevent premature stop while an active view objective can improve evidence."""
+
         if not getattr(self.view_control_state, "active", False):
             return result
         self.view_control_state.record_attempt(
@@ -1213,7 +1012,7 @@ class HM3D_Objnav_Agent:
             self.view_control_state.reset()
             return result
 
-        # 中文说明：如果 verifier 在 better-view 子目标中想 accept，但当前
+        # 如果 verifier 在 better-view 子目标中想 accept，但当前
         # 证据相对 baseline 没有实质改善，且还有可行视角未尝试，则继续执行
         # view objective。这里不判断对象类别，只约束执行闭环不能“一步 retry”
         # 后提前停。
@@ -1249,6 +1048,8 @@ class HM3D_Objnav_Agent:
         return blocked
 
     def _enter_better_view_control(self, candidate, evidence, result):
+        """Start a better-view subgoal from verifier feedback."""
+
         objective = dict(result.view_objective or {})
         if result.preferred_view_goal and "preferred_view_goal" not in objective:
             objective["preferred_view_goal"] = result.preferred_view_goal
@@ -1267,6 +1068,8 @@ class HM3D_Objnav_Agent:
         return True
 
     def _defer_initial_accept_if_better_view_exists(self, candidate, evidence, result, instruction_mode=False):
+        """Give view control one chance before accepting an initially valid stop."""
+
         if not instruction_mode:
             return result
         if not (result.satisfied and result.decision == "accept"):
@@ -1334,11 +1137,13 @@ class HM3D_Objnav_Agent:
         )
 
     def final_instruction_check(self, evidence_override=None):
+        """Run the instruction-mode final verifier, bypassing baseline ObjectNav."""
+
         plan = getattr(self.mapper, "instruction_plan", None)
         spec = getattr(self.mapper, "instruction_spec", None)
         if plan is None and spec is None:
-            # 中文说明：普通 HM3D ObjectNav benchmark 不启用指令解析层。
-            # 此时 final verifier 完全旁路，保持 STRIVE 原始 stop 行为。
+            # 普通 HM3D ObjectNav benchmark 不启用指令解析层。
+            # 此时 final verifier 完全旁路，保持原始 stop 行为。
             return True
 
         if getattr(self.object_final, "_instruction_reference_role", "") == "anchor":
@@ -1616,6 +1421,8 @@ class HM3D_Objnav_Agent:
         return False
 
     def step_mod(self, idx):
+        """Execute one Habitat action and trigger replanning/checking when needed."""
+
         self.final_instruction_accepted_this_step = False
         if self.episode_steps == 499:
             self.obs = self.env.step(0)
@@ -1623,66 +1430,28 @@ class HM3D_Objnav_Agent:
             logger.info('Episode over!!!!!')
             return False
 
-        pid_waypoint = self.waypoint + self.mapper.initial_position
-        pid_waypoint = np.array(
-            [pid_waypoint[0],
-             self.env.sim.get_agent_state().position[1], pid_waypoint[1]])
-
-        current_position = self.mapper.current_position + self.mapper.initial_position
-        current_position = np.array([
-            current_position[0], self.mapper.initial_position[2] - 0.88, current_position[1]
-        ])
-        geo_distance = self.env.sim.geodesic_distance(current_position, pid_waypoint)
+        # Habitat 使用世界坐标，mapper 内部使用相对初始位置的局部坐标。
+        # action_controller 统一做坐标转换，避免 step_mod 里散落重复数组拼接。
+        _ = habitat_waypoint(self)
+        geo_distance = geodesic_distance_to_waypoint(self)
         logger.info(f'Geo distance: {geo_distance}')
 
-        # tmp = habitat_translation(self.obs['gps'])-self.mapper.initial_position
-        # print(self.obs['gps'])
-        # print(self.mapper.initial_position)
-        # print(self.mapper.current_position)
         if self.found_goal:
             logger.info("Found goal!!!")
             logger.info("Current position: {}", self.mapper.current_position)
             logger.info("Goal position: {}", self.object_final.position)
 
-            positions = self.object_final.pcd.point.positions.cpu().numpy()
-            to_target_distance = np.min(
-                np.linalg.norm(positions[:, :2] - self.mapper.current_position[:2], axis=1))
+            to_target_distance = distance_to_object(self)
             logger.info("Distance to goal: {}", to_target_distance)
 
             if self.need_check_again:
                 to_check_again_distance = self.calculate_geo_distance(self.check_again_postion, self.mapper.current_position)
                 if to_check_again_distance > 0.5:
-                    act = self.planner.get_next_action(pid_waypoint)
+                    act = next_action_to_waypoint(self)
                 else:
-                    # check again
                     self.need_check_again = False
-
-                    final_pos = self.object_final.position[:2]
-                    nw_pos = self.mapper.current_position[:2]
-                    nw_ori = self.rotation
-                    nw_ori = habitat_rotation(nw_ori)
-                    nw_ori = np.array([-nw_ori[0, 2], -nw_ori[1, 2]])
-                    final_pos = final_pos - nw_pos
-
-                    nw_ori = nw_ori / np.linalg.norm(nw_ori)
-                    final_pos = final_pos / np.linalg.norm(final_pos)
-                    dot_product = np.clip(np.dot(nw_ori, final_pos), -1.0, 1.0)
-                    angle_rad = np.arccos(dot_product)
-                    angle_deg = np.degrees(angle_rad)
-
-                    cross_product = np.cross(nw_ori, final_pos)
-                    direction = 3 if cross_product > 0 else 2
-                    num_turns = int(np.round(angle_deg / 30))
-
-                    logger.info("Now step: {}", self.episode_steps)
-                    logger.info("Direction: {}", direction)
-                    logger.info("Num turns: {}", num_turns)
-
-                    for i in range(num_turns):
-                        self.obs = self.env.step(direction)
-                        self.update_trajectory(self.on_node_flag)
-                        if self.env.episode_over:
-                            return False
+                    if not rotate_toward_object_for_recheck(self):
+                        return False
 
                     self.found_goal = self.check_again(self.episode_steps)
                     logger.info("Check again at step: {}", self.episode_steps)
@@ -1698,79 +1467,18 @@ class HM3D_Objnav_Agent:
                             self.final_instruction_accepted_this_step = True
                             act = 0
                         else:
-                            pid_waypoint = self.waypoint + self.mapper.initial_position
-                            pid_waypoint = np.array(
-                                [pid_waypoint[0],
-                                 self.env.sim.get_agent_state().position[1], pid_waypoint[1]])
-                            if self.need_check_again:
-                                act = self.planner.get_next_action(pid_waypoint)
-                                if act == 0:
-                                    self.need_check_again = False
-                                    self.after_check_again()
-                                    pid_waypoint = self.waypoint + self.mapper.initial_position
-                                    pid_waypoint = np.array(
-                                        [pid_waypoint[0],
-                                         self.env.sim.get_agent_state().position[1], pid_waypoint[1]])
-                            else:
-                                self.after_check_again()
-                                pid_waypoint = self.waypoint + self.mapper.initial_position
-                                pid_waypoint = np.array(
-                                    [pid_waypoint[0],
-                                     self.env.sim.get_agent_state().position[1], pid_waypoint[1]])
-                            act = self.planner.get_next_action(pid_waypoint)
+                            act = action_after_instruction_reject(self)
             else:
                 if to_target_distance > self.success_distance * self.stop_criterion:
-                    act = self.planner.get_next_action(pid_waypoint)
+                    act = next_action_to_waypoint(self)
                 else:
                     act = 0
 
         # not use else because self.check_again may change the self.found_goal
         if not self.found_goal:
-            act = self.planner.get_next_action(pid_waypoint)
-            while act == 0 and not self.found_goal:
-                self.path_index += 1
-                if self.path_index >= len(self.path):
-                    # get to the next waypoint we want
-                    if self.relocate:
-                        flag, self.found_goal = self.make_plan_mod_relocate(
-                            rotate=True, idx=idx, node=self.waypoint_final)
-                    else:
-                        flag, self.found_goal = self.make_plan_mod_no_relocate(
-                            rotate=True,
-                            idx=idx,
-                            node=self.waypoint_final,
-                            use_gpt_relocate=self.gpt_relocate,
-                        )
-                    if self.env.episode_over:
-                        return False
-
-                    if not flag and not self.env.episode_over:
-                        self.obs = self.env.step(act)
-                        self.update_trajectory(self.on_node_flag)
-                        logger.info(self.env.episode_over)
-                        return False
-                else:
-                    logger.info(f'!!!!!!!!!!!!!!!!Bug: enter make_plan_mod_process')
-                    self.obs = self.env.step(0)
-                    self.update_trajectory(self.on_node_flag)
-                    logger.info(self.env.episode_over)
-                    return False
-                    # self.make_plan_mod_process(idx=idx, node=None, path_idx=self.path_index)
-
-                self.waypoint = self.path[self.path_index]
-                self.waypoint[2] = self.mapper.current_position[2]
-
-                # self.waypoint = [-6.1704755, -1.333439, -0.8]
-
-                logger.info(f'Waypoint: {self.waypoint}')
-                pid_waypoint = self.waypoint + self.mapper.initial_position
-                pid_waypoint = np.array(
-                    [pid_waypoint[0],
-                     self.env.sim.get_agent_state().position[1], pid_waypoint[1]])
-                act = self.planner.get_next_action(pid_waypoint)
-
-            if act == 1:
-                self.on_node_flag = False
+            act, should_continue = action_after_replan(self, episode_idx=idx)
+            if not should_continue:
+                return False
 
         logger.info("Step: {}", self.episode_steps)
         logger.info("Next Action: {}", act)
@@ -1785,28 +1493,16 @@ class HM3D_Objnav_Agent:
                     final_instruction_flag = self.final_instruction_check()
                     if not final_instruction_flag:
                         if self.need_check_again:
-                            pid_waypoint = self.waypoint + self.mapper.initial_position
-                            pid_waypoint = np.array(
-                                [pid_waypoint[0],
-                                 self.env.sim.get_agent_state().position[1], pid_waypoint[1]])
-                            act = self.planner.get_next_action(pid_waypoint)
+                            act = next_action_to_waypoint(self)
                             if act == 0:
                                 # 已经没有可移动的更好视角时，不能把 act=0 当成成功 stop。
                                 self.need_check_again = False
                                 self.after_check_again()
                         else:
                             self.after_check_again()
-                        pid_waypoint = self.waypoint + self.mapper.initial_position
-                        pid_waypoint = np.array(
-                            [pid_waypoint[0],
-                             self.env.sim.get_agent_state().position[1], pid_waypoint[1]])
-                        act = self.planner.get_next_action(pid_waypoint)
+                        act = next_action_to_waypoint(self)
                 else:
-                    pid_waypoint = self.waypoint + self.mapper.initial_position
-                    pid_waypoint = np.array(
-                        [pid_waypoint[0],
-                         self.env.sim.get_agent_state().position[1], pid_waypoint[1]])
-                    act = self.planner.get_next_action(pid_waypoint)
+                    act = next_action_to_waypoint(self)
 
             logger.info("Next Action: {}", act)
             self.obs = self.env.step(act)
@@ -1820,104 +1516,12 @@ class HM3D_Objnav_Agent:
         return self.mapper.to_json()
 
     def whether_to_check_again(self):
-        logger.info(f'Need to check again')
-        self.need_check_again = True
+        """Select the next viewpoint used for target re-verification."""
 
-        # find the best point to check
-        pathfinder = self.env.sim.pathfinder
-        import habitat_sim
-        path_request = habitat_sim.ShortestPath()
-        current_position = self.found_goal_position + self.mapper.initial_position
-        current_position = np.array([
-            current_position[0], self.env.sim.get_agent_state().position[1], current_position[1]
-        ])
-        path_request.requested_start = current_position
-        pid_waypoint = self.waypoint + self.mapper.initial_position
-        pid_waypoint = np.array(
-            [pid_waypoint[0],
-             self.env.sim.get_agent_state().position[1], pid_waypoint[1]])
-        path_request.requested_end = pid_waypoint
-
-        # 计算最短路径
-        found_path = pathfinder.find_path(path_request)
-        points = path_request.points
-        logger.info(f'Path: {points}')
-        proposals, interpolated_path = build_check_again_viewpoints(
-            object_node=self.object_final,
-            camera_intrinsic=self.mapper.camera_intrinsic,
-            mapper_initial_position=self.mapper.initial_position,
-            habitat_path_points=points,
-            target_height=self.found_goal_position[2] + 0.88,
-            success_distance=self.success_distance,
-            stop_criterion=self.stop_criterion,
-        )
-        logger.info(f"Interpolated_path: {interpolated_path}")
-
-        best_candidate = None
-        for candidate in proposals:
-            logger.info(
-                "Check-again candidate {} score {:.3f}, visible {:.3f}, center {:.3f}, border {:.3f}, area {:.3f}, dist {:.3f}",
-                candidate["position"],
-                candidate["score"],
-                candidate["visible_ratio"],
-                candidate["center_score"],
-                candidate["border_score"],
-                candidate["area_ratio"],
-                candidate["distance_to_target"],
-            )
-            if best_candidate is None or candidate["score"] > best_candidate["score"]:
-                best_candidate = candidate
-
-        current_candidate = candidate_from_object(
-            self.object_final,
-            canonical_label=getattr(self.mapper, "target", ""),
-            step=self.episode_steps,
-        )
-        state = getattr(self.mapper, "instruction_execution_state", None)
-        pending_pair_active = (
-            getattr(state, "mode", "") == "better_view_for_verified_pair"
-            and bool(getattr(state, "pending_verified_pair", {}) or {})
-        )
-        if getattr(self.view_control_state, "active", False) and (
-            self.view_control_state.candidate_uid == current_candidate.uid
-            or pending_pair_active
-        ):
-            self.view_control_state.set_proposals(proposals)
-            proposal = self.view_control_state.next_proposal()
-            if proposal is not None:
-                logger.info(
-                    "Selected view-control proposal: {}, score {:.3f}, remaining {}",
-                    proposal.pose,
-                    proposal.score,
-                    self.view_control_state.remaining_count(),
-                )
-                self.check_again_postion = np.array(proposal.pose, dtype=float)
-                self.need_check_again = True
-                return
-            logger.info("View-control proposals exhausted for {}", current_candidate.uid)
-            self.need_check_again = False
-            self.check_again_postion = self.mapper.current_position
-        elif best_candidate is not None:
-            logger.info(
-                "Selected check-again viewpoint: {}, score {:.3f}, visible {:.3f}, center {:.3f}, border {:.3f}, area {:.3f}, dist {:.3f}",
-                best_candidate["position"],
-                best_candidate["score"],
-                best_candidate["visible_ratio"],
-                best_candidate["center_score"],
-                best_candidate["border_score"],
-                best_candidate["area_ratio"],
-                best_candidate["distance_to_target"],
-            )
-            self.check_again_postion = best_candidate["position"]
-        elif len(interpolated_path) > 0:
-            logger.info(f"Can't score a good point to check, use the last point")
-            self.check_again_postion = interpolated_path[-1]
-        else:
-            logger.info(f"Can't find a good point to check, use the current position")
-            self.check_again_postion = self.mapper.current_position
+        return select_check_again_viewpoint(self)
 
     def after_check_again(self):
-        # 中文说明：任何复核失败都必须退出“已找到目标”状态。
+        # 任何复核失败都必须退出“已找到目标”状态。
         # 否则 STRIVE 的 stop 分支会在后续 step 继续围绕同一候选触发，
         # 即使 final verifier 已经把该实例 hard-reject。
         if getattr(self.object_final, "_instruction_reference_role", "") == "anchor":
@@ -1935,7 +1539,7 @@ class HM3D_Objnav_Agent:
         self.need_check_again = False
         old_tag = str(getattr(self.object_final, "tag", ""))
         old_confidence = getattr(self.object_final, "confidence", torch.tensor(1.0))
-        # 中文说明：这里只是让该实例退出“当前目标候选”状态，不能清空
+        # 这里只是让该实例退出“当前目标候选”状态，不能清空
         # ObjectNode 的历史类别计数。mapper 后续 association 仍会按旧 tag
         # 读取 num_list/conf_list；如果直接替换成 {"nothing": ...} 会破坏地图记忆。
         if old_tag and old_tag not in getattr(self.object_final, "num_list", {}):

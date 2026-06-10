@@ -25,10 +25,52 @@ from instruction_adapter.semantic_edges import RelationPairLedger
 from instruction_adapter.spatial_graph import InstructionSpatialGraph
 from instruction_adapter.verifier import VerificationLedger, candidate_from_object
 from llm_utils.cognav_llm_adapter import get_client_and_model
+from mapping.frontier_extractor import (
+    adaptive_intersection_distance,
+    append_traversable_candidate,
+    concat_frontier_points,
+)
+from mapping.frontier_clusterer import analyze_frontier_clusters
+from mapping.node_candidate_builder import add_nodes_from_candidates
+from planning.exploration_policy import (
+    explore_after_check as policy_explore_after_check,
+    explore_after_fully_explored as policy_explore_after_fully_explored,
+    explore_in_room as policy_explore_in_room,
+    explore_in_room_relocate as policy_explore_in_room_relocate,
+    find_closest_nodes as policy_find_closest_nodes,
+    find_closest_viewpoint_in_room,
+)
 from planning.mode_policy import is_ordered_execution
 from planning.object_search_policy import InstructionObjectSearchPolicy
 from planning.room_policy import select_nearest_frontier_room
+from planning.target_selection_policy import select_target_candidate
 from prompting.templates import OBJECT_PROMPT, RELOCATE_PROMPT, ROOM_PROMPT
+from mapping.room_segmenter import (
+    fallback_single_room as segmenter_fallback_single_room,
+    segment_room as segmenter_segment_room,
+)
+from mapping.map_serializer import (
+    to_json as serialize_map,
+    to_json_save_node_info as serialize_map_node_info,
+    to_json_wo_some_class as serialize_objects_for_target_selection,
+)
+from mapping.topology_graph import (
+    add_edge as topology_add_edge,
+    add_node as topology_add_node,
+    check_connected as topology_check_connected,
+    find_closest_node as topology_find_closest_node,
+    find_closest_unexplored_node as topology_find_closest_unexplored_node,
+    find_the_closest_path as topology_find_the_closest_path,
+    get_edges as topology_get_edges,
+    get_nodes_positions as topology_get_nodes_positions,
+    get_nodes_states as topology_get_nodes_states,
+    remove_edge as topology_remove_edge,
+    update_node_frontier as topology_update_node_frontier,
+    update_node_true_frontier as topology_update_node_true_frontier,
+    update_obj as topology_update_obj,
+    update_room_state as topology_update_room_state,
+    visit_node as topology_visit_node,
+)
 
 from pydantic import BaseModel
 
@@ -37,7 +79,6 @@ import math
 import skimage
 import habitat_sim
 import torch
-import heapq
 from bresenham import bresenham
 
 
@@ -82,6 +123,9 @@ class Instruct_Mapper:
         self.target_list = []
         self.perception_target_list = []
         self.target_aliases = []
+
+        # 指令模式的状态全部挂在 mapper 上，保证 benchmark 原始 ObjectNav
+        # 仍然可以只依赖 target/target_list 跑通，不被复杂指令解析耦合。
         self.instruction_plan = None
         self.instruction_spec = None
         self.verification_ledger = VerificationLedger()
@@ -178,6 +222,9 @@ class Instruct_Mapper:
         self.target_list = []
         self.perception_target_list = []
         self.target_aliases = []
+
+        # 每个 episode 必须清空指令记忆，否则上一个指令拒绝的实例、
+        # 已验证关系边或 anchor 搜索记录会污染当前 episode。
         self.instruction_plan = None
         self.instruction_spec = None
         self.verification_ledger.reset()
@@ -248,6 +295,8 @@ class Instruct_Mapper:
         init_map_and_pose()
 
     def _target_match_terms(self):
+        """Collect detector labels and grounded aliases that may satisfy the target."""
+
         terms = [self.target]
         terms.extend(list(self.target_list or []))
         terms.extend(list(self.target_aliases or []))
@@ -282,6 +331,8 @@ class Instruct_Mapper:
         return normalize_term(tag) in self._target_match_terms()
 
     def _raw_instruction_for_verifier(self):
+        """Return the original instruction used by runtime verifiers."""
+
         plan = getattr(self, "instruction_plan", None)
         if plan is not None:
             return str(getattr(plan, "raw_instruction", "") or self.target)
@@ -291,6 +342,8 @@ class Instruct_Mapper:
         return str(self.target or "")
 
     def _is_verifier_rejected(self, obj, step=None):
+        """Check whether the final verifier has hard-rejected this object instance."""
+
         candidate = candidate_from_object(obj, canonical_label=self.target, step=step)
         return self.verification_ledger.is_hard_rejected(
             self._raw_instruction_for_verifier(),
@@ -341,6 +394,8 @@ class Instruct_Mapper:
         return concepts
 
     def _has_unblocked_anchor_evidence(self, plan, target, candidate_obj, step=None, debug=None):
+        """Require usable anchor evidence before chasing a relation-constrained target."""
+
         concepts = self._anchor_concepts_for_terminal_target(plan, target)
         if not concepts:
             return True
@@ -371,288 +426,55 @@ class Instruct_Mapper:
         return False
 
     def add_node(self, position, pcd=None, has_frontier=False, frontier_idxs=np.array([]), block_current=False):
+        """Add a viewpoint node through the topology graph service."""
 
-        logger.info("---------- Checking ---------- {}", position)
-        if len(self.nodes) > 1:
-            current_node = self.nodes[self.current_node_idx]
-            current_node_idx = current_node.idx
-            # if only 1 node to be added, need to ensure it wont be blocked by the current node
-            if block_current:
-                nodes_positions = [node.position for node in self.nodes if node.idx != current_node_idx]
-                nodes_idxs = [node.idx for node in self.nodes if node.idx != current_node_idx]
-            else:
-                nodes_positions = [node.position for node in self.nodes]
-                nodes_idxs = [node.idx for node in self.nodes]
-            nodes_positions = np.array(nodes_positions)
-            nodes_positions = nodes_positions + self.initial_position
-            nodes_positions[:, 2] = self.initial_position[2] - 0.88
-            nodes_positions = nodes_positions[:, [0, 2, 1]]
-
-            current_node_position = position + self.initial_position
-            current_node_position = np.array([
-                current_node_position[0], self.initial_position[2] - 0.88, current_node_position[1]
-            ])
-            distance = [
-                self.env.sim.geodesic_distance(current_node_position, node_position)
-                for node_position in nodes_positions
-            ]
-            if np.min(distance) < 1.35 * 0.7:
-                block_node = self.nodes[nodes_idxs[np.argmin(distance)]]
-                block_node_idx = block_node.idx
-                logger.info(f'Node at {block_node.position} is blocking adding new node at {position}')
-                # if not adding node, need to update the frontier to the node blocking it
-                if has_frontier and block_node_idx!=current_node_idx and block_node.state==NodeState.UNEXPLORED:
-                    logger.info(f'Updating frontier of node at {position} to node at {block_node.position}')
-                    if block_node.has_frontier:
-                        frontier_idxs = frontier_idxs.astype(int)
-                        block_node.frontier_idxs = np.concatenate((block_node.frontier_idxs, frontier_idxs), axis=0)
-                        block_node.has_frontier = True
-                        block_node.state=NodeState.UNEXPLORED
-                    else:
-                        logger.info(f'Node at {block_node.position} has no frontier, move it to the new node at {position}')
-                        frontier_idxs = frontier_idxs.astype(int)
-                        block_node.frontier_idxs = np.concatenate((block_node.frontier_idxs, frontier_idxs), axis=0)
-                        block_node.has_frontier = True
-                        block_node.state=NodeState.UNEXPLORED
-                        block_node.position = position
-                        block_node.pcd = pcd
-
-
-                    self.frontiers_considered[frontier_idxs[:, 0], frontier_idxs[:, 1]] = 1
-
-                return self.node_cnt - 1, False
-
-        logger.info("---------- adding node ---------- {}", position)
-        position = position.copy()
-        node = our_Node(None, None, pcd, position, None, self.node_cnt, has_frontier, frontier_idxs.astype(int))
-        self.nodes.append(node)
-        self.node_cnt += 1
-        self.neighbors.append([])
-        self.nodes_pos_to_idx[tuple(position)] = self.node_cnt - 1
-
-        # update the grid_map
-        if has_frontier:
-            # print(frontier_idxs.shape) # 12,2
-            frontier_idxs = frontier_idxs.astype(int)
-            # concatenate self.frontiers_considered and frontier_idxs
-            self.frontiers_considered[frontier_idxs[:, 0], frontier_idxs[:, 1]] = 1
-
-        return self.node_cnt - 1, True
+        return topology_add_node(self, position, pcd, has_frontier, frontier_idxs, block_current)
 
     def visit_node(self, node_idx):
-        node_pos = self.nodes[node_idx].position
-        logger.info(f"---------- visiting node ---------- {node_idx} at {node_pos}")
-        for key, value in self.nodes_pos_to_idx.items():
-            logger.info("{} {}", key, value)
-        self.nodes[node_idx].state = NodeState.EXPLORED
-        self.nodes[node_idx].has_frontier = False
-        self.nodes[node_idx].has_true_frontier = False
+        """Mark a viewpoint node as explored."""
+
+        return topology_visit_node(self, node_idx)
 
     def update_node_frontier(self):
-        for node in self.nodes:
-            if node.has_frontier:
-                frontier_idxs = node.frontier_idxs
-                frontier_idxs = np.array(frontier_idxs).astype(int)
-                frontier_idxs = [idx for idx in frontier_idxs if self.grid_map[idx[0], idx[1]] != 0]
-                if len(frontier_idxs) == 0:
-                    node.has_frontier = False
-                    node.has_true_frontier = False
-                    node.frontier_idxs = np.array(frontier_idxs).reshape((-1, 2))
-                else:
-                    node.has_frontier = True
-                    node.frontier_idxs = np.array(frontier_idxs).reshape((-1, 2))
-            else:
-                node.has_frontier = False
-                node.has_true_frontier = False
-                node.frontier_idxs = np.array([]).reshape((-1, 2))
+        return topology_update_node_frontier(self)
 
     def update_node_true_frontier(self):
-        for node in self.nodes:
-            if node.has_frontier:
-                frontier_idxs = node.frontier_idxs
-                frontier_idxs = np.array(frontier_idxs).astype(int)
-                frontier_idxs = [idx for idx in frontier_idxs if self.grid_map[idx[0], idx[1]] == 2]
-                if len(frontier_idxs) > 0:
-                    node.has_true_frontier = True
-                else:
-                    node.has_true_frontier = False
+        return topology_update_node_true_frontier(self)
 
     def update_room_state(self):
-        for room_node in self.room_nodes:
-            room_node.update_state()
+        return topology_update_room_state(self)
 
     def add_edge(self, node1_idx, node2_idx):
-
-        self.neighbors[node1_idx].append(node2_idx)
-        self.neighbors[node2_idx].append(node1_idx)
+        return topology_add_edge(self, node1_idx, node2_idx)
 
     def remove_edge(self, node1_idx, node2_idx):
-
-        self.neighbors[node1_idx].remove(node2_idx)
-        self.neighbors[node2_idx].remove(node1_idx)
+        return topology_remove_edge(self, node1_idx, node2_idx)
 
     def get_edges(self):
-        edges = []
-        for i in range(self.node_cnt):
-            for j in self.neighbors[i]:
-                if i < j:
-                    edges.append((i, j))
-        return edges
+        return topology_get_edges(self)
 
     def update_obj(self, current_node_idx, obj_indices):
-        # each object connect all nodes in 2.5m
-        dis_thres = 2.5
+        """Update object-node edges around the current viewpoint node."""
 
-        node = self.nodes[current_node_idx]
-        for ind in obj_indices:
-            if ind in node.objects:
-                continue
-
-            nwdist = np.linalg.norm(self.objects[ind].position[:2] - node.position[:2])
-            if nwdist < dis_thres:
-                need_del = []
-                for other_obj in self.objects[ind].nodes:
-                    dis = np.linalg.norm(self.nodes[other_obj].position[:2] -
-                                         self.objects[ind].position[:2])
-                    if dis >= dis_thres:
-                        need_del.append(other_obj)
-
-                for other_obj in need_del:
-                    self.nodes[other_obj].objects.remove(ind)
-                    self.objects[ind].nodes.remove(other_obj)
-
-                self.objects[ind].nodes.append(node.idx)
-                node.objects.append(ind)
-            else:
-                if len(self.objects[ind].nodes) == 0:
-                    self.objects[ind].nodes.append(node.idx)
-                    node.objects.append(ind)
+        return topology_update_obj(self, current_node_idx, obj_indices)
 
     def get_nodes_positions(self):
-        return np.array([node.position for node in self.nodes])
+        return topology_get_nodes_positions(self)
 
     def get_nodes_states(self):
-        return np.array([node.state for node in self.nodes])
+        return topology_get_nodes_states(self)
 
     def find_closest_node(self, position):
-        dist = []
-        for node in self.nodes:
-            dist.append(np.linalg.norm(node.position[:2] - position[:2]))
-        dist = np.array(dist)
-        return self.nodes[np.argmin(dist)]
+        return topology_find_closest_node(self, position)
 
     def find_closest_unexplored_node(self, node_pos):
-        # find the closet node to any given node in the graph, distance is the sum of edge weights
-        node = self.nodes[self.current_node_idx]
-        node_indx = node.idx
-        dist = np.full(self.node_cnt, np.inf)
-        dist[node_indx] = 0
-
-        pq = []
-        heapq.heappush(pq, (0, node_indx))
-        while pq:
-            current_dist, u = heapq.heappop(pq)
-            if self.nodes[u].state == NodeState.UNEXPLORED:
-                return self.nodes[u]
-            for v in self.neighbors[u]:
-                alt = current_dist + np.linalg.norm(self.nodes[u].position[:2] -
-                                                    self.nodes[v].position[:2])
-                if alt < dist[v]:
-                    dist[v] = alt
-                    heapq.heappush(pq, (alt, v))
-        return None
+        return topology_find_closest_unexplored_node(self, node_pos)
 
     def find_the_closest_path(self, start, end):
-        # Initialize distances and previous nodes
-        start = self.find_closest_node(start)
-        end = self.find_closest_node(end)
-
-        start_idx = start.idx
-        end_idx = end.idx
-
-        dist = np.full(self.node_cnt, np.inf)
-        prev = np.full(self.node_cnt, -1, dtype=int)
-        dist[start_idx] = 0
-
-        # Priority queue for Dijkstra's algorithm
-        pq = []
-        heapq.heappush(pq, (0, start_idx))  # (distance, node)
-
-        while pq:
-            current_dist, u_idx = heapq.heappop(pq)
-            u = self.nodes[u_idx]
-            # If we reach the end node, stop early
-            if u == end:
-                break
-
-            # Skip if the distance is not optimal
-            if current_dist > dist[u_idx]:
-                continue
-
-            # Iterate over neighbors
-            for v_idx in self.neighbors[u_idx]:
-                alt = dist[u_idx] + np.linalg.norm(self.nodes[u_idx].position[:2] -
-                                                   self.nodes[v_idx].position[:2])
-                if alt < dist[v_idx]:
-                    dist[v_idx] = alt
-                    prev[v_idx] = u_idx
-                    heapq.heappush(pq, (alt, v_idx))
-
-        # Reconstruct path from end to start
-        path_node_position = []
-        path_node_idx = []
-        u = end
-        u_idx = u.idx
-        while u_idx != -1:
-            path_node_position.append(self.nodes[u_idx].position)
-            path_node_idx.append(u_idx)
-            u_idx = prev[u_idx]
-        path_node_position.reverse()
-        path_node_idx.reverse()
-
-        # If the path doesn't reach the start node, return an empty path
-        if tuple(path_node_position[0]) != tuple(start.position):
-            return np.array([]), np.array([])
-        return np.array(path_node_position), path_node_idx
+        return topology_find_the_closest_path(self, start, end)
 
     def check_connected(self, start, end):
-        # 将输入点映射到图中最近的节点
-        start = self.nodes[start]
-        end = self.nodes[end]
-
-        start_idx = start.idx
-        end_idx = end.idx
-
-        # 初始化距离数组
-        dist = np.full(self.node_cnt, np.inf)
-        dist[start_idx] = 0
-
-        # Dijkstra 使用的优先队列
-        pq = []
-        heapq.heappush(pq, (0, start_idx))
-
-        while pq:
-            current_dist, u_idx = heapq.heappop(pq)
-
-            # 如果已经到达目标节点，说明 start 与 end 相通
-            if u_idx == end_idx:
-                return True
-
-            # 如果不是最短距离，跳过
-            if current_dist > dist[u_idx]:
-                continue
-
-            # 遍历相邻节点
-            for v_idx in self.neighbors[u_idx]:
-                alt = dist[u_idx] + np.linalg.norm(
-                    self.nodes[u_idx].position[:2] - self.nodes[v_idx].position[:2]
-                )
-                if alt < dist[v_idx]:
-                    dist[v_idx] = alt
-                    heapq.heappush(pq, (alt, v_idx))
-
-        # 如果最终没有到达 end 节点，说明不相通
-        return False
+        return topology_check_connected(self, start, end)
 
     def update_edges(self):
         cluster_points = self.navigable_pcd.point.positions.cpu().numpy().copy()
@@ -1393,12 +1215,8 @@ class Instruct_Mapper:
             direction = np.array([np.cos(angle), np.sin(angle)])
             end_point = origin_point + direction * max_distance_map
 
-            # print(origin_point, end_point)
-
             interpolate_points = bresenham(origin_point[0], origin_point[1], int(end_point[0]), int(end_point[1]))
-            # output the interpolate_points
             interpolate_points = list(interpolate_points)
-            # print(interpolate_points)
             for idx, point in enumerate(interpolate_points):
                 if point_map[point[0], point[1]] == 0:
                     point = np.array(list(point))
@@ -1643,9 +1461,14 @@ class Instruct_Mapper:
             logger.info('Failed to save node state: {}', e)
 
     def get_nodes(self, temporary_pcd, angles, node, episode_idx, step):
+        """Grow the navigation graph from the latest panoramic observation."""
+
+        # 只保留最大可通行连通域，避免噪声地面点在图里生成不可达 frontier。
         # only keep the max connected component in traversable area
         self.traversable_pcd = self.keep_the_max_connect_component(self.traversable_pcd_all)
 
+        # 合并当前全景一圈的临时点云，后面会按候选 frontier 方向切片，
+        # 作为新增 node 的局部观测证据。
         current_node_pcd = o3d.t.geometry.PointCloud(self.pcd_device)
         for i in range(len(temporary_pcd)):
             current_node_pcd = gpu_merge_pointcloud(current_node_pcd, temporary_pcd[i])
@@ -1730,6 +1553,8 @@ class Instruct_Mapper:
 
         closest_distance = 1.35
 
+        # 在全局可通行地图上提取 frontier。frontier 是未探索区域的边界，
+        # 后续会被聚成新的 viewpoint node 候选。
         # get the frontier_clusters
         # self-implemented function
         # frontier_clusters, frontier_centers = self.get_frontiers(current_navigable_pcd, current_pcd.point.positions.cpu().numpy())
@@ -1745,26 +1570,19 @@ class Instruct_Mapper:
         frontier_centers = global_frontier_centers
 
         self.current_global_frontier_map_idxs = frontier_map_idxs_all
-        # print(global_frontier_map_idxs)
-
-        # save the frontier clusters
-        if len(frontier_clusters) != 0:
-            frontiers_to_save = np.concatenate(frontier_clusters, axis=0)
-        else:
-            frontiers_to_save = np.array([]).reshape(0, 3)
+        frontiers_to_save = concat_frontier_points(frontier_clusters)
 
         logger.info("Current position: {}", standing_position)
-        # logger.info(len(current_navigable_position))
 
+        # 根据最近 frontier 自适应截断当前可见区域。这样既保留局部连通结构，
+        # 又避免一次观测把过远、未验证的地面区域错误连进当前 node。
         # decide the max distance
-        if len(frontier_clusters) != 0:
-            frontiers_all = np.concatenate(frontier_clusters, axis=0)
-            distance_to_frontiers = np.linalg.norm(frontiers_all - standing_position, axis=1)
-            min_distance_to_frontiers = np.min(distance_to_frontiers)
+        max_distance, min_distance_to_frontiers = adaptive_intersection_distance(
+            frontier_clusters,
+            standing_position,
+        )
+        if min_distance_to_frontiers is not None:
             logger.info(f"Min distance to frontiers: {min_distance_to_frontiers}")
-            max_distance = min(2.5, min_distance_to_frontiers * 1.2)
-        else:
-            max_distance = 2.5
 
         logger.info(f"Max distance Threshold: {max_distance}")
         intersections = self.calculate_intersections(current_navigable_position,
@@ -1795,6 +1613,8 @@ class Instruct_Mapper:
         colors = np.random.rand(3)
         pcd_in_circle.paint_uniform_color(colors)
 
+        # 对当前视野外侧的可通行点聚类。带 frontier 的 cluster 产生探索节点；
+        # 没有 frontier 但足够大的 cluster 用于补充可能漏掉的通路节点。
         # cluster the remaing points
         with o3d.utility.VerbosityContextManager(o3d.utility.VerbosityLevel.Debug) as cm:
             labels = np.array(
@@ -1803,119 +1623,32 @@ class Instruct_Mapper:
         # logger.info(labels)
         if step != 12 and len(labels) == 0:
             return
-        max_label = labels.max().cpu().numpy()
-
-        # extract each cluster and rule out the small ones caluclate the center of each cluster
-        clusters = []
-        centers_from_frontiers = []
-        centers_from_frontiers_map_idxs = []
-        centers_from_clusters = []
-        for i in range(max_label + 1):
-            mask_idx_tensor = o3d.core.Tensor((labels == i).nonzero()[0],
-                                              o3d.core.Dtype.Int64,
-                                              device=current_navigable_pcd.device)
-            cluster = pcd_removed.select_by_index(mask_idx_tensor)
-            cluster_point = cluster.point.positions.cpu().numpy()
-            # generate random colors, shape is (n, 3)
-            colors = np.random.rand(3)
-            cluster.paint_uniform_color(colors)
-
-            # extract frontiers in this cluster
-            current_frontier_clusters = []
-            current_frontier_centers = []
-            current_frontier_map_idxs = []
-            for frontier_index, frontier_cluster in enumerate(frontier_clusters):
-                distances = np.linalg.norm(frontier_cluster[:, np.newaxis, :2] -
-                                           cluster_point[np.newaxis, :, :2],
-                                           axis=2)
-                if np.min(distances) < 0.2:
-                    # frontier_cluster_new = frontier_cluster[np.min(distances, axis=1) < 0.15]
-                    # frontier_center_new = np.mean(frontier_cluster_new, axis=0)
-                    frontier_cluster_new = frontier_cluster
-                    frontier_center_new = frontier_centers[frontier_index]
-                    frontier_cluster_map_idxs_new = global_frontier_map_idxs[frontier_index]
-                    current_frontier_clusters.append(frontier_cluster_new)
-                    current_frontier_centers.append(frontier_center_new)
-                    current_frontier_map_idxs.append(frontier_cluster_map_idxs_new)
-
-            if len(current_frontier_clusters) != 0 and len(cluster_point) > 50:
-                clusters.append(cluster)
-                # merge the frontier clusters
-                merged_frontier_clusters, merged_frontier_centers, merged_frontier_map_idxs, line_set = self.merge_frontier_with_visibility_1(
-                    cluster_point,
-                    obstacle_pcd_points,
-                    current_frontier_clusters,
-                    current_frontier_centers,
-                    current_frontier_map_idxs,
-                    current_position,
-                )
-
-                os.makedirs(f'{self.save_dir}/episode-{episode_idx}/frontier_line', exist_ok=True)
-                o3d.io.write_line_set(
-                    f'{self.save_dir}/episode-{episode_idx}/frontier_line/line_set_{step}_cluster_{i}.ply',
-                    line_set)
-
-                center_idx_to_remove = set()  # 改用 set 避免重复
-                for index1 in range(len(merged_frontier_centers)):
-                    for index2 in range(index1 + 1, len(merged_frontier_centers)):
-                        if index1 in center_idx_to_remove or index2 in center_idx_to_remove:
-                            continue  # 跳过已标记删除的索引
-
-                        center1 = merged_frontier_centers[index1]
-                        center2 = merged_frontier_centers[index2]
-                        angle1 = np.arctan2(center1[1] - standing_position[1],
-                                            center1[0] - standing_position[0])
-                        angle2 = np.arctan2(center2[1] - standing_position[1],
-                                            center2[0] - standing_position[0])
-                        angle_diff = np.abs((angle1 - angle2 + np.pi) % (2 * np.pi) - np.pi)
-
-                        if angle_diff < 10 * np.pi / 180 and self.is_visible(
-                                center1, center2, cluster_point, obstacle_pcd_points):
-                            distance1 = np.linalg.norm(center1[:2] - standing_position[:2])
-                            distance2 = np.linalg.norm(center2[:2] - standing_position[:2])
-
-                            if distance1 < distance2:
-                                center_idx_to_remove.add(index2)
-                            else:
-                                center_idx_to_remove.add(index1)
-
-                # 从大到小排序，避免索引偏移问题
-                center_idx_to_remove = sorted(center_idx_to_remove, reverse=True)
-                centers_new = [center for idx, center in enumerate(merged_frontier_centers) if
-                               idx not in center_idx_to_remove]
-                centers_map_idxs_new = [map_idx for idx, map_idx in enumerate(merged_frontier_map_idxs) if
-                                        idx not in center_idx_to_remove]
-
-                centers_from_frontiers.extend(centers_new)  # 直接使用 extend 替代 for-loop
-                centers_from_frontiers_map_idxs.extend(centers_map_idxs_new)
-
-            # cluster without frontiers
-            if len(current_frontier_clusters) == 0 and (
-                (all_points_num / 20 < len(cluster.point.positions.cpu().numpy())) or
-                (50 < len(cluster.point.positions.cpu().numpy()))):
-                # determine whether there are frontiers in the cluster
-                flag = True
-                nav_map = np.zeros((self.voxel_dimension[0], self.voxel_dimension[1]))
-                cluster_points = cluster.point.positions.cpu().numpy()
-                nav_grid_idxs = translate_point_to_grid(cluster_points, self.grid_resolution, self.voxel_dimension)
-                nav_map[nav_grid_idxs[:, 0], nav_grid_idxs[:, 1]] = 1
-                node_positions = np.array([node.position for node in self.nodes])
-                node_grid_idxs = translate_point_to_grid(node_positions, self.grid_resolution, self.voxel_dimension)
-                for node_grid_idx in node_grid_idxs:
-                    if nav_map[node_grid_idx[0], node_grid_idx[1]] == 1:
-                        flag = False
-                        break
-
-                if flag:
-                    clusters.append(cluster)
-                    center = np.mean(cluster.point.positions.cpu().numpy(), axis=0)
-                    centers_from_clusters.append(center)
+        cluster_result = analyze_frontier_clusters(
+            self,
+            pcd_removed=pcd_removed,
+            labels=labels,
+            current_navigable_pcd=current_navigable_pcd,
+            frontier_clusters=frontier_clusters,
+            frontier_centers=frontier_centers,
+            global_frontier_map_idxs=global_frontier_map_idxs,
+            obstacle_points=obstacle_pcd_points,
+            current_position=current_position,
+            standing_position=standing_position,
+            all_points_num=all_points_num,
+            episode_idx=episode_idx,
+            step=step,
+        )
+        clusters = cluster_result.clusters
+        centers_from_frontiers = cluster_result.centers_from_frontiers
+        centers_from_frontiers_map_idxs = cluster_result.centers_from_frontiers_map_idxs
+        centers_from_clusters = cluster_result.centers_from_clusters
 
         current_nav_pcd_to_save = o3d.t.geometry.PointCloud(self.pcd_device)
         current_nav_pcd_to_save = gpu_merge_pointcloud(current_nav_pcd_to_save, pcd_in_circle, False)
         for cluster in clusters:
             current_nav_pcd_to_save = gpu_merge_pointcloud(current_nav_pcd_to_save, cluster, False)
 
+        # 将 frontier/cluster 中心投影回可通行点云，并过滤不可达候选。
         # compute the distance between the current centers and self.nodes,
         # if the distance is less than a threshold, then remove the center
         # and add the new center to self.nodes
@@ -1931,64 +1664,34 @@ class Instruct_Mapper:
         # logger.info(f'Nodes positions: {nodes_positions}')
         for idx, center in enumerate(centers_from_frontiers):
             frontier_idxs = centers_from_frontiers_map_idxs[idx]
-            # ensure the center is in the traversable area, if not use the closest point in the traversable area
-            center = self.find_closest_point_in_pc(center, self.traversable_pcd)
-            if center is None: continue
-            traversable_flag = self.check_traversability(current_position, center)
-
-            if traversable_flag:
-                # distance = np.linalg.norm(nodes_positions[:, :2] - center[:2], axis=1)
-                # # logger.info(f'Center: {center}, min distance: {np.min(distance)}, threshold: {closest_distance*0.7}')
-                # if np.min(distance) > closest_distance * 0.7:
-
-                center[2] = self.current_position[2]
-                valid_centers.append((center, True, frontier_idxs))
+            append_traversable_candidate(
+                self,
+                valid_centers,
+                center=center,
+                has_frontier=True,
+                frontier_idxs=frontier_idxs,
+                current_position=current_position,
+            )
 
         for center in centers_from_clusters:
-            # ensure the center is in the traversable area, if not use the closest point in the traversable area
-            center = self.find_closest_point_in_pc(center, self.traversable_pcd)
-            if center is None: continue
-            traversable_flag = self.check_traversability(current_position, center)
+            append_traversable_candidate(
+                self,
+                valid_centers,
+                center=center,
+                has_frontier=False,
+                frontier_idxs=np.array([]),
+                current_position=current_position,
+            )
 
-            if traversable_flag:
-                # distance = np.linalg.norm(nodes_positions[:, :2] - center[:2], axis=1)
-                # # logger.info(f'Center: {center}, min distance: {np.min(distance)}, threshold: {closest_distance*0.7}')
-                # if np.min(distance) > closest_distance * 0.7:
-
-                center[2] = self.current_position[2]
-                valid_centers.append((center, False, np.array([])))
-
-        if len(valid_centers) > 0:
-            block_current = (len(valid_centers) == 1)
-            for center, has_frontier, frontier_idxs in valid_centers:
-                angle_center = np.arctan2(center[1] - self.current_position[1],
-                                          center[0] - self.current_position[0])
-                angle_center = np.where(angle_center < 0, angle_center + 2 * np.pi, angle_center)
-                angle_center = np.where(angle_center > 2 * np.pi, angle_center - 2 * np.pi,
-                                        angle_center)
-
-                start_angle = self.normalize_angle(angle_center - 40 * np.pi / 180)
-                end_angle = self.normalize_angle(angle_center + 40 * np.pi / 180)
-                if start_angle < end_angle:
-                    mask_idx_tensor = o3d.core.Tensor(
-                        np.where((angles_current_node > start_angle) &
-                                 (angles_current_node < end_angle))[0],
-                        o3d.core.Dtype.Int64,
-                        device=self.pcd_device)
-                    pcd_to_node = current_node_pcd.select_by_index(mask_idx_tensor)
-                else:
-                    mask_idx_tensor = o3d.core.Tensor(
-                        np.where((angles_current_node > start_angle) |
-                                 (angles_current_node < end_angle))[0],
-                        o3d.core.Dtype.Int64,
-                        device=self.pcd_device)
-                    pcd_to_node = current_node_pcd.select_by_index(mask_idx_tensor)
-
-                _, add_node_flag = self.add_node(center, pcd_to_node, has_frontier, frontier_idxs, block_current)
-                if add_node_flag:
-                    self.add_edge(self.current_node_idx, self.nodes[-1].idx)
+        add_nodes_from_candidates(
+            self,
+            valid_centers=valid_centers,
+            current_node_pcd=current_node_pcd,
+            angles_current_node=angles_current_node,
+        )
 
 
+        # 新增 node 后同步三张图：object-node 图、node-node 可见边、room-node 图。
         # update the obj, node edges
         self.update_obj_node()
 
@@ -2239,6 +1942,8 @@ class Instruct_Mapper:
         logger.info(f'Node state after: {nodes_states}')
 
     def get_candidate_room_fully_explored(self, instruct_goal, idx=None, step=None):
+        """Select an unexplored room with an LLM policy when local exploration stalls."""
+
         self.process_obs_pcd = o3d.t.geometry.PointCloud(self.pcd_device)
         self.process_nav_pcd = o3d.t.geometry.PointCloud(self.pcd_device)
 
@@ -2255,8 +1960,10 @@ class Instruct_Mapper:
             traj_info += f'Position {self.nodes[traj_idx].position} --> '
         traj_info = traj_info[:-4]
 
+        # LLM 只选择“下一个房间”，不直接判断任务成功。任务成功仍由
+        # object_found/final verifier 根据对象实例和视觉证据确认。
         json_dict = self.to_json()
-        #transfer this dict to string
+        # transfer this dict to string
         json_str = json.dumps(json_dict)
 
         candidate_room_idxs = [room_node.room_id for room_node in self.room_nodes if room_node.state == 0]
@@ -2379,8 +2086,10 @@ class Instruct_Mapper:
         return room_final
 
     def object_found(self, instruct_goal, idx=None, step=None):
+        """Legacy LLM object selector over the serialized map state."""
+
         json_dict = self.to_json_wo_some_class()
-        #transfer this dict to string
+        # transfer this dict to string
         json_str = json.dumps(json_dict)
 
         prompt_info = instruct_goal + '\n' + json_str
@@ -2453,23 +2162,11 @@ class Instruct_Mapper:
         return answer.flag, obj_final
 
     def object_found_no_gpt(self, instruct_goal, idx=None, step=None):
+        """Select a candidate object without the legacy object-planning LLM call."""
+
         plan = getattr(self, "instruction_plan", None)
-        if plan is not None:
-            self.instruction_constraint_evaluator.register_mapper_objects(
-                mapper=self,
-                step=step,
-                current_node_idx=getattr(self, "current_node_idx", None),
-            )
-            state = self.instruction_constraint_evaluator.ensure_state(self, plan)
-            active = state.active_target(plan)
-            if active is not None and is_ordered_execution(plan):
-                # 中文说明：sequence 模式只允许当前子目标触发 stop。
-                # 后续目标即使被 detector 看见，也不能提前终止。
-                self.target_list = list(active.detector_terms or [active.name])
-                self.target_aliases = list(active.match_terms)
-                self.target = active.name
         json_dict = self.to_json_wo_some_class()
-        #transfer this dict to string
+        # transfer this dict to string
         json_str = json.dumps(json_dict)
         prompt_info = instruct_goal + '\n' + json_str
 
@@ -2482,48 +2179,20 @@ class Instruct_Mapper:
             f.write(f'\n')
             f.write(f'\n')
 
-        if plan is not None:
-            result = self.instruction_object_search_policy.select(self, plan=plan, step=step)
-            with open(f'{self.save_dir}/episode-{idx}/no_gpt_obj/answer_{step}.txt', 'w') as f:
-                f.write(f'Input: {prompt_info}\n')
-                f.write(f'Answer: {result.answer}\n')
-                if result.anchor_record:
-                    f.write(f'Anchor match: {json.dumps(result.anchor_record, ensure_ascii=False)}\n')
-                if result.skipped_objs:
-                    f.write(f'Skipped by final verifier: {json.dumps(result.skipped_objs, ensure_ascii=False)}\n')
-                if result.concept_debug:
-                    f.write(f'Concept matches: {json.dumps(result.concept_debug, ensure_ascii=False)}\n')
-                f.write(f'\n')
-                f.write(f'\n')
-            return result.found, result.obj
-
-        target_objs = []
-        for obj in self.objects:
-            if self._is_target_tag(obj.tag):
-                target_objs.append(obj)
-        if len(target_objs) == 0:
-            answer = f"No target object '{self.target}' found; accepted aliases: {sorted(self._target_match_terms())}"
-            with open(f'{self.save_dir}/episode-{idx}/no_gpt_obj/answer_{step}.txt', 'w') as f:
-                f.write(f'Input: {prompt_info}\n')
-                f.write(f'Answer: {answer}\n')
-                f.write(f'\n')
-                f.write(f'\n')
-            return False, None
-
-        target_objs = sorted(target_objs, key=lambda x: x.confidence.numpy().item(), reverse=True)
-        target_obj = target_objs[0]
-        if target_obj.tag != self.target:
-            target_obj.tag = self.target
-            target_obj.conf_list[self.target] = target_obj.confidence
-
-        answer = f"Choose Obj '{target_obj.tag}' at position {target_obj.position} with confidence {target_obj.confidence.numpy().item()}."
+        result = select_target_candidate(self, plan=plan, step=step)
         with open(f'{self.save_dir}/episode-{idx}/no_gpt_obj/answer_{step}.txt', 'w') as f:
             f.write(f'Input: {prompt_info}\n')
-            f.write(f'Answer: {answer}\n')
+            f.write(f'Answer: {result.answer}\n')
+            if result.anchor_record:
+                f.write(f'Anchor match: {json.dumps(result.anchor_record, ensure_ascii=False)}\n')
+            if result.skipped_objs:
+                f.write(f'Skipped by final verifier: {json.dumps(result.skipped_objs, ensure_ascii=False)}\n')
+            if result.concept_debug:
+                f.write(f'Concept matches: {json.dumps(result.concept_debug, ensure_ascii=False)}\n')
             f.write(f'\n')
             f.write(f'\n')
 
-        return True, target_obj
+        return result.found, result.obj
 
     def get_candidate_room_relocate(self, instruct_goal, idx=None, step=None):
         self.process_obs_pcd = o3d.t.geometry.PointCloud(self.pcd_device)
@@ -2725,77 +2394,14 @@ class Instruct_Mapper:
 
 
     def to_json(self):
-        json_data = {}
-        object_json = []
-        for i in range(len(self.objects)):
-            obj = self.objects[i]
-            nwpcd = obj.pcd.point.positions.cpu().numpy()
-            size = np.zeros(3)
-            size[0] = np.max(nwpcd[:, 0]) - np.min(nwpcd[:, 0])
-            size[1] = np.max(nwpcd[:, 1]) - np.min(nwpcd[:, 1])
-            size[2] = np.max(nwpcd[:, 2]) - np.min(nwpcd[:, 2])
+        """Serialize mapper state for room-selection prompts."""
 
-            object_json.append({
-                'index': i,
-                'position': [round(p, 3) for p in obj.position.tolist()],
-                'class': obj.tag,
-                'confidence': round(obj.confidence.numpy().item(), 3),
-                'size': [round(s, 3) for s in size.tolist()],
-            })
-        json_data['objects'] = object_json
-
-        room_nodes = []
-        for i in range(len(self.room_nodes)):
-            room_node = self.room_nodes[i]
-            nodes_in_room = room_node.nodes
-            nodes = []
-            for j in range(len(nodes_in_room)):
-                node = nodes_in_room[j]
-                if node.state == NodeState.EXPLORED:
-                    node.has_frontier = False
-                    node.has_true_frontier = False
-                nodes.append({
-                    # 'idx': node.idx,
-                    'position': [round(p, 3) for p in node.position.tolist()],
-                    # 'state': node.state,
-                    # 'neighbors': self.neighbors[node.idx],
-                    'has_frontier': node.has_frontier,
-                })
-
-                nodes[-1]['objects'] = node.objects
-            room_nodes.append({
-                'room_idx': room_node.room_id,
-                'state': room_node.state,
-                'distance': round(room_node.distance, 3),
-                'viewpoints': nodes,
-            })
-
-        json_data['Room'] = room_nodes
-
-        return json_data
+        return serialize_map(self)
 
     def to_json_wo_some_class(self):
-        json_data = {}
-        object_json = []
-        for i in range(len(self.objects)):
-            obj = self.objects[i]
-            nwpcd = obj.pcd.point.positions.cpu().numpy()
-            size = np.zeros(3)
-            size[0] = np.max(nwpcd[:, 0]) - np.min(nwpcd[:, 0])
-            size[1] = np.max(nwpcd[:, 1]) - np.min(nwpcd[:, 1])
-            size[2] = np.max(nwpcd[:, 2]) - np.min(nwpcd[:, 2])
+        """Serialize object state for target-selection prompts."""
 
-            if obj.tag != 'unknown' and obj.tag != 'furniture':
-                object_json.append({
-                    'index': i,
-                    'position': obj.position.tolist(),
-                    'class': obj.tag,
-                    'confidence': obj.confidence.numpy().item(),
-                    'size': size.tolist(),
-                })
-        json_data['objects'] = object_json
-
-        return json_data
+        return serialize_objects_for_target_selection(self)
 
     def find_closest_point_in_pc(self, position, pcd):
         pcd_positions = pcd.point.positions.cpu().numpy()
@@ -2895,406 +2501,44 @@ class Instruct_Mapper:
 
 
     def segment_room(self, step_idx):
-        self.room_nodes = []
-        for node in self.nodes:
-            node.room_idx = -1
+        """Partition navigation nodes into room-level regions from the map point cloud."""
 
-        obs_pcd = self.scene_pcd.select_by_index((self.scene_pcd.point.positions[:, 2]
-                                                  < self.ceiling_height).nonzero()[0])
-        nav_pcd = self.navigable_pcd
-        tmp_floor_path = f'{self.save_dir}/episode-{self.episode_idx}/room_inter/step_{self.update_iterations}'
-        os.makedirs(tmp_floor_path, exist_ok=True)
-
-        save_intermediate_results = True
-
-        obs_pcd = obs_pcd.voxel_down_sample(voxel_size=0.05)
-        nav_pcd = nav_pcd.voxel_down_sample(voxel_size=0.05)
-
-        # floor_pcd.voxel_down_sample(voxel_size=0.05)
-        xyz = obs_pcd.point.positions.cpu().numpy()
-        nav_points = nav_pcd.point.positions.cpu().numpy()
-        xyz = np.concatenate([xyz, nav_points], axis=0)
-
-        # print(xyz)
-        xyz_full = xyz.copy()
-        floor_zero_level = -0.8
-        floor_height = 0.8
-        ## Slice below the ceiling ##
-        xyz = xyz[xyz[:, 2] < floor_height]
-        xyz = xyz[xyz[:, 2] >= floor_zero_level + 0.2]
-        xyz_full = xyz_full[xyz_full[:, 2] < floor_height]
-
-        # project the point cloud to 2d
-        # pcd_2d = xyz[:, [0, 1]]
-        # xyz_full = xyz_full[:, [0, 1]]
-        pcd_2d = xyz
-        xyz_full = xyz_full
-
-        room_resolution = 0.05
-        # room_dimension = self.voxel_dimension
-        # room_dimension[0] *= (self.grid_resolution // room_resolution)
-        # room_dimension[1] *= (self.grid_resolution // room_resolution)
-
-        room_dimension = np.asarray([1000,1000,20])
-        nodes_positions = translate_point_to_grid(
-            self.get_nodes_positions(),
-            grid_resolution=room_resolution,
-            voxel_dimension=room_dimension,
-        )[:, :2]
-        nodes_positions[:, 0] = np.clip(nodes_positions[:, 0], 0, room_dimension[0] - 1)
-        nodes_positions[:, 1] = np.clip(nodes_positions[:, 1], 0, room_dimension[1] - 1)
-
-        hist = project_room(pcd_2d,grid_resolution=room_resolution,voxel_dimension=room_dimension)
-        if save_intermediate_results:
-            cv2.imwrite(os.path.join(tmp_floor_path, "obstacale_2D_histogram.png"), hist)
-
-        # applythresholding
-        hist = cv2.normalize(hist, hist, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-        hist = cv2.GaussianBlur(hist, (5, 5), 1)
-        hist_threshold = 0.25 * np.max(hist)
-        _, walls_skeleton_hist = cv2.threshold(hist, hist_threshold, 255, cv2.THRESH_BINARY)
-
-        # apply closing to the walls skeleton
-        kernal = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
-        walls_skeleton_hist = cv2.morphologyEx(walls_skeleton_hist,
-                                               cv2.MORPH_CLOSE,
-                                               kernal,
-                                               iterations=1)
-
-        if save_intermediate_results:
-            cv2.imwrite(os.path.join(tmp_floor_path, "walls_skeleton.png"), walls_skeleton_hist)
-
-        # extract outside boundary from histogram of xyz_full
-        hist_full = project_room(xyz_full,grid_resolution=room_resolution,voxel_dimension=room_dimension)
-
-        hist_full = cv2.normalize(hist_full, hist_full, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-
-        _, outside_boundary = cv2.threshold(hist_full, 0.001, 255, cv2.THRESH_BINARY)
-        outside_boundary = outside_boundary.astype(np.uint8)
-
-        # draw contours fill the blank
-        contours, _ = cv2.findContours(outside_boundary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        outside_boundary = np.zeros_like(outside_boundary)
-        cv2.drawContours(outside_boundary, contours, -1, (255, 255, 255), -1)
-
-        # visualize the walls_skeleton_hist
-        if save_intermediate_results:
-            cv2.imwrite(os.path.join(tmp_floor_path, "full_map1.png"), outside_boundary)
-
-            # save the full map as point cloud
-            positions = np.where(outside_boundary != 0)
-            # switch the first 2 dimension of the positions
-            positions = np.asarray(positions).T
-            position_world = translate_grid_to_point(np.asarray(positions), grid_resolution=room_resolution,
-                                                     voxel_dimension=room_dimension)
-            # save the pcd
-            pcd = o3d.geometry.PointCloud()
-            pcd.points = o3d.utility.Vector3dVector(position_world)
-            o3d.io.write_point_cloud(os.path.join(tmp_floor_path, f"full_map_ori.ply"), pcd)
-
-        # print(outside_boundary.shape, walls_skeleton_hist.shape)
-        wall_positions = np.where(walls_skeleton_hist != 0)
-        outside_boundary[wall_positions] = 0
-
-        if save_intermediate_results:
-            cv2.imwrite(os.path.join(tmp_floor_path, "full_map2.png"), outside_boundary)
-
-        # draw the outside boundary
-        outside_boundary_tmp = cv2.bitwise_not(outside_boundary)
-
-        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
-            outside_boundary_tmp, connectivity=8)
-
-        # get all components with the area larger than 10
-        outside_boundary_tmp = np.zeros_like(outside_boundary_tmp)
-        for i in range(1, num_labels):
-            if stats[i, cv2.CC_STAT_AREA] > 10:
-                outside_boundary_tmp[labels == i] = 255
-
-        outside_boundary_tmp = cv2.bitwise_not(outside_boundary_tmp)
-
-        # visualize the largest component
-        if save_intermediate_results:
-            cv2.imwrite(os.path.join(tmp_floor_path, "full_map3.png"), outside_boundary_tmp)
-
-        # get the contours of the outside boundary
-        contours, _ = cv2.findContours(outside_boundary_tmp, cv2.RETR_EXTERNAL,
-                                       cv2.CHAIN_APPROX_SIMPLE)
-        outside_boundary_tmp = np.zeros_like(outside_boundary_tmp)
-        cv2.drawContours(outside_boundary_tmp, contours, -1, (255, 255, 255), -1)
-        outside_boundary_tmp = outside_boundary_tmp.astype(np.uint8)
-
-        # get the components
-        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
-            outside_boundary_tmp, connectivity=8)
-        if num_labels <= 1:
-            logger.warning("Room segmentation found no connected free-space component at step {}.", step_idx)
-            self._fallback_single_room(nodes_positions)
-            return
-        # get the largest component
-        max_label = np.argmax(stats[1:, cv2.CC_STAT_AREA]) + 1
-        outside_boundary_tmp = np.zeros_like(outside_boundary_tmp)
-        outside_boundary_tmp[labels == max_label] = 255
-
-        # apply closing to the outside boundary
-        outside_boundary_tmp = cv2.bitwise_not(outside_boundary_tmp)
-        kernal = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-        outside_boundary_tmp = cv2.morphologyEx(outside_boundary_tmp,
-                                                cv2.MORPH_CLOSE,
-                                                kernal,
-                                                iterations=2)
-        outside_boundary_tmp = cv2.bitwise_not(outside_boundary_tmp)
-
-        if save_intermediate_results:
-            cv2.imwrite(os.path.join(tmp_floor_path, "full_map4.png"), outside_boundary_tmp)
-            #
-
-        free_mask = (outside_boundary_tmp > 0).astype(np.uint8) * 255
-        num_regions, markers, region_stats, _ = cv2.connectedComponentsWithStats(
-            free_mask, connectivity=8
-        )
-        if num_regions <= 1:
-            logger.warning("Room segmentation produced no region markers at step {}.", step_idx)
-            self._fallback_single_room(nodes_positions)
-            return
-
-        # 遍历每个唯一的 region_id，并创建 mask
-        unique_regions = np.unique(markers)
-        region_masks = {}
-        position_worlds = {}
-        position_maps = {}
-        for region_id in unique_regions:
-            if region_id in [-1, 0]:  # 跳过 watershed 线和背景
-                continue
-            if region_stats[int(region_id), cv2.CC_STAT_AREA] <= 10:
-                continue
-            mask = (markers == region_id).astype(np.uint8) * 255
-            region_masks[region_id] = mask  # 存储每个区域的 mask
-            # transform to world point cloud
-            positions = np.where(mask == 255)
-            positions = np.asarray(positions).T
-            position_world = translate_grid_to_point(np.asarray(positions),grid_resolution=room_resolution,voxel_dimension=room_dimension)
-            position_map = translate_point_to_grid(position_world,grid_resolution=self.grid_resolution,voxel_dimension=self.voxel_dimension)[:, :2]
-            position_worlds[region_id] = position_world
-            position_maps[region_id] = position_map
-
-            # determine which points belong to this room region
-            nodes_in_region = []
-            for node_idx, nodes_position in enumerate(nodes_positions):
-                if mask[nodes_position[0], nodes_position[1]] == 255:
-                    nodes_in_region.append(self.nodes[node_idx])
-
-            if len(nodes_in_region) != 0:
-                # room_node = Room_node(nodes_in_region, position_world, len(self.room_nodes))
-                for node in nodes_in_region:
-                    node.room_idx = region_id
-
-                # # save the pcd
-                # pcd = o3d.geometry.PointCloud()
-                # pcd.points = o3d.utility.Vector3dVector(position_world)
-                # o3d.io.write_point_cloud(os.path.join(tmp_floor_path, f"region_{len(self.room_nodes)}.ply"), pcd)
-
-                # self.room_nodes.append(room_node)
-        for node in self.nodes:
-            room_idx = node.room_idx
-            node_idx = node.idx
-            current_position = nodes_positions[node_idx]
-            if room_idx == -1:
-                # find the closest mask to this node
-                node_distance_to_mask = {}
-                for region_id, mask in region_masks.items():
-                    positions = np.where(mask == 255)
-                    distance = np.linalg.norm(np.array(positions).T - current_position, axis=1)
-                    distance_min = np.min(distance)
-                    node_distance_to_mask[region_id] = distance_min
-                if not node_distance_to_mask:
-                    self._fallback_single_room(nodes_positions)
-                    return
-                closest_region_id = min(node_distance_to_mask, key=node_distance_to_mask.get)
-                node.room_idx = closest_region_id
-
-        remaining_node_idxs = [node.idx for node in self.nodes]
-
-        while remaining_node_idxs:
-            node_idx = remaining_node_idxs[0]  # 取出当前节点
-            node = self.nodes[node_idx]
-            room_idx = node.room_idx
-
-            # 获取该 room 内的所有节点
-            nodes_in_region = [self.nodes[idx] for idx in remaining_node_idxs if self.nodes[idx].room_idx == room_idx]
-            node_idxs_in_region = [node.idx for node in nodes_in_region]
-            room_node = Room_node(nodes_in_region, position_worlds[room_idx], position_maps[room_idx], len(self.room_nodes))
-            logger.info(f"Room {len(self.room_nodes)} has Nodes: {node_idxs_in_region}")
-
-            for node_in_region in nodes_in_region:
-                node_in_region.room_idx = len(self.room_nodes)
-
-            self.room_nodes.append(room_node)
-
-            # 移除已处理的节点
-            remaining_node_idxs = list(set(remaining_node_idxs) - set(node_idxs_in_region))
-
-        # update the distance from current pos to each room
-        current_node = self.nodes[self.current_node_idx]
-        for room_node in self.room_nodes:
-            closet_node = self.find_closet_viewpoint_in_room(room_node)
-            if closet_node is None:
-                continue
-
-            path_length = self.get_path_length(closet_node)
-            room_node.distance = path_length
-
-
-        # update the frontier state(frontier in room and frontier out room)
-        # first get all the room mask
-        room_map = np.ones((self.voxel_dimension[0], self.voxel_dimension[1]))
-        for room_node in self.room_nodes:
-            room_map_pos = room_node.mask_map
-            room_map[room_map_pos[:, 0], room_map_pos[:, 1]] = 0
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-        room_map = cv2.dilate(room_map, kernel, iterations=2)
-
-        for frontier_idxs in self.current_global_frontier_map_idxs:
-            # boarder_frontier = [[x,y] for (x,y) in frontier_idxs if room_map[x, y] == 1]
-            inner_frontier = [[x,y] for (x,y) in frontier_idxs if room_map[x, y] == 0]
-
-            if len(inner_frontier) > 0.6 * len(frontier_idxs):
-                # print(inner_frontier)
-                # print(frontier_idxs)
-                # print(len(inner_frontier), len(frontier_idxs))
-                self.grid_map[frontier_idxs[:, 0], frontier_idxs[:, 1]] = 1
-            else:
-                self.grid_map[frontier_idxs[:, 0], frontier_idxs[:, 1]] = 2
+        return segmenter_segment_room(self, step_idx)
 
     def _fallback_single_room(self, nodes_positions=None):
-        """Fallback room partition when watershed/connected components are empty.
+        """Fallback room partition when watershed/connected components are empty."""
 
-        早期探索阶段点云和墙体骨架可能还不足以切出稳定房间。此时不能让
-        relocation 崩溃，先把已有 viewpoint 归为一个临时 room；后续地图更完整
-        时 `segment_room()` 会重新生成更细的 room nodes。
-        """
-
-        if len(self.nodes) == 0:
-            self.room_nodes = []
-            return
-        position_world = np.asarray(self.get_nodes_positions(), dtype=float).reshape(-1, 3)
-        position_map = translate_point_to_grid(
-            position_world,
-            grid_resolution=self.grid_resolution,
-            voxel_dimension=self.voxel_dimension,
-        )[:, :2]
-        position_map[:, 0] = np.clip(position_map[:, 0], 0, self.voxel_dimension[0] - 1)
-        position_map[:, 1] = np.clip(position_map[:, 1], 0, self.voxel_dimension[1] - 1)
-        room_node = Room_node(list(self.nodes), position_world, position_map, len(self.room_nodes))
-        for node in self.nodes:
-            node.room_idx = room_node.room_id
-        closet_node = self.find_closet_viewpoint_in_room(room_node)
-        if closet_node is not None:
-            room_node.distance = self.get_path_length(closet_node)
-        self.room_nodes.append(room_node)
+        return segmenter_fallback_single_room(self, nodes_positions)
 
     def find_closet_viewpoint_in_room(self, room_node):
-        nodes = [node for node in room_node.nodes if node.state == 0 and node.has_frontier is True]
-        if len(nodes) == 0:
-            return None
-        # get the positions of the nodes whose state is 0
-        nodes_positions = [node.position for node in nodes]
-        nodes_positions = np.array(nodes_positions)
-        nodes_positions = nodes_positions + self.initial_position
-        nodes_positions[:, 2] = self.initial_position[2] - 0.88
-        nodes_positions = nodes_positions[:, [0, 2, 1]]
+        """Return the closest unexplored frontier viewpoint inside a room."""
 
-        current_position = self.current_position + self.initial_position
-        current_position = np.array(
-            [current_position[0], self.initial_position[2] - 0.88, current_position[1]])
-        distance = [
-            self.env.sim.geodesic_distance(current_position, node_position)
-            for node_position in nodes_positions
-        ]
-        distance = np.array(distance)
-        closet_node_idx = np.argmin(distance)
-        closet_node = nodes[closet_node_idx]
-
-        return closet_node
+        return find_closest_viewpoint_in_room(self, room_node)
 
     def find_closest_nodes(self, nodes):
-        nodes_positions = [node.position for node in nodes]
-        nodes_positions = np.array(nodes_positions)
-        nodes_positions = nodes_positions + self.initial_position
-        nodes_positions[:, 2] = self.initial_position[2] - 0.88
-        nodes_positions = nodes_positions[:, [0, 2, 1]]
+        """Pick the geodesically closest node from a candidate node list."""
 
-        current_position = self.current_position + self.initial_position
-        current_position = np.array(
-            [current_position[0], self.initial_position[2] - 0.88, current_position[1]])
-        distance = [
-            self.env.sim.geodesic_distance(current_position, node_position)
-            for node_position in nodes_positions
-        ]
-        distance = np.array(distance)
-        closet_node_idx = np.argmin(distance)
-        closet_node = nodes[closet_node_idx]
-
-        return closet_node
+        return policy_find_closest_nodes(self, nodes)
 
     def explore_in_room(self, room_node):
-        self.process_obs_pcd = o3d.t.geometry.PointCloud(self.pcd_device)
-        self.process_nav_pcd = o3d.t.geometry.PointCloud(self.pcd_device)
+        """Choose the next frontier node inside the current room."""
 
-        nodes = [node for node in room_node.nodes if node.has_frontier is True]
-        if len(nodes) == 0:
-            return None
-
-        closet_node = self.find_closest_nodes(nodes)
-
-        return closet_node
-
+        return policy_explore_in_room(self, room_node)
 
     def explore_in_room_relocate(self, room_node):
-        self.process_obs_pcd = o3d.t.geometry.PointCloud(self.pcd_device)
-        self.process_nav_pcd = o3d.t.geometry.PointCloud(self.pcd_device)
+        """Choose a frontier during relocation and close exhausted rooms."""
 
-        nodes_true_frontier = [node for node in room_node.nodes if node.state == 0 and node.has_true_frontier is True]
-        if len(nodes_true_frontier) == 0:
-            logger.info('No true frontier in this room')
-            inner_nodes = [node for node in room_node.nodes if node.has_frontier is True and node.state == 0 and node.has_true_frontier is False and node.frontier_idxs.shape[0] > self.frontier_thres]
-            if len(inner_nodes) == 0:
-                logger.info('No inner nodes in this room')
-                room_node.state = 1
-                for node in room_node.nodes:
-                    node.has_frontier = False
-                    node.has_true_frontier = False
-                return None
-            else:
-                closet_node = self.find_closest_nodes(inner_nodes)
-
-                return closet_node
-
-        # may need improve
-        closet_node = self.find_closest_nodes(nodes_true_frontier)
-
-        return closet_node
+        return policy_explore_in_room_relocate(self, room_node)
 
     def explore_after_check(self):
-        nodes_true_frontier = [node for node in self.nodes if node.state == 0 and node.has_frontier is True]
-        if len(nodes_true_frontier) == 0:
-            return None
+        """Continue exploration after a rejected check-again candidate."""
 
-        # may need improve
-        closet_node = self.find_closest_nodes(nodes_true_frontier)
-
-        return closet_node
+        return policy_explore_after_check(self)
 
     def explore_after_fully_explored(self):
-        nodes = [node for node in self.nodes if node.state == 0]
+        """Fallback to the nearest unexplored node when room-level policy is exhausted."""
 
-        if len(nodes) == 0:
-            return None
-
-        closet_node = self.find_closest_nodes(nodes)
-
-        return closet_node
-
+        return policy_explore_after_fully_explored(self)
 
     def get_path_length(self, end):
 
@@ -3325,52 +2569,6 @@ class Instruct_Mapper:
         return distance_to_end
 
     def to_json_save_node_info(self):
-        json_data = {}
-        object_json = []
-        for i in range(len(self.objects)):
-            obj = self.objects[i]
-            nwpcd = obj.pcd.point.positions.cpu().numpy()
-            size = np.zeros(3)
-            size[0] = np.max(nwpcd[:, 0]) - np.min(nwpcd[:, 0])
-            size[1] = np.max(nwpcd[:, 1]) - np.min(nwpcd[:, 1])
-            size[2] = np.max(nwpcd[:, 2]) - np.min(nwpcd[:, 2])
+        """Serialize detailed node graph state for debug artifacts."""
 
-            object_json.append({
-                'index': i,
-                'position': [round(p, 3) for p in obj.position.tolist()],
-                'class': obj.tag,
-                'confidence': round(obj.confidence.numpy().item(), 3),
-                'size': [round(s, 3) for s in size.tolist()],
-            })
-        json_data['objects'] = object_json
-
-        room_nodes = []
-        for i in range(len(self.room_nodes)):
-            room_node = self.room_nodes[i]
-            nodes_in_room = room_node.nodes
-            nodes = []
-            for j in range(len(nodes_in_room)):
-                node = nodes_in_room[j]
-                if node.state == NodeState.EXPLORED:
-                    node.has_frontier = False
-                    node.has_true_frontier = False
-                nodes.append({
-                    'idx': node.idx,
-                    'position': [round(p, 3) for p in node.position.tolist()],
-                    'state': node.state,
-                    'neighbors': self.neighbors[node.idx],
-                    'has_frontier': node.has_frontier,
-                    'has_true_frontier': node.has_true_frontier,
-                })
-
-                nodes[-1]['objects'] = node.objects
-            room_nodes.append({
-                'room_idx': room_node.room_id,
-                'state': room_node.state,
-                'distance': round(room_node.distance, 3),
-                'viewpoints': nodes,
-            })
-
-        json_data['Room'] = room_nodes
-
-        return json_data
+        return serialize_map_node_info(self)

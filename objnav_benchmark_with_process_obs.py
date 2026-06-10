@@ -271,6 +271,8 @@ if __name__ == "__main__":
         target = habitat_agent.instruct_goal
         dataset_target = extract_dataset_target(target)
         if args.enable_instruction_adapter or str(args.custom_instruction or "").strip():
+            # 指令模式：先把自然语言编译成 plan/spec，再把 detector prompt、
+            # runtime verifier 和 mapper 搜索策略都接到同一个 plan 上。
             current_episode = getattr(habitat_agent.env, "current_episode", None)
             custom_instruction = str(args.custom_instruction or "").strip()
             episode_info = {} if custom_instruction else (getattr(current_episode, "info", None) or {})
@@ -290,6 +292,9 @@ if __name__ == "__main__":
             habitat_mapper.instruction_spec = instruction_spec
             habitat_mapper.instruction_execution_state = None
             habitat_mapper.instruction_constraint_evaluator.ensure_state(habitat_mapper, instruction_plan)
+
+            # perception_target_list 可以包含 terminal 和 anchor 的 detector terms，
+            # 但最终 stop 只能由 terminal target + verifier 决定。
             habitat_mapper.target_list = list(
                 instruction_spec.target_detector_prompts
                 or [instruction_spec.canonical_target or dataset_target]
@@ -309,6 +314,8 @@ if __name__ == "__main__":
             with open(os.path.join(instruction_dir, "spec.json"), "w", encoding="utf-8") as f:
                 json.dump(instruction_spec.as_dict(), f, ensure_ascii=False, indent=2, sort_keys=True)
         else:
+            # benchmark 模式：关闭 instruction adapter，保持 STRIVE 原始
+            # ObjectNav 流程，只做目标类别同义扩展。
             habitat_mapper.instruction_plan = None
             habitat_mapper.instruction_spec = None
             habitat_mapper.instruction_execution_state = None
@@ -340,6 +347,8 @@ if __name__ == "__main__":
 
         habitat_agent.save_trajectory(f"./{args.save_dir}/episode-{i}/")
         evaluation_metrics.append({
+            # success/spl 是 Habitat 原始目标类别指标；instruction_success
+            # 是自然语言指令 verifier 的终止结果，两者不能混读。
             'Episode': i,
             'success': habitat_agent.metrics['success'],
             'spl': habitat_agent.metrics['spl'],

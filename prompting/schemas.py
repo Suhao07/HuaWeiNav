@@ -1,3 +1,9 @@
+"""Structured response schemas shared by prompt callers.
+
+The fallback classes keep offline smoke tests usable when pydantic is missing
+inside a minimal container.
+"""
+
 from __future__ import annotations
 
 from typing import Any
@@ -132,4 +138,3 @@ class SimilarObjectsResponse(BaseModel):
 class CheckAgainBBoxResponse(BaseModel):
     steps: list[ReasoningStep] = Field(default_factory=list)
     flag: bool = False
-

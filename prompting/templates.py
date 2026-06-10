@@ -1,8 +1,15 @@
+"""Central prompt templates for STRIVE LLM/VLM calls.
+
+This module owns prompt text only. Runtime state, image packaging, caching, and
+model invocation stay in the caller modules so prompt changes remain isolated.
+"""
+
 from __future__ import annotations
 
 from llm_utils.nav_prompt_room import OBJECT_PROMPT, RELOCATE_PROMPT, ROOM_PROMPT
 
 
+#指令解析
 INSTRUCTION_PARSE_PROMPT = """
 You are a semantic compiler for indoor object navigation instructions.
 
@@ -31,7 +38,7 @@ targets: bed terminal true; towel terminal true.
 constraints: sequence bed before towel hard.
 """
 
-
+#概念映射
 CONCEPT_GROUNDING_PROMPT = """
 You map an instruction target concept to detector vocabulary for open-vocabulary
 object navigation.
@@ -44,7 +51,7 @@ Also provide a concise semantic description and negative_terms that distinguish
 this concept from related but different concepts.
 """
 
-
+#执行策略
 EXECUTION_STRATEGY_PROMPT = """
 You choose an execution strategy for an indoor navigation instruction.
 
@@ -54,7 +61,7 @@ target. The anchor itself must not satisfy the final goal.
 Do not use object-name rules; reason from the structured plan.
 """
 
-
+#概念匹配
 CONCEPT_MATCH_PROMPT = """
 You decide whether a mapped object instance satisfies an instruction concept.
 
@@ -67,7 +74,7 @@ Do not rely on hard-coded synonym tables. Judge whether the observed object can
 play the requested role for this specific instruction. Return strict JSON.
 """
 
-
+#关系验证（几何和语义关系）
 RELATION_VERIFIER_PROMPT = """
 You verify one spatial/semantic relation for an indoor navigation robot.
 
@@ -82,7 +89,7 @@ Return strict JSON:
 - reason: concise visual/geometric explanation.
 """
 
-
+# LVLM最终决策（是否接受当前候选对象作为停靠目标）
 FINAL_VERIFIER_PROMPT = """
 You are the final instruction-satisfaction verifier for an indoor navigation robot.
 
@@ -135,7 +142,7 @@ Important:
   limited-view acceptance is justified by the instruction and evidence.
 """
 
-
+# 目标识别（基于bbox的单目标识别）
 BBOX_OBJECT_LABEL_PROMPT = """
 I will provide you an image with one bounding box drawn on it and the cropped
 image inside the bounding box. For this bounding box, reason step-by-step and
@@ -155,7 +162,7 @@ Your goal:
 Pre-defined object list: {detect_objects}
 """
 
-
+# 标签细化（基于候选对象列表的标签规范化）
 TAG_REFINE_PROMPT = (
     "Here is a list of words and a target word. For each word in the list, if "
     "it has the same meaning as the target, please replace it with the target. "
@@ -183,7 +190,7 @@ Your response should include:
   'object3'].
 """
 
-
+#bbox复核（给定bbox和标签，判断是否满足停靠要求）
 CHECK_AGAIN_BBOX_PROMPT = """
 I will give you an image with a bbox drawn on it and an object class label. Your
 task is to determine whether the object within the bbox is the given object
@@ -205,4 +212,3 @@ Your response should include:
 - `flag`: a boolean value. If the object in the bbox is the given class, output
   True. If the object is not the given class, output False.
 """
-

@@ -18,10 +18,15 @@ python -m py_compile \
   cv_utils/sam.py \
   cv_utils/stitch.py \
   cv_utils/visualizer.py \
+  artifact_utils/*.py \
   instruction_adapter/*.py \
   llm_utils/*.py \
+  mapping/*.py \
   mapping_utils/*.py \
+  navigation/*.py \
   navigation_core/*.py \
   planning/*.py
+
+PYTHONPATH=. pytest -q tests
 
 echo "refactor compile checks passed"

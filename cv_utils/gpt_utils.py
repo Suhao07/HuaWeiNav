@@ -1,3 +1,9 @@
+"""Image-oriented VLM helper functions for detector refinement.
+
+Prompt text and response schemas live under ``prompting``. This module handles
+image crops, local artifacts, cache keys, and legacy-compatible return values.
+"""
+
 import base64
 import hashlib
 import json

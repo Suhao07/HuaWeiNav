@@ -1,3 +1,5 @@
+"""Stable prompt identities used in logs, caches, and prompt versioning."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -32,4 +34,3 @@ TAG_REFINE_OBJECT_LIST = PromptSpec(
 )
 SIMILAR_OBJECTS = PromptSpec("similar_objects.v1", "similar_objects", "SimilarObjectsResponse")
 CHECK_AGAIN_BBOX = PromptSpec("check_again.bbox.v1", "check_again_object_in_bbox", "CheckAgainBBoxResponse")
-

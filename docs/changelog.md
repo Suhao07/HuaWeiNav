@@ -1,5 +1,77 @@
 # Instruction Adapter Changelog
 
+## 2026-06-11
+
+### Added
+
+- 新增轻量回归测试：
+  - `tests/test_frontier_extractor.py` 覆盖 frontier 自适应半径；
+  - `tests/test_panoramic_detection.py` 覆盖 panorama triplet index 与 center-panel bbox filter；
+  - `tests/test_artifact_paths.py` 覆盖 artifact path builder。
+- 新增 `navigation/planner_loop.py`：
+  - 抽离每个 planning cycle 的 observation->mapping 前缀；
+  - 统一执行 panoramic observation、point-cloud merge、obs debug 保存、
+    `mapper.get_nodes()` 和 `mapper.update_obj()`；
+  - 返回 `PlanningCycleResult`，不处理目标确认、room exploration 或 stop。
+- 新增 `navigation/panoramic_detection.py`：
+  - 抽离 stitched triplet 构造、中心面板 bbox 过滤和 pose/depth triplet 对齐；
+  - 只做 detector 输入输出整理，不创建 mapper object。
+- 新增 `navigation/detection_artifacts.py`：
+  - 集中保存 detection RGB/depth、mask overlay、C object point cloud、
+    projected bbox image 等 debug artifact。
+- 新增 `navigation/object_cluster_merger.py`：
+  - 抽离 C 类对象跨视角 point-cloud overlap merge；
+  - 保留 asymmetric containment guard，避免小物体被大物体错误吞并。
+- 新增 `navigation/object_view_projector.py`：
+  - 将 merged object point cloud 投影回全景 RGB 证据图；
+  - 输出 projected bbox，供 bbox tag refinement 使用。
+- 新增 `navigation/bbox_refinement.py`：
+  - 封装 legacy `ask_gpt_object_in_box()` 与 tag refine；
+  - 只更新 mapper object label/confidence，不执行 final instruction stop。
+- 新增 `navigation/path_progress.py`：
+  - 抽离 `step_mod()` 中 path/path_index/waypoint 推进和 path exhausted replan。
+- 新增 `navigation/goal_approach_controller.py`：
+  - 抽离 found-goal 后的距离计算、朝目标转向和 final-instruction reject 后动作恢复。
+- 新增 `mapping/frontier_clusterer.py`：
+  - 抽离 `get_nodes()` 中 DBSCAN cluster 到 frontier/fallback center 的转换；
+  - 仍复用 mapper geometry helper，但不创建 node、不更新 graph。
+- 新增 `mapping/node_candidate_builder.py`：
+  - 抽离 traversable candidate 到 topology node 的 materialization；
+  - 负责 candidate bearing、80-degree local pcd sector 和 `add_node/add_edge` 调用。
+- 新增 `artifact_utils/path_builder.py`：
+  - 集中 episode/subdir/detection step debug 路径构造。
+- 新增 `artifact_utils/pointcloud_writer.py`：
+  - 集中 line-set / point-cloud debug writer 的目录创建和 Open3D 写入。
+
+### Changed
+
+- `scripts/check_refactor.sh` 增加 `PYTHONPATH=. pytest -q tests`，让重构检查覆盖轻量回归测试。
+- `navigation/panoramic_detection.py` 将 `combine_image` 改为函数内懒加载：
+  - 运行时行为不变；
+  - 纯 bbox/filter 单测不再依赖本机 cv2 安装。
+- 清理 `objnav_agent_with_process_obs.py` 和 `mapper_with_process_obs.py` 中已确认废弃的历史注释块。
+- `navigation/observation_pipeline.py` 扩展为全景观测采集模块：
+  - 新增 panoramic buffer reset；
+  - 新增 12-view RGB/depth/pose/point-cloud sweep 采集；
+  - 保持 segmentation、object association 和 LLM bbox refine 在 agent 中。
+- `objnav_agent_with_process_obs.py` 的 `rotate_panoramic()` 改为调用
+  `collect_panoramic_observations()`，自身只保留 orchestration 和 segmentation 调用。
+- `objnav_agent_with_process_obs.py` 的 `rotate_segmentation()` 改为清晰的五段流水线：
+  - triplet detection；
+  - B 类对象即时入图；
+  - C 类对象缓存；
+  - C 类对象几何合并；
+  - bbox refinement 后统一 association。
+- `objnav_agent_with_process_obs.py` 的 `step_mod()` 改为委托 path progress
+  和 goal approach 几何控制；final verifier 调用点保持不变。
+- `make_plan_mod_no_relocate()` 与 `make_plan_mod_relocate()` 复用
+  `run_observation_mapping_cycle()`，减少两个规划入口的重复前缀。
+- `mapper_with_process_obs.py` 的 `get_nodes()` 进一步委托：
+  - `analyze_frontier_clusters()` 负责 frontier/fallback candidate center 分析；
+  - `add_nodes_from_candidates()` 负责候选 node 创建和 edge 连接。
+- `navigation.detection_artifacts`、`navigation.observation_pipeline` 和
+  `mapping.frontier_clusterer` 开始复用 `artifact_utils` 路径/writer 基础层。
+
 ## 2026-06-10
 
 ### Added
@@ -20,10 +92,46 @@
 - 新增 `planning/room_policy.py`：
   - `--no_gpt_relocate` 时使用最近 frontier room 作为确定性 relocation 策略；
   - 该策略不读取目标类别或自然语言语义。
+- 新增 `planning/exploration_policy.py`：
+  - 从 mapper 中抽离 room/frontier node 选择逻辑；
+  - 统一 `explore_in_room`、`explore_in_room_relocate`、
+    `explore_after_check` 和 `explore_after_fully_explored`；
+  - mapper 保留兼容 wrapper，策略层只选择下一探索 node。
+- 新增 `mapping/room_segmenter.py`：
+  - 从 mapper 中抽离 room segmentation 与 fallback_single_room；
+  - 负责 2D obstacle histogram、free-space connected components、
+    node-room assignment 和 frontier map labeling；
+  - 当前仍写回 mapper runtime state，后续可继续收敛为
+    `RoomSegmentationResult`。
+- 新增 `mapping/topology_graph.py`：
+  - 抽离 viewpoint graph / object-node graph 操作；
+  - 承接 `add_node`、`visit_node`、`add_edge`、`remove_edge`、
+    `update_obj`、`find_the_closest_path`、`check_connected` 等图操作。
+- 新增 `mapping/map_serializer.py`：
+  - 抽离 `to_json`、`to_json_wo_some_class`、`to_json_save_node_info`；
+  - mapper 不再直接维护 prompt/debug JSON 构造。
+- 新增 `mapping/frontier_extractor.py`：
+  - 抽离 `get_nodes()` 中的 frontier debug 聚合、自适应局部半径、
+    可见中心去重和 traversable candidate 追加逻辑；
+  - 当前仍保留 DBSCAN、Open3D slicing、node 创建在 mapper 主流程中，
+    以避免一次性迁移高耦合状态。
+- 新增 `planning/target_selection_policy.py`：
+  - 统一 benchmark target tag matching 与 instruction-mode object policy；
+  - 返回 `TargetSelectionResult`，mapper 只负责兼容日志写入。
+- 新增 `navigation/view_verification_controller.py`：
+  - 抽离 `whether_to_check_again()` 中的 better-view proposal 选择；
+  - agent 保留兼容 wrapper。
+- 新增 `navigation/observation_pipeline.py`：
+  - 抽离 panoramic observation point-cloud merge 与 debug PLY 保存；
+  - 后续 `rotate_panoramic()` / `rotate_segmentation()` 将继续向该模块迁移。
+- 新增 `navigation/action_controller.py`：
+  - 集中 mapper-local waypoint 到 Habitat simulator waypoint 的坐标转换；
+  - `step_mod()` 中主导航路径改为通过 action controller 获取 geodesic distance
+    和 low-level planner action。
 - 新增 `scripts/check_refactor.sh`：
   - 本地 py_compile 检查核心入口、adapter、planning 和 core 模块。
 - 新增 `docs/refactor_architecture.md`：
-  - 记录 Phase0-3 重构边界、模块输入输出、后续拆分路线。
+  - 记录 Phase0-6 重构边界、模块输入输出、后续拆分路线。
 - 新增 `prompting/`：
   - `templates.py` 集中维护 prompt 文本；
   - `schemas.py` 集中维护 LLM/VLM response schema；
@@ -44,6 +152,18 @@
   不再复用 `gpt_room/` 命名。
 - instruction adapter、bbox VLM 复核和 mapper legacy room/object/relocate prompt
   改为从 `prompting` 层导入 prompt/schema/trace label，调用行为保持不变。
+- `mapper_with_process_obs.py` 的 `segment_room()` / `_fallback_single_room()`
+  改为委托 `mapping.room_segmenter`。
+- `mapper_with_process_obs.py` 的 room/frontier exploration 方法改为委托
+  `planning.exploration_policy`。
+- `mapper_with_process_obs.py` 的 topology graph、map serialization、
+  target selection 逻辑改为委托 `mapping.*` / `planning.*` 模块。
+- `mapper_with_process_obs.py` 的 frontier 子步骤改为委托
+  `mapping.frontier_extractor`，主流程仍负责 mapper 状态写入和 debug IO。
+- `objnav_agent_with_process_obs.py` 的 check-again viewpoint 选择改为委托
+  `navigation.view_verification_controller`。
+- `objnav_agent_with_process_obs.py` 的 observation point-cloud helper 和
+  `step_mod()` 主 action 获取路径改为委托 `navigation.*` 模块。
 
 ### Removed
 
