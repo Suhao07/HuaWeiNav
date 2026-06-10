@@ -1,5 +1,61 @@
 # Instruction Adapter Changelog
 
+## 2026-06-10
+
+### Added
+
+- 新增 `navigation_core/view_geometry.py`：
+  - 路径插值；
+  - stop 半径裁剪；
+  - 朝向矩阵计算；
+  - class-agnostic 投影视角质量评分。
+- 新增 `planning/viewpoint_policy.py`：
+  - 从 Habitat shortest path 生成 check-again / view-control 候选视角；
+  - agent 只负责状态推进，不再内联全部评分公式。
+- 新增 `planning/object_search_policy.py`：
+  - instruction mode 的 terminal target 与 anchor reference 选择从 mapper 中抽离；
+  - anchor 仍只作为搜索参考物，不参与最终 stop。
+- 新增 `planning/mode_policy.py`：
+  - 集中管理 execution mode 比较，避免下划线模式字符串散落。
+- 新增 `planning/room_policy.py`：
+  - `--no_gpt_relocate` 时使用最近 frontier room 作为确定性 relocation 策略；
+  - 该策略不读取目标类别或自然语言语义。
+- 新增 `scripts/check_refactor.sh`：
+  - 本地 py_compile 检查核心入口、adapter、planning 和 core 模块。
+- 新增 `docs/refactor_architecture.md`：
+  - 记录 Phase0-3 重构边界、模块输入输出、后续拆分路线。
+
+### Changed
+
+- `objnav_agent_with_process_obs.py` 的 `whether_to_check_again()` 改为调用
+  `build_check_again_viewpoints()`，保留原 view-control 行为和日志输出。
+- `mapper_with_process_obs.py` 的 instruction-mode 对象选择改为调用
+  `InstructionObjectSearchPolicy`；普通 benchmark 没有 `InstructionPlan` 时仍走
+  legacy tag 匹配路径。
+- sequence/ordered 判断改为使用 `planning.mode_policy.is_ordered_execution()`。
+- `make_plan_mod_no_relocate()` 新增 `use_gpt_relocate` 参数，统一 LLM /
+  deterministic relocation 两条路径。
+- 关闭 LLM relocation 时，mapper 改为调用
+  `get_candidate_room_fully_explored_by_distance()`，日志写入 `room_policy/`，
+  不再复用 `gpt_room/` 命名。
+
+### Removed
+
+- 删除 `whether_to_check_again()` 中确认无效的旧 depth debug 注释块。
+- 删除重复的 `make_plan_mod_no_relocate_no_gpt()` 主流程。
+- 删除旧的 `get_candidate_room_fully_explored_no_gpt()` 方法；等价行为迁移到
+  `planning.room_policy.select_nearest_frontier_room()`。
+- 清理 `mapper_with_process_obs.py` / `objnav_agent_with_process_obs.py` 中的大块
+  历史注释代码：
+  - 旧 `get_nodes_process()`；
+  - 旧 `get_candidate_node()`；
+  - 旧路径选择、旧 JSON 导出、旧可视化 debug 分支；
+  - agent 中旧视频/debug 输出和旧 final waypoint 保存分支。
+
+### Fixed
+
+- 修复 `instruction_adapter/constraints.py` 中一处中文注释误改。
+
 ## 2026-06-09
 
 ### Added

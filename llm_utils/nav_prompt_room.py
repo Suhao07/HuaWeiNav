@@ -130,7 +130,7 @@ You must analyze the JSON file step by step, using logical reasoning and common 
 - The relevance of each viewpoint to the target object.
 - The efficiency of the exploration process, minimizing unnecessary backtracking.
 - The object's size as a constraint on its classification.
-- The completeness of the current room’s exploration.
+- The completeness of the current room's exploration.
 
 ### Decision Process:
 - If the target object is likely present in the current room or exploration is incomplete, continue exploring this room.

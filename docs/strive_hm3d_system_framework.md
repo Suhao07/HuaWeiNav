@@ -102,7 +102,16 @@ instruction_adapter/
   semantic_edges.py                  # 动态语义边几何预筛和缓存
   relation_verifier.py               # CogNav VLM relation verifier
   verifier.py                        # 原始指令 final verifier 和实例级 ledger
+navigation_core/
+  view_geometry.py                   # 纯几何视角质量评分和路径插值
+planning/
+  mode_policy.py                     # execution mode 判断集中入口
+  object_search_policy.py            # instruction terminal/anchor 对象选择策略
+  room_policy.py                     # 关闭 LLM relocation 时的确定性房间选择策略
+  viewpoint_policy.py                # check_again 更好视角候选生成
 ```
+
+详细重构边界见 `docs/refactor_architecture.md`。
 
 ## 4. 端到端数据流
 

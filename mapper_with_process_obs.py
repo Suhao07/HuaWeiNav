@@ -19,13 +19,16 @@ import cv2
 from cv_utils.image_perceiver import *
 from instruction_adapter.concept_matcher import AnchorSearchLedger, RuntimeConceptMatcher
 from instruction_adapter.constraints import ConstraintEvaluator
-from instruction_adapter.ontology import compact_key, normalize_term
+from instruction_adapter.ontology import normalize_term
 from instruction_adapter.relation_verifier import DynamicRelationService
 from instruction_adapter.semantic_edges import RelationPairLedger
 from instruction_adapter.spatial_graph import InstructionSpatialGraph
 from instruction_adapter.verifier import VerificationLedger, candidate_from_object
 from llm_utils.nav_prompt_room import *
 from llm_utils.cognav_llm_adapter import get_client_and_model
+from planning.mode_policy import is_ordered_execution
+from planning.object_search_policy import InstructionObjectSearchPolicy
+from planning.room_policy import select_nearest_frontier_room
 
 from pydantic import BaseModel
 
@@ -88,6 +91,7 @@ class Instruct_Mapper:
         self.instruction_execution_state = None
         self.instruction_spatial_graph = InstructionSpatialGraph()
         self.instruction_relation_service = DynamicRelationService(vlm=vlm)
+        self.instruction_object_search_policy = InstructionObjectSearchPolicy()
         self.instruction_constraint_evaluator = ConstraintEvaluator(
             spatial_graph=self.instruction_spatial_graph,
             relation_service=self.instruction_relation_service,
@@ -257,7 +261,7 @@ class Instruct_Mapper:
         if plan is not None:
             try:
                 state = getattr(self, "instruction_execution_state", None)
-                if state is not None and getattr(plan.execution, "ordered", False):
+                if state is not None and is_ordered_execution(plan):
                     active = state.active_target(plan)
                     if active is not None:
                         terms.extend(list(active.match_terms))
@@ -933,18 +937,6 @@ class Instruct_Mapper:
 
         self.trav_map = torch.from_numpy(trav_map_np).float().to(self.device)
 
-        # tmp_vector = [0.0, 0.0, -1.0]
-        # world_tmp_vector = self.current_rotation @ tmp_vector
-        # angle = math.atan2(world_tmp_vector[1], world_tmp_vector[0]) * 180 / math.pi
-        # length = 80
-        # print(f'angle2: {angle}')
-        #
-        # center = [self.map_size // 2, self.map_size // 2]
-        #
-        # for i in range(length):
-        #     x_ = int(center[0] + i * math.cos(math.radians(angle)))
-        #     y_ = int(center[1] + i * math.sin(math.radians(angle)))
-        #     self.trav_map[x_, y_] = 0.5
 
         # save the traversability map as an image and draw the trajectory on it
         trav_map_to_save = self.trav_map.cpu().numpy()
@@ -953,13 +945,6 @@ class Instruct_Mapper:
             y = int((traj_y + self.map_size * self.map_resolution / 2.0) / self.map_resolution)
             trav_map_to_save[x, y] = 0.5
 
-        # traj_x, traj_y, ori = self.traj_on_trav[-1]
-        # for i in range(80):
-        #     x = int((traj_x + self.map_size * self.map_resolution / 2.0) / self.map_resolution)
-        #     y = int((traj_y + self.map_size * self.map_resolution / 2.0) / self.map_resolution)
-        #     x_ = int(x + i * math.cos(math.radians(ori)))
-        #     y_ = int(y + i * math.sin(math.radians(ori)))
-        #     trav_map_to_save[x_, y_] = 0.5
 
         trav_map_img = trav_map_to_save
         # switch the x and y axis
@@ -1251,11 +1236,6 @@ class Instruct_Mapper:
                             argmax_entity.tag = new_tag
                             argmax_entity.confidence = c2
 
-                    # if argmax_entity.pcd.point.positions.shape[0] < \
-                    #    entity.pcd.point.positions.shape[0] or entity.tag in INTEREST_OBJECTS:
-                    #     if entity.confidence > argmax_entity.confidence:
-                    #         argmax_entity.tag = entity.tag
-                    #         argmax_entity.confidence = entity.confidence
 
                     ref_entities[arg_overlap_index] = argmax_entity
                     entity_indices.append(arg_overlap_index)
@@ -1431,17 +1411,6 @@ class Instruct_Mapper:
                     point_1 = translate_single_grid_to_point(point, self.grid_resolution, self.voxel_dimension)[:2] + 0.15 * direction
                     intersections_false_postive.append(point_1)
 
-            # for idx, d in enumerate(np.linspace(0, max_distance, delta)):  # 逐渐增大距离
-            #     point = current_position + d * direction
-            #
-            #     if self.is_out_of_boundary(point_cloud, point):
-            #         # if self.is_out_of_boundary(point_cloud, point) or idx == delta - 1:
-            #         point = current_position + (d + 0.15) * direction
-            #         intersections.append(point)
-            #         intersections_false_postive.append(point)
-            #         break
-            #     if idx == delta - 1:
-            #         intersections_false_postive.append(point)
 
         intersections = np.array(intersections)
         intersections_false_postive = np.array(intersections_false_postive)
@@ -1492,19 +1461,6 @@ class Instruct_Mapper:
         cv2.imwrite(f'{self.save_dir}/episode-{episode_idx}/frontier_map/frontier_map_considered_{step_idx}.png',
                     frontier_map_save*255)
 
-        # # save the waypoint
-        # try:
-        #     waypoint_pcd = o3d.geometry.PointCloud()
-        #     waypoint_pcd.points = o3d.utility.Vector3dVector(
-        #         waypoint_gpu_pcd.point.positions.cpu().numpy())
-        #     waypoint_pcd.paint_uniform_color([0, 1, 0])
-        #     os.makedirs(f'{self.save_dir}/episode-{episode_idx}/waypoint', exist_ok=True)
-        #     o3d.io.write_point_cloud(
-        #         f'{self.save_dir}/episode-{episode_idx}/waypoint/waypoint_{step_idx}.ply',
-        #         waypoint_pcd)
-        # except:
-        #     logger.info('Failed to save waypoint')
-        #     pass
 
         # save the obs
         try:
@@ -1673,19 +1629,6 @@ class Instruct_Mapper:
 
             o3d.io.write_point_cloud(f'{self.save_dir}/episode-{episode_idx}/whole/step_{step_idx}/centers_label.ply', combined_labels)
 
-            # # save the frontier info
-            # node_info = {}
-            # for node in self.nodes:
-            #     node_info[node.idx] = {
-            #         'idx': node.idx,
-            #         'position': node.position.tolist(),
-            #         'has_frontier': node.has_frontier,
-            #         'has_true_frontier': node.has_true_frontier,
-            #         'frontier_idxs': (node.frontier_idxs.tolist()),
-            #     }
-            # node_info = json.dumps(node_info)
-            # with open(f'{self.save_dir}/episode-{episode_idx}/whole/step_{step_idx}/info.txt', 'w') as f:
-            #     f.write(f'{node_info}')
         except Exception as e:
             logger.info('Failed to save whole visualization: {}', e)
 
@@ -1707,12 +1650,6 @@ class Instruct_Mapper:
         for i in range(len(temporary_pcd)):
             current_node_pcd = gpu_merge_pointcloud(current_node_pcd, temporary_pcd[i])
 
-        # # save current_node_pcd
-        # save_pcd = o3d.geometry.PointCloud()
-        # save_pcd.points = o3d.utility.Vector3dVector(current_node_pcd.point.positions.cpu().numpy())
-        # save_pcd.colors = o3d.utility.Vector3dVector(current_node_pcd.point.colors.cpu().numpy())
-        # os.makedirs(f'{self.save_dir}/episode-{episode_idx}/current_node_pcd', exist_ok=True)
-        # o3d.io.write_point_cloud(f'{self.save_dir}/episode-{episode_idx}/current_node_pcd/current_node_pcd_{step}.ply', save_pcd)
 
         current_node_pcd_position = current_node_pcd.point.positions.cpu().numpy()
         angles_current_node = np.arctan2(current_node_pcd_position[:, 1] - self.current_position[1],
@@ -1778,12 +1715,6 @@ class Instruct_Mapper:
 
         current_navigable_pcd = self.process_nav_pcd
 
-        # # save current_node_pcd
-        # save_pcd = o3d.geometry.PointCloud()
-        # save_pcd.points = o3d.utility.Vector3dVector(self.navigable_pcd.point.positions.cpu().numpy())
-        # save_pcd.colors = o3d.utility.Vector3dVector(self.navigable_pcd.point.colors.cpu().numpy())
-        # os.makedirs(f'{self.save_dir}/episode-{episode_idx}/current_node_pcd', exist_ok=True)
-        # o3d.io.write_point_cloud(f'{self.save_dir}/episode-{episode_idx}/current_node_pcd/current_node_pcd_{step}.ply', save_pcd)
 
         current_position = self.current_position
 
@@ -2057,20 +1988,6 @@ class Instruct_Mapper:
                 if add_node_flag:
                     self.add_edge(self.current_node_idx, self.nodes[-1].idx)
 
-                    # for index in self.current_obj_indices:
-                    #     nwobj = self.objects[index]
-                    #     objpos = nwobj.position
-                    #     objpos[2] = self.floor_height
-                    #
-                    #     obj_angle = np.arctan2(objpos[1] - self.current_position[1],
-                    #                            objpos[0] - self.current_position[0])
-                    #     obj_angle = np.where(obj_angle < 0, obj_angle + 2 * np.pi, obj_angle)
-                    #     obj_angle = np.where(obj_angle > 2 * np.pi, obj_angle - 2 * np.pi, obj_angle)
-                    #
-                    #     is_visible = self.is_visible_obj(center, objpos, self.obstacle_pcd.point.positions.cpu().numpy())
-                    #
-                    #     if (np.abs(obj_angle - angle_center) < 30 * np.pi / 180 or np.abs(obj_angle - angle_center) > 330 * np.pi / 180) and is_visible:
-                    #         self.update_obj(center, [index])
 
         # update the obj, node edges
         self.update_obj_node()
@@ -2110,333 +2027,6 @@ class Instruct_Mapper:
                     node_obj_idxs.append(index)
             self.update_obj(node_idx, node_obj_idxs)
 
-
-    # def get_nodes_process(self, node, idx, path_idx, step):
-    #     # only keep the max connected component in traversable area
-    #     self.traversable_pcd = self.keep_the_max_connect_component(self.traversable_pcd)
-    #
-    #     current_node_pcd = self.process_obs_pcd.select_by_index(
-    #         (self.process_obs_pcd.point.positions[:, 2] < self.ceiling_height).nonzero()[0])
-    #     current_node_pcd_position = current_node_pcd.point.positions.cpu().numpy()
-    #     angles_current_node = np.arctan2(current_node_pcd_position[:, 1] - self.current_position[1],
-    #                                      current_node_pcd_position[:, 0] - self.current_position[0])
-    #     angles_current_node = np.where(angles_current_node < 0, angles_current_node + 2 * np.pi,
-    #                                    angles_current_node)
-    #     angles_current_node = np.where(angles_current_node > 2 * np.pi,
-    #                                    angles_current_node - 2 * np.pi, angles_current_node)
-    #
-    #     floor_height = self.floor_height
-    #
-    #     # obstcale_pcd_points = self.obstacle_pcd.point.positions.cpu().numpy()
-    #     try:
-    #         obstacle_pcd = self.process_obs_pcd.select_by_index(
-    #             (self.process_obs_pcd.point.positions[:, 2] > self.floor_height + 0.2).nonzero()[0])
-    #         obstacle_pcd = obstacle_pcd.select_by_index((obstacle_pcd.point.positions[:, 2]
-    #                                                      < self.ceiling_height).nonzero()[0])
-    #         obstacle_pcd_points = obstacle_pcd.point.positions.cpu().numpy()
-    #     except:
-    #         obstacle_pcd_points = np.array([])
-    #
-    #     current_navigable_pcd = self.process_nav_pcd
-    #     current_position = self.current_position
-    #
-    #     current_navigable_position = current_navigable_pcd.point.positions.cpu().numpy()
-    #     all_points_num = current_navigable_position.shape[0]
-    #
-    #     save_pcd = o3d.geometry.PointCloud()
-    #     save_pcd.points = o3d.utility.Vector3dVector(
-    #         current_navigable_pcd.point.positions.cpu().numpy())
-    #     save_pcd.colors = o3d.utility.Vector3dVector(
-    #         current_navigable_pcd.point.colors.cpu().numpy())
-    #     import os
-    #     os.makedirs(f'{self.save_dir}/episode-{idx}/nav', exist_ok=True)
-    #     o3d.io.write_point_cloud(f'{self.save_dir}/episode-{idx}/nav/nav_{step}_{path_idx}.ply',
-    #                              save_pcd)
-    #
-    #     # change the z value of the points to the mean of the floor points
-    #     obstacle_pcd_points[:, 2] = np.ones_like(obstacle_pcd_points[:, 2]) * np.mean(
-    #         current_navigable_position[:, 2])
-    #
-    #     standing_position = np.array(
-    #         [current_position[0], current_position[1], current_navigable_position[:, 2].mean()])
-    #
-    #     closest_distance = 1.35
-    #
-    #     # frontier_clusters, frontier_centers = self.get_frontiers_offerd(
-    #     #     obstacle_pcd, current_navigable_pcd, self.floor_height + 0.2, 0.1,
-    #     #     closest_distance * 0.67)
-    #
-    #     global_frontier_clusters, global_frontier_centers, global_frontier_map_idxs = self.get_frontiers_offerd(
-    #         self.obstacle_pcd, self.navigable_pcd, self.floor_height + 0.2, 0.1,
-    #         closest_distance*0.7)
-    #     frontier_clusters = global_frontier_clusters
-    #     frontier_centers = global_frontier_centers
-    #
-    #     # frontier_clusters_whole, frontier_centers_whole = self.get_frontiers_offerd(obstacle_pcd,
-    #     #                                                                             current_navigable_pcd,
-    #     #                                                                             self.floor_height + 0.2,
-    #     #                                                                             0.1, closest_distance)
-    #     #
-    #     # # extract frontiers in current observation
-    #     # frontier_clusters = []
-    #     # frontier_centers = []
-    #     # for frontier_index, frontier_cluster in enumerate(frontier_clusters_whole):
-    #     #     distances = np.linalg.norm(
-    #     #         frontier_cluster[:, np.newaxis, :2] - current_navigable_position[np.newaxis, :, :2],
-    #     #         axis=2)
-    #     #     if np.min(distances) < 0.2:
-    #     #         frontier_cluster_new = frontier_cluster[np.min(distances, axis=1) < 0.2]
-    #     #         frontier_center_new = np.mean(frontier_cluster_new, axis=0)
-    #     #         frontier_clusters.append(frontier_cluster_new)
-    #     #         frontier_centers.append(frontier_center_new)
-    #
-    #     if len(frontier_clusters) != 0:
-    #         # logger.info('Frontier clusters', (frontier_clusters))
-    #         frontiers_to_save = np.concatenate(frontier_clusters, axis=0)
-    #         save_pcd = o3d.geometry.PointCloud()
-    #         save_pcd.points = o3d.utility.Vector3dVector(frontiers_to_save)
-    #         save_pcd.paint_uniform_color([0, 1, 0])
-    #         import os
-    #         os.makedirs(f'{self.save_dir}/episode-{idx}/frontier', exist_ok=True)
-    #         o3d.io.write_point_cloud(
-    #             f'{self.save_dir}/episode-{idx}/frontier/frontier_{step}_{path_idx}.ply', save_pcd)
-    #     else:
-    #         return
-    #
-    #     # decide the max distance
-    #     if len(frontier_clusters) != 0:
-    #         frontiers_all = np.concatenate(frontier_clusters, axis=0)
-    #         distance_to_frontiers = np.linalg.norm(frontiers_all - standing_position, axis=1)
-    #         min_distance_to_frontiers = np.min(distance_to_frontiers)
-    #         logger.info(f"Min distance to frontiers: {min_distance_to_frontiers}")
-    #         max_distance = min(2.5, min_distance_to_frontiers * 1.2)
-    #
-    #     intersections = self.calculate_intersections(current_navigable_position,
-    #                                                  standing_position,
-    #                                                  max_distance=max_distance)
-    #
-    #     # extand the dimention of the intersections to 3
-    #     intersections = np.concatenate((intersections, np.ones(
-    #         (intersections.shape[0], 1)) * np.mean(current_navigable_position[:, 2])),
-    #                                    axis=1)
-    #
-    #     polygon_path = Path(intersections[:, :2])
-    #     # Remove points inside the polygon
-    #     points = current_navigable_position[:, :2]
-    #     mask = 1 - polygon_path.contains_points(points)
-    #
-    #     # Ensure the mask is a tensor on the correct device
-    #     mask_tensor = o3d.core.Tensor(np.where(mask)[0],
-    #                                   o3d.core.Dtype.Int64,
-    #                                   device=current_navigable_pcd.device)
-    #
-    #     # Select points by index
-    #     pcd_removed = current_navigable_pcd.select_by_index(mask_tensor)
-    #
-    #     mask_tensor_in_circle = o3d.core.Tensor(np.where(1 - mask)[0],
-    #                                             o3d.core.Dtype.Int64,
-    #                                             device=current_navigable_pcd.device)
-    #     pcd_in_circle = current_navigable_pcd.select_by_index(mask_tensor_in_circle)
-    #     colors = np.random.rand(3)
-    #     pcd_in_circle.paint_uniform_color(colors)
-    #
-    #     # cluster the remaining points
-    #     with o3d.utility.VerbosityContextManager(o3d.utility.VerbosityLevel.Debug) as cm:
-    #         labels = np.array(
-    #             pcd_removed.cluster_dbscan(eps=0.1, min_points=4, print_progress=False))
-    #
-    #     # logger.info(labels)
-    #     if step != 12 and len(labels) == 0:
-    #         return
-    #     max_label = labels.max().cpu().numpy()
-    #     # logger.info(f"point cloud has {max_label + 1} clusters")
-    #
-    #     # extract each cluster and rule out the small ones caluclate the center of each cluster
-    #     clusters = []
-    #     centers_from_frontiers = []
-    #     centers_from_frontiers_map_idxs = []
-    #     centers_from_clusters = []
-    #     for i in range(max_label + 1):
-    #         mask_idx_tensor = o3d.core.Tensor((labels == i).nonzero()[0],
-    #                                           o3d.core.Dtype.Int64,
-    #                                           device=current_navigable_pcd.device)
-    #         cluster = pcd_removed.select_by_index(mask_idx_tensor)
-    #         cluster_point = cluster.point.positions.cpu().numpy()
-    #         # generate random colors, shape is (n, 3)
-    #         colors = np.random.rand(3)
-    #         cluster.paint_uniform_color(colors)
-    #
-    #         # extract frontiers in this cluster
-    #         current_frontier_clusters = []
-    #         current_frontier_centers = []
-    #         current_frontier_map_idxs = []
-    #         for frontier_index, frontier_cluster in enumerate(frontier_clusters):
-    #             distances = np.linalg.norm(frontier_cluster[:, np.newaxis, :2] -
-    #                                        cluster_point[np.newaxis, :, :2],
-    #                                        axis=2)
-    #             if np.min(distances) < 0.2:
-    #                 # frontier_cluster_new = frontier_cluster[np.min(distances, axis=1) < 0.15]
-    #                 # frontier_center_new = np.mean(frontier_cluster_new, axis=0)
-    #                 frontier_cluster_new = frontier_cluster
-    #                 frontier_center_new = frontier_centers[frontier_index]
-    #                 frontier_cluster_map_idxs_new = global_frontier_map_idxs[frontier_index]
-    #                 current_frontier_clusters.append(frontier_cluster_new)
-    #                 current_frontier_centers.append(frontier_center_new)
-    #                 current_frontier_map_idxs.append(frontier_cluster_map_idxs_new)
-    #
-    #         if len(current_frontier_clusters) != 0 and len(cluster_point) > 50:
-    #             clusters.append(cluster)
-    #             # merge the frontier clusters
-    #             merged_frontier_clusters, merged_frontier_centers, merged_frontier_map_idxs, non_merged_frontier_map_idxs, line_set = self.merge_frontier_with_visibility_1(
-    #                 cluster_point,
-    #                 obstacle_pcd_points,
-    #                 current_frontier_clusters,
-    #                 current_frontier_centers,
-    #                 current_frontier_map_idxs,
-    #                 current_position,
-    #             )
-    #
-    #             os.makedirs(f'{self.save_dir}/episode-{idx}/frontier_line', exist_ok=True)
-    #             o3d.io.write_line_set(
-    #                 f'{self.save_dir}/episode-{idx}/frontier_line/line_set_{step}_{path_idx}_cluster_{i}.ply',
-    #                 line_set)
-    #
-    #             center_idx_to_remove = set()  # 改用 set 避免重复
-    #             for index1 in range(len(merged_frontier_centers)):
-    #                 for index2 in range(index1 + 1, len(merged_frontier_centers)):
-    #                     if index1 in center_idx_to_remove or index2 in center_idx_to_remove:
-    #                         continue  # 跳过已标记删除的索引
-    #
-    #                     center1 = merged_frontier_centers[index1]
-    #                     center2 = merged_frontier_centers[index2]
-    #                     angle1 = np.arctan2(center1[1] - standing_position[1],
-    #                                         center1[0] - standing_position[0])
-    #                     angle2 = np.arctan2(center2[1] - standing_position[1],
-    #                                         center2[0] - standing_position[0])
-    #                     angle_diff = np.abs((angle1 - angle2 + np.pi) % (2 * np.pi) - np.pi)
-    #
-    #                     if angle_diff < 10 * np.pi / 180 and self.is_visible(
-    #                             center1, center2, cluster_point, obstacle_pcd_points):
-    #                         distance1 = np.linalg.norm(center1[:2] - standing_position[:2])
-    #                         distance2 = np.linalg.norm(center2[:2] - standing_position[:2])
-    #
-    #                         if distance1 < distance2:
-    #                             center_idx_to_remove.add(index2)
-    #                         else:
-    #                             center_idx_to_remove.add(index1)
-    #
-    #             # 从大到小排序，避免索引偏移问题
-    #             center_idx_to_remove = sorted(center_idx_to_remove, reverse=True)
-    #             centers_new = [center for idx, center in enumerate(merged_frontier_centers) if
-    #                            idx not in center_idx_to_remove]
-    #             centers_map_idxs_new = [map_idx for idx, map_idx in enumerate(merged_frontier_map_idxs) if
-    #                                     idx not in center_idx_to_remove]
-    #
-    #             centers_from_frontiers.extend(centers_new)  # 直接使用 extend 替代 for-loop
-    #             centers_from_frontiers_map_idxs.extend(centers_map_idxs_new)
-    #         # if len(current_frontier_clusters) == 0 and (
-    #         #         (all_points_num / 20 < len(cluster.point.positions.cpu().numpy()) < all_points_num / 5) or (
-    #         #         50 < len(cluster.point.positions.cpu().numpy()) < 200)):
-    #         #     clusters.append(cluster)
-    #         #     center = np.mean(cluster.point.positions.cpu().numpy(), axis=0)
-    #         #     centers_from_clusters.append(center)
-    #
-    #     current_pcd_to_save = o3d.t.geometry.PointCloud(self.pcd_device)
-    #     current_pcd_to_save = gpu_merge_pointcloud(current_pcd_to_save, pcd_in_circle)
-    #     for cluster in clusters:
-    #         current_pcd_to_save = gpu_merge_pointcloud(current_pcd_to_save, cluster)
-    #     save_pcd = o3d.geometry.PointCloud()
-    #     save_pcd.points = o3d.utility.Vector3dVector(
-    #         current_pcd_to_save.point.positions.cpu().numpy())
-    #     save_pcd.colors = o3d.utility.Vector3dVector(current_pcd_to_save.point.colors.cpu().numpy())
-    #     import os
-    #     os.makedirs(f'{self.save_dir}/episode-{idx}/nav', exist_ok=True)
-    #     o3d.io.write_point_cloud(f'{self.save_dir}/episode-{idx}/nav/nav_{step}_{path_idx}.ply',
-    #                              save_pcd)
-    #
-    #     centers_from_frontiers = np.array(centers_from_frontiers)
-    #     centers_from_clusters = np.array(centers_from_clusters)
-    #     valid_centers = []
-    #
-    #     nodes_positions = self.get_nodes_positions()
-    #     # logger.info(f'Nodes positions: {nodes_positions}')
-    #     for idx, center in enumerate(centers_from_frontiers):
-    #         frontier_idxs = centers_from_frontiers_map_idxs[idx]
-    #         # ensure the center is in the traversable area, if not use the closest point in the traversable area
-    #         center = self.find_closest_point_in_pc(center, self.traversable_pcd)
-    #         if center is None: continue
-    #         traversable_flag = self.check_traversability(current_position, center)
-    #
-    #         if traversable_flag:
-    #             # distance = np.linalg.norm(nodes_positions[:, :2] - center[:2], axis=1)
-    #             # # logger.info(f'Center: {center}, min distance: {np.min(distance)}, threshold: {closest_distance*0.7}')
-    #             # if np.min(distance) > closest_distance * 0.7:
-    #
-    #             center[2] = self.current_position[2]
-    #             valid_centers.append((center, True, frontier_idxs))
-    #
-    #     for center in centers_from_clusters:
-    #         # ensure the center is in the traversable area, if not use the closest point in the traversable area
-    #         center = self.find_closest_point_in_pc(center, self.traversable_pcd)
-    #         if center is None: continue
-    #         traversable_flag = self.check_traversability(current_position, center)
-    #
-    #         if traversable_flag:
-    #             # distance = np.linalg.norm(nodes_positions[:, :2] - center[:2], axis=1)
-    #             # # logger.info(f'Center: {center}, min distance: {np.min(distance)}, threshold: {closest_distance*0.7}')
-    #             # if np.min(distance) > closest_distance * 0.7:
-    #
-    #             center[2] = self.current_position[2]
-    #             valid_centers.append((center, False, np.array([])))
-    #
-    #     # logger.info(self.nodes)
-    #     # logger.info(valid_centers)
-    #     if len(valid_centers) > 0:
-    #         block_current = (len(valid_centers) == 1)
-    #         for center, has_frontier, frontier_idxs in valid_centers:
-    #             angle_center = np.arctan2(center[1] - self.current_position[1],
-    #                                       center[0] - self.current_position[0])
-    #             angle_center = np.where(angle_center < 0, angle_center + 2 * np.pi, angle_center)
-    #             angle_center = np.where(angle_center > 2 * np.pi, angle_center - 2 * np.pi,
-    #                                     angle_center)
-    #             # # find the closet index in the angles
-    #             # angle_diff = np.abs(angles - angle_center)
-    #             # index = np.argmin(angle_diff)
-    #             # pcd_to_node = temporary_pcd[index]
-    #
-    #             start_angle = self.normalize_angle(angle_center - 40 * np.pi / 180)
-    #             end_angle = self.normalize_angle(angle_center + 40 * np.pi / 180)
-    #             if start_angle < end_angle:
-    #                 mask_idx_tensor = o3d.core.Tensor(
-    #                     np.where((angles_current_node > start_angle) &
-    #                              (angles_current_node < end_angle))[0],
-    #                     o3d.core.Dtype.Int64,
-    #                     device=self.pcd_device)
-    #                 pcd_to_node = current_node_pcd.select_by_index(mask_idx_tensor)
-    #             else:
-    #                 mask_idx_tensor = o3d.core.Tensor(
-    #                     np.where((angles_current_node > start_angle) |
-    #                              (angles_current_node < end_angle))[0],
-    #                     o3d.core.Dtype.Int64,
-    #                     device=self.pcd_device)
-    #                 pcd_to_node = current_node_pcd.select_by_index(mask_idx_tensor)
-    #
-    #             _, add_node_flag = self.add_node(center, pcd_to_node, has_frontier, frontier_idxs, block_current)
-    #             if add_node_flag:
-    #                 self.add_edge(self.current_position, center)
-    #
-    #     # remove the processed pcd
-    #     self.process_obs_pcd = o3d.t.geometry.PointCloud(self.pcd_device)
-    #     self.process_nav_pcd = o3d.t.geometry.PointCloud(self.pcd_device)
-    #
-    #     valid_centers = np.array([center for center, _, _ in valid_centers])
-    #
-    #     # check the visibility of the nodes in the graph
-    #     if step != 12:
-    #         self.update_edges(self.navigable_pcd, self.current_position, valid_centers)
-    #
-    #     self.update_node_frontier()
-    #     self.segment_room(step)
 
     def get_frontiers_offerd(self,
                              obstacle_pcd,
@@ -2487,11 +2077,6 @@ class Instruct_Mapper:
             frontier_cluster_map_idxs = translate_point_to_grid(frontier_cluster_points, self.grid_resolution, self.voxel_dimension)[:, :2]
 
             grid_map_new[frontier_cluster_map_idxs[:, 0], frontier_cluster_map_idxs[:, 1]] = 1
-            # if 80% of the points are already marked 1 in the grid map, then ignore this cluster
-            # print('!!!!!!!!!!!!!!!!!!!!!!!!!')
-            # print(frontier_cluster_map_idxs.shape)
-            # print(np.sum(self.frontiers_considered[frontier_cluster_map_idxs[:, 0], frontier_cluster_map_idxs[:, 1]]),
-            #       0.8 * len(frontier_cluster_map_idxs))
             frontier_map_idxs_all.append(frontier_cluster_map_idxs)
             if np.sum(self.frontiers_considered[frontier_cluster_map_idxs[:, 0], frontier_cluster_map_idxs[:, 1]]) > 0.8 * len(frontier_cluster_map_idxs):
                 continue
@@ -2654,102 +2239,6 @@ class Instruct_Mapper:
 
         nodes_states = self.get_nodes_states()
         logger.info(f'Node state after: {nodes_states}')
-        # node_idx = np.where((self.nodes == node).all(axis=1))[0]
-        # logger.info(f'Node index: {node_idx}')
-        # logger.info(f'Node state before: {self.nodes_state}')
-        # logger.info(f'Selected nodes {self.nodes[node_idx]}')
-        # self.nodes_state[node_idx] = 1
-        # logger.info(f'Node state after: {self.nodes_state}')
-
-    # def get_candidate_node(self, instruct_goal, idx=None, step=None):
-    #     self.process_obs_pcd = o3d.t.geometry.PointCloud(self.pcd_device)
-    #     self.process_nav_pcd = o3d.t.geometry.PointCloud(self.pcd_device)
-    #
-    #     current_node = self.find_closest_node(self.current_position)
-    #     current_node_idx = current_node.idx
-    #     current_node_pos = current_node.position
-    #
-    #     current_state_info = f"You are now at node {current_node_idx} with position {current_node_pos}."
-    #
-    #     traj_info = 'The robot history trajectory is: '
-    #     for traj_idx in self.traj:
-    #         traj_info += f'Viewpoint {traj_idx} Position {self.nodes[traj_idx].position} --> '
-    #     traj_info = traj_info[:-4]
-    #
-    #     json_dict = self.to_json()
-    #     #transfer this dict to string
-    #     json_str = json.dumps(json_dict)
-    #
-    #     prompt_info = instruct_goal + '\n' + current_state_info + '\n' + traj_info + '\n' + json_str
-    #
-    #     os.makedirs(f'{self.save_dir}/episode-{idx}/gpt', exist_ok=True)
-    #     with open(f'{self.save_dir}/episode-{idx}/gpt/prompt_{step}.txt', 'w') as f:
-    #         f.write(f'Prompt_info: {prompt_info}\n')
-    #         f.write(f'\n')
-    #
-    #     client = OpenAI()
-    #     class Step(BaseModel):
-    #         explanation: str
-    #         output: str
-    #
-    #     class Reasoning(BaseModel):
-    #         steps: list[Step]
-    #         final_answer: int
-    #         final_object: int
-    #         flag: bool
-    #
-    #     completion = client.beta.chat.completions.parse(
-    #         model="gpt-4o-2024-08-06",
-    #         messages=[
-    #             {"role": "system",
-    #              "content": CHAINON_PROMPT},
-    #             {"role": "user", "content": prompt_info}
-    #         ],
-    #         response_format=Reasoning,
-    #     )
-    #
-    #     answer = completion.choices[0].message.parsed
-    #     # save the answer to a txt file
-    #     with open(f'{self.save_dir}/episode-{idx}/gpt/answer_{step}.txt', 'w') as f:
-    #         f.write(f'Answer: {answer}\n')
-    #         f.write(f'\n')
-    #         f.write(f'\n')
-    #     with open(f'{self.save_dir}/episode-{idx}/gpt/input_{step}.txt', 'a') as f:
-    #         f.write(f'Input: {instruct_goal}\n' + json_str)
-    #         f.write(f'\n')
-    #         f.write(f'\n')
-    #
-    #     logger.info(f'Answer: {answer}')
-    #     print(f'Answer: {answer}')
-    #
-    #     waypoint_final = self.nodes[answer.final_answer]
-    #     try:
-    #         assert waypoint_final.state == 0
-    #     except:
-    #         with open(f'{self.save_dir}/episode-{idx}/gpt_failure.txt', 'w') as f:
-    #             f.write(f'GPT failed to find an unexplored node\n')
-    #
-    #     # ratings = answer.final_answer
-    #     # nodes_states = self.get_nodes_states()
-    #     # # choose the node with the highest rating and node state is 0
-    #     # max_rating = -1
-    #     # max_rating_idx = -1
-    #     # for idx, rating in enumerate(ratings):
-    #     #     if rating > max_rating and nodes_states[idx] == 0:
-    #     #         max_rating = rating
-    #     #         max_rating_idx = idx
-    #     #
-    #     # if max_rating_idx == -1:
-    #     #     return None, None, False
-    #     #
-    #     # waypoint_final = self.nodes[max_rating_idx]
-    #
-    #     if answer.final_object != -1 and answer.flag:
-    #         object_final = self.objects[answer.final_object]
-    #     else:
-    #         object_final = None
-    #
-    #     return waypoint_final, object_final, answer.flag
 
     def get_candidate_room_fully_explored(self, instruct_goal, idx=None, step=None):
         self.process_obs_pcd = o3d.t.geometry.PointCloud(self.pcd_device)
@@ -2867,78 +2356,28 @@ class Instruct_Mapper:
 
         return room_final
 
-    def get_candidate_room_fully_explored_no_gpt(self, instruct_goal, idx=None, step=None):
-        self.process_obs_pcd = o3d.t.geometry.PointCloud(self.pcd_device)
-        self.process_nav_pcd = o3d.t.geometry.PointCloud(self.pcd_device)
+    def get_candidate_room_fully_explored_by_distance(self, instruct_goal, idx=None, step=None):
+        """Deterministic relocation policy used when LLM room selection is off."""
 
-        current_node = self.nodes[self.current_node_idx]
-        current_node_idx = current_node.idx
-        current_node_pos = current_node.position
-
-        room_idx = current_node.room_idx
-
-        current_state_info = f"You are now at node with position {current_node_pos} in the Room {room_idx}."
-
-        traj_info = 'The robot history trajectory is: '
-        for traj_idx in self.traj:
-            traj_info += f'Position {self.nodes[traj_idx].position} --> '
-        traj_info = traj_info[:-4]
-
-        json_dict = self.to_json()
-        #transfer this dict to string
-        json_str = json.dumps(json_dict)
-
-        candidate_room_idxs = [room_node.room_id for room_node in self.room_nodes if room_node.state == 0]
-        choose_instruction = f'Please choose a room to explore from the following rooms: {candidate_room_idxs}'
-
-        prompt_info = instruct_goal + '\n' + current_state_info + '\n' + traj_info + '\n' + json_str + '\n' + choose_instruction
-
-        os.makedirs(f'{self.save_dir}/episode-{idx}/gpt_room', exist_ok=True)
-        with open(f'{self.save_dir}/episode-{idx}/gpt_room/prompt_{step}.txt', 'w') as f:
-            # logger.info(f'Prompt info: {prompt_info}')
-
-            f.write(f'Prompt_info: {prompt_info}\n')
+        selection = select_nearest_frontier_room(self)
+        os.makedirs(f'{self.save_dir}/episode-{idx}/room_policy', exist_ok=True)
+        with open(f'{self.save_dir}/episode-{idx}/room_policy/answer_{step}.txt', 'w') as f:
+            f.write(f'Instruction: {instruct_goal}\n')
+            f.write(f'Policy: nearest_frontier_room\n')
+            f.write(f'Answer: {selection.reason}\n')
+            f.write(f'Closest node: {selection.closest_node_idx}\n')
+            f.write(f'Distances: {selection.distances or []}\n')
             f.write(f'\n')
 
-        frontier_nodes_pos = [node.position for node in self.nodes if node.has_frontier == 1]
-        frontier_nodes_idx = [node.idx for node in self.nodes if node.has_frontier == 1]
-        # calculate the distance between the current position and the frontier nodes using self.env.sim.geodesic_distance
-        nodes_positions = np.array(frontier_nodes_pos)
-        nodes_positions = nodes_positions + self.initial_position
-        nodes_positions[:, 2] = self.initial_position[2] - 0.88
-        nodes_positions = nodes_positions[:, [0, 2, 1]]
-
-        current_node_position = self.current_position + self.initial_position
-        current_node_position = np.array([
-            current_node_position[0], self.initial_position[2] - 0.88, current_node_position[1]
-        ])
-        distance = [
-            self.env.sim.geodesic_distance(current_node_position, node_position)
-            for node_position in nodes_positions
-        ]
-
-        closest_node = self.nodes[frontier_nodes_idx[np.argmin(distance)]]
-        room_idx = closest_node.room_idx
-        room_final = self.room_nodes[room_idx]
-
-        answer = f"""
-                Distance to {frontier_nodes_idx} are {distance}.
-                Node {closest_node.idx} in Room {room_idx} is the closest node to the current position.
-                """
-
-        logger.info(f'Answer: {answer}')
-
-        with open(f'{self.save_dir}/episode-{idx}/gpt_room/answer_{step}.txt', 'w') as f:
-            f.write(f'Answer: {answer}\n')
-            f.write(f'\n')
-            f.write(f'\n')
-
+        logger.info(f'Answer: {selection.reason}')
+        room_final = selection.room
+        if room_final is None:
+            return None
         try:
             assert room_final.state == 0
         except:
-            with open(f'{self.save_dir}/episode-{idx}/gpt_failure.txt', 'w') as f:
-                f.write(f'GPT failed to find an unexplored room\n')
-
+            with open(f'{self.save_dir}/episode-{idx}/room_policy/failure_{step}.txt', 'w') as f:
+                f.write(f'Deterministic room policy selected an explored room\n')
         return room_final
 
     def object_found(self, instruct_goal, idx=None, step=None):
@@ -3025,7 +2464,7 @@ class Instruct_Mapper:
             )
             state = self.instruction_constraint_evaluator.ensure_state(self, plan)
             active = state.active_target(plan)
-            if active is not None and getattr(plan.execution, "ordered", False):
+            if active is not None and is_ordered_execution(plan):
                 # 中文说明：sequence 模式只允许当前子目标触发 stop。
                 # 后续目标即使被 detector 看见，也不能提前终止。
                 self.target_list = list(active.detector_terms or [active.name])
@@ -3045,132 +2484,34 @@ class Instruct_Mapper:
             f.write(f'\n')
             f.write(f'\n')
 
-        target_objs = []
-        skipped_objs = []
-        concept_debug = []
-        terminal_match_records = {}
-        raw_instruction = self._raw_instruction_for_verifier()
         if plan is not None:
-            # terminal concept 也必须批量 grounding。否则每次
-            # object_found 都会对所有非 exact 对象逐个发图像 VLM 请求，调用量
-            # 会随地图对象数线性爆炸。
-            for target in plan.terminal_targets:
-                records = self.concept_matcher.match_many(
-                    raw_instruction=raw_instruction,
-                    concept=target.concept_query(),
-                    objects=list(self.objects),
-                    step=step,
-                )
-                for record in records:
-                    terminal_match_records[(target.id, record.object_uid)] = record
-        for obj in self.objects:
-            tag = obj.tag
-            matched_target = None
-            if plan is not None:
-                for target in plan.terminal_targets:
-                    obj_uid = candidate_from_object(obj, canonical_label=target.name, step=step).uid
-                    record = terminal_match_records.get((target.id, obj_uid))
-                    if record is None:
-                        continue
-                    if record.matches_concept and record.terminal_eligible:
-                        matched_target = target
-                        concept_debug.append(record.as_dict())
-                        break
-            elif self._is_target_tag(tag):
-                matched_target = None
+            result = self.instruction_object_search_policy.select(self, plan=plan, step=step)
+            with open(f'{self.save_dir}/episode-{idx}/no_gpt_obj/answer_{step}.txt', 'w') as f:
+                f.write(f'Input: {prompt_info}\n')
+                f.write(f'Answer: {result.answer}\n')
+                if result.anchor_record:
+                    f.write(f'Anchor match: {json.dumps(result.anchor_record, ensure_ascii=False)}\n')
+                if result.skipped_objs:
+                    f.write(f'Skipped by final verifier: {json.dumps(result.skipped_objs, ensure_ascii=False)}\n')
+                if result.concept_debug:
+                    f.write(f'Concept matches: {json.dumps(result.concept_debug, ensure_ascii=False)}\n')
+                f.write(f'\n')
+                f.write(f'\n')
+            return result.found, result.obj
 
-            if matched_target is not None or (plan is None and self._is_target_tag(tag)):
-                if self._is_verifier_rejected(obj, step=step):
-                    # verifier 拒绝的是这个对象实例，不是整个类别。
-                    # 例如蓝色椅子不满足“红色椅子”，但其它 chair 仍可继续验证。
-                    skipped_objs.append(candidate_from_object(obj, canonical_label=self.target, step=step).as_dict())
-                    continue
-                if (
-                    plan is not None
-                    and matched_target is not None
-                    and compact_key(getattr(plan.execution, "mode", "")) == "anchor_first_relation_search"
-                    and not self._has_unblocked_anchor_evidence(plan, matched_target, obj, step=step, debug=concept_debug)
-                ):
-                    skipped_objs.append({
-                        **candidate_from_object(obj, canonical_label=matched_target.name, step=step).as_dict(),
-                        "skip_reason": "missing_unblocked_relation_anchor_evidence",
-                    })
-                    continue
-                if matched_target is not None:
-                    obj.tag = matched_target.name
-                    obj.conf_list[matched_target.name] = obj.confidence
+        target_objs = []
+        for obj in self.objects:
+            if self._is_target_tag(obj.tag):
                 target_objs.append(obj)
         if len(target_objs) == 0:
-            anchor_obj = None
-            anchor_record = None
-            if plan is not None and compact_key(getattr(plan.execution, "mode", "")) == "anchor_first_relation_search":
-                anchor_candidates = []
-                for concept in self._anchor_concepts_for_plan():
-                    raw_instruction = self._raw_instruction_for_verifier()
-                    records = self.concept_matcher.match_many(
-                        raw_instruction=raw_instruction,
-                        concept=concept,
-                        objects=list(self.objects),
-                        step=step,
-                    )
-                    by_uid = {record.object_uid: record for record in records}
-                    for obj in self.objects:
-                        candidate = candidate_from_object(obj, canonical_label=concept.name, step=step)
-                        record = by_uid.get(candidate.uid)
-                        if record is None:
-                            continue
-                        concept_debug.append(record.as_dict())
-                        if not record.matches_concept:
-                            continue
-                        if self.anchor_search_ledger.is_blocked(
-                            raw_instruction,
-                            concept.id,
-                            candidate.uid,
-                        ):
-                            continue
-                        anchor_candidates.append((record.confidence, concept, obj, candidate, record))
-                if anchor_candidates:
-                    anchor_candidates = sorted(anchor_candidates, key=lambda item: item[0], reverse=True)
-                    _, concept, anchor_obj, candidate, anchor_record = anchor_candidates[0]
-                    # anchor 只是参考导航点，绝不能触发最终成功。
-                    # agent 到达后会把该实例写入 AnchorSearchLedger，再继续找 terminal target。
-                    anchor_obj._instruction_reference_role = "anchor"
-                    anchor_obj._instruction_anchor_concept_id = concept.id
-                    anchor_obj._instruction_anchor_concept_name = concept.name
-                    anchor_obj._instruction_anchor_candidate_uid = candidate.uid
-                    self.anchor_search_ledger.mark(
-                        raw_instruction=self._raw_instruction_for_verifier(),
-                        concept_id=concept.id,
-                        anchor_uid=candidate.uid,
-                        status="navigating_to_anchor",
-                        step=step,
-                        reason=anchor_record.reason,
-                    )
-            if anchor_obj is not None:
-                answer = (
-                    f"No terminal target '{self.target}' found; navigate to anchor reference "
-                    f"'{anchor_obj.tag}' for local search. Anchor is not a goal."
-                )
-                with open(f'{self.save_dir}/episode-{idx}/no_gpt_obj/answer_{step}.txt', 'w') as f:
-                    f.write(f'Input: {prompt_info}\n')
-                    f.write(f'Answer: {answer}\n')
-                    f.write(f'Anchor match: {json.dumps(anchor_record.as_dict() if anchor_record else {}, ensure_ascii=False)}\n')
-                    f.write(f'Concept matches: {json.dumps(concept_debug, ensure_ascii=False)}\n')
-                    f.write(f'\n')
-                    f.write(f'\n')
-                return True, anchor_obj
             answer = f"No target object '{self.target}' found; accepted aliases: {sorted(self._target_match_terms())}"
             with open(f'{self.save_dir}/episode-{idx}/no_gpt_obj/answer_{step}.txt', 'w') as f:
                 f.write(f'Input: {prompt_info}\n')
                 f.write(f'Answer: {answer}\n')
-                if skipped_objs:
-                    f.write(f'Skipped by final verifier: {json.dumps(skipped_objs, ensure_ascii=False)}\n')
-                if concept_debug:
-                    f.write(f'Concept matches: {json.dumps(concept_debug, ensure_ascii=False)}\n')
                 f.write(f'\n')
                 f.write(f'\n')
             return False, None
-        # choose the object with the highest confidence
+
         target_objs = sorted(target_objs, key=lambda x: x.confidence.numpy().item(), reverse=True)
         target_obj = target_objs[0]
         if target_obj.tag != self.target:
@@ -3181,10 +2522,6 @@ class Instruct_Mapper:
         with open(f'{self.save_dir}/episode-{idx}/no_gpt_obj/answer_{step}.txt', 'w') as f:
             f.write(f'Input: {prompt_info}\n')
             f.write(f'Answer: {answer}\n')
-            if skipped_objs:
-                f.write(f'Skipped by final verifier: {json.dumps(skipped_objs, ensure_ascii=False)}\n')
-            if concept_debug:
-                f.write(f'Concept matches: {json.dumps(concept_debug, ensure_ascii=False)}\n')
             f.write(f'\n')
             f.write(f'\n')
 
@@ -3297,44 +2634,7 @@ class Instruct_Mapper:
 
         return np.array([end.position]), [end.idx]
 
-        # path_node_position, path_node_idx = self.find_the_closest_path(self.current_position, end.position)
-        # # calculate the geometric distance along the path
-        # path_distance = 0
-        # for i in range(len(path_node_position) - 1):
-        #     pos1 = path_node_position[i]
-        #     pos2 = path_node_position[i + 1]
-        #     pos1 = pos1 + self.initial_position
-        #     pos2 = pos2 + self.initial_position
-        #     pos1[2] = self.initial_position[2]-0.88
-        #     pos2[2] = self.initial_position[2]-0.88
-        #     pos1 = [pos1[0], pos1[2], pos1[1]]
-        #     pos2 = [pos2[0], pos2[2], pos2[1]]
-        #     path_distance += self.env.sim.geodesic_distance(pos1, pos2)
-        # # calculate the geometric distance from the current position to the end position
-        # current_position = self.current_position
-        # current_position = current_position + self.initial_position
-        # current_position[2] = self.initial_position[2]-0.88
-        # current_position = [current_position[0], current_position[2], current_position[1]]
-        # end_position = end.position + self.initial_position
-        # end_position[2] = self.initial_position[2]-0.88
-        # end_position = [end_position[0], end_position[2], end_position[1]]
-        # distance_to_end = self.env.sim.geodesic_distance(current_position, end_position)
-        #
-        # if path_distance > distance_to_end * 2:
-        #     # discard the path
-        #     return np.array([end.position]), [end.idx]
-        # else:
-        #     return path_node_position, path_node_idx
 
-    # def choose_waypoint(self, candidate_nodes):
-    #     node_idx = np.argmin(
-    #         [np.linalg.norm(np.array([node[0], node[1]]) - self.current_position[:2]) for node in
-    #          candidate_nodes])
-    #     node = candidate_nodes[node_idx]
-    #
-    #     self.process_obs_pcd = o3d.t.geometry.PointCloud(self.pcd_device)
-    #
-    #     return node
 
     def get_closest_disances_and_points(self,
                                         current_pcd_position,
@@ -3344,14 +2644,6 @@ class Instruct_Mapper:
         distance_current = np.linalg.norm(current_pcd_position - current_position, axis=1)
         distance_whole = np.linalg.norm(whole_pcd_position - current_position, axis=1)
 
-        # # avoid noise
-        # pcd_position = pcd_position[distance > 0.3]
-        # distance = distance[distance > 0.3]
-        #
-        # # avoid noise
-        # if len(pcd_position[distance < 0.55]) < 10:
-        #     pcd_position = pcd_position[distance > 0.55]
-        #     distance = distance[distance > 0.55]
 
         # logger.info(f'Min distance: {np.min(distance)}')
         # logger.info(f'Max distance: {np.max(distance)}')
@@ -3419,21 +2711,10 @@ class Instruct_Mapper:
                             distance_whole_within_range < (np.min(distance_whole_within_range) +
                                                            0.06)]
 
-                    # # select the k nearest points in pcd_position_within_range
-                    # nearest_point_k_nearest = pcd_position_within_range[np.argsort(distance_within_range)[:2]]
-                    # # merge nearest_point_avoid_noise and nearest_point and remove the duplicate points
-                    # nearest_point = np.concatenate((nearest_point, nearest_point_k_nearest), axis=0)
-                    # nearest_point = np.unique(nearest_point, axis=0)
 
                     if len(nearest_point) > 0:
                         nearest_points = np.concatenate((nearest_points, nearest_point), axis=0)
 
-        # save_pcd = o3d.geometry.PointCloud()
-        # save_pcd.points = o3d.utility.Vector3dVector(nearest_points)
-        # save_pcd.paint_uniform_color([1, 0, 0])
-        # import os
-        # os.makedirs(f'{self.save_dir}/episode-0/inter', exist_ok=True)
-        # o3d.io.write_point_cloud(f'{self.save_dir}/episode-{0}/inter/inter_{self.update_iterations}.ply', save_pcd)
 
         return nearest_distances, nearest_points
 
@@ -3444,54 +2725,6 @@ class Instruct_Mapper:
             angle -= 2 * np.pi
         return angle
 
-    # def to_json(self):
-    #     json_data = {}
-    #     object_json = []
-    #     for i in range(len(self.objects)):
-    #         obj = self.objects[i]
-    #         nwpcd = obj.pcd.point.positions.cpu().numpy()
-    #         size = np.zeros(3)
-    #         size[0] = np.max(nwpcd[:, 0]) - np.min(nwpcd[:, 0])
-    #         size[1] = np.max(nwpcd[:, 1]) - np.min(nwpcd[:, 1])
-    #         size[2] = np.max(nwpcd[:, 2]) - np.min(nwpcd[:, 2])
-    #
-    #         object_json.append({
-    #             'index': i,
-    #             'position': obj.position.tolist(),
-    #             'class': obj.tag,
-    #             'confidence': obj.confidence.numpy().item(),
-    #             'size': size.tolist(),
-    #         })
-    #     json_data['objects'] = object_json
-    #
-    #     nodes = []
-    #     for i in range(self.node_cnt):
-    #         node = self.nodes[i]
-    #         if node.state == NodeState.EXPLORED:
-    #             node.has_frontier = False
-    #         nodes.append({
-    #             'idx': i,
-    #             'position': node.position.tolist(),
-    #             'state': node.state,
-    #             'neighbors': self.neighbors[i],
-    #             'has_frontier': node.has_frontier,
-    #         })
-    #
-    #         # nwobj = []
-    #         # for obj_idx in node.objects:
-    #         #     obj = self.objects[obj_idx]
-    #         #     nwobj.append({
-    #         #         'idx': obj_idx,
-    #         #         'position': obj.position.tolist(),
-    #         #         'class': obj.tag,
-    #         #         'confidence': obj.confidence.numpy().item(),
-    #         #     })
-    #
-    #         nodes[-1]['objects'] = node.objects
-    #
-    #     json_data['nodes'] = nodes
-    #
-    #     return json_data
 
     def to_json(self):
         json_data = {}
@@ -3806,144 +3039,6 @@ class Instruct_Mapper:
         if save_intermediate_results:
             cv2.imwrite(os.path.join(tmp_floor_path, "full_map4.png"), outside_boundary_tmp)
             #
-            # plt.figure()
-            # plt.imshow(outside_boundary_tmp, cmap="gray", origin="lower")
-            # plt.savefig(os.path.join(tmp_floor_path, "2D_histogram_full_outside_contours.png"))
-
-        # save the full map as point cloud
-        positions = np.where(outside_boundary_tmp != 0)
-        positions = np.asarray(positions).T
-        position_world = translate_grid_to_point(np.asarray(positions),grid_resolution=room_resolution,voxel_dimension=room_dimension)
-        # save the pcd
-        pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(position_world)
-        o3d.io.write_point_cloud(os.path.join(tmp_floor_path, f"full_map.ply"), pcd)
-
-        full_map = cv2.bitwise_not(outside_boundary_tmp)
-        # # convert white to black and black to white
-        # outside_boundary = cv2.bitwise_not(outside_boundary)
-        # # dilate the outside boundary
-        # kernel = np.ones((3, 3), np.uint8)  # 3x3 的膨胀核
-        # outside_boundary = cv2.dilate(outside_boundary, kernel, iterations=1)
-        # # convert white to black and black to white
-        # outside_boundary = cv2.bitwise_not(outside_boundary)
-
-        if save_intermediate_results:
-            cv2.imwrite(os.path.join(tmp_floor_path, "full_map.png"), full_map)
-
-            # # plot the full map
-            # plt.figure()
-            # plt.imshow(full_map, cmap="gray", origin="lower")
-            # plt.savefig(os.path.join(tmp_floor_path, "full_map.png"))
-
-        boundary_mask = full_map.copy()
-
-        # 记录已发现的不连通区域
-        found_region_centers = []
-        found_region_masks = []
-
-        # 结构元素
-        # kernel = np.ones((3, 3), np.uint8)
-        kernel = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
-        # kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-
-        # 迭代膨胀
-        iteration = 0
-        max_iterations = 100  # 设置最大迭代次数，避免无限循环
-        flag = True
-        while iteration < max_iterations and flag:
-            # 膨胀边界
-            new_boundary = cv2.dilate(boundary_mask, kernel, iterations=1)
-
-            # # save the new boundary
-            # plt.figure()
-            # plt.imshow(new_boundary, cmap="gray", origin="lower")
-            # os.makedirs(os.path.join(tmp_floor_path, "process"), exist_ok=True)
-            # plt.savefig(os.path.join(tmp_floor_path, f"process/new_boundary_{iteration}.png"))
-            # plt.close()
-
-            # because the connect compoent detector detect white connect region, so we need to invert the color
-            new_boundary_inv = cv2.bitwise_not(new_boundary)
-            # calculate the connected components
-            num_labels, new_labels, new_stats, centers = cv2.connectedComponentsWithStats(
-                new_boundary_inv, connectivity=8)
-            # print(num_labels)
-
-            if num_labels >= 2:
-                for label in range(0, num_labels):
-                    # mask = (new_labels == label).astype(np.uint8) * 255
-                    # plt.imshow(mask, cmap="gray")
-                    # plt.title(f"Connected Component {label}")
-                    # plt.show()
-                    # print(new_stats[label, cv2.CC_STAT_AREA])
-                    if 20 < new_stats[label, cv2.CC_STAT_AREA] < 900:
-                        print(centers[label])
-                        found_region_centers.append(centers[label])
-                        # remove this region from the new boundary
-                        new_boundary[new_labels == label] = 255
-
-                        # store the mask
-                        mask = (new_labels == label).astype(np.uint8) * 255
-                        found_region_masks.append(mask)
-
-            # for label in range(1, num_labels):
-            #     if label != max_label and new_stats[label, cv2.CC_STAT_AREA] > 0:
-            #         # 提取新的区域
-            #         new_region = (new_labels == label).astype(np.uint8) * 255
-            #         found_regions.append(new_region)
-
-            # 更新边界
-            boundary_mask = new_boundary
-
-            # # 终止条件：如果没有新区域产生，则结束
-            # if len(found_regions) == 0:
-            #     break
-
-            iteration += 1
-
-            # if the whole image is white, then stop the iteration
-            if np.all(boundary_mask == 255):
-                flag = False
-
-        # Create the marker image for the watershed algorithm
-        markers = np.zeros_like(boundary_mask, dtype=np.int32)
-        for i, mask in enumerate(found_region_masks):
-            markers[mask == 255] = i + 1
-
-        # Draw the background marker
-        circle_radius = 1  # in pixels
-        cv2.circle(markers, (3, 3), circle_radius, len(found_region_masks) + 1, -1)
-
-        # plt.figure()
-        # plt.imshow(markers, cmap="jet", origin="lower")
-        # plt.savefig(os.path.join(tmp_floor_path, "water_start.png"))
-        # plt.show()
-
-        # Perform the watershed algorithm
-        full_map = cv2.cvtColor(full_map, cv2.COLOR_GRAY2BGR)
-        cv2.watershed(full_map, markers)
-
-        # also draw the nodes on the map
-        nodes_positions = []
-        for node in self.nodes:
-            pos_world = node.position
-            pos_map = translate_point_to_grid(pos_world,grid_resolution=room_resolution,voxel_dimension=room_dimension)
-            nodes_positions.append(pos_map[:2])
-
-        if save_intermediate_results:
-            room_segs = markers.copy()
-            for pos in nodes_positions:
-                room_segs[pos[0], pos[1]] = 0
-            room_segs[room_segs==len(found_region_masks) + 1] = 0
-            room_segs_to_save = save_grid_map(room_segs)
-            cv2.imwrite(os.path.join(tmp_floor_path, "markers.png"), room_segs_to_save)
-
-            # plt.figure()
-            # plt.imshow(markers, cmap="jet", origin="lower")
-            # plt.scatter([pos[0] for pos in nodes_positions], [pos[1] for pos in nodes_positions],
-            #             c="r",
-            #             label="Nodes")
-            # plt.savefig(os.path.join(tmp_floor_path, "markers.png"))
 
         # 遍历每个唯一的 region_id，并创建 mask
         unique_regions = np.unique(markers)
