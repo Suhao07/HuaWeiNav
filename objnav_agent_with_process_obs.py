@@ -19,6 +19,7 @@ from cv_utils.stitch import combine_image, image_stitch_and_crop
 from cv_utils.visualizer import visualize_mask
 from mapper_with_process_obs import Instruct_Mapper
 from instruction_adapter.verifier import FinalInstructionVerifier, VerificationResult, candidate_from_object
+from instruction_adapter.view_control import ViewControlState
 from mapping_utils.geometry import (gpu_cluster_filter, gpu_merge_pointcloud,
                                     gpu_pointcloud_from_array, pointcloud_distance,
                                     project_to_camera)
@@ -52,8 +53,15 @@ class HM3D_Objnav_Agent:
         self.stop_criterion = 0.7
         self.vlm = vlm
         self.final_instruction_verifier = FinalInstructionVerifier(vlm=vlm)
-        self.final_verifier_retry_counts = {}
+        self.view_control_state = ViewControlState()
         self.last_check_again_image_path = ""
+        self.last_check_again_evidence = None
+        self.final_instruction_accepted_this_step = False
+        self.instruction_success = False
+        self.instruction_decision = ""
+        self.instruction_accept_step = None
+        self.accepted_candidate_uid = ""
+        self.accepted_relation_edge = {}
 
     def translate_objnav(self, object_goal):
         if object_goal.lower() == 'plant':
@@ -118,8 +126,15 @@ class HM3D_Objnav_Agent:
 
         self.current_node_idx = 0
         self.update_trajectory()
-        self.final_verifier_retry_counts = {}
+        self.view_control_state.reset()
         self.last_check_again_image_path = ""
+        self.last_check_again_evidence = None
+        self.final_instruction_accepted_this_step = False
+        self.instruction_success = False
+        self.instruction_decision = ""
+        self.instruction_accept_step = None
+        self.accepted_candidate_uid = ""
+        self.accepted_relation_edge = {}
 
     def rotate_panoramic(self, rotate_times=12):
         self.temporary_pcd = []
@@ -188,7 +203,7 @@ class HM3D_Objnav_Agent:
                     self.mapper.object_perceiver.perceive(
                         comb_img,
                         target=self.mapper.target,
-                        target_list=self.mapper.target_list,
+                        target_list=getattr(self.mapper, "perception_target_list", None) or self.mapper.target_list,
                         save_dir=self.save_dir,
                         episode_idx=self.episode_samples - 1,
                         episode_step=self.episode_steps,
@@ -418,7 +433,7 @@ class HM3D_Objnav_Agent:
             # GroundingDINO/LLM 可能返回 tv_monitor。这里统一成主目标名，
             # 否则后续 object_found_no_gpt 的目标确认会被精确字符串匹配卡住。
             target_aliases = {self.mapper.target}
-            target_aliases.update(getattr(self.mapper, "target_list", []) or [])
+            target_aliases.update(getattr(self.mapper, "target_aliases", []) or [])
             if res in target_aliases:
                 res = self.mapper.target
 
@@ -1097,10 +1112,59 @@ class HM3D_Objnav_Agent:
         }
         return torch.tensor(bbox_np).unsqueeze(0), geometry
 
+    @staticmethod
+    def _view_quality_facts(geometry):
+        geometry = dict(geometry or {})
+        center = geometry.get("bbox_center_norm") or []
+        area = geometry.get("bbox_area_ratio")
+        cx = cy = None
+        center_offset_norm = None
+        border_margin_norm = None
+        if isinstance(center, (list, tuple)) and len(center) >= 2:
+            try:
+                cx = float(center[0])
+                cy = float(center[1])
+                center_offset_norm = float(np.linalg.norm(np.array([cx - 0.5, cy - 0.5], dtype=float)))
+                border_margin_norm = float(min(cx, 1.0 - cx, cy, 1.0 - cy))
+            except Exception:
+                cx = cy = None
+                center_offset_norm = None
+                border_margin_norm = None
+        target_position_hint = "unknown"
+        if cx is not None and cy is not None:
+            horizontal = "center" if abs(cx - 0.5) < 0.15 else ("left" if cx < 0.5 else "right")
+            vertical = "middle" if 0.25 <= cy <= 0.75 else ("upper" if cy < 0.25 else "lower")
+            target_position_hint = f"{vertical}-{horizontal}"
+        return {
+            "bbox_center_norm": center,
+            "bbox_area_ratio": area,
+            "visible_projected_points": geometry.get("visible_projected_points"),
+            "distance_to_object": geometry.get("distance_to_object"),
+            "center_offset_norm": center_offset_norm,
+            "border_margin_norm": border_margin_norm,
+            "target_position_hint": target_position_hint,
+            "projection_failed": bool(geometry.get("projection_failed_in_final_view", False)),
+            "instruction": (
+                "Use these generic camera-quality facts to judge final stop evidence. "
+                "Large center_offset, small border_margin, tiny bbox area, or failed projection "
+                "means the candidate may need a clearer view even when semantics are correct."
+            ),
+        }
+
+    def _estimate_distance_to_object_final(self):
+        try:
+            positions = self.object_final.pcd.point.positions.cpu().numpy()
+            if len(positions) == 0:
+                return None
+            return float(np.min(np.linalg.norm(positions[:, :2] - self.mapper.current_position[:2], axis=1)))
+        except Exception:
+            return None
+
     def check_again(self, episode_step):
-        bbox, _geometry = self._project_object_bbox_on_current_view()
+        bbox, geometry = self._project_object_bbox_on_current_view()
         if bbox is None:
             logger.info(f"Abort check again due to visibility.")
+            self.last_check_again_evidence = None
             return True
 
         img = self.rgb_trajectory[-1].copy()
@@ -1113,14 +1177,58 @@ class HM3D_Objnav_Agent:
         cv2.imwrite(
             self.last_check_again_image_path,
             img_vis)
-        return check_again_object_in_bbox(
-            img_vis=img_vis,
-            target=self.mapper.target,
-            save_dir=self.save_dir,
-            episode_idx=self.episode_samples - 1,
-            episode_step=episode_step,
-            vlm=self.vlm,
+        instruction_mode = (
+            getattr(self.mapper, "instruction_plan", None) is not None
+            or getattr(self.mapper, "instruction_spec", None) is not None
         )
+        if instruction_mode:
+            # 中文说明：指令模式下不再用独立的类别复核作为语义结论。
+            # check_again 只采集更清晰证据；candidate 是否是目标、关系是否
+            # 成立、当前视角是否足够 stop，统一交给 final verifier 判断。
+            flag = True
+            answer_path = f'{self.save_dir}/episode-{self.episode_samples - 1}/check_again/answer_{episode_step}.txt'
+            with open(answer_path, "w", encoding="utf-8") as f:
+                f.write("Evidence-only check_again for instruction mode. Unified final verifier owns semantic decision.\n")
+        else:
+            flag = check_again_object_in_bbox(
+                img_vis=img_vis,
+                target=self.mapper.target,
+                save_dir=self.save_dir,
+                episode_idx=self.episode_samples - 1,
+                episode_step=episode_step,
+                vlm=self.vlm,
+            )
+        candidate = candidate_from_object(
+            self.object_final,
+            canonical_label=getattr(self.mapper, "target", ""),
+            step=episode_step,
+        )
+        distance = self._estimate_distance_to_object_final()
+        geometry_for_evidence = {
+            **dict(geometry or {}),
+            "source": "check_again",
+        }
+        if distance is not None:
+            geometry_for_evidence["distance_to_object"] = distance
+        # check_again 的 bbox 图通常是目标最清楚的一帧。
+        # 成功时直接作为 final verifier 和 relation verifier 的证据，
+        # 避免后续几何 stop 流程丢失“book on shelf”这类上下文。
+        self.last_check_again_evidence = {
+            "current_rgb_with_bbox_path": self.last_check_again_image_path,
+            "object_crop_path": "",
+            "centered_view_path": self.last_check_again_image_path,
+            "geometry": geometry_for_evidence,
+            "view_quality_facts": self._view_quality_facts(geometry_for_evidence),
+            "nearby_objects": self._nearby_objects_for_final_evidence(),
+            "room_context": None,
+            "relation_evidence_paths": [self.last_check_again_image_path] if flag else [],
+            "check_again": {
+                "bbox_verified": bool(flag),
+                "semantic_decision_deferred": bool(instruction_mode),
+                "candidate": candidate.as_dict(),
+            },
+        }
+        return flag
 
     def _raw_instruction_for_verifier(self):
         plan = getattr(self.mapper, "instruction_plan", None)
@@ -1130,6 +1238,23 @@ class HM3D_Objnav_Agent:
         if spec is not None:
             return str(getattr(spec, "raw_instruction", "") or self.mapper.target)
         return str(self.instruct_goal or self.mapper.target or "")
+
+    def _nearby_objects_for_final_evidence(self):
+        nearby_objects = []
+        for obj in getattr(self.mapper, "objects", []) or []:
+            if obj is self.object_final:
+                continue
+            try:
+                dist = float(np.linalg.norm(np.array(obj.position[:2]) - np.array(self.object_final.position[:2])))
+            except Exception:
+                continue
+            if dist <= 2.0:
+                nearby_objects.append({
+                    "label": str(getattr(obj, "tag", "")),
+                    "distance_to_candidate": round(dist, 3),
+                    "position": [float(x) for x in np.array(getattr(obj, "position", []), dtype=float).reshape(-1)[:3].tolist()],
+                })
+        return sorted(nearby_objects, key=lambda x: x["distance_to_candidate"])[:8]
 
     def _build_final_verifier_evidence(self, candidate, bbox, geometry):
         episode_idx = self.episode_samples - 1
@@ -1159,28 +1284,13 @@ class HM3D_Objnav_Agent:
         geometry = dict(geometry or {})
         geometry["distance_to_object"] = distance
 
-        nearby_objects = []
-        for obj in getattr(self.mapper, "objects", []) or []:
-            if obj is self.object_final:
-                continue
-            try:
-                dist = float(np.linalg.norm(np.array(obj.position[:2]) - np.array(self.object_final.position[:2])))
-            except Exception:
-                continue
-            if dist <= 2.0:
-                nearby_objects.append({
-                    "label": str(getattr(obj, "tag", "")),
-                    "distance_to_candidate": round(dist, 3),
-                    "position": [float(x) for x in np.array(getattr(obj, "position", []), dtype=float).reshape(-1)[:3].tolist()],
-                })
-        nearby_objects = sorted(nearby_objects, key=lambda x: x["distance_to_candidate"])[:8]
-
         evidence = {
             "current_rgb_with_bbox_path": current_path,
             "object_crop_path": crop_path,
             "centered_view_path": current_path,
             "geometry": geometry,
-            "nearby_objects": nearby_objects,
+            "view_quality_facts": self._view_quality_facts(geometry),
+            "nearby_objects": self._nearby_objects_for_final_evidence(),
             "room_context": None,
             "relation_evidence_paths": [],
         }
@@ -1192,13 +1302,185 @@ class HM3D_Objnav_Agent:
             }, f, ensure_ascii=False, indent=2, sort_keys=True)
         return evidence
 
-    def final_instruction_check(self):
+    def _attach_view_control_context(self, evidence, candidate):
+        evidence = dict(evidence or {})
+        if getattr(self.view_control_state, "active", False):
+            context = self.view_control_state.as_context()
+            context["candidate_uid_matches_current"] = self.view_control_state.candidate_uid == candidate.uid
+            context["current_candidate_uid"] = candidate.uid
+            evidence["view_control"] = context
+        return evidence
+
+    def _pin_verified_relation_from_evidence(self, evidence):
+        context = dict((evidence or {}).get("verified_relation_context") or {})
+        if context and getattr(self.view_control_state, "active", False):
+            self.view_control_state.pin_relation_context(context)
+
+    def _view_control_override_if_needed(self, candidate, evidence, result):
+        if not getattr(self.view_control_state, "active", False):
+            return result
+        self.view_control_state.record_attempt(
+            step=self.episode_steps,
+            evidence=evidence,
+            decision=result.decision,
+        )
+        if not (result.satisfied and result.decision == "accept"):
+            return result
+        if not self.view_control_state.should_block_accept(evidence):
+            self.view_control_state.reset()
+            return result
+
+        # 中文说明：如果 verifier 在 better-view 子目标中想 accept，但当前
+        # 证据相对 baseline 没有实质改善，且还有可行视角未尝试，则继续执行
+        # view objective。这里不判断对象类别，只约束执行闭环不能“一步 retry”
+        # 后提前停。
+        improved = self.view_control_state.current_improvement(evidence)
+        context = self.view_control_state.as_context()
+        blocked = VerificationResult(
+            satisfied=False,
+            decision="need_better_view",
+            confidence=result.confidence,
+            semantic_satisfied=result.semantic_satisfied,
+            view_sufficient_for_stop=False,
+            satisfied_constraints=list(result.satisfied_constraints or []),
+            failed_constraints=list(result.failed_constraints or []) + [
+                "view-control evidence did not improve enough over baseline"
+            ],
+            view_feedback=(
+                "The semantic relation may be satisfied, but the better-view subgoal "
+                "has not produced a substantially improved final evidence view yet."
+            ),
+            preferred_view_goal=result.preferred_view_goal or "Try the next feasible viewpoint from the current view objective.",
+            view_objective=dict(result.view_objective or context.get("objective") or {}),
+            reason=(
+                f"View-control blocked final accept: improvement={improved:.3f}, "
+                f"required={self.view_control_state.min_required_improvement():.3f}, "
+                f"remaining_proposals={self.view_control_state.remaining_count()}."
+            ),
+            diagnostics={
+                **dict(result.diagnostics or {}),
+                "view_control_override": True,
+                "view_control": context,
+            },
+        )
+        return blocked
+
+    def _enter_better_view_control(self, candidate, evidence, result):
+        objective = dict(result.view_objective or {})
+        if result.preferred_view_goal and "preferred_view_goal" not in objective:
+            objective["preferred_view_goal"] = result.preferred_view_goal
+        if result.view_feedback and "view_feedback" not in objective:
+            objective["view_feedback"] = result.view_feedback
+        self.view_control_state.start(candidate.uid, objective, evidence)
+        self._pin_verified_relation_from_evidence(evidence)
+        self.whether_to_check_again()
+        if not self.need_check_again:
+            logger.info("View-control could not find a feasible better-view proposal.")
+            return False
+        self.waypoint = self.check_again_postion.copy()
+        self.waypoint[2] = self.mapper.current_position[2]
+        self.path = np.array([self.waypoint])
+        self.path_index = 0
+        return True
+
+    def _defer_initial_accept_if_better_view_exists(self, candidate, evidence, result, instruction_mode=False):
+        if not instruction_mode:
+            return result
+        if not (result.satisfied and result.decision == "accept"):
+            return result
+        if getattr(self.view_control_state, "active", False):
+            return result
+
+        objective = dict(result.view_objective or {})
+        if not objective:
+            objective = {
+                "keep_visible_roles": ["candidate"],
+                "improve_goals": ["clarity", "centering", "scale"],
+                "minimum_expected_improvement": "moderate",
+                "accept_if_no_better_view": True,
+                "reason": "Initial accept should still check whether a clearly better final evidence view is feasible.",
+            }
+        self.view_control_state.start(candidate.uid, objective, evidence)
+        self._pin_verified_relation_from_evidence(evidence)
+        self.whether_to_check_again()
+        if not self.need_check_again:
+            self.view_control_state.reset()
+            return result
+
+        selected = None
+        if self.view_control_state.last_selected_index is not None:
+            try:
+                selected = self.view_control_state.proposals[self.view_control_state.last_selected_index]
+            except Exception:
+                selected = None
+        baseline_score = self.view_control_state.baseline_quality.get("score", 0.0)
+        predicted_score = selected.score if selected is not None else baseline_score
+        predicted_improvement = predicted_score - baseline_score
+        if predicted_improvement < self.view_control_state.min_required_improvement():
+            # 没有明显更好的几何视角时，不因为控制层保守性阻止 VLM 的 accept。
+            self.view_control_state.reset()
+            self.need_check_again = False
+            return result
+
+        self.waypoint = self.check_again_postion.copy()
+        self.waypoint[2] = self.mapper.current_position[2]
+        self.path = np.array([self.waypoint])
+        self.path_index = 0
+        return VerificationResult(
+            satisfied=False,
+            decision="need_better_view",
+            confidence=result.confidence,
+            semantic_satisfied=result.semantic_satisfied,
+            view_sufficient_for_stop=False,
+            satisfied_constraints=list(result.satisfied_constraints or []),
+            failed_constraints=list(result.failed_constraints or []) + [
+                "initial accept deferred because a better final evidence viewpoint is feasible"
+            ],
+            view_feedback="A better final evidence viewpoint is geometrically feasible before stopping.",
+            preferred_view_goal=result.preferred_view_goal or "Move to the proposed viewpoint and re-check final instruction satisfaction.",
+            view_objective=objective,
+            reason=(
+                f"Initial accept deferred by view-control: predicted_improvement={predicted_improvement:.3f}, "
+                f"required={self.view_control_state.min_required_improvement():.3f}."
+            ),
+            diagnostics={
+                **dict(result.diagnostics or {}),
+                "view_control_initial_deferral": True,
+                "view_control": self.view_control_state.as_context(),
+            },
+        )
+
+    def final_instruction_check(self, evidence_override=None):
         plan = getattr(self.mapper, "instruction_plan", None)
         spec = getattr(self.mapper, "instruction_spec", None)
         if plan is None and spec is None:
             # 中文说明：普通 HM3D ObjectNav benchmark 不启用指令解析层。
             # 此时 final verifier 完全旁路，保持 STRIVE 原始 stop 行为。
             return True
+
+        if getattr(self.object_final, "_instruction_reference_role", "") == "anchor":
+            # anchor-first 模式下，anchor 只是局部搜索参考点，
+            # 不能进入 final verifier，也不能被当成任务成功。到达后屏蔽
+            # 该 anchor 实例，后续探索会寻找 terminal target 或其它 anchor。
+            raw_instruction = self._raw_instruction_for_verifier()
+            concept_id = getattr(self.object_final, "_instruction_anchor_concept_id", "")
+            anchor_uid = getattr(self.object_final, "_instruction_anchor_candidate_uid", "")
+            self.mapper.anchor_search_ledger.mark(
+                raw_instruction=raw_instruction,
+                concept_id=concept_id,
+                anchor_uid=anchor_uid,
+                status="searched_no_terminal_found",
+                step=self.episode_steps,
+                reason="Reached anchor reference; no terminal target was accepted before final stop.",
+                evidence={"role": "anchor_reference"},
+            )
+            self.mapper.instruction_constraint_evaluator.dump_state(
+                mapper=self.mapper,
+                episode_idx=self.episode_samples - 1,
+                step=self.episode_steps,
+            )
+            logger.info("Anchor reference reached and blocked for this instruction: {}", anchor_uid)
+            return False
 
         raw_instruction = self._raw_instruction_for_verifier()
         candidate = candidate_from_object(
@@ -1219,8 +1501,48 @@ class HM3D_Objnav_Agent:
 
         bbox, geometry = self._project_object_bbox_on_current_view()
         constraint_eval = None
-        if bbox is None:
-            # 中文说明：final stop 姿态可能看不到点云投影，但 check_again
+        if evidence_override is not None:
+            evidence = dict(evidence_override)
+            evidence.setdefault("relation_evidence_paths", [])
+            if plan is not None and target_for_candidate is not None:
+                evidence = self._attach_view_control_context(evidence, candidate)
+                constraint_eval = self.mapper.instruction_constraint_evaluator.evaluate_before_final_verifier(
+                    mapper=self.mapper,
+                    plan=plan,
+                    target=target_for_candidate,
+                    candidate=candidate,
+                    candidate_obj=self.object_final,
+                    evidence=evidence,
+                    step=self.episode_steps,
+                )
+                evidence = constraint_eval.evidence
+            if constraint_eval is not None and not constraint_eval.satisfied:
+                result = VerificationResult(
+                    satisfied=False,
+                    decision="need_relation_check" if constraint_eval.decision == "need_relation_check" else "uncertain",
+                    confidence=constraint_eval.confidence,
+                    satisfied_constraints=constraint_eval.satisfied_constraints,
+                    failed_constraints=constraint_eval.failed_constraints,
+                    reason=constraint_eval.reason,
+                    diagnostics={"constraint_eval": constraint_eval.as_dict()},
+                )
+            else:
+                evidence = self._attach_view_control_context(evidence, candidate)
+                result = self.final_instruction_verifier.verify(
+                    raw_instruction=raw_instruction,
+                    instruction_plan=plan,
+                    candidate=candidate,
+                    evidence=evidence,
+                )
+            evidence_paths = [
+                path for path in [
+                    evidence.get("current_rgb_with_bbox_path"),
+                    evidence.get("object_crop_path"),
+                    evidence.get("centered_view_path"),
+                ] if path
+            ]
+        elif bbox is None:
+            # final stop 姿态可能看不到点云投影，但 check_again
             # 刚刚保存过 VLM 复核图。此时继续用 check_again 图做原始指令
             # 满足度判断，而不是直接让控制流重新 stop。
             fallback_path = self.last_check_again_image_path
@@ -1231,12 +1553,14 @@ class HM3D_Objnav_Agent:
                 "geometry": {
                     "projection_failed_in_final_view": True,
                 },
+                "view_quality_facts": self._view_quality_facts({"projection_failed_in_final_view": True}),
                 "nearby_objects": [],
                 "room_context": None,
                 "relation_evidence_paths": [],
             }
             if fallback_path and os.path.exists(fallback_path):
                 if plan is not None and target_for_candidate is not None:
+                    evidence = self._attach_view_control_context(evidence, candidate)
                     constraint_eval = self.mapper.instruction_constraint_evaluator.evaluate_before_final_verifier(
                         mapper=self.mapper,
                         plan=plan,
@@ -1259,6 +1583,7 @@ class HM3D_Objnav_Agent:
                         )
                         evidence_paths = [fallback_path]
                     else:
+                        evidence = self._attach_view_control_context(evidence, candidate)
                         result = self.final_instruction_verifier.verify(
                             raw_instruction=raw_instruction,
                             instruction_plan=plan,
@@ -1267,6 +1592,7 @@ class HM3D_Objnav_Agent:
                         )
                         evidence_paths = [fallback_path]
                 else:
+                    evidence = self._attach_view_control_context(evidence, candidate)
                     result = self.final_instruction_verifier.verify(
                         raw_instruction=raw_instruction,
                         instruction_plan=plan,
@@ -1283,6 +1609,7 @@ class HM3D_Objnav_Agent:
         else:
             evidence = self._build_final_verifier_evidence(candidate, bbox, geometry)
             if plan is not None and target_for_candidate is not None:
+                evidence = self._attach_view_control_context(evidence, candidate)
                 constraint_eval = self.mapper.instruction_constraint_evaluator.evaluate_before_final_verifier(
                     mapper=self.mapper,
                     plan=plan,
@@ -1304,6 +1631,7 @@ class HM3D_Objnav_Agent:
                     diagnostics={"constraint_eval": constraint_eval.as_dict()},
                 )
             else:
+                evidence = self._attach_view_control_context(evidence, candidate)
                 result = self.final_instruction_verifier.verify(
                     raw_instruction=raw_instruction,
                     instruction_plan=plan,
@@ -1318,6 +1646,24 @@ class HM3D_Objnav_Agent:
                 ] if path
             ]
 
+        instruction_mode = plan is not None or spec is not None
+        result = self._view_control_override_if_needed(candidate, evidence, result)
+        result = self._defer_initial_accept_if_better_view_exists(
+            candidate,
+            evidence,
+            result,
+            instruction_mode=instruction_mode,
+        )
+
+        out_dir = f'{self.save_dir}/episode-{self.episode_samples - 1}/final_verifier'
+        os.makedirs(out_dir, exist_ok=True)
+        with open(os.path.join(out_dir, f'evidence_{self.episode_steps}.json'), 'w', encoding='utf-8') as f:
+            json.dump({
+                "candidate": candidate.as_dict(),
+                "raw_instruction": raw_instruction,
+                "evidence": evidence,
+            }, f, ensure_ascii=False, indent=2, sort_keys=True)
+
         record = self.mapper.verification_ledger.put(
             raw_instruction,
             candidate.uid,
@@ -1325,8 +1671,6 @@ class HM3D_Objnav_Agent:
             step=self.episode_steps,
             evidence_paths=evidence_paths,
         )
-        out_dir = f'{self.save_dir}/episode-{self.episode_samples - 1}/final_verifier'
-        os.makedirs(out_dir, exist_ok=True)
         with open(os.path.join(out_dir, f'result_{self.episode_steps}.json'), 'w', encoding='utf-8') as f:
             json.dump({
                 "candidate": candidate.as_dict(),
@@ -1342,7 +1686,9 @@ class HM3D_Objnav_Agent:
         )
 
         logger.info("Final instruction verifier decision: {}", result.as_dict())
+        self.instruction_decision = result.decision
         if result.satisfied and result.decision == "accept":
+            relation_edges = list((evidence or {}).get("relation_edges") or [])
             if plan is not None:
                 task_done = self.mapper.instruction_constraint_evaluator.apply_final_result(
                     mapper=self.mapper,
@@ -1354,6 +1700,11 @@ class HM3D_Objnav_Agent:
                 if not task_done:
                     logger.info("Instruction subgoal accepted but full task is not complete yet.")
                     return False
+            self.instruction_success = True
+            self.instruction_decision = result.decision
+            self.instruction_accept_step = self.episode_steps
+            self.accepted_candidate_uid = candidate.uid
+            self.accepted_relation_edge = relation_edges[0] if relation_edges else {}
             return True
 
         if plan is not None:
@@ -1366,19 +1717,21 @@ class HM3D_Objnav_Agent:
             )
 
         if result.decision == "need_better_view":
-            retries = self.final_verifier_retry_counts.get(candidate.uid, 0)
-            if retries < 1:
-                self.final_verifier_retry_counts[candidate.uid] = retries + 1
-                self.whether_to_check_again()
-                self.waypoint = self.check_again_postion.copy()
-                self.waypoint[2] = self.mapper.current_position[2]
-                self.path = np.array([self.waypoint])
-                self.path_index = 0
+            logger.info(
+                "Final verifier requests better view for {}: {} / {}",
+                candidate.uid,
+                result.view_feedback,
+                result.preferred_view_goal,
+            )
+            if (result.diagnostics or {}).get("view_control_initial_deferral"):
+                return False
+            if self._enter_better_view_control(candidate, evidence, result):
                 return False
 
         return False
 
     def step_mod(self, idx):
+        self.final_instruction_accepted_this_step = False
         if self.episode_steps == 499:
             self.obs = self.env.step(0)
             self.update_trajectory()
@@ -1453,7 +1806,33 @@ class HM3D_Objnav_Agent:
                     if not self.found_goal:
                         self.after_check_again()
                     else:
-                        act = self.planner.get_next_action(pid_waypoint)
+                        final_instruction_flag = self.final_instruction_check(
+                            evidence_override=self.last_check_again_evidence,
+                        )
+                        if final_instruction_flag:
+                            self.final_instruction_accepted_this_step = True
+                            act = 0
+                        else:
+                            pid_waypoint = self.waypoint + self.mapper.initial_position
+                            pid_waypoint = np.array(
+                                [pid_waypoint[0],
+                                 self.env.sim.get_agent_state().position[1], pid_waypoint[1]])
+                            if self.need_check_again:
+                                act = self.planner.get_next_action(pid_waypoint)
+                                if act == 0:
+                                    self.need_check_again = False
+                                    self.after_check_again()
+                                    pid_waypoint = self.waypoint + self.mapper.initial_position
+                                    pid_waypoint = np.array(
+                                        [pid_waypoint[0],
+                                         self.env.sim.get_agent_state().position[1], pid_waypoint[1]])
+                            else:
+                                self.after_check_again()
+                                pid_waypoint = self.waypoint + self.mapper.initial_position
+                                pid_waypoint = np.array(
+                                    [pid_waypoint[0],
+                                     self.env.sim.get_agent_state().position[1], pid_waypoint[1]])
+                            act = self.planner.get_next_action(pid_waypoint)
             else:
                 if to_target_distance > self.success_distance * self.stop_criterion:
                     act = self.planner.get_next_action(pid_waypoint)
@@ -1515,7 +1894,7 @@ class HM3D_Objnav_Agent:
         logger.info("Waypoint: {}", self.waypoint)
 
         if not self.env.episode_over:
-            if self.found_goal and act == 0:
+            if self.found_goal and act == 0 and not self.final_instruction_accepted_this_step:
                 final_check_flag = self.final_check()
                 if final_check_flag:
                     final_instruction_flag = self.final_instruction_check()
@@ -1620,11 +1999,16 @@ class HM3D_Objnav_Agent:
         # invert the path
         interpolated_path = interpolated_path[::-1]
         final_pos = self.object_final.position[:2]
+        best_candidate = None
+        proposals = []
         for point_idx, point in enumerate(interpolated_path):
             position = point
             stop_pos = position[:2]
             orient = final_pos - stop_pos
-            orient = orient / np.linalg.norm(orient)
+            orient_norm = np.linalg.norm(orient)
+            if orient_norm < 1e-6:
+                continue
+            orient = orient / orient_norm
             rotation_matrix = np.array([[-orient[1], 0, -orient[0]],
                                         [orient[0], 0, -orient[1]],
                                         [0, 1, 0]])
@@ -1632,7 +2016,11 @@ class HM3D_Objnav_Agent:
                                               position,
                                               rotation_matrix)
             camera_points = np.array(camera_points)
+            if camera_points.ndim < 2 or camera_points.shape[1] <= 0:
+                continue
             all_pc_number = camera_points.shape[1]
+            if all_pc_number <= 0:
+                continue
             camera_points = camera_points.T
             depth = np.array(camera_points[:, 2], dtype=np.float32)
             camera_points = np.array(camera_points[:, :2], dtype=np.int32)
@@ -1645,9 +2033,15 @@ class HM3D_Objnav_Agent:
                 continue
 
             bbox = np.array([np.min(camera_points, axis=0), np.max(camera_points, axis=0)])
-            bbox_area = (bbox[1][0] - bbox[0][0]) * (bbox[1][1] - bbox[0][1])
-            length = (bbox[1][0] - bbox[0][0])
-            width = (bbox[1][1] - bbox[0][1])
+            length = max(1.0, float(bbox[1][0] - bbox[0][0]))
+            width = max(1.0, float(bbox[1][1] - bbox[0][1]))
+            bbox_area = length * width
+            cx = float((bbox[0][0] + bbox[1][0]) / 2.0 / 640.0)
+            cy = float((bbox[0][1] + bbox[1][1]) / 2.0 / 480.0)
+            center_offset = float(np.linalg.norm(np.array([cx - 0.5, cy - 0.5], dtype=float)))
+            center_score = max(0.0, 1.0 - center_offset / np.sqrt(0.5))
+            border_margin = float(min(cx, 1.0 - cx, cy, 1.0 - cy))
+            border_score = max(0.0, min(1.0, border_margin / 0.25))
 
             # # x1 y1 x2 y2
             # bbox1 = np.array([bbox[0][0], bbox[0][1], bbox[1][0], bbox[1][1]])
@@ -1666,18 +2060,102 @@ class HM3D_Objnav_Agent:
             #     img_vis)
 
             visible_pc_number = len(camera_points)
-            logger.info(f'At {position}, Visible Ratio: {visible_pc_number / all_pc_number}, Box Ratio: {bbox_area / obj_bbox_area}')
-            if visible_pc_number > 0.95 * all_pc_number and bbox_area > obj_bbox_area:
-                big_ratio = np.sqrt(bbox_area / obj_bbox_area)
-                if length > 0.8 * big_ratio * obj_bbox_length and width > 0.8 * big_ratio * obj_bbox_width:
-                    # this is the best point to check
-                    logger.info(f'Found a good point to check: {position}, Visible Ratio: {visible_pc_number / all_pc_number}, Box Ratio: {bbox_area / obj_bbox_area}')
-                    self.check_again_postion = position
-                    return
+            visible_ratio = float(visible_pc_number / max(1, all_pc_number))
+            area_ratio = float(bbox_area / max(1.0, obj_bbox_area))
+            area_score = max(0.0, min(1.0, np.sqrt(area_ratio) / 2.0))
+            to_target_distance = float(np.min(np.linalg.norm(positions[:, :2] - position[:2], axis=1)))
+            preferred_distance = max(0.25, float(self.success_distance))
+            distance_score = max(0.0, 1.0 - abs(to_target_distance - preferred_distance) / max(preferred_distance, 1.0))
+            aspect_stability = min(
+                1.0,
+                float(length / max(1.0, obj_bbox_length)),
+                float(width / max(1.0, obj_bbox_width)),
+            )
+            # 中文说明：这里是通用相机视角质量评分，不包含 book/shelf/chair
+            # 等语义规则。语义是否满足仍由 unified final verifier 决定；
+            # 控制器只负责挑一个更可见、更居中、更适合停止确认的姿态。
+            view_score = (
+                0.35 * visible_ratio
+                + 0.25 * center_score
+                + 0.15 * border_score
+                + 0.15 * area_score
+                + 0.10 * distance_score
+            ) * (0.75 + 0.25 * aspect_stability)
+            candidate = {
+                "position": position.copy(),
+                "pose": [float(x) for x in position.reshape(-1).tolist()],
+                "score": float(view_score),
+                "visible_ratio": visible_ratio,
+                "area_ratio": area_ratio,
+                "center_score": float(center_score),
+                "border_score": float(border_score),
+                "distance_score": float(distance_score),
+                "distance_to_target": to_target_distance,
+                "predicted_quality": {
+                    "score": float(view_score),
+                    "area_score": float(area_score),
+                    "center_score": float(center_score),
+                    "border_score": float(border_score),
+                    "visible_score": float(visible_ratio),
+                    "distance_score": float(distance_score),
+                    "bbox_area_ratio": float(bbox_area / (640.0 * 480.0)),
+                    "center_offset_norm": float(center_offset),
+                    "border_margin_norm": float(border_margin),
+                },
+                "reason": "generic geometry proposal from visibility, centering, scale, border margin, and path distance",
+            }
+            proposals.append(candidate)
+            logger.info(
+                "Check-again candidate {} score {:.3f}, visible {:.3f}, center {:.3f}, border {:.3f}, area {:.3f}, dist {:.3f}",
+                position,
+                candidate["score"],
+                candidate["visible_ratio"],
+                candidate["center_score"],
+                candidate["border_score"],
+                candidate["area_ratio"],
+                candidate["distance_to_target"],
+            )
+            if best_candidate is None or candidate["score"] > best_candidate["score"]:
+                best_candidate = candidate
 
-        # if we can't find a good point to check, then use the last point
-        if len(interpolated_path) > 0:
-            logger.info(f"Can't find a good point to check, use the last point")
+        current_candidate = candidate_from_object(
+            self.object_final,
+            canonical_label=getattr(self.mapper, "target", ""),
+            step=self.episode_steps,
+        )
+        if (
+            getattr(self.view_control_state, "active", False)
+            and self.view_control_state.candidate_uid == current_candidate.uid
+        ):
+            self.view_control_state.set_proposals(proposals)
+            proposal = self.view_control_state.next_proposal()
+            if proposal is not None:
+                logger.info(
+                    "Selected view-control proposal: {}, score {:.3f}, remaining {}",
+                    proposal.pose,
+                    proposal.score,
+                    self.view_control_state.remaining_count(),
+                )
+                self.check_again_postion = np.array(proposal.pose, dtype=float)
+                self.need_check_again = True
+                return
+            logger.info("View-control proposals exhausted for {}", current_candidate.uid)
+            self.need_check_again = False
+            self.check_again_postion = self.mapper.current_position
+        elif best_candidate is not None:
+            logger.info(
+                "Selected check-again viewpoint: {}, score {:.3f}, visible {:.3f}, center {:.3f}, border {:.3f}, area {:.3f}, dist {:.3f}",
+                best_candidate["position"],
+                best_candidate["score"],
+                best_candidate["visible_ratio"],
+                best_candidate["center_score"],
+                best_candidate["border_score"],
+                best_candidate["area_ratio"],
+                best_candidate["distance_to_target"],
+            )
+            self.check_again_postion = best_candidate["position"]
+        elif len(interpolated_path) > 0:
+            logger.info(f"Can't score a good point to check, use the last point")
             self.check_again_postion = interpolated_path[-1]
         else:
             logger.info(f"Can't find a good point to check, use the current position")
@@ -1726,12 +2204,32 @@ class HM3D_Objnav_Agent:
         # 中文说明：任何复核失败都必须退出“已找到目标”状态。
         # 否则 STRIVE 的 stop 分支会在后续 step 继续围绕同一候选触发，
         # 即使 final verifier 已经把该实例 hard-reject。
+        if getattr(self.object_final, "_instruction_reference_role", "") == "anchor":
+            self.mapper.anchor_search_ledger.mark(
+                raw_instruction=self._raw_instruction_for_verifier(),
+                concept_id=getattr(self.object_final, "_instruction_anchor_concept_id", ""),
+                anchor_uid=getattr(self.object_final, "_instruction_anchor_candidate_uid", ""),
+                status="searched_no_terminal_found",
+                step=self.episode_steps,
+                reason="Anchor reference local search ended without an accepted terminal target.",
+                evidence={"role": "anchor_reference"},
+            )
+        self.view_control_state.reset()
         self.found_goal = False
         self.need_check_again = False
+        old_tag = str(getattr(self.object_final, "tag", ""))
+        old_confidence = getattr(self.object_final, "confidence", torch.tensor(1.0))
+        # 中文说明：这里只是让该实例退出“当前目标候选”状态，不能清空
+        # ObjectNode 的历史类别计数。mapper 后续 association 仍会按旧 tag
+        # 读取 num_list/conf_list；如果直接替换成 {"nothing": ...} 会破坏地图记忆。
+        if old_tag and old_tag not in getattr(self.object_final, "num_list", {}):
+            self.object_final.num_list[old_tag] = 1
+        if old_tag and old_tag not in getattr(self.object_final, "conf_list", {}):
+            self.object_final.conf_list[old_tag] = old_confidence
         self.object_final.tag = "nothing"
         self.object_final.confidence = torch.tensor(1.0)
-        self.object_final.conf_list = {"nothing": self.object_final.confidence}
-        self.object_final.num_list = {"nothing": 10000}
+        self.object_final.conf_list["nothing"] = self.object_final.confidence
+        self.object_final.num_list["nothing"] = 10000
 
         waypoint_node = self.mapper.explore_after_check()
         if waypoint_node is None:

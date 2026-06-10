@@ -5,7 +5,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from .contracts import InstructionPlan, TargetQuery
-from .ontology import normalize_term
+from .ontology import compact_key, normalize_term
 
 
 def _constraint_key(value: Any) -> str:
@@ -141,7 +141,7 @@ class InstructionExecutionState:
             self.completed = progress.complete and self.active_target_index >= len(plan.terminal_targets) - 1
             return self.completed
 
-        mode = normalize_term(getattr(plan.execution, "mode", "")) or normalize_term(plan.eval_mode)
+        mode = compact_key(getattr(plan.execution, "mode", "")) or compact_key(plan.eval_mode)
         if mode in ("all_targets_success", "all", "exhaustive") or getattr(plan.execution, "exhaustive", False):
             self.completed = all(
                 self.target_progress[target.id].complete

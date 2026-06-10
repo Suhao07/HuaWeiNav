@@ -20,6 +20,7 @@ from instruction_adapter import (
     extract_dataset_target,
     render_instruction_context,
 )
+from llm_utils.lvlm_call_tracker import counts_compact, reset_counts, set_trace_dir
 from mapper_with_process_obs import Instruct_Mapper
 from mapping_utils.transform import habitat_camera_intrinsic
 from objnav_agent_with_process_obs import HM3D_Objnav_Agent
@@ -263,6 +264,9 @@ if __name__ == "__main__":
 
         _set_next_episode_by_index(habitat_agent.env, i)
         habitat_agent.reset(i)
+        episode_dir = os.path.join(args.save_dir, f"episode-{i}")
+        reset_counts()
+        set_trace_dir(os.path.join(episode_dir, "lvlm_calls"))
 
         target = habitat_agent.instruct_goal
         dataset_target = extract_dataset_target(target)
@@ -290,6 +294,10 @@ if __name__ == "__main__":
                 instruction_spec.target_detector_prompts
                 or [instruction_spec.canonical_target or dataset_target]
             )
+            perception_terms = list(habitat_mapper.target_list)
+            for concept in getattr(instruction_plan, "concept_queries", []) or []:
+                perception_terms.extend(list(getattr(concept, "detector_terms", []) or []))
+            habitat_mapper.perception_target_list = list(dict.fromkeys([term for term in perception_terms if term]))
             habitat_mapper.target = instruction_spec.canonical_target or habitat_mapper.target_list[0]
             habitat_mapper.target_aliases = list(instruction_spec.target_match_terms)
             habitat_agent.instruct_goal = render_instruction_context(instruction_plan)
@@ -340,6 +348,14 @@ if __name__ == "__main__":
             'start and goal distance': habitat_agent.start_end_episode_distance,
             'travel distance': habitat_agent.travel_distance,
             'Found Goal': habitat_agent.found_goal,
+            'instruction_success': habitat_agent.instruction_success,
+            'instruction_decision': habitat_agent.instruction_decision,
+            'instruction_accept_step': habitat_agent.instruction_accept_step,
+            'accepted_candidate_uid': habitat_agent.accepted_candidate_uid,
+            'accepted_relation_edge': json.dumps(habitat_agent.accepted_relation_edge, ensure_ascii=False, sort_keys=True),
+            'lvlm_call_count_by_type': counts_compact(),
+            # 兼容前期文档/脚本中的拼写；规范字段是 lvlm_call_count_by_type。
+            'lvml_call_count_by_type': counts_compact(),
             'End': 1,
             'object_goal': habitat_agent.instruct_goal,
         })

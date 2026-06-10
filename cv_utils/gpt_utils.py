@@ -1,4 +1,6 @@
 import base64
+import hashlib
+import json
 import os
 
 import cv2
@@ -7,6 +9,7 @@ from pydantic import BaseModel
 from constants import DETECT_OBJECTS
 from cv_utils.visualizer import visualize_mask
 from llm_utils.cognav_llm_adapter import get_client_and_model
+from llm_utils.lvlm_call_tracker import record_cache_hit
 
 
 def _get_client_and_model(vlm: str):
@@ -17,6 +20,10 @@ def _get_client_and_model(vlm: str):
 def _encode_image_base64(image) -> str:
     image_jpg = cv2.imencode(".jpg", image)[1]
     return base64.b64encode(image_jpg).decode("utf-8")
+
+
+def _image_jpg_bytes(image) -> bytes:
+    return cv2.imencode(".jpg", image)[1].tobytes()
 
 
 def _step_dir(save_dir, episode_idx, episode_step) -> str:
@@ -52,7 +59,32 @@ def ask_gpt_object_in_box(img, boxes, save_dir, episode_idx, episode_step, ind, 
         img_cropped,
     )
 
-    img_cropped_base64 = _encode_image_base64(img_cropped)
+    crop_bytes = _image_jpg_bytes(img_cropped)
+    img_cropped_base64 = base64.b64encode(crop_bytes).decode("utf-8")
+    cache_key_raw = json.dumps({
+        "bbox": [x1, y1, x2, y2],
+        "crop_sha1": hashlib.sha1(crop_bytes).hexdigest(),
+        "classes_sha1": hashlib.sha1(json.dumps(DETECT_OBJECTS, sort_keys=True).encode("utf-8")).hexdigest(),
+    }, sort_keys=True)
+    cache_key = hashlib.sha1(cache_key_raw.encode("utf-8")).hexdigest()
+    cache_path = f"{save_dir}/episode-{episode_idx}/detection/object_box_cache.json"
+    try:
+        with open(cache_path, "r", encoding="utf-8") as f:
+            cache = json.load(f)
+    except Exception:
+        cache = {}
+    if cache_key in cache:
+        cached = cache[cache_key]
+        label = str(cached.get("res", "unknown") or "unknown")
+        record_cache_hit("bbox_object_in_box")
+        nwlabels = [label]
+        img_vis = visualize_mask(img, boxes, None, nwlabels, None)
+        cv2.imwrite(f"{step_dir}/real_C_image_gpt_output_{ind}.jpg", img_vis)
+        with open(f"{step_dir}/real_C_image_gpt_output_{ind}.txt", "w", encoding="utf-8") as f:
+            f.write("Cache-Hit: true\n")
+            f.write(f"Cache-Key: {cache_key}\n")
+            f.write(f"Answer: {label}\n")
+        return label
 
     class Step(BaseModel):
         explanation: str
@@ -121,6 +153,7 @@ def ask_gpt_object_in_box(img, boxes, save_dir, episode_idx, episode_step, ind, 
             ]
         }],
         response_format=DetResult,
+        trace_label="bbox_object_in_box",
     )
 
     answer = completion.choices[0].message.parsed
@@ -140,6 +173,14 @@ def ask_gpt_object_in_box(img, boxes, save_dir, episode_idx, episode_step, ind, 
         f.write(f'Answer: {answer}\n')
         f.write(f'\n')
         f.write(f'\n')
+
+    cache[cache_key] = {
+        "res": answer.res,
+        "cache_key": cache_key,
+        "bbox": [x1, y1, x2, y2],
+    }
+    with open(cache_path, "w", encoding="utf-8") as f:
+        json.dump(cache, f, ensure_ascii=False, indent=2, sort_keys=True)
 
     return answer.res
 
@@ -175,6 +216,7 @@ def refine_tag_with_target(res, target, save_dir, episode_idx, episode_step, ind
             },
         ],
         response_format=Result,
+        trace_label="refine_tag_with_target",
     )
 
     ans = completion.choices[0].message.parsed
@@ -243,6 +285,7 @@ def refine_tag_with_target_obj_list(res, target, save_dir, episode_idx, episode_
             },
         ],
         response_format=Result,
+        trace_label="refine_tag_with_target_obj_list",
     )
     ans = completion.choices[0].message.parsed
     if ans is None:
@@ -292,6 +335,7 @@ def ask_gpt_similar_objects(obj_list, target, vlm="cognav"):
             {"role": "user", "content": user_input},
         ],
         response_format=Result,
+        trace_label="similar_objects",
     )
 
     answer = completion.choices[0].message.parsed
@@ -367,6 +411,7 @@ def check_again_object_in_bbox(img_vis, target, save_dir, episode_idx, episode_s
             model=model_name,
             messages=messages,
             response_format=Result,
+            trace_label="check_again_object_in_bbox",
         )
     except Exception:
         if vlm != "gemini":
@@ -375,6 +420,7 @@ def check_again_object_in_bbox(img_vis, target, save_dir, episode_idx, episode_s
             model="gemini-2.0-flash",
             messages=messages,
             response_format=Result,
+            trace_label="check_again_object_in_bbox_retry",
         )
 
     answer = completion.choices[0].message.parsed

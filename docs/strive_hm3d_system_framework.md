@@ -93,7 +93,9 @@ cv_utils/
 llm_utils/
   cognav_llm_adapter.py              # CogNav LLMClient 适配 OpenAI parse 接口
 instruction_adapter/
-  contracts.py                       # InstructionPlan / TargetQuery / Constraint schema
+  contracts.py                       # InstructionPlan / ConceptQuery / TargetQuery / Constraint schema
+  grounding.py                       # 编译期 target/anchor concept grounding
+  concept_matcher.py                 # 运行时 concept-instance matcher 与 anchor ledger
   execution.py                       # count / any-success / sequence 执行状态
   constraints.py                     # room / attribute / relation 运行时约束评估
   spatial_graph.py                   # object-view 共视索引
@@ -440,15 +442,32 @@ metrics.mp4  # top-down map + 指标
 
 `save_trajectory()` 会把不同阶段产生的 frame 统一 resize 到首帧尺寸，避免 `imageio` 写 mp4 时因为尺寸不同失败。
 
+指令模式还会输出可审计的结构化日志：
+
+```text
+instruction_adapter/plan.json
+instruction_adapter/spec.json
+instruction_adapter/runtime_state_<step>.json
+final_verifier/evidence_<step>.json
+final_verifier/result_<step>.json
+lvlm_calls/0001_<kind>.json
+detection/object_box_cache.json
+```
+
+其中 `lvlm_calls/*.json` 保存每次真实 LLM/LVLM 调用的 `kind`、元数据和
+`raw_response`，不保存 prompt 图像 base64。`object_box_cache.json` 缓存同一
+bbox crop 的类别复核结果，避免重复调用视觉模型。
+
 ## 10. 终止验证数据流
 
 STRIVE 的最终停止现在由三层共同决定：
 
 ```text
 候选目标实例
-  -> check_again: bbox 视觉复核目标类别
-  -> final_check: 几何可见性检查
-  -> FinalInstructionVerifier: 原始自然语言指令满足度检查
+  -> check_again: 普通 benchmark 做 bbox 类别复核；指令模式只采集 bbox evidence
+  -> instruction mode 下立即复用该图做约束、原始指令和视角质量验证
+  -> final_check: 几何可见性检查（未提前完成时）
+  -> FinalInstructionVerifier: 原始自然语言指令满足度 + view feedback
 ```
 
 `FinalInstructionVerifier` 复用 CogNav 风格 LLM client。它的输入是：
@@ -460,21 +479,140 @@ CandidateInstance
 当前视角 bbox 图
 目标 crop 图
 bbox 几何事实
+view_quality_facts：中心偏移、边界余量、bbox 面积、距离、投影状态
 附近对象摘要
 预留空间关系证据
 ```
+
+对于带空间关系的指令，`ConstraintEvaluator` 会在 final verifier 前先验证
+动态语义边：
+
+```text
+candidate object record
+anchor object record
+check_again/current bbox image
+  -> DynamicRelationService
+  -> SemanticEdge(subject_uid, relation, object_uid)
+```
+
+成功边写入 `semantic_edges`；失败 pair 写入 `relation_pair_ledger`。失败粒度
+是对象对，不是目标类别或 anchor 概念。
 
 输出是结构化 `VerificationResult`：
 
 ```text
 accept: 可以 stop
 reject_candidate: 当前实例不是目标，写入 VerificationLedger 并继续探索
-need_better_view: 复用 STRIVE 视角优化再验证一次
+need_better_view: 语义可满足但当前证据视角不足，复用 STRIVE 视角优化再验证一次
 need_relation_check: 预留给动态语义边 verifier
 uncertain: 不终止，按 soft rejection 继续
 ```
 
+指令模式的停止条件是双条件：
+
+```text
+semantic_satisfied == true
+view_sufficient_for_stop == true
+```
+
+`view_sufficient_for_stop` 先由 VLM 根据 `bbox_center_norm`、
+`bbox_area_ratio`、`visible_projected_points`、距离和关系证据做软判断；随后
+`FinalInstructionVerifier` 会执行一层可配置的通用 view guard：
+
+```text
+projection must exist
+center_offset_norm should not be too large
+border_margin_norm should not be too small
+bbox_area_ratio should not be too small
+```
+
+这些是相机停止证据的几何硬约束，不是目标语义规则。默认阈值可通过
+`STRIVE_FINAL_VIEW_MAX_CENTER_OFFSET`、`STRIVE_FINAL_VIEW_MIN_BORDER_MARGIN`、
+`STRIVE_FINAL_VIEW_MIN_BBOX_AREA` 调整，也可用 `STRIVE_FINAL_VIEW_GUARD=0`
+关闭。
+
+如果 verifier 返回 `need_better_view`，agent 进入 `ViewControlState`。这不是
+物体规则状态机，而是围绕 verifier 给出的 `view_objective` 执行通用视角控制：
+
+```text
+ViewObjective:
+  keep_visible_roles
+  improve_goals
+  minimum_expected_improvement
+  accept_if_no_better_view
+```
+
+`whether_to_check_again()` 不写“book/shelf/chair”等规则，而是在到候选实例的可达路径上生成多个候选姿态，并用通用几何质量排序：
+
+```text
+score = visibility + centerability + border margin + projected area + distance suitability
+```
+
+`ViewControlState` 记录 baseline、已尝试 proposal、观测质量和剩余候选。若
+verifier 想 accept，但当前 evidence 相对 baseline 没有达到
+`STRIVE_VIEW_CONTROL_MIN_IMPROVEMENT` 且还有候选未尝试，控制层会继续
+`need_better_view`。这只约束执行闭环，最终是否满足原始指令仍由 relation
+verifier 和 FinalInstructionVerifier 决定。
+
+为避免 VLM 在弱远景上第一次就过度自信 `accept`，instruction mode 的首次
+accept 也会经过 initial-accept deferral：如果通用几何 proposal 预测可得到明显更好的
+final evidence，agent 会先执行该 better-view 子目标；如果没有明显改善空间，则保留
+verifier 的 accept。
+
+better-view 子目标会 pin 已验证的 `DynamicSemanticEdge`。例如
+`book_uid on cabinet_uid` 已经通过后，后续视角优化只重新评估视角质量，不重新把关系发现
+从零开始。若 mapper 在近距离把同一书架区域切成新的 book uid，约束层会通过
+`pinned_relation_context` 把它视为同一已接受语义区域的证据更新。
+
+对 `check_again` 产生的强视觉证据，关系几何预筛失败不再直接 hard reject；系统会允许
+VLM relation verifier 覆盖几何不确定性，并在缓存层绕过旧的 geometry failure。
+
 关键原则是“屏蔽实例，不屏蔽类别”。例如找红色椅子时，蓝色椅子被 verifier 拒绝后，只跳过该椅子实例；检测器后续发现其它 `chair` 实例仍会继续验证。
+
+### Concept Grounding And Anchor-First
+
+指令模式下，STRIVE 现在维护三类运行时状态：
+
+```text
+ConceptQuery:
+  编译期 LLM/VLM grounding 的指令概念。terminal target 和 relation anchor
+  使用同一 schema，但 terminal 标志不同。
+
+ConceptMatchRecord:
+  RuntimeConceptMatcher 判断 mapper object 是否满足某个 ConceptQuery。
+  非精确匹配由 LLM/VLM 决定，并按 instruction/concept/object 缓存。
+  多对象场景使用 `match_many()` 批量询问，避免每个 object 单独调用 LVLM。
+
+AnchorSearchLedger:
+  anchor-first 模式的参考物搜索记忆。某个 anchor 附近未找到 terminal
+  target 时，只屏蔽这个 anchor uid，不屏蔽整个 anchor concept。
+
+RelationPairLedger:
+  空间关系验证记忆。某个 terminal-anchor pair 失败后，只跳过该 pair；
+  其它 terminal 实例和其它 anchor 实例仍可继续组合验证。
+
+ViewControlState:
+  final verifier 请求 better view 后的通用视角控制记忆。它保存
+  view objective、baseline quality、proposal attempts 和 observed quality，
+  防止“一步 retry 后 VLM 直接 accept”导致提前停止。
+```
+
+`anchor_first_relation_search` 的数据流：
+
+```text
+InstructionPlan(book on shelf)
+  -> terminal concept: book
+  -> anchor concept: shelf
+  -> RuntimeConceptMatcher(book/books...)
+  -> 如果 terminal 未出现，RuntimeConceptMatcher(shelf/bookshelf/cabinet...)
+  -> 导航到 anchor reference
+  -> anchor 到达后记录 AnchorSearchLedger
+  -> 后续 terminal candidate + anchor instance 进入 DynamicRelationService
+  -> relation verified 后才允许 FinalInstructionVerifier accept
+```
+
+anchor reference 不会进入最终成功链；agent 在 final verifier 前会识别
+`_instruction_reference_role=anchor`，写入 ledger 后继续探索。
 
 日志位置：
 
@@ -495,6 +633,62 @@ export STRIVE_FINAL_VERIFIER=0     # 关闭，恢复旧停止行为
 ```
 
 普通 benchmark 模式不传 `--enable_instruction_adapter` / `--custom_instruction` 时没有 `InstructionPlan`，final verifier 在 agent 层直接旁路，不额外调用 VLM，也不改变原始 STRIVE 停止条件。
+
+### Instruction-Level Metrics
+
+`metrics.csv` 保留 Habitat 官方字段，例如：
+
+```text
+success
+spl
+distance to goal
+steps
+```
+
+这些字段仍按 HM3D ObjectNav 原始目标类别和距离阈值计算。自然语言指令模式额外写入：
+
+```text
+instruction_success
+instruction_decision
+instruction_accept_step
+accepted_candidate_uid
+accepted_relation_edge
+lvlm_call_count_by_type
+lvml_call_count_by_type
+```
+
+复杂指令实验需要同时看两类指标：
+
+```text
+success:
+  Habitat 原始 ObjectNav 成功，适合和 baseline 对齐。
+
+instruction_success:
+  原始自然语言指令、实例约束、动态语义边和 final verifier 的执行结果。
+```
+
+例如 `book on shelf` 在指令链路中可以 `instruction_success=True`，但 Habitat
+原始 `success` 仍可能是 0，因为官方 episode 只知道单一 object goal，不知道
+“on shelf” 这类动态语义关系。
+
+`lvlm_call_count_by_type` 是 JSON 字符串，包含：
+
+```text
+calls:
+  instruction_parser / concept_grounding / concept_match_batch /
+  relation_verifier / final_instruction_verifier / room_selection / ...
+cache_hits:
+  bbox_object_in_box / ...
+total_calls
+total_cache_hits
+```
+
+`lvml_call_count_by_type` 是早期文档拼写的兼容别名，内容与
+`lvlm_call_count_by_type` 相同。
+
+`instruction_adapter/runtime_state_<step>.json` 还会记录
+`concept_matcher_stats`，其中 `batch_llm_calls` 是真实批量请求次数，
+`batch_items_requested` 是这些请求覆盖的候选 object 数量。
 
 ## 11. 可替换模块
 

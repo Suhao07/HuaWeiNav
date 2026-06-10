@@ -359,6 +359,35 @@ logs/<save_dir>/episode-0/metrics.mp4
 - `depth.mp4`：深度图过程。
 - `metrics.mp4`：top-down map 和导航指标过程。
 
+指令模式下，`metrics.csv` 会额外包含：
+
+```text
+instruction_success
+instruction_decision
+instruction_accept_step
+accepted_candidate_uid
+accepted_relation_edge
+lvlm_call_count_by_type
+lvml_call_count_by_type
+```
+
+`success` 仍是 Habitat 原始 ObjectNav 指标；复杂自然语言指令应优先看
+`instruction_success`。例如空间关系任务可能已经通过 final verifier 和动态语义边
+确认，但官方 `success` 仍因原始单目标指标显示为 0。
+
+可审计日志：
+
+```text
+logs/<save_dir>/episode-*/lvlm_calls/                 # raw LLM/LVLM response
+logs/<save_dir>/episode-*/instruction_adapter/        # plan/spec/runtime_state
+logs/<save_dir>/episode-*/final_verifier/             # final evidence/result
+logs/<save_dir>/episode-*/detection/object_box_cache.json
+```
+
+`lvlm_call_count_by_type` 是 JSON 字符串，记录真实调用次数和缓存命中；其中
+`concept_match_batch` 表示一次批量 concept-instance grounding 请求，不等于
+候选 object 的数量。`lvml_call_count_by_type` 是兼容旧拼写的同内容别名。
+
 VS Code 中可以在 Explorer 里直接点击 mp4 预览；如果不能播放，右键选择 `Open With...` 再选择内置视频预览器。
 
 ## 7. 进入容器调试

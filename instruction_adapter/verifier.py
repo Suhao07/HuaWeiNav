@@ -40,7 +40,16 @@ Do not invent room/object facts that are not visible or provided. If a required
 condition cannot be determined from the evidence, do not accept.
 
 Return strict JSON:
-- satisfied: true only if the robot may stop for the original instruction.
+- satisfied: true only if the robot may stop for the original instruction from
+  the current evidence.
+- semantic_satisfied: true if the candidate and explicit instruction constraints
+  are satisfied, even if the current camera view is not yet sufficient to stop.
+- view_sufficient_for_stop: true if the current view is good enough for final
+  stopping evidence. Consider whether the target/relation are clearly visible,
+  the target is not clipped or too close to image borders, and the evidence is
+  not too weak. Use the provided geometry facts as factual cues, not as rigid
+  thresholds. A view can be semantically correct but still insufficient for
+  stopping if a clearer, more centered, less clipped, or closer view is needed.
 - decision:
   - accept: all explicit requirements are satisfied.
   - reject_candidate: the candidate is clearly the wrong instance or violates a hard requirement.
@@ -50,7 +59,28 @@ Return strict JSON:
 - confidence: number in [0, 1].
 - satisfied_constraints: short strings.
 - failed_constraints: short strings.
+- view_feedback: concise feedback for the navigation controller if a better
+  view is needed.
+- preferred_view_goal: a short natural-language view goal, e.g. keep both the
+  candidate and relation anchor visible while making the candidate more central.
+- view_objective: an optional JSON object for the geometry controller when
+  decision=need_better_view. It may include keep_visible_roles, improve_goals,
+  minimum_expected_improvement, accept_if_no_better_view, and reason.
 - reason: concise explanation grounded in the evidence.
+
+Important:
+- accept requires satisfied=true, semantic_satisfied=true, and
+  view_sufficient_for_stop=true.
+- If the candidate appears to satisfy the instruction but the target is near
+  the image border, very small, clipped, mostly low/outside the useful camera
+  area, or relation evidence is not jointly visible enough, return
+  decision=need_better_view with semantic_satisfied=true.
+- Do not reject a candidate only because the view is poor; use
+  need_better_view unless the candidate clearly violates the instruction.
+- If view_control history is provided, use it. If there are remaining feasible
+  proposals and previous attempts did not substantially improve the evidence,
+  prefer need_better_view over accept. If no better view remains, decide whether
+  limited-view acceptance is justified by the instruction and evidence.
 """
 
 
@@ -96,8 +126,13 @@ class VerificationResult:
     satisfied: bool
     decision: str
     confidence: float = 0.0
+    semantic_satisfied: bool = False
+    view_sufficient_for_stop: bool = True
     satisfied_constraints: list[str] = field(default_factory=list)
     failed_constraints: list[str] = field(default_factory=list)
+    view_feedback: str = ""
+    preferred_view_goal: str = ""
+    view_objective: dict[str, Any] = field(default_factory=dict)
     reason: str = ""
     diagnostics: dict[str, Any] = field(default_factory=dict)
 
@@ -107,10 +142,15 @@ class VerificationResult:
 
 class _ParsedVerification(BaseModel):
     satisfied: bool = False
+    semantic_satisfied: bool = False
+    view_sufficient_for_stop: bool = True
     decision: str = "uncertain"
     confidence: float = 0.0
     satisfied_constraints: list[str] = Field(default_factory=list)
     failed_constraints: list[str] = Field(default_factory=list)
+    view_feedback: str = ""
+    preferred_view_goal: str = ""
+    view_objective: dict[str, Any] = Field(default_factory=dict)
     reason: str = ""
 
 
@@ -254,12 +294,68 @@ class FinalInstructionVerifier:
     def __init__(self, vlm: str = "cognav"):
         self.vlm = vlm
 
+    @staticmethod
+    def _view_guard(evidence: dict[str, Any]) -> tuple[bool, list[str], str]:
+        """Generic geometry guard for final stop views.
+
+        这不是目标语义规则，而是相机停止证据的硬约束：目标不能完全投影失败，
+        也不应在最终 stop 图里过度贴边、过小或偏离中心。阈值全部可配置，
+        用于补足 VLM 偶尔把“语义正确但视角很差”的图直接 accept 的问题。
+        """
+
+        mode = os.getenv("STRIVE_FINAL_VIEW_GUARD", "1").lower()
+        if mode in ("0", "false", "no", "off"):
+            return True, [], ""
+        facts = dict((evidence or {}).get("view_quality_facts") or {})
+        failures: list[str] = []
+        if bool(facts.get("projection_failed", False)):
+            failures.append("target projection failed in final view")
+        center_offset = facts.get("center_offset_norm")
+        border_margin = facts.get("border_margin_norm")
+        area = facts.get("bbox_area_ratio")
+        try:
+            max_center_offset = float(os.getenv("STRIVE_FINAL_VIEW_MAX_CENTER_OFFSET", "0.35"))
+        except Exception:
+            max_center_offset = 0.35
+        try:
+            min_border_margin = float(os.getenv("STRIVE_FINAL_VIEW_MIN_BORDER_MARGIN", "0.08"))
+        except Exception:
+            min_border_margin = 0.08
+        try:
+            min_area = float(os.getenv("STRIVE_FINAL_VIEW_MIN_BBOX_AREA", "0.003"))
+        except Exception:
+            min_area = 0.003
+        try:
+            if center_offset is not None and float(center_offset) > max_center_offset:
+                failures.append("target is too far from the image center")
+        except Exception:
+            pass
+        try:
+            if border_margin is not None and float(border_margin) < min_border_margin:
+                failures.append("target is too close to the image border")
+        except Exception:
+            pass
+        try:
+            if area is not None and float(area) < min_area:
+                failures.append("target projection is too small for final stop evidence")
+        except Exception:
+            pass
+        if not failures:
+            return True, [], ""
+        preferred = (
+            "Move to a viewpoint where the candidate remains visible, occupies a clearer area, "
+            "and is closer to the image center; keep any required relation anchor visible."
+        )
+        return False, failures, preferred
+
     def _fallback(self, reason: str) -> VerificationResult:
         # When LLM is intentionally unavailable, preserve baseline behavior.
         return VerificationResult(
             satisfied=True,
             decision="accept",
             confidence=0.0,
+            semantic_satisfied=True,
+            view_sufficient_for_stop=True,
             reason=f"final verifier fallback accepted: {reason}",
             diagnostics={"fallback": reason},
         )
@@ -311,6 +407,7 @@ class FinalInstructionVerifier:
                     {"role": "user", "content": content},
                 ],
                 response_format=_ParsedVerification,
+                trace_label="final_instruction_verifier",
             )
             parsed = completion.choices[0].message.parsed
         except Exception as exc:
@@ -321,12 +418,60 @@ class FinalInstructionVerifier:
         if decision not in allowed:
             decision = "accept" if bool(getattr(parsed, "satisfied", False)) else "uncertain"
         confidence = max(0.0, min(1.0, _safe_float(getattr(parsed, "confidence", 0.0))))
+        semantic_satisfied = bool(getattr(parsed, "semantic_satisfied", False))
+        view_sufficient = bool(getattr(parsed, "view_sufficient_for_stop", True))
+        parsed_satisfied = bool(getattr(parsed, "satisfied", False))
+        if parsed_satisfied:
+            semantic_satisfied = True
+        if decision == "accept" and not view_sufficient:
+            decision = "need_better_view"
+        view_guard_ok, view_guard_failures, view_guard_goal = self._view_guard(evidence)
+        if semantic_satisfied and decision == "accept" and not view_guard_ok:
+            decision = "need_better_view"
+            view_sufficient = False
+            parsed_satisfied = False
+        failed_constraints = list(getattr(parsed, "failed_constraints", []) or [])
+        for failure in view_guard_failures:
+            if failure not in failed_constraints:
+                failed_constraints.append(failure)
+        view_feedback = str(getattr(parsed, "view_feedback", "") or "")
+        preferred_view_goal = str(getattr(parsed, "preferred_view_goal", "") or "")
+        reason = str(getattr(parsed, "reason", "") or "")
+        if view_guard_failures and not view_feedback:
+            view_feedback = "; ".join(view_guard_failures)
+        if view_guard_goal and not preferred_view_goal:
+            preferred_view_goal = view_guard_goal
+        view_objective = dict(getattr(parsed, "view_objective", {}) or {})
+        if decision == "need_better_view" and not view_objective:
+            view_objective = {
+                "keep_visible_roles": ["candidate"],
+                "improve_goals": ["clarity", "centering", "scale"],
+                "minimum_expected_improvement": "moderate",
+                "accept_if_no_better_view": False,
+                "reason": view_feedback or reason or "Need stronger final stop evidence.",
+            }
+        if view_guard_failures:
+            suffix = "Generic view guard requested a better final stop view: " + "; ".join(view_guard_failures)
+            reason = f"{reason} {suffix}".strip()
         return VerificationResult(
-            satisfied=bool(getattr(parsed, "satisfied", False)) and decision == "accept",
+            satisfied=parsed_satisfied and decision == "accept" and view_sufficient,
             decision=decision,
             confidence=confidence,
+            semantic_satisfied=semantic_satisfied,
+            view_sufficient_for_stop=view_sufficient,
             satisfied_constraints=list(getattr(parsed, "satisfied_constraints", []) or []),
-            failed_constraints=list(getattr(parsed, "failed_constraints", []) or []),
-            reason=str(getattr(parsed, "reason", "") or ""),
-            diagnostics={"source": "vlm", "model_provider": self.vlm},
+            failed_constraints=failed_constraints,
+            view_feedback=view_feedback,
+            preferred_view_goal=preferred_view_goal,
+            view_objective=view_objective,
+            reason=reason,
+            diagnostics={
+                "source": "vlm",
+                "model_provider": self.vlm,
+                "view_guard": {
+                    "ok": view_guard_ok,
+                    "failures": view_guard_failures,
+                    "enabled": os.getenv("STRIVE_FINAL_VIEW_GUARD", "1").lower() not in ("0", "false", "no", "off"),
+                },
+            },
         )

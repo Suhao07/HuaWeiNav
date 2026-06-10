@@ -45,6 +45,89 @@ class SemanticEdge:
         return asdict(self)
 
 
+@dataclass
+class RelationPairRecord:
+    """Instruction-scoped memory for one candidate-anchor relation pair.
+
+    关系失败只说明“这个目标实例和这个 anchor 实例不满足该关系”，
+    不能屏蔽目标类别，也不能屏蔽 anchor 类别。这个 ledger 的粒度与
+    SysNav 的动态 object-object edge 对齐。
+    """
+
+    instruction_hash: str
+    subject_id: str
+    relation: str
+    object_id: str
+    status: str
+    confidence: float = 0.0
+    step: int | None = None
+    reason: str = ""
+    evidence_view_ids: list[str] = field(default_factory=list)
+
+    @property
+    def key(self) -> tuple[str, str, str, str]:
+        return (
+            str(self.instruction_hash),
+            str(self.subject_id),
+            normalize_relation(self.relation),
+            str(self.object_id),
+        )
+
+    def as_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+class RelationPairLedger:
+    """Cache accepted/rejected object-object relation pairs."""
+
+    def __init__(self):
+        self.records: dict[tuple[str, str, str, str], RelationPairRecord] = {}
+
+    def reset(self):
+        self.records.clear()
+
+    def get(self, instruction_hash: str, subject_id: str, relation: str, object_id: str) -> RelationPairRecord | None:
+        return self.records.get((str(instruction_hash), str(subject_id), normalize_relation(relation), str(object_id)))
+
+    def is_rejected(self, instruction_hash: str, subject_id: str, relation: str, object_id: str) -> bool:
+        record = self.get(instruction_hash, subject_id, relation, object_id)
+        return bool(record and record.status == "rejected_relation")
+
+    def is_accepted(self, instruction_hash: str, subject_id: str, relation: str, object_id: str) -> bool:
+        record = self.get(instruction_hash, subject_id, relation, object_id)
+        return bool(record and record.status == "accepted_relation")
+
+    def mark(
+        self,
+        *,
+        instruction_hash: str,
+        subject_id: str,
+        relation: str,
+        object_id: str,
+        status: str,
+        confidence: float = 0.0,
+        step: int | None = None,
+        reason: str = "",
+        evidence_view_ids: list[str] | None = None,
+    ) -> RelationPairRecord:
+        record = RelationPairRecord(
+            instruction_hash=str(instruction_hash),
+            subject_id=str(subject_id),
+            relation=normalize_relation(relation),
+            object_id=str(object_id),
+            status=str(status),
+            confidence=max(0.0, min(1.0, float(confidence or 0.0))),
+            step=step,
+            reason=str(reason or ""),
+            evidence_view_ids=list(evidence_view_ids or []),
+        )
+        self.records[record.key] = record
+        return record
+
+    def as_dict(self) -> dict[str, dict[str, Any]]:
+        return {"|".join(key): record.as_dict() for key, record in self.records.items()}
+
+
 class SemanticEdgeCache:
     """Small deterministic cache for expensive relation checks."""
 
@@ -104,7 +187,7 @@ class DynamicSemanticEdgeVerifier:
     """Lazy semantic edge verifier following the SysNav split.
 
     几何只做硬过滤：明显不可能的候选对直接拒绝；语义关系是否成立交给 VLM
-    callback。这样解析模块不需要知道“电视常在客厅”这类常识，运行时也不会对
+    callback。这样解析模块不需要知道“电视常在客厅”这类常识 运行时也不会对
     所有物体对做昂贵推理。
     """
 
@@ -130,12 +213,24 @@ class DynamicSemanticEdgeVerifier:
     ) -> SemanticEdge:
         relation = normalize_relation(relation)
         query = RelationQuery(str(subject.get("id", "")), relation, str(object_.get("id", "")))
+        evidence = list(evidence_views or [])
+        allow_visual_override = any(bool(view.get("allow_vlm_despite_geometry")) for view in evidence)
         cached = self.cache.get(query)
         if cached is not None:
-            return cached
+            if not (allow_visual_override and not cached.verified and cached.source == "geometry"):
+                return cached
 
-        evidence = list(evidence_views or [])
         if not self._geometry_allows(subject, relation, object_):
+            # 小物体点云高度有时不稳定。若调用方提供了
+            # check_again 这类明确的视觉复核图，可以让 VLM 覆盖几何预筛；
+            # 否则仍保持几何硬约束，避免无根据地验证所有对象对。
+            if allow_visual_override and vlm_callback is not None:
+                prompt = self._build_vlm_prompt(subject, relation, object_)
+                result = vlm_callback(relation, subject, object_, evidence, prompt)
+                edge = self._coerce_vlm_result(query, evidence, result)
+                if not edge.reason:
+                    edge.reason = "Geometry prefilter failed, but visual evidence override was used."
+                return self.cache.put(edge)
             return self.cache.put(
                 SemanticEdge(
                     subject_id=query.subject_id,

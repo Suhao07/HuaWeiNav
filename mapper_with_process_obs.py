@@ -17,9 +17,11 @@ import os
 from mapping_utils.representation import *
 import cv2
 from cv_utils.image_perceiver import *
+from instruction_adapter.concept_matcher import AnchorSearchLedger, RuntimeConceptMatcher
 from instruction_adapter.constraints import ConstraintEvaluator
-from instruction_adapter.ontology import normalize_term
+from instruction_adapter.ontology import compact_key, normalize_term
 from instruction_adapter.relation_verifier import DynamicRelationService
+from instruction_adapter.semantic_edges import RelationPairLedger
 from instruction_adapter.spatial_graph import InstructionSpatialGraph
 from instruction_adapter.verifier import VerificationLedger, candidate_from_object
 from llm_utils.nav_prompt_room import *
@@ -75,10 +77,14 @@ class Instruct_Mapper:
         self.obj_number = 2
         self.target = ""
         self.target_list = []
+        self.perception_target_list = []
         self.target_aliases = []
         self.instruction_plan = None
         self.instruction_spec = None
         self.verification_ledger = VerificationLedger()
+        self.concept_matcher = RuntimeConceptMatcher(vlm=vlm)
+        self.anchor_search_ledger = AnchorSearchLedger()
+        self.relation_pair_ledger = RelationPairLedger()
         self.instruction_execution_state = None
         self.instruction_spatial_graph = InstructionSpatialGraph()
         self.instruction_relation_service = DynamicRelationService(vlm=vlm)
@@ -166,10 +172,14 @@ class Instruct_Mapper:
 
         self.target = ""
         self.target_list = []
+        self.perception_target_list = []
         self.target_aliases = []
         self.instruction_plan = None
         self.instruction_spec = None
         self.verification_ledger.reset()
+        self.concept_matcher.reset()
+        self.anchor_search_ledger.reset()
+        self.relation_pair_ledger.reset()
         self.instruction_execution_state = None
         self.instruction_spatial_graph.reset()
         self.instruction_relation_service.reset()
@@ -260,7 +270,7 @@ class Instruct_Mapper:
     def _is_target_tag(self, tag):
         """Return whether a mapped object tag may satisfy the task target.
 
-        中文说明：这里严格只使用 adapter 输出的 target aliases / detector
+        这里严格只使用 adapter 输出的 target aliases / detector
         prompts。support objects 只服务房间搜索，不能在这里通过，否则
         "watch movie" 会把 couch/sofa 误判成可停止目标。
         """
@@ -282,6 +292,79 @@ class Instruct_Mapper:
             self._raw_instruction_for_verifier(),
             candidate.uid,
         )
+
+    def _anchor_concepts_for_plan(self):
+        """Return non-terminal concepts that may guide anchor-first search."""
+        plan = getattr(self, "instruction_plan", None)
+        if plan is None:
+            return []
+        concepts = []
+        for target in getattr(plan, "anchor_targets", []):
+            concepts.append(target.concept_query())
+        for constraint in getattr(plan, "constraints", []) or []:
+            concept = getattr(constraint, "object_concept", None)
+            if concept is not None and not getattr(concept, "terminal", False):
+                concepts.append(concept)
+        seen = set()
+        out = []
+        for concept in concepts:
+            key = getattr(concept, "id", "") or normalize_term(getattr(concept, "name", ""))
+            if key and key not in seen:
+                seen.add(key)
+                out.append(concept)
+        return out
+
+    def _anchor_concepts_for_terminal_target(self, plan, target):
+        """Return relation anchors required by a terminal target.
+
+        显式空间关系中的 anchor 是硬约束证据。对于
+        `book on shelf`，如果当前地图里没有能匹配 shelf concept 的实例，
+        就不应该先追一个孤立 book 否则会卡在错误目标上。
+        """
+        target_terms = {normalize_term(x) for x in target.match_terms}
+        target_terms.add(normalize_term(target.id))
+        concepts = []
+        for constraint in getattr(plan, "constraints", []) or []:
+            ctype = normalize_term(getattr(constraint, "type", ""))
+            if ctype not in ("spatial", "relation", "object_relation", "co_occurrence"):
+                continue
+            subject = normalize_term(getattr(constraint, "subject", ""))
+            if subject and subject not in target_terms:
+                continue
+            concept = getattr(constraint, "object_concept", None)
+            if concept is not None and not getattr(concept, "terminal", False):
+                concepts.append(concept)
+        return concepts
+
+    def _has_unblocked_anchor_evidence(self, plan, target, candidate_obj, step=None, debug=None):
+        concepts = self._anchor_concepts_for_terminal_target(plan, target)
+        if not concepts:
+            return True
+        raw_instruction = self._raw_instruction_for_verifier()
+        for concept in concepts:
+            objs = [obj for obj in self.objects if obj is not candidate_obj]
+            records = self.concept_matcher.match_many(
+                raw_instruction=raw_instruction,
+                concept=concept,
+                objects=objs,
+                step=step,
+            )
+            by_uid = {record.object_uid: record for record in records}
+            for obj in objs:
+                if obj is candidate_obj:
+                    continue
+                anchor_uid = candidate_from_object(obj, canonical_label=concept.name, step=step).uid
+                record = by_uid.get(anchor_uid)
+                if record is None:
+                    continue
+                if debug is not None:
+                    debug.append(record.as_dict())
+                if not record.matches_concept:
+                    continue
+                if self.anchor_search_ledger.is_blocked(raw_instruction, concept.id, anchor_uid):
+                    continue
+                return True
+        return False
 
     def add_node(self, position, pcd=None, has_frontier=False, frontier_idxs=np.array([]), block_current=False):
 
@@ -1148,6 +1231,13 @@ class Instruct_Mapper:
                         argmax_entity.tag = new_tag
                         argmax_entity.confidence = argmax_entity.conf_list[new_tag]
                     else:
+                        # 部分 verifier 路径会临时把 tag 置为 nothing
+                        # 以退出当前候选，但历史类别字典可能来自旧版本日志或其它
+                        # 路径而缺 key。这里补齐默认值，避免地图关联阶段崩溃。
+                        if ori_tag not in argmax_entity.num_list:
+                            argmax_entity.num_list[ori_tag] = 1
+                        if ori_tag not in argmax_entity.conf_list:
+                            argmax_entity.conf_list[ori_tag] = argmax_entity.confidence
                         n1 = argmax_entity.num_list[ori_tag]
                         n2 = argmax_entity.num_list[new_tag]
                         c1 = argmax_entity.conf_list[ori_tag]
@@ -2718,6 +2808,7 @@ class Instruct_Mapper:
                         "content": prompt_info
                     }],
                     response_format=Reasoning,
+                    trace_label="room_selection",
                 )
             except Exception as e:
                 if self.vlm != 'gemini':
@@ -2735,6 +2826,7 @@ class Instruct_Mapper:
                         "content": prompt_info
                     }],
                     response_format=Reasoning,
+                    trace_label="room_selection_retry",
                 )
         if self.vlm == 'openai':
             client, _ = get_client_and_model(self.vlm)
@@ -2749,6 +2841,7 @@ class Instruct_Mapper:
                     "content": prompt_info
                 }],
                 response_format=Reasoning,
+                trace_label="room_selection",
             )
 
         answer = completion.choices[0].message.parsed
@@ -2882,6 +2975,7 @@ class Instruct_Mapper:
                     "content": prompt_info
                 }],
                 response_format=Reasoning,
+                trace_label="object_found_planner",
             )
         if self.vlm == 'openai':
             client, _ = get_client_and_model(self.vlm)
@@ -2896,6 +2990,7 @@ class Instruct_Mapper:
                     "content": prompt_info
                 }],
                 response_format=Reasoning,
+                trace_label="object_found_planner",
             )
 
         answer = completion.choices[0].message.parsed
@@ -2952,22 +3047,126 @@ class Instruct_Mapper:
 
         target_objs = []
         skipped_objs = []
+        concept_debug = []
+        terminal_match_records = {}
+        raw_instruction = self._raw_instruction_for_verifier()
+        if plan is not None:
+            # terminal concept 也必须批量 grounding。否则每次
+            # object_found 都会对所有非 exact 对象逐个发图像 VLM 请求，调用量
+            # 会随地图对象数线性爆炸。
+            for target in plan.terminal_targets:
+                records = self.concept_matcher.match_many(
+                    raw_instruction=raw_instruction,
+                    concept=target.concept_query(),
+                    objects=list(self.objects),
+                    step=step,
+                )
+                for record in records:
+                    terminal_match_records[(target.id, record.object_uid)] = record
         for obj in self.objects:
             tag = obj.tag
-            if self._is_target_tag(tag):
+            matched_target = None
+            if plan is not None:
+                for target in plan.terminal_targets:
+                    obj_uid = candidate_from_object(obj, canonical_label=target.name, step=step).uid
+                    record = terminal_match_records.get((target.id, obj_uid))
+                    if record is None:
+                        continue
+                    if record.matches_concept and record.terminal_eligible:
+                        matched_target = target
+                        concept_debug.append(record.as_dict())
+                        break
+            elif self._is_target_tag(tag):
+                matched_target = None
+
+            if matched_target is not None or (plan is None and self._is_target_tag(tag)):
                 if self._is_verifier_rejected(obj, step=step):
-                    # 中文说明：verifier 拒绝的是这个对象实例，不是整个类别。
+                    # verifier 拒绝的是这个对象实例，不是整个类别。
                     # 例如蓝色椅子不满足“红色椅子”，但其它 chair 仍可继续验证。
                     skipped_objs.append(candidate_from_object(obj, canonical_label=self.target, step=step).as_dict())
                     continue
+                if (
+                    plan is not None
+                    and matched_target is not None
+                    and compact_key(getattr(plan.execution, "mode", "")) == "anchor_first_relation_search"
+                    and not self._has_unblocked_anchor_evidence(plan, matched_target, obj, step=step, debug=concept_debug)
+                ):
+                    skipped_objs.append({
+                        **candidate_from_object(obj, canonical_label=matched_target.name, step=step).as_dict(),
+                        "skip_reason": "missing_unblocked_relation_anchor_evidence",
+                    })
+                    continue
+                if matched_target is not None:
+                    obj.tag = matched_target.name
+                    obj.conf_list[matched_target.name] = obj.confidence
                 target_objs.append(obj)
         if len(target_objs) == 0:
+            anchor_obj = None
+            anchor_record = None
+            if plan is not None and compact_key(getattr(plan.execution, "mode", "")) == "anchor_first_relation_search":
+                anchor_candidates = []
+                for concept in self._anchor_concepts_for_plan():
+                    raw_instruction = self._raw_instruction_for_verifier()
+                    records = self.concept_matcher.match_many(
+                        raw_instruction=raw_instruction,
+                        concept=concept,
+                        objects=list(self.objects),
+                        step=step,
+                    )
+                    by_uid = {record.object_uid: record for record in records}
+                    for obj in self.objects:
+                        candidate = candidate_from_object(obj, canonical_label=concept.name, step=step)
+                        record = by_uid.get(candidate.uid)
+                        if record is None:
+                            continue
+                        concept_debug.append(record.as_dict())
+                        if not record.matches_concept:
+                            continue
+                        if self.anchor_search_ledger.is_blocked(
+                            raw_instruction,
+                            concept.id,
+                            candidate.uid,
+                        ):
+                            continue
+                        anchor_candidates.append((record.confidence, concept, obj, candidate, record))
+                if anchor_candidates:
+                    anchor_candidates = sorted(anchor_candidates, key=lambda item: item[0], reverse=True)
+                    _, concept, anchor_obj, candidate, anchor_record = anchor_candidates[0]
+                    # anchor 只是参考导航点，绝不能触发最终成功。
+                    # agent 到达后会把该实例写入 AnchorSearchLedger，再继续找 terminal target。
+                    anchor_obj._instruction_reference_role = "anchor"
+                    anchor_obj._instruction_anchor_concept_id = concept.id
+                    anchor_obj._instruction_anchor_concept_name = concept.name
+                    anchor_obj._instruction_anchor_candidate_uid = candidate.uid
+                    self.anchor_search_ledger.mark(
+                        raw_instruction=self._raw_instruction_for_verifier(),
+                        concept_id=concept.id,
+                        anchor_uid=candidate.uid,
+                        status="navigating_to_anchor",
+                        step=step,
+                        reason=anchor_record.reason,
+                    )
+            if anchor_obj is not None:
+                answer = (
+                    f"No terminal target '{self.target}' found; navigate to anchor reference "
+                    f"'{anchor_obj.tag}' for local search. Anchor is not a goal."
+                )
+                with open(f'{self.save_dir}/episode-{idx}/no_gpt_obj/answer_{step}.txt', 'w') as f:
+                    f.write(f'Input: {prompt_info}\n')
+                    f.write(f'Answer: {answer}\n')
+                    f.write(f'Anchor match: {json.dumps(anchor_record.as_dict() if anchor_record else {}, ensure_ascii=False)}\n')
+                    f.write(f'Concept matches: {json.dumps(concept_debug, ensure_ascii=False)}\n')
+                    f.write(f'\n')
+                    f.write(f'\n')
+                return True, anchor_obj
             answer = f"No target object '{self.target}' found; accepted aliases: {sorted(self._target_match_terms())}"
             with open(f'{self.save_dir}/episode-{idx}/no_gpt_obj/answer_{step}.txt', 'w') as f:
                 f.write(f'Input: {prompt_info}\n')
                 f.write(f'Answer: {answer}\n')
                 if skipped_objs:
                     f.write(f'Skipped by final verifier: {json.dumps(skipped_objs, ensure_ascii=False)}\n')
+                if concept_debug:
+                    f.write(f'Concept matches: {json.dumps(concept_debug, ensure_ascii=False)}\n')
                 f.write(f'\n')
                 f.write(f'\n')
             return False, None
@@ -2984,6 +3183,8 @@ class Instruct_Mapper:
             f.write(f'Answer: {answer}\n')
             if skipped_objs:
                 f.write(f'Skipped by final verifier: {json.dumps(skipped_objs, ensure_ascii=False)}\n')
+            if concept_debug:
+                f.write(f'Concept matches: {json.dumps(concept_debug, ensure_ascii=False)}\n')
             f.write(f'\n')
             f.write(f'\n')
 
@@ -3042,6 +3243,7 @@ class Instruct_Mapper:
                     "content": prompt_info
                 }],
                 response_format=Reasoning,
+                trace_label="relocate_planner",
             )
         if self.vlm == 'openai':
             client, _ = get_client_and_model(self.vlm)
@@ -3056,6 +3258,7 @@ class Instruct_Mapper:
                     "content": prompt_info
                 }],
                 response_format=Reasoning,
+                trace_label="relocate_planner",
             )
 
         answer = completion.choices[0].message.parsed

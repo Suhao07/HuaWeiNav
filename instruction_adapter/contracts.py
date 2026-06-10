@@ -20,6 +20,33 @@ def _dedupe_text(values) -> list[str]:
 
 
 @dataclass
+class ConceptQuery:
+    """Unified instruction concept for terminal targets and anchors.
+
+    ConceptQuery 是“指令概念”，不是 detector label。LLM/VLM
+    grounding 产生 detector_terms、aliases、description 和 negative_terms
+    并写入 plan.json 
+    """
+
+    id: str
+    name: str
+    role: str = "primary"
+    detector_terms: list[str] = field(default_factory=list)
+    aliases: list[str] = field(default_factory=list)
+    description: str = ""
+    negative_terms: list[str] = field(default_factory=list)
+    terminal: bool = False
+    source: str = ""
+
+    def as_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @property
+    def match_terms(self) -> list[str]:
+        return _dedupe_text([self.name] + list(self.detector_terms) + list(self.aliases))
+
+
+@dataclass
 class TargetQuery:
     """One object concept extracted from an instruction.
 
@@ -37,13 +64,30 @@ class TargetQuery:
     min_count: int = 1
     terminal: bool = True
     source: str = ""
+    concept: ConceptQuery | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
 
     @property
     def match_terms(self) -> list[str]:
-        return _dedupe_text([self.name] + list(self.detector_terms) + list(self.aliases))
+        terms = [self.name] + list(self.detector_terms) + list(self.aliases)
+        if self.concept is not None:
+            terms.extend(self.concept.match_terms)
+        return _dedupe_text(terms)
+
+    def concept_query(self) -> ConceptQuery:
+        if self.concept is not None:
+            return self.concept
+        return ConceptQuery(
+            id=self.id,
+            name=self.name,
+            role=self.role,
+            detector_terms=list(self.detector_terms),
+            aliases=list(self.aliases),
+            terminal=self.terminal,
+            source=self.source,
+        )
 
 
 @dataclass
@@ -63,6 +107,8 @@ class Constraint:
     hardness: str = "soft"
     verifier: str = "planner"
     source: str = ""
+    object_concept: ConceptQuery | None = None
+    subject_concept: ConceptQuery | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -109,6 +155,7 @@ class InstructionPlan:
     constraints: list[Constraint] = field(default_factory=list)
     search_priors: SearchPriors = field(default_factory=SearchPriors)
     execution: ExecutionPolicy = field(default_factory=ExecutionPolicy)
+    concept_queries: list[ConceptQuery] = field(default_factory=list)
     valid: bool = False
     diagnostics: dict[str, Any] = field(default_factory=dict)
 
@@ -118,6 +165,13 @@ class InstructionPlan:
     @property
     def terminal_targets(self) -> list[TargetQuery]:
         return [target for target in self.targets if target.terminal]
+
+    @property
+    def anchor_targets(self) -> list[TargetQuery]:
+        return [
+            target for target in self.targets
+            if not target.terminal and target.role in ("anchor", "support", "secondary")
+        ]
 
     @property
     def active_terminal_target(self) -> TargetQuery | None:

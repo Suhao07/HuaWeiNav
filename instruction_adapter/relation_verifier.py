@@ -117,6 +117,7 @@ class VLMRelationVerifier:
                     {"role": "user", "content": content},
                 ],
                 response_format=_ParsedRelationResult,
+                trace_label="relation_verifier",
             )
             parsed = completion.choices[0].message.parsed
             return {

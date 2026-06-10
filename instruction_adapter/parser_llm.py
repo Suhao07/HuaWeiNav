@@ -142,6 +142,7 @@ def parse_instruction_with_llm(
                 },
             ],
             response_format=ParsedInstruction,
+            trace_label="instruction_parser",
         )
         parsed = completion.choices[0].message.parsed
     except Exception as exc:
