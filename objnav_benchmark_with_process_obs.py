@@ -1,17 +1,13 @@
 import argparse
 import csv
-import gzip
 import json
 import os
-import sys
-from pathlib import Path
 
 import habitat
 from loguru import logger
-from matplotlib.pyplot import savefig
 from tqdm import tqdm
 
-from config_utils import hm3d_config, mp3d_config
+from benchmark import available_benchmarks, get_provider
 from constants import *
 from cv_utils.gpt_utils import ask_gpt_similar_objects
 #指令解析模块
@@ -28,10 +24,6 @@ from objnav_agent_with_process_obs import HM3D_Objnav_Agent
 os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 os.environ["MAGNUM_LOG"] = "quiet"
 os.environ["HABITAT_SIM_LOG"] = "quiet"
-
-
-def _safe_name(value):
-    return "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in value)
 
 
 def write_metrics(metrics, path="objnav_hm3d.csv"):
@@ -97,96 +89,24 @@ def _filter_episodes(env, scene_id_contains=None, object_category=None):
     )
 
 
-def _candidate_content_files(data_root, stage, scene_id):
-    scene_file = f"{scene_id}.json.gz"
-    explicit = os.getenv("STRIVE_SCENE_OBJECT_DATASET")
-    if explicit:
-        yield Path(explicit)
-
-    preferred = [
-        f"datasets/objectnav/hm3d_ovon/v1/val_seen_complex_balanced_2k/content/{scene_file}",
-        f"datasets/objectnav/hm3d_ovon/v1/val_seen_complex_instruction/content/{scene_file}",
-        f"datasets/objectnav/hm3d_ovon/v1/val_seen_instruction_balanced_3k/content/{scene_file}",
-        f"datasets/objectnav/hm3d_ovon/v1/val_seen_instruction_2k/content/{scene_file}",
-        f"datasets/objectnav/hm3d/v1/{stage}_instruction/content/{scene_file}",
-        f"objectgoal_hm3d_ovon/val_seen/content/{scene_file}",
-        f"objectgoal_hm3d/{stage}/content/{scene_file}",
-        f"objectgoal_hm3d_custom/{stage}/content/{scene_file}",
-        f"objectgoal_hm3d/{stage}_mini/content/{scene_file}",
-    ]
-    for rel in preferred:
-        yield Path(data_root) / rel
-
-
-def _episode_category(episode):
-    return str(episode.get("object_category", episode.get("object_category_name", ""))).lower()
-
-
-def _prepare_scene_object_dataset(args, stage="val"):
-    if not args.scene_id or not args.object_category:
-        return
-
-    data_root = os.getenv("HM3D_DATA_PATH")
-    if not data_root:
-        raise ValueError("HM3D_DATA_PATH is not set; cannot locate scene content files.")
-
-    matched_source = None
-    matched_episodes = None
-    target_category = args.object_category.lower()
-    for path in _candidate_content_files(data_root, stage, args.scene_id):
-        if not path.exists():
-            continue
-        with gzip.open(path, "rt", encoding="utf-8") as f:
-            dataset = json.load(f)
-        episodes = [
-            episode for episode in dataset.get("episodes", [])
-            if _episode_category(episode) == target_category
-        ]
-        if episodes:
-            matched_source = path
-            matched_episodes = episodes
-            break
-
-    if not matched_episodes:
-        searched = [str(path) for path in _candidate_content_files(data_root, stage, args.scene_id)]
-        raise ValueError(
-            f"No episode matched scene_id={args.scene_id!r}, object_category={args.object_category!r}. "
-            f"Searched: {searched}"
-        )
-
-    if args.episode_rank < 0 or args.episode_rank >= len(matched_episodes):
-        raise IndexError(
-            f"episode_rank={args.episode_rank} is out of range; "
-            f"{len(matched_episodes)} matched episodes are available."
-        )
-
-    with gzip.open(matched_source, "rt", encoding="utf-8") as f:
-        filtered_dataset = json.load(f)
-    filtered_dataset["episodes"] = [matched_episodes[args.episode_rank]]
-
-    output_dir = Path(args.filtered_dataset_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = output_dir / (
-        f"{_safe_name(args.scene_id)}_{_safe_name(args.object_category)}_rank{args.episode_rank}.json.gz"
-    )
-    with gzip.open(output_path, "wt", encoding="utf-8") as f:
-        json.dump(filtered_dataset, f)
-
-    os.environ["HM3D_DATASET_PATH"] = str(output_path.resolve())
-    args.dataset_episodes = 1
-    args.eval_episodes = 1
-    args.start_episode = 0
-    logger.info(
-        "Prepared filtered dataset: source={}, output={}, matched_count={}, episode_id={}",
-        matched_source,
-        output_path,
-        len(matched_episodes),
-        filtered_dataset["episodes"][0].get("episode_id"),
-    )
-
-
 def get_args():
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--benchmark",
+        type=str,
+        default="auto",
+        choices=["auto"] + available_benchmarks(),
+        help="Benchmark provider. Use auto for backwards-compatible HM3D/OVON smoke tests.",
+    )
+    parser.add_argument(
+        "--benchmark_split",
+        type=str,
+        default=None,
+        help="Explicit provider split, e.g. val_seen_instruction_balanced_3k for HM3D-OVON.",
+    )
+    parser.add_argument("--dataset_root", type=str, default="")
+    parser.add_argument("--dataset_path", type=str, default="")
+    parser.add_argument("--success_distance", type=float, default=None)
     parser.add_argument("--eval_episodes", type=int, default=1000)
     parser.add_argument("--start_episode", type=int, default=0)
     parser.add_argument("--dataset_episodes", type=int, default=None)
@@ -219,14 +139,17 @@ if __name__ == "__main__":
     args.save_dir = "logs/" + args.save_dir
     os.makedirs(args.save_dir, exist_ok=True)
 
-    # 通过 scene_id/object_category 指定任务时，先生成单 episode 数据集。
-    # 这样 Habitat 只会看到一个 episode，避免不同版本 iterator 的采样顺序差异。
-    _prepare_scene_object_dataset(args, stage="val")
+    benchmark_provider = get_provider(args)
+    benchmark_spec = benchmark_provider.prepare(args)
+    with open(os.path.join(args.save_dir, "benchmark_spec.json"), "w", encoding="utf-8") as f:
+        json.dump(benchmark_spec.as_dict(), f, ensure_ascii=False, indent=2, sort_keys=True)
+    logger.info("Benchmark spec: {}", benchmark_spec.as_dict())
 
     dataset_episodes = args.dataset_episodes or max(args.eval_episodes, args.start_episode + 1)
-    habitat_config = hm3d_config(stage='val', episodes=dataset_episodes)
+    habitat_config = benchmark_provider.make_config(benchmark_spec, episodes=dataset_episodes)
     habitat_env = habitat.Env(habitat_config)
-    _filter_episodes(habitat_env, args.scene_id_contains, args.object_category)
+    if not benchmark_spec.is_filtered:
+        _filter_episodes(habitat_env, args.scene_id_contains, args.object_category)
     habitat_mapper = Instruct_Mapper(
         habitat_camera_intrinsic(habitat_config),
         pcd_resolution=args.mapper_resolution,
@@ -350,6 +273,12 @@ if __name__ == "__main__":
             # success/spl 是 Habitat 原始目标类别指标；instruction_success
             # 是自然语言指令 verifier 的终止结果，两者不能混读。
             'Episode': i,
+            'benchmark': benchmark_spec.benchmark,
+            'benchmark_split': benchmark_spec.split,
+            'benchmark_dataset_path': benchmark_spec.dataset_path,
+            'benchmark_source_file': benchmark_spec.source_file,
+            'benchmark_source_episode_id': benchmark_spec.source_episode_id,
+            'benchmark_success_distance': benchmark_spec.success_distance,
             'success': habitat_agent.metrics['success'],
             'spl': habitat_agent.metrics['spl'],
             'distance_to_goal': habitat_agent.metrics['distance_to_goal'],

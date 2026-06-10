@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+from typing import Optional
 
 import habitat
 
@@ -43,6 +44,11 @@ MP3D_CONFIG_PATH = _first_existing([
     str(_HABITAT_ROOT / "habitat-lab/configs/tasks/objectnav_mp3d.yaml"),
     str(_HABITAT_ROOT / "configs/tasks/objectnav_mp3d.yaml"),
 ])
+GIBSON_CONFIG_PATH = _first_existing([
+    str(_HABITAT_ROOT / "habitat-lab/habitat/config/benchmark/nav/objectnav/objectnav_gibson.yaml"),
+    str(_HABITAT_ROOT / "habitat-lab/configs/tasks/objectnav_gibson.yaml"),
+    str(_HABITAT_ROOT / "configs/tasks/objectnav_gibson.yaml"),
+])
 
 SAM_CHECKPOINT = _get_env("SAM_CHECKPOINT")
 GROUNDING_DINO_PATH = _get_env("GROUNDING_DINO_PATH")
@@ -78,7 +84,9 @@ def _write_context(cfg):
     return _ConfigWrite(cfg)
 
 
-def _legacy_hm3d_data_path(data_path: str, stage: str) -> str:
+def _legacy_hm3d_data_path(data_path: str, stage: str, dataset_path: Optional[str] = None) -> str:
+    if dataset_path:
+        return dataset_path
     override = os.getenv("HM3D_DATASET_PATH")
     if override:
         return override
@@ -96,12 +104,21 @@ def _legacy_hm3d_data_path(data_path: str, stage: str) -> str:
     return os.path.join(data_path, candidates[0])
 
 
-def _set_modern_common(cfg, data_path: str, stage: str, episodes: int, dataset_rel: str):
+def _set_modern_common(
+    cfg,
+    data_path: str,
+    stage: str,
+    episodes: int,
+    dataset_rel: str,
+    *,
+    success_distance: float = 1.0,
+    scene_dataset: Optional[str] = None,
+):
     # 新版 Habitat config 字段位于 cfg.habitat.*。
     cfg.habitat.dataset.split = stage
     cfg.habitat.dataset.scenes_dir = os.path.join(data_path, "scene_datasets")
     cfg.habitat.dataset.data_path = os.path.join(data_path, dataset_rel)
-    scene_dataset = os.path.join(
+    scene_dataset = scene_dataset or os.path.join(
         data_path,
         "scene_datasets/hm3d_v0.2/hm3d_annotated_basis.scene_dataset_config.json",
     )
@@ -128,18 +145,27 @@ def _set_modern_common(cfg, data_path: str, stage: str, episodes: int, dataset_r
     depth = cfg.habitat.simulator.agents.main_agent.sim_sensors.depth_sensor
     depth.max_depth = 5.0
     depth.normalize_depth = False
-    cfg.habitat.task.measurements.success.success_distance = 1.0
+    cfg.habitat.task.measurements.success.success_distance = float(success_distance)
     cfg.habitat.environment.max_episode_steps = 500
 
 
-def _set_legacy_common(cfg, data_path: str, stage: str, episodes: int, dataset_path: str):
+def _set_legacy_common(
+    cfg,
+    data_path: str,
+    stage: str,
+    episodes: int,
+    dataset_path: str,
+    *,
+    success_distance: float = 1.0,
+    scene_dataset: Optional[str] = None,
+):
     # CogNav 基础镜像中的 Habitat 0.2 使用大写字段。
     # 同时关闭 top-down map 中依赖 semantic scene 的目标绘制，避免 HM3D 旧数据触发崩溃。
     cfg.DATASET.SPLIT = stage
     cfg.DATASET.SCENES_DIR = os.path.join(data_path, "scene_datasets")
     cfg.DATASET.DATA_PATH = dataset_path
     if hasattr(cfg.SIMULATOR, "SCENE_DATASET"):
-        cfg.SIMULATOR.SCENE_DATASET = os.path.join(
+        cfg.SIMULATOR.SCENE_DATASET = scene_dataset or os.path.join(
             data_path,
             "scene_datasets/hm3d_v0.2/hm3d_annotated_basis.scene_dataset_config.json",
         )
@@ -154,7 +180,7 @@ def _set_legacy_common(cfg, data_path: str, stage: str, episodes: int, dataset_p
         if hasattr(cfg.SIMULATOR.DEPTH_SENSOR, "NORMALIZE_DEPTH"):
             cfg.SIMULATOR.DEPTH_SENSOR.NORMALIZE_DEPTH = False
     if hasattr(cfg.TASK, "SUCCESS"):
-        cfg.TASK.SUCCESS.SUCCESS_DISTANCE = 1.0
+        cfg.TASK.SUCCESS.SUCCESS_DISTANCE = float(success_distance)
     if hasattr(cfg.TASK, "MEASUREMENTS"):
         measurements = list(cfg.TASK.MEASUREMENTS)
         for name in ("TOP_DOWN_MAP", "COLLISIONS"):
@@ -177,15 +203,36 @@ def _set_legacy_common(cfg, data_path: str, stage: str, episodes: int, dataset_p
                 setattr(top_down_map, key, value)
 
 
-def hm3d_config(path: str = HM3D_CONFIG_PATH, stage: str = "val", episodes=200):
+def hm3d_config(
+    path: str = HM3D_CONFIG_PATH,
+    stage: str = "val",
+    episodes=200,
+    dataset_path: Optional[str] = None,
+    success_distance: float = 1.0,
+):
     cfg = habitat.get_config(path)
     data_path = _get_env("HM3D_DATA_PATH")
     with _write_context(cfg):
         if hasattr(cfg, "habitat"):
-            dataset_rel = os.path.relpath(_legacy_hm3d_data_path(data_path, stage), data_path)
-            _set_modern_common(cfg, data_path, stage, episodes, dataset_rel)
+            resolved_dataset = _legacy_hm3d_data_path(data_path, stage, dataset_path)
+            dataset_rel = os.path.relpath(resolved_dataset, data_path) if os.path.isabs(resolved_dataset) else resolved_dataset
+            _set_modern_common(
+                cfg,
+                data_path,
+                stage,
+                episodes,
+                dataset_rel,
+                success_distance=success_distance,
+            )
         else:
-            _set_legacy_common(cfg, data_path, stage, episodes, _legacy_hm3d_data_path(data_path, stage))
+            _set_legacy_common(
+                cfg,
+                data_path,
+                stage,
+                episodes,
+                _legacy_hm3d_data_path(data_path, stage, dataset_path),
+                success_distance=success_distance,
+            )
     return cfg
 
 
@@ -202,5 +249,47 @@ def mp3d_config(path: str = MP3D_CONFIG_PATH, stage: str = "val", episodes=200):
                 stage,
                 episodes,
                 os.path.join(data_path, "habitat_task/objectnav/{split}/{split}.json.gz"),
+            )
+    return cfg
+
+
+def _legacy_gibson_data_path(data_path: str, stage: str, dataset_path: Optional[str] = None) -> str:
+    if dataset_path:
+        return dataset_path
+    return os.path.join(data_path, f"datasets/objectnav/gibson/v1.1/{stage}/{stage}.json.gz")
+
+
+def gibson_config(
+    path: str = GIBSON_CONFIG_PATH,
+    stage: str = "val",
+    episodes=200,
+    dataset_path: Optional[str] = None,
+    success_distance: float = 1.5,
+):
+    cfg = habitat.get_config(path)
+    data_path = os.getenv("GIBSON_DATA_PATH") or _get_env("HM3D_DATA_PATH")
+    scene_dataset = os.path.join(data_path, "scene_datasets/gibson_semantic")
+    with _write_context(cfg):
+        if hasattr(cfg, "habitat"):
+            resolved_dataset = _legacy_gibson_data_path(data_path, stage, dataset_path)
+            dataset_rel = os.path.relpath(resolved_dataset, data_path) if os.path.isabs(resolved_dataset) else resolved_dataset
+            _set_modern_common(
+                cfg,
+                data_path,
+                stage,
+                episodes,
+                dataset_rel,
+                success_distance=success_distance,
+                scene_dataset=scene_dataset,
+            )
+        else:
+            _set_legacy_common(
+                cfg,
+                data_path,
+                stage,
+                episodes,
+                _legacy_gibson_data_path(data_path, stage, dataset_path),
+                success_distance=success_distance,
+                scene_dataset=scene_dataset,
             )
     return cfg

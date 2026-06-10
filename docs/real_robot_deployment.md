@@ -1,0 +1,755 @@
+# STRIVE 实物部署接口设计
+
+本文档整理 STRIVE 从 HM3D/Habitat 仿真迁移到真实机器人时的接口设计、模块边界、输入输出数据流和上下层规划闭环。目标不是把仿真代码直接搬到机器人上，而是建立一个可插拔的 real-robot runtime，让 STRIVE 的高层语义导航能力复用真实机器人传感器、SLAM 和底层运动控制。
+
+## 1. 设计目标
+
+实物模式需要满足四个边界：
+
+1. 保持 benchmark 模式不变。
+2. 将真实传感器数据适配成 STRIVE 内部统一观测格式。
+3. STRIVE 只负责语义目标理解、目标确认、关系验证和高层子目标选择。
+4. 底层局部避障、路径跟踪、速度控制和安全停止交给 ROS/机器人规划控制栈。
+
+推荐总体形态：
+
+```text
+Real sensors / ROS topics
+  -> real_robot adapters
+  -> STRIVE semantic mapper and instruction planner
+  -> NavigationIntent
+  -> ROS navigation bridge
+  -> local planner / path follower / robot base
+```
+
+## 2. 硬件与传感器
+
+STRIVE 论文中的真实平台配置：
+
+```text
+Base:
+  Mecanum wheel platform
+
+RGB / RGB-D sensor:
+  Primary: Ricoh Theta Z1 360-degree panoramic camera
+  Optional: Intel RealSense RGB-D camera
+
+Spatial sensor:
+  Livox Mid-360 LiDAR
+
+Compatibility:
+  LiDAR point clouds can be converted to depth maps when STRIVE needs
+  simulation-like RGB-D inputs.
+```
+
+默认配置和 SysNav 的 wheeled robot 分支高度一致。RealSense 也可以接入，
+但应作为另一个 `CameraAdapter` 实现，而不是替换接口中的相机抽象。
+SysNav 使用 ROS2，将真实机器人分解为多个节点：
+
+```text
+livox_ros_driver2
+  -> Mid-360 point cloud
+
+arise_slam_mid360
+  -> state estimation / odometry
+
+semantic_mapping
+  -> object detection, SAM2 segmentation, object graph
+
+vlm_node
+  -> instruction decomposition, room selection, object/anchor verification
+
+tare_planner / local_planner / pathFollower
+  -> exploration, local path, cmd_vel, serial control
+```
+
+## 3. 当前 STRIVE 仿真接口
+
+当前 HM3D runtime 的主入口仍是 Habitat 风格：
+
+```text
+objnav_benchmark_with_process_obs.py
+  -> Habitat env
+  -> HM3D_Objnav_Agent
+  -> Instruct_Mapper
+```
+
+单步输入：
+
+```text
+obs["rgb"]   : H x W x 3 uint8
+obs["depth"] : H x W x 1 float32
+pose         : Habitat sensor state
+```
+
+单步输出：
+
+```text
+Habitat discrete action:
+  move_forward / turn_left / turn_right / stop
+```
+
+这套接口在真实机器人上不能直接使用。真实机器人没有 Habitat dense depth，也不应该由高层直接输出离散 action 或 `/cmd_vel`。
+
+## 4. 推荐真实机器人分层
+
+### 4.1 Sensor Adapter
+
+职责：订阅真实传感器和 SLAM 输出，生成 STRIVE 可消费的统一观测。
+
+输入建议：
+
+```text
+/camera/image
+  sensor_msgs/Image
+  Ricoh Theta Z1 panoramic RGB, or RealSense RGB
+
+/registered_scan
+  sensor_msgs/PointCloud2
+  Livox Mid-360 registered point cloud
+
+/camera/aligned_depth_to_color/image_raw
+  sensor_msgs/Image
+  Optional RealSense aligned depth
+
+/state_estimation
+  nav_msgs/Odometry
+  SLAM pose in map frame
+```
+
+输出 contract：
+
+```python
+RealObservation:
+    rgb: np.ndarray
+    pointcloud: np.ndarray
+    pose: SE3
+    timestamp: float
+    camera_model: str
+    intrinsics: dict
+    extrinsics: SE3
+    fov: dict
+    rgb_pano: np.ndarray | None
+    depth_pano: np.ndarray | None
+    depth: np.ndarray | None
+    depth_valid_mask: np.ndarray | None
+    frame_ids: dict[str, str]
+```
+
+关键原则：
+
+```text
+RGB 是语义主输入。
+LiDAR point cloud 是几何主输入。
+RealSense aligned depth 是局部 pinhole RGB-D 的直接几何输入。
+projected depth 只是兼容层，不能假设和 Habitat dense depth 等价。
+```
+
+相机模型建议显式标注：
+
+```python
+CameraFrame:
+    rgb: np.ndarray
+    depth: np.ndarray | None
+    camera_model: Literal["panorama", "pinhole"]
+    intrinsics: dict
+    extrinsics: SE3
+    fov: dict
+    timestamp: float
+```
+
+Theta Z1 对应 `camera_model="panorama"`；RealSense 对应
+`camera_model="pinhole"`。上层 planner 不应直接判断相机品牌，而应只看
+camera model、FOV、depth availability 和当前 evidence quality。
+
+### 4.2 Depth / Cloud Fusion Adapter
+
+职责：将 LiDAR 点云与相机图像对齐，并统一处理全景和 pinhole 相机。
+
+输入：
+
+```text
+rgb or rgb_pano
+registered point cloud
+camera intrinsics / panorama projection model / pinhole projection model
+camera-to-lidar extrinsic
+lidar-to-map pose
+optional RealSense aligned depth
+```
+
+输出：
+
+```text
+projected_depth
+depth_valid_mask
+colored point cloud
+camera-frame object points
+```
+
+核心算法：
+
+```text
+1. 按 timestamp 对齐 RGB、LiDAR、odom。
+2. 将 LiDAR 点从 map/sensor frame 变换到 camera frame。
+3. 根据 camera_model 选择投影模型：
+   - panorama: 使用 Theta 全景投影得到 pixel coordinate。
+   - pinhole: 使用 RealSense intrinsics 投影到局部 RGB frame。
+4. 对每个 pixel 保留最近 depth。
+5. 输出 sparse depth 和 valid mask。
+```
+
+注意事项：
+
+```text
+不要用 sparse depth 直接替代 Habitat depth 做所有三维重建。
+小物体附近的 depth 缺失必须保留为 unknown，而不是插值成虚假表面。
+RealSense FOV 较窄，不具备 Theta 一次观测 360 度上下文的能力。
+```
+
+RealSense 接入策略：
+
+```text
+RealSense RGB + aligned depth
+  -> RealSenseCameraAdapter
+  -> pinhole CameraFrame
+  -> depth 直接反投影为局部点云
+  -> 若需要全景上下文：
+       机器人原地旋转采集多帧
+       或只在局部视角内执行 detection / verification
+```
+
+经验判断：
+
+```text
+Theta 更适合房间级语义判断、快速全局观察和远距离上下文。
+RealSense 更适合近距离目标确认、小物体检测和稳定 RGB-D 几何。
+```
+
+### 4.3 Detector Adapter
+
+职责：统一不同检测器的输出格式。
+
+当前 STRIVE benchmark 使用：
+
+```text
+MMDINOSAM_Perceiver / GroundingDINO + SAM
+```
+
+SysNav 真实机器人使用：
+
+```text
+YOLO World / YOLOE tracking
+SAM2 segmentation
+```
+
+推荐统一输出：
+
+```python
+DetectionFrame:
+    image: np.ndarray
+    boxes_xyxy: np.ndarray
+    labels: list[str]
+    confidences: list[float]
+    masks: list[np.ndarray] | None
+    track_ids: list[int] | None
+    timestamp: float
+```
+
+可插拔实现：
+
+```text
+SimulationDetectorAdapter
+  -> calls current STRIVE perceiver
+
+ROSDetectionResultAdapter
+  -> subscribes /detection_result
+
+DirectRealDetectorAdapter
+  -> runs detector inside STRIVE real runtime
+```
+
+建议优先复用 SysNav 的 `/detection_result`，降低实物模式初期风险。
+
+### 4.4 Semantic Map Adapter
+
+职责：把真实检测、分割、点云、pose 融合成对象图和导航图。
+
+STRIVE 当前内部状态：
+
+```text
+mapper.objects
+mapper.nodes
+mapper.room_nodes
+mapper.grid_map
+mapper.frontiers
+mapper.navigable_pcd
+mapper.obstacle_pcd
+```
+
+推荐导出统一快照：
+
+```python
+SemanticMapSnapshot:
+    timestamp: float
+    robot_pose: SE3
+    objects: list[ObjectNode]
+    nav_nodes: list[NavNode]
+    rooms: list[RoomNode]
+    frontiers: list[Frontier]
+```
+
+对象节点：
+
+```python
+ObjectNode:
+    uid: str | int
+    label: str
+    confidence: float
+    position: np.ndarray
+    bbox2d: list[float] | None
+    bbox3d_center: np.ndarray | None
+    bbox3d_extent: np.ndarray | None
+    image_ref: str | None
+    pointcloud_ref: str | None
+    room_id: int | None
+    visible_viewpoints: list[int]
+    verified_state: str
+```
+
+这层应保持独立于 ROS message。ROS bridge 可以负责消息转换，STRIVE 内部只消费 Python contract。
+
+## 5. 高层导航器接口
+
+真实机器人模式下，STRIVE 高层不输出 discrete action，而输出语义导航意图。
+
+推荐 contract：
+
+```python
+NavigationIntent:
+    mode: str
+    goal_pose: Pose2D | None
+    target_object_uid: str | None
+    anchor_object_uid: str | None
+    relation_edge_id: str | None
+    stop_allowed: bool
+    reason: str
+```
+
+典型 mode：
+
+```text
+explore_room
+go_to_frontier
+go_to_object
+go_to_anchor
+improve_view
+stop
+wait
+```
+
+高层模块职责：
+
+```text
+Instruction parser:
+  原始自然语言 -> InstructionPlan
+
+Concept grounding:
+  target / anchor / support region 概念归一
+
+Runtime concept matcher:
+  observed object -> target/anchor concept
+
+Constraint evaluator:
+  room / attribute / count / sequence / relation
+
+Dynamic relation verifier:
+  object-object relation edge, e.g. on / near / inside
+
+Final instruction verifier:
+  原始 prompt 是否已满足
+
+View controller:
+  语义满足但视角不足时，围绕 pinned target/relation 改善视角
+```
+
+这部分可以直接复用当前 instruction adapter 的核心设计。
+
+## 6. 下层规划与控制接口
+
+SysNav 下层已经给出了很好的真实机器人闭环：
+
+```text
+high-level planner
+  -> /way_point
+
+localPlanner
+  subscribes:
+    /state_estimation
+    /registered_scan
+    /terrain_map
+    /way_point
+    /navigation_boundary
+    /added_obstacles
+    /check_obstacle
+  publishes:
+    /path
+    /slow_down
+    /free_paths
+
+pathFollower
+  subscribes:
+    /state_estimation
+    /path
+    /joy
+    /speed
+    /stop
+  publishes:
+    /cmd_vel
+  optional:
+    serial /dev/ttyACM0
+```
+
+STRIVE 实物模式建议只发布 waypoint：
+
+```text
+NavigationIntent.goal_pose
+  -> geometry_msgs/PointStamped
+  -> /way_point
+```
+
+不要让 STRIVE 高层直接发 `/cmd_vel`。原因：
+
+```text
+cmd_vel 需要实时安全控制。
+局部避障、急停、速度限制和手柄接管都应该在下层闭环中完成。
+语义层调用 VLM/LLM，延迟不可控，不适合直接控制底盘。
+```
+
+## 7. 上下层闭环
+
+推荐真实机器人闭环：
+
+```text
+1. SensorAdapter 读取 RGB / LiDAR / odom。
+2. DetectorAdapter 生成 detection frame。
+3. SemanticMapBuilder 更新对象图、房间、frontier 和导航节点。
+4. Instruction planner 读取 SemanticMapSnapshot。
+5. Planner 输出 NavigationIntent。
+6. ROSNavigationBridge 发布 /way_point。
+7. localPlanner 基于点云和地形生成 /path。
+8. pathFollower 生成 /cmd_vel 或串口控制。
+9. 机器人移动产生新 RGB / LiDAR / odom。
+10. 高层根据新证据更新 verifier / ledger / relation edge。
+```
+
+停止条件应由三部分共同决定：
+
+```text
+instruction_satisfied == true
+view_sufficient_for_stop == true
+robot_stable_or_goal_reached == true
+```
+
+其中：
+
+```text
+instruction_satisfied:
+  FinalInstructionVerifier 对原始自然语言确认。
+
+view_sufficient_for_stop:
+  目标/anchor/relation 在当前视角中有足够证据。
+
+robot_stable_or_goal_reached:
+  底层报告 waypoint 到达，或已无法继续改善视角且证据充分。
+```
+
+## 8. 与 SysNav 的对照
+
+| 层级 | SysNav | STRIVE 当前 | STRIVE 实物建议 |
+| --- | --- | --- | --- |
+| 传感器 | ROS2 topics | Habitat observation | RealObservationAdapter |
+| RGB / RGB-D | `/camera/image`, optional RealSense aligned depth | `obs["rgb"]`, `obs["depth"]` | CameraFrame |
+| 几何 | `/registered_scan` | `obs["depth"]` | pointcloud + optional projected/aligned depth |
+| 位姿 | `/state_estimation` | Habitat sensor state | SE3 pose |
+| 检测 | YOLOE / YOLO World | MMDINO/SAM | DetectorAdapter |
+| 分割 | SAM2 | SAM | 可插拔 |
+| 语义地图 | `/object_nodes_list` | mapper.objects | SemanticMapSnapshot |
+| 任务理解 | VLM node | instruction_adapter | 复用 instruction_adapter |
+| 房间选择 | VLM room navigation | room_policy / LLM | 可接 room snapshot |
+| 高层输出 | `/way_point` | discrete action | NavigationIntent |
+| 局部规划 | localPlanner | Habitat SPF | ROSNavigationBridge |
+| 底盘控制 | pathFollower / serial | env.step | pathFollower / cmd_vel |
+
+## 9. 推荐代码结构
+
+建议在 `robotic` 分支新增：
+
+```text
+real_robot/
+  __init__.py
+  contracts.py
+  camera_adapter.py
+  observation_adapter.py
+  depth_projection.py
+  detector_adapter.py
+  semantic_map_adapter.py
+  navigation_bridge.py
+  runtime_node.py
+
+docs/
+  real_robot_deployment.md
+```
+
+模块职责：
+
+```text
+contracts.py
+  定义 RealObservation, DetectionFrame, SemanticMapSnapshot,
+  NavigationIntent 等数据结构。
+
+camera_adapter.py
+  封装 Theta panorama 与 RealSense pinhole RGB-D 相机差异。
+
+observation_adapter.py
+  ROS topic buffer, timestamp sync, pose extraction。
+
+depth_projection.py
+  LiDAR point cloud -> panorama/pinhole sparse depth。
+
+detector_adapter.py
+  STRIVE detector / ROS detection result 的统一封装。
+
+semantic_map_adapter.py
+  将 real observation + detection 转成 mapper update 输入或 map snapshot。
+
+navigation_bridge.py
+  NavigationIntent -> /way_point，读取 path/odom/stop 状态。
+
+runtime_node.py
+  实物模式主循环。
+```
+
+## 10. 实施路线
+
+### Phase 0: 离线 bag replay
+
+目标：不接真车，先用 rosbag 或导出的 topic 文件验证接口。
+
+输入：
+
+```text
+recorded /camera/image
+recorded /registered_scan
+recorded /state_estimation
+```
+
+输出：
+
+```text
+RealObservation 序列
+debug projected_depth
+debug object snapshots
+```
+
+验收：
+
+```text
+RGB、点云、pose 时间同步误差可记录。
+投影 depth 和 RGB 对齐可视化正常。
+mapper 不崩溃。
+```
+
+### Phase 1: 真实观测适配
+
+目标：实现 `RealObservationAdapter`。
+
+验收：
+
+```text
+可持续输出 rgb_pano / pointcloud / pose。
+所有 frame id 和 extrinsic 明确记录。
+遇到缺帧时返回 wait，而不是阻塞 planner。
+```
+
+### Phase 2: 检测与对象图接入
+
+目标：先复用 SysNav `/detection_result` 或 STRIVE detector 生成 `DetectionFrame`。
+
+验收：
+
+```text
+ObjectNode uid 稳定。
+同一对象不会频繁漂移。
+目标/anchor matcher 可以消费真实对象。
+```
+
+### Phase 3: 高层输出 waypoint
+
+目标：让 STRIVE 输出 `NavigationIntent`，通过 bridge 发布 `/way_point`。
+
+验收：
+
+```text
+localPlanner 收到 waypoint。
+pathFollower 能跟踪 path。
+STRIVE 不直接控制 cmd_vel。
+```
+
+### Phase 4: 目标确认闭环
+
+目标：复用 instruction verifier、relation verifier、view-control。
+
+验收：
+
+```text
+red chair:
+  错误实例会被 ledger 屏蔽。
+
+book on shelf:
+  anchor/target/relation edge 可验证。
+
+cup:
+  能使用 support region 或 anchor-first 策略去桌面/柜台区域搜索。
+```
+
+### Phase 5: 真车小范围测试
+
+测试顺序：
+
+```text
+find chair
+find table
+find cup
+red chair
+book on shelf
+cup on desk
+```
+
+每个测试必须保存：
+
+```text
+raw observation log
+projected depth visualization
+semantic map snapshot
+NavigationIntent trace
+VLM raw response
+final verifier result
+lower planner status
+```
+
+## 11. 关键风险
+
+### 11.1 时间同步
+
+真实系统中 RGB、LiDAR、odom 不会天然同步。必须记录：
+
+```text
+rgb_stamp
+cloud_stamp
+odom_stamp
+max_sync_delta
+```
+
+超出阈值时应返回 `wait` 或降低该帧置信度。
+
+### 11.2 坐标系
+
+必须显式维护：
+
+```text
+map
+vehicle/base_link
+sensor/lidar
+camera
+```
+
+禁止在业务逻辑里散落手写坐标转换。所有转换应集中到 adapter 或 geometry module。
+
+### 11.3 Sparse depth
+
+LiDAR projected depth 是稀疏深度，不能假设每个 RGB pixel 都有可靠 depth。
+
+必须在 object reconstruction 中保留：
+
+```text
+valid_depth_ratio
+point_count
+geometry_confidence
+```
+
+### 11.4 VLM 调用延迟
+
+实物模式必须使用缓存：
+
+```text
+candidate-instance verification cache
+relation pair cache
+final verifier cache
+view-control pinned state
+```
+
+同一对象、同一关系、同一证据图不能重复调用 VLM。
+
+### 11.5 安全控制
+
+高层语义模块不承担急停职责。最低要求：
+
+```text
+manual joystick override
+/stop topic
+local obstacle check
+planner heartbeat
+watchdog timeout
+```
+
+## 12. 初始接口草案
+
+```python
+class RealRobotNavigator:
+    def __init__(
+        self,
+        observation_adapter,
+        detector_adapter,
+        mapper,
+        high_level_policy,
+        navigation_bridge,
+    ):
+        ...
+
+    def step(self, instruction: str | None = None) -> RuntimeDecision:
+        observation = self.observation_adapter.read()
+        if observation is None:
+            return RuntimeDecision(mode="wait", reason="waiting for synchronized observation")
+
+        detections = self.detector_adapter.detect(observation)
+        snapshot = self.mapper.update_real(observation, detections)
+        intent = self.high_level_policy.decide(snapshot, instruction)
+        self.navigation_bridge.execute(intent)
+        return RuntimeDecision(snapshot=snapshot, intent=intent)
+```
+
+`RuntimeDecision` 需要落盘，便于复盘：
+
+```python
+RuntimeDecision:
+    timestamp: float
+    mode: str
+    intent: NavigationIntent
+    accepted_candidate_uid: str | None
+    accepted_relation_edge: dict | None
+    verifier_decision: dict | None
+    lower_planner_state: dict | None
+```
+
+## 13. 当前结论
+
+实物模式的核心路线是：
+
+```text
+STRIVE high-level semantic navigation
+  + SysNav-style ROS sensor and motion stack
+```
+
+STRIVE 不需要重写底层局部规划，也不应该直接控制速度。它应输出可解释的语义子目标；真实机器人底层负责安全、连续、实时地到达该子目标。
+
+下一步建议先实现 `real_robot/contracts.py` 和离线 `RealObservationAdapter`，用 bag replay 验证数据契约，再接 ROS live topics。

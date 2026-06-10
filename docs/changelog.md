@@ -4,6 +4,24 @@
 
 ### Added
 
+- 新增 `benchmark/` provider 抽象：
+  - `BenchmarkSpec` 统一记录 benchmark、split、dataset path、success distance
+    和单 episode materialization provenance；
+  - `hm3d_objectnav`、`hm3d_ovon`、`gibson_objectnav`、`gibson_custom`
+    provider 初步拆分；
+  - HM3D-OVON 支持显式 `--benchmark hm3d_ovon --benchmark_split ...`，
+    `auto` 仅保留旧单场景 smoke test 兼容路径。
+- 新增 `docs/benchmark_providers.md`：
+  - 说明 provider 边界、HM3D-OVON split 选择、success distance 对齐和
+    Gibson custom wrapper 的迁移边界。
+- 新增 `docs/real_robot_deployment.md`：
+  - 整理 STRIVE 实物部署接口设计；
+  - 对照 SysNav ROS2 传感器、语义地图、VLM、exploration planner、
+    local planner 和 path follower；
+  - 明确 RealObservation、DetectionFrame、SemanticMapSnapshot、
+    NavigationIntent 等建议 contract；
+  - 补充 Theta Z1 与 RealSense 的可插拔 CameraAdapter 设计；
+  - 给出离线 bag replay 到真车测试的分阶段落地路线。
 - 新增轻量回归测试：
   - `tests/test_frontier_extractor.py` 覆盖 frontier 自适应半径；
   - `tests/test_panoramic_detection.py` 覆盖 panorama triplet index 与 center-panel bbox filter；
@@ -45,6 +63,11 @@
 
 ### Changed
 
+- `objnav_benchmark_with_process_obs.py` 不再内联 HM3D-OVON 文件搜索和
+  filtered dataset 构造，改为通过 benchmark provider 准备 `BenchmarkSpec`
+  并将 `benchmark_spec.json` 写入日志目录。
+- `config_utils.hm3d_config()` 支持显式 `dataset_path` 和 `success_distance`，
+  避免 HM3D-OVON 被普通 HM3D 默认成功距离覆盖。
 - `scripts/check_refactor.sh` 增加 `PYTHONPATH=. pytest -q tests`，让重构检查覆盖轻量回归测试。
 - `navigation/panoramic_detection.py` 将 `combine_image` 改为函数内懒加载：
   - 运行时行为不变；
