@@ -1,0 +1,977 @@
+\documentclass[UTF8,zihao=-4]{ctexart}
+
+\usepackage[a4paper,margin=2.4cm]{geometry}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{listings}
+\usepackage{caption}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!45!black,
+  urlcolor=blue!45!black,
+  citecolor=blue!45!black
+}
+
+\lstdefinestyle{pseudo}{
+  basicstyle=\ttfamily\small,
+  keywordstyle=\bfseries\color{blue!45!black},
+  commentstyle=\itshape\color{green!35!black},
+  stringstyle=\color{purple!60!black},
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  stepnumber=1,
+  numbersep=8pt,
+  frame=single,
+  framerule=0.3pt,
+  rulecolor=\color{gray!45},
+  breaklines=true,
+  showstringspaces=false,
+  tabsize=2,
+  xleftmargin=1.2em,
+  framexleftmargin=1.0em
+}
+
+\lstdefinestyle{json}{
+  basicstyle=\ttfamily\small,
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  frame=single,
+  framerule=0.3pt,
+  breaklines=true,
+  showstringspaces=false,
+  xleftmargin=1.2em,
+  framexleftmargin=1.0em
+}
+
+\title{\bfseries STRIVE--CogNav Object Navigation 系统技术白皮书}
+\author{Huawei Nav / STRIVE 工程实现}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+本文档给出本项目的系统性技术说明。项目以 STRIVE 的三层结构化环境表征为基础，
+结合 CogNav 的数据与大模型客户端，扩展出可执行的自然语言指令解析、运行时概念
+匹配、动态语义关系验证以及最终停止验证机制。文档从任务形式化出发，依次说明
+总体架构、指令解析、语义建图、导航策略、VLM 验证闭环与实物部署接口。相关描述
+参考 STRIVE 与 SysNav 的论文思想，但以本仓库当前实现为准；其中仍处于设计阶段的
+实物模式会明确标注为计划接口，而非已完成运行路径。
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+\section{系统定位与设计原则}
+
+Object Navigation 的难点并不只在于检测目标物体，而在于持续维护空间一致性、
+长期探索记忆与语义目标之间的关系。STRIVE 的基本思想是将环境组织为
+Room--Viewpoint--Object 三层结构，从而让 VLM 在结构化上下文中进行高层语义
+推理，而不是在每一步动作上直接充当控制策略。SysNav 进一步将这一思想推广到
+真实机器人系统：语义推理、导航规划与运动控制应由不同层级承担，以避免 VLM
+越权处理三维几何和底层安全问题。
+
+本项目延续这一分层原则。LLM/VLM 负责解析任务、生成概念 grounding、验证语义
+关系和判断最终停止；几何建图、前沿探索、路径规划与动作执行由确定性模块完成。
+在工程上，benchmark object-goal 会被编译成窄指令，例如
+\texttt{Find the <tv>.}，从而与自然语言任务共享同一套 final verifier 与
+view-control 闭环；同时，benchmark 的结构化目标不会被复杂自然语言任务中的
+常识推理污染。
+
+图~\ref{fig:pipeline} 展示了当前系统的整体管线。左侧为观测输入与三层场景图，
+中间为 VLM 推理、任务计划与候选确认，右侧为导向点选择和局部导航规划。
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=\textwidth]{/home/ubuntu/Downloads/HuaWeiVLN_Nav-Pipeline.png}
+  \caption{STRIVE--CogNav Object Navigation 系统管线示意图。}
+  \label{fig:pipeline}
+\end{figure}
+
+\subsection{总体数据流}
+
+系统的端到端执行链路可以概括为：
+
+\begin{equation}
+\begin{aligned}
+&\text{Observation}
+\rightarrow \text{Detection \& Segmentation}
+\rightarrow \text{Object Reconstruction} \\
+&\rightarrow \text{Structured Map}
+\rightarrow \text{Instruction Plan}
+\rightarrow \text{Target / Room Policy} \\
+&\rightarrow \text{Candidate Verification}
+\rightarrow \text{View Control}
+\rightarrow \text{Action or Stop}.
+\end{aligned}
+\end{equation}
+
+这种组织方式有两个直接收益。第一，历史观测被压缩为可检索的图结构，VLM 查询
+只需要读取与当前决策相关的节点、边和证据图像。第二，几何可达性、距离、遮挡和
+视角质量被保留在规划层，不需要 VLM 在像素空间或自然语言中隐式推断。
+
+\section{任务形式化}
+
+在仿真 benchmark 中，智能体在未知环境中寻找目标物体实例。第 $t$ 个时间步的
+观测记为
+\begin{equation}
+  O_t = \{I_t, D_t, P_t\}, \qquad P_t=\langle p_t, R_t\rangle ,
+\end{equation}
+其中 $I_t$ 是 RGB 图像，$D_t$ 是深度图，$P_t$ 是相机位姿。仿真动作空间为
+\begin{equation}
+  a_t \in \{\texttt{move\_forward},\texttt{turn\_left},
+  \texttt{turn\_right},\texttt{stop}\}.
+\end{equation}
+
+给定目标实例集合 $\mathcal{G}$ 和成功距离 $d_s$，传统 ObjectNav benchmark 的
+成功条件为
+\begin{equation}
+  \mathrm{Success}
+  =
+  \mathbb{I}
+  \left[
+    a_t = \texttt{stop}
+    \land
+    d(p_t,\mathcal{G}) \le d_s
+    \land
+    t \le T
+  \right].
+  \label{eq:benchmark_success}
+\end{equation}
+
+自然语言任务的停止条件更严格。若当前候选物体为 $o_i$，指令计划为
+$\mathcal{P}$，证据集合为 $\mathcal{E}_i$，则 final verifier 输出
+\begin{equation}
+  V_{\mathrm{final}}(o_i,\mathcal{P},\mathcal{E}_i)
+  =
+  (s_{\mathrm{sem}}, s_{\mathrm{con}}, s_{\mathrm{view}}, d),
+\end{equation}
+其中 $s_{\mathrm{sem}}$ 表示语义目标满足，$s_{\mathrm{con}}$ 表示显式约束满足，
+$s_{\mathrm{view}}$ 表示当前视角足以支持最终停止，$d$ 是离散决策。最终接受条件为
+\begin{equation}
+  \mathrm{Accept}
+  =
+  \mathbb{I}
+  \left[
+    d=\texttt{accept}
+    \land s_{\mathrm{sem}}
+    \land s_{\mathrm{con}}
+    \land s_{\mathrm{view}}
+  \right].
+  \label{eq:final_accept}
+\end{equation}
+
+对于 benchmark object-goal，$\mathcal{P}$ 是由目标类别自动生成的窄计划；
+对于自然语言指令，$\mathcal{P}$ 可能包含属性、数量、顺序、房间和空间关系约束。
+
+\section{系统模块概览}
+
+\begin{longtable}{p{0.22\linewidth}p{0.28\linewidth}p{0.42\linewidth}}
+\toprule
+\textbf{模块} & \textbf{主要代码路径} & \textbf{核心功能} \\
+\midrule
+Benchmark Runtime &
+\texttt{objnav\_benchmark\_with\_process\_obs.py} &
+构造 Habitat 环境，筛选 HM3D/OVON episode，安装 object-goal plan，
+驱动 episode 循环并保存 metrics。\\
+\midrule
+Agent Runtime &
+\texttt{objnav\_agent\_with\_process\_obs.py} &
+作为编排层连接观测、建图、目标选择、复核、final verifier、view-control
+和动作执行。\\
+\midrule
+Mapper Runtime &
+\texttt{mapper\_with\_process\_obs.py}, \texttt{mapping/} &
+维护点云、对象实例、viewpoint 图、room 图、frontier 和调试产物。\\
+\midrule
+Instruction Adapter &
+\texttt{instruction\_adapter/} &
+将自然语言或 benchmark 目标编译为 \texttt{InstructionPlan}，并处理
+concept grounding、运行时匹配、约束验证和动态语义边。\\
+\midrule
+Planning Services &
+\texttt{planning/} &
+实现目标候选选择、房间选择、探索策略和视角候选生成。\\
+\midrule
+Navigation Services &
+\texttt{navigation/}, \texttt{navigation\_core/} &
+封装全景观测、检测合并、动作控制、目标靠近和视角几何评分。\\
+\midrule
+Prompt Layer &
+\texttt{prompting/} &
+集中维护 prompt 文本、prompt id、schema 名称和调用 trace label。\\
+\midrule
+LLM/VLM Adapter &
+\texttt{llm\_utils/} &
+复用 CogNav LLMClient，兼容 OpenAI-style parse 接口，并记录调用次数。\\
+\bottomrule
+\end{longtable}
+
+\section{指令解析模块}
+
+\subsection{功能边界}
+
+指令解析模块是任务编译层，而不是导航策略层。它的输出应当回答五个问题：
+用户要找什么，哪些条件必须满足，哪些目标可以终止任务，哪些对象只是上下文，
+以及哪些约束需要在运行时验证。它不应在代码中保存“电视通常在客厅”或
+“杯子通常在桌上”这样的静态常识表。常识可以由 LLM 通过 prompt 显式输出，也
+可以由 room-level reasoning 在运行时使用，但不能以隐式规则混入 parser。
+
+\subsection{InstructionPlan}
+
+自然语言指令或 benchmark object-goal 被统一编译为
+\texttt{InstructionPlan}：
+
+\begin{lstlisting}[style=pseudo,caption={InstructionPlan 的核心字段}]
+InstructionPlan:
+  raw_instruction: str        # 原始自然语言或自动生成的 object-goal 指令
+  dataset_target: str         # benchmark 或数据集给出的目标类别
+  task_type: str              # object_goal, relation_goal, counting 等
+  eval_mode: str              # any_target_success, sequential, exhaustive
+  targets: list[TargetQuery]  # 可执行目标；只有 terminal target 可触发成功
+  constraints: list[Constraint]
+  search_priors: SearchPriors # 搜索提示，不参与最终成功判定
+  execution: ExecutionPolicy  # 当前任务的执行方式
+  concept_queries: list[ConceptQuery]
+  diagnostics: dict           # 记录解析来源、fallback 和 grounding 信息
+\end{lstlisting}
+
+目标、anchor 和支持物统一表达为 \texttt{ConceptQuery}：
+
+\begin{equation}
+  q =
+  \{id, name, role, detector\_terms, aliases,
+  description, negative\_terms, terminal\}.
+\end{equation}
+
+只有 $terminal(q)=\mathrm{true}$ 的概念可以进入停止判定。若指令为
+\textit{find a book on a shelf}，则 \texttt{book} 是 terminal concept，
+\texttt{shelf} 是 anchor concept；后者只能作为搜索参考和关系验证对象。
+
+\subsection{编译与 Grounding}
+
+给定原始指令 $x$、episode metadata $M$ 与检测类别集合 $\mathcal{C}_{det}$，
+任务编译过程写为
+\begin{equation}
+  \mathcal{P} =
+  \begin{cases}
+  f_{\mathrm{meta}}(M), & M \text{ 中存在结构化任务字段},\\
+  f_{\mathrm{LLM}}(x,\mathcal{C}_{det}), & \text{否则}.
+  \end{cases}
+  \label{eq:plan_compile}
+\end{equation}
+
+随后对每个 concept 进行 detector vocabulary grounding：
+\begin{equation}
+  g(q,\mathcal{C}_{det})
+  \rightarrow
+  \{terms, aliases, negatives, desc\}.
+  \label{eq:concept_grounding}
+\end{equation}
+
+这里的 grounding 是显式产物，会写入 \texttt{plan.json}。例如将 shelf
+ground 到 bookshelf、cabinet 或 shelving，不是通过代码中隐藏的同义词表完成，
+而是由本次指令、本次 detector vocabulary 与 concept role 共同决定。
+
+\subsection{运行时概念匹配}
+
+编译期 concept 并不等同于运行时 object label。mapper 观测到对象实例 $o_i$ 后，
+需要判断它是否满足 concept $q_j$：
+\begin{equation}
+  m(q_j,o_i,x,r)
+  \rightarrow
+  (\mathrm{match}, conf, role, reason),
+  \label{eq:runtime_match}
+\end{equation}
+其中 $x$ 是原始指令，$r$ 是 concept role。匹配结果按
+\begin{equation}
+  key=(hash(x), id(q_j), uid(o_i))
+\end{equation}
+缓存，以避免同一对象在局部搜索中反复调用 VLM。
+
+\subsection{伪代码}
+
+\begin{lstlisting}[style=pseudo,caption={指令编译流程}]
+Algorithm CompileInstruction(x, M, C_det):
+  # x: 原始指令；M: episode metadata；C_det: detector vocabulary
+  # 返回值 P 是导航器唯一消费的任务计划
+
+  if HasStructuredFields(M):
+      P <- ParseMetadata(M)
+      # 数据集已有结构化语义时优先使用，避免重复猜测任务含义
+  else:
+      P <- LLMParseInstruction(x, C_det)
+      # prompt 只抽取显式目标与约束，不写入场景常识
+
+  for q in Concepts(P):
+      q_grounded <- GroundConcept(q, C_det)
+      # grounding 负责 detector_terms / aliases / negative_terms
+      ReplaceConcept(P, q, q_grounded)
+
+  P.execution <- SelectExecutionPolicy(P)
+  # 例如 any-success、sequence、count、anchor-first
+
+  ValidateTerminalAndAnchorRoles(P)
+  Save(P, "plan.json")
+  return P
+\end{lstlisting}
+
+\subsection{Prompt 样例}
+
+\begin{lstlisting}[style=pseudo,caption={Instruction parsing prompt 片段}]
+You are a semantic compiler for indoor object navigation instructions.
+
+Return strict JSON. Do not solve navigation and do not invent scene-specific facts.
+Extract only what the user asks for:
+- targets: object concepts mentioned or implied by the instruction.
+- terminal=true only for objects that may satisfy the final goal.
+- anchors/support objects must be terminal=false.
+- constraints: room, spatial, sequence, count, attribute, co_occurrence.
+- Do not encode common-sense priors such as "TV is in living room" unless
+  the room or context is explicitly stated by the instruction.
+
+Instruction:
+  "find a book on a shelf"
+
+Expected:
+  target: book, terminal=true
+  anchor: shelf, terminal=false
+  constraint: book on shelf, verifier=vlm
+\end{lstlisting}
+
+\begin{lstlisting}[style=json,caption={Concept grounding 输出示例}]
+{
+  "concept": "shelf",
+  "role": "anchor",
+  "detector_terms": ["bookshelf", "cabinet", "shelf"],
+  "aliases": ["bookcase", "shelving"],
+  "description": "storage furniture or shelf-like structure that can hold books",
+  "negative_terms": ["book", "table surface"],
+  "terminal": false
+}
+\end{lstlisting}
+
+\section{建图模块}
+
+\subsection{从 RGB-D 到对象点云}
+
+仿真中，输入是 posed RGB-D；实物计划中，输入可以是全景 RGB、RealSense RGB-D
+或由 LiDAR 投影得到的稀疏深度。对于 pinhole 相机，像素 $(u,v)$ 的三维点为
+\begin{equation}
+  X_c(u,v)
+  =
+  D(u,v)K^{-1}
+  \begin{bmatrix}
+  u\\v\\1
+  \end{bmatrix},
+  \qquad
+  X_w = R_tX_c + p_t .
+  \label{eq:back_projection}
+\end{equation}
+
+给定第 $i$ 个分割 mask $M_i$，对象点云为
+\begin{equation}
+  \mathcal{P}_i =
+  \left\{
+  R_tD(u,v)K^{-1}
+  \begin{bmatrix}u\\v\\1\end{bmatrix}
+  +p_t
+  \;\middle|\;
+  (u,v)\in M_i
+  \right\}.
+  \label{eq:object_cloud}
+\end{equation}
+
+对象节点保存类别、置信度、点云、三维包围盒和代表图像：
+\begin{equation}
+  A(v_i^o)=
+  \{c_i, conf_i,\mathcal{P}_i,bbox_i,I_i,\phi_i\}.
+\end{equation}
+其中 $\phi_i$ 是按需推理得到的属性，如颜色、材质或状态。
+
+\subsection{三层场景图}
+
+结构化环境表示为图
+\begin{equation}
+  \mathcal{R}=(\mathcal{V},\mathcal{E}),
+\end{equation}
+其中
+\begin{equation}
+  \mathcal{V}
+  =
+  \mathcal{V}^{room}
+  \cup
+  \mathcal{V}^{vp}
+  \cup
+  \mathcal{V}^{obj}.
+\end{equation}
+
+边集合包括
+\begin{equation}
+  \mathcal{E}
+  =
+  \mathcal{E}^{r-r}
+  \cup
+  \mathcal{E}^{r-v}
+  \cup
+  \mathcal{E}^{r-o}
+  \cup
+  \mathcal{E}^{v-v}
+  \cup
+  \mathcal{E}^{v-o}
+  \cup
+  \mathcal{E}^{o-o}.
+  \label{eq:edge_set}
+\end{equation}
+
+Room node 是跨房间规划的语义单位；Viewpoint node 是探索与拓扑连接的空间单位；
+Object node 是目标定位、属性判断和关系验证的实例单位。三者的分离使得 VLM
+只在高层语义或候选确认中参与，而不是在局部几何规划中频繁介入。
+
+\subsection{Viewpoint 与 Frontier}
+
+每个 viewpoint $v_i^{vp}$ 覆盖半径为 $\zeta_{cover}$ 的区域：
+\begin{equation}
+  C(v_i^{vp})
+  =
+  \{x\in\mathbb{R}^2 \mid \|x-p_i\|_2\le \zeta_{cover}\}.
+\end{equation}
+累计覆盖区域为
+\begin{equation}
+  C_{\mathrm{prev}}
+  =
+  \bigcup_{v_i^{vp}\in\mathcal{R}} C(v_i^{vp}).
+\end{equation}
+当当前观测带来的新增覆盖超过阈值时，系统添加新的 viewpoint：
+\begin{equation}
+  |C_t\setminus C_{\mathrm{prev}}|>\epsilon .
+\end{equation}
+
+有 frontier 的区域以 frontier cluster 或 clique 中心生成候选 viewpoint；
+没有 frontier 的区域则取连通区域中心。这样既保留了 STRIVE 的稀疏拓扑思想，
+又避免将每个可通行网格都暴露给 VLM。
+
+\subsection{Object Association}
+
+新对象是否与历史对象合并，由类别一致性、空间邻近和点云重叠共同决定。可抽象为
+\begin{equation}
+  \mathrm{merge}(i,j)
+  =
+  \mathbb{I}
+  \left[
+  s_c(c_i,c_j)
+  + \lambda_o s_o(\mathcal{P}_i,\mathcal{P}_j)
+  + \lambda_d \exp(-\|p_i-p_j\|_2)
+  >
+  \tau_m
+  \right],
+  \label{eq:object_merge}
+\end{equation}
+其中 $s_c$ 表示类别或概念一致性，$s_o$ 表示点云重叠或近邻程度。
+
+\subsection{Room Segmentation}
+
+房间分割以墙体或障碍结构将可通行空间划分为连通组件。房间节点属性为
+\begin{equation}
+  A(v_i^r)=
+  \{m_i^r,c_i^r,I_i^r,\mathcal{O}_i,\mathcal{V}_i^{vp}\},
+\end{equation}
+其中 $m_i^r$ 是 top-down mask，$c_i^r$ 是可选的房间类别，$I_i^r$ 是代表图像，
+$\mathcal{O}_i$ 和 $\mathcal{V}_i^{vp}$ 分别为房间内对象与 viewpoint 集合。
+
+\subsection{动态语义边}
+
+空间关系不应在所有对象对之间预先计算。对于指令中的关系约束
+$\varphi$，例如 \textit{book on shelf}，系统只在出现候选 terminal 与 anchor
+实例后按需验证。若候选对象为 $v_i^o$，anchor 为 $v_j^o$，共同观察二者的
+viewpoint 集合为
+\begin{equation}
+  \mathcal{V}_{i,j}
+  =
+  \{v_k^v
+  \mid
+  e_{k,i}^{v-o}\in\mathcal{R}
+  \land
+  e_{k,j}^{v-o}\in\mathcal{R}
+  \}.
+  \label{eq:shared_views}
+\end{equation}
+
+VLM 在这些证据图像或 check-again 图像上判断关系：
+\begin{equation}
+  h_{\mathrm{VLM}}(I_k,v_i^o,v_j^o,\varphi)
+  \rightarrow
+  (verified,conf,reason).
+\end{equation}
+若关系成立，则添加动态 object-object edge：
+\begin{equation}
+  e_{i,j}^{o-o}\in\mathcal{E}^{o-o},
+  \qquad
+  A(e_{i,j}^{o-o})=\{\varphi,conf,evidence\}.
+  \label{eq:dynamic_edge}
+\end{equation}
+
+这种设计的关键在于拒绝粒度。关系失败只拒绝该对象对：
+\begin{equation}
+  reject(v_i^o,v_j^o,\varphi)
+  \not\Rightarrow
+  reject(c_i)
+  \quad \text{and} \quad
+  reject(v_j^o).
+\end{equation}
+因此，当系统寻找红色椅子却看到蓝色椅子，或寻找书架上的书但当前书不在该
+anchor 上时，不会屏蔽整个类别，也不会反复回到同一错误实例。
+
+\subsection{伪代码}
+
+\begin{lstlisting}[style=pseudo,caption={结构化地图更新}]
+Algorithm UpdateStructuredMap(O_t, Q, R):
+  # O_t: 当前 RGB-D 或真实观测
+  # Q: detector prompts，由 InstructionPlan 提供
+  # R: 当前三层场景图
+
+  boxes, labels, scores <- Detector(O_t.rgb, Q)
+  masks <- Segmenter(O_t.rgb, boxes)
+
+  for each detection i:
+      P_i <- BackProject(masks[i], O_t.depth, O_t.pose)
+      # 将 2D mask 和 depth 转换成地图坐标下的对象点云
+
+      obj_i <- BuildObjectNode(P_i, labels[i], scores[i], boxes[i])
+      MergeOrInsertObject(R, obj_i)
+      # 若与历史对象属于同一物理实例，则合并；否则新增 object node
+
+  UpdateNavigableCloud(R, O_t)
+  UpdateViewpointNodes(R, current_pose)
+  # 根据 frontier、覆盖范围和拓扑连接更新 viewpoint graph
+
+  SegmentOrUpdateRooms(R)
+  # 房间分割失败时回退为单房间，不中断主循环
+
+  UpdateRoomViewObjectEdges(R)
+  return R
+\end{lstlisting}
+
+\section{导航策略模块}
+
+\subsection{Room-level 与 In-room 策略}
+
+系统采用两阶段导航策略：高层在 room-level 上做语义选择，低层在房间内部执行
+frontier/viewpoint 探索。房间选择可以写成效用最大化：
+\begin{equation}
+  r^\star =
+  \arg\max_{r_i\in\mathcal{R}_{cand}}
+  U(r_i\mid g,\mathcal{R}),
+\end{equation}
+其中
+\begin{equation}
+  U(r_i\mid g,\mathcal{R})
+  =
+  \alpha S_{\mathrm{sem}}(r_i,g)
+  + \beta S_{\mathrm{frontier}}(r_i)
+  - \gamma \tilde{d}(p_t,r_i)
+  - \eta B(r_i).
+  \label{eq:room_utility}
+\end{equation}
+
+$S_{\mathrm{sem}}$ 表示房间对象与目标的语义相关性，
+$S_{\mathrm{frontier}}$ 表示剩余探索价值，$\tilde{d}$ 是带回溯惩罚的路径代价，
+$B(r_i)$ 是已失败或低价值房间的惩罚项。实际实现中，VLM 不直接计算公式数值，
+而是通过结构化 prompt 同时读取房间对象、候选房间、历史轨迹和路径代价。
+
+房间内部探索则由 viewpoint/frontier 策略驱动：
+\begin{equation}
+  v^\star =
+  \arg\max_{v_i^{vp}}
+  \left[
+  \lambda_f F(v_i^{vp})
+  + \lambda_c C_{\mathrm{novel}}(v_i^{vp})
+  + \lambda_o O_{\mathrm{rel}}(v_i^{vp})
+  - \lambda_d d(p_t,v_i^{vp})
+  \right].
+  \label{eq:viewpoint_score}
+\end{equation}
+该层主要是几何与覆盖问题，不应由 VLM 逐步决定。
+
+\subsection{Anchor-first Relation Search}
+
+复杂关系任务通常不能只等待 terminal object 被直接检测到。以
+\textit{find a book on a shelf} 为例，终止目标是 book，而 shelf 是 anchor。
+系统应先找到 shelf-like 区域，再在其附近局部扫描 book，并对 book--shelf
+对象对验证关系。这一流程可表示为
+\begin{equation}
+  q_{term}=\texttt{book},
+  \quad
+  q_{anchor}=\texttt{shelf},
+  \quad
+  \varphi=\texttt{on}.
+\end{equation}
+
+执行时，anchor 只提供导航参考，不能触发成功：
+\begin{equation}
+  terminal(q_{anchor}) = \mathrm{false}.
+\end{equation}
+若某个 anchor 附近未找到满足约束的 terminal object，只记录该 anchor 实例已经
+搜索过，而不拒绝 anchor 类别。
+
+\subsection{Final Verifier 与 View-control}
+
+最终停止由统一 verifier 决定。输入包括原始指令、候选对象、结构化计划、几何事实、
+关系边、视角证据和历史尝试。输出为
+\begin{equation}
+  V_{\mathrm{final}}
+  =
+  \{
+  decision,
+	  semantic\_satisfied,
+	  view\_sufficient,
+	  hard\_constraints,
+	  confidence,
+  constraints,
+  view\_objective,
+  reason
+  \}.
+\end{equation}
+
+\texttt{hard\_constraints} 表示通用机器人停止合同，例如 final-stop 距离。它不是对象类别
+规则；若该约束未满足，除非 verifier 给出不可执行或不适用的结构化解释，否则
+\texttt{accept} 会被转为 \texttt{need\_better\_view}。
+
+\texttt{need\_better\_view} 不是语义拒绝。它表示候选目标或关系已经可信，但当前
+视角不足以支持停止。系统会 pin 住当前 candidate、relation edge、candidate
+record 和首次语义确认的 stable visual reference，进入 view-control 子任务。若后续
+视角改善失败，系统仍应围绕同一已确认目标继续处理，而不是回到普通探索重新寻找
+其他目标。该 stable visual reference 只作为目标身份参照；当前 stop evidence 仍需由
+final verifier 重新判断。view-control 是有限子任务：系统为同一已确认目标维护
+viewpoint proposal、final verifier 调用和同一 candidate final verifier 调用预算，并保存
+当前最高质量的 \texttt{best\_visual\_evidence}。连续无改善只写为
+\texttt{progress\_stalled}，用于切换 proposal 或重采样，不表示 proposal 已耗尽。若候选
+视角或 verifier 调用达到上限，控制层会将 \texttt{budget\_exhausted}、
+\texttt{best\_visual\_evidence}、remaining proposal 摘要与 attempt history 回传给 final
+verifier；是否接受 best available evidence 仍由 prompt 在原始任务和视觉证据下判断。
+
+在安装自然语言 \texttt{InstructionPlan} 或 benchmark object-goal plan 后，\texttt{STOP}
+权限只属于 final verifier。legacy 几何可见性检查可以提供证据，但不能单独结束
+episode；若 verifier 未返回 \texttt{accept}，控制器必须继续 view-control、旋转采集新视角
+或恢复搜索。
+
+\subsection{伪代码}
+
+\begin{lstlisting}[style=pseudo,caption={导航主循环}]
+Algorithm Navigate(Env, G):
+  # G 可以是 benchmark object category，也可以是自然语言指令
+
+  P <- CompileInstructionOrObjectGoal(G)
+  R <- InitializeMap()
+  E <- InitializeExecutionState(P)
+
+  while step < max_steps:
+      O_t <- Env.Observe()
+      R <- UpdateStructuredMap(O_t, DetectorTerms(P), R)
+
+      candidate <- SelectTargetCandidate(R, P, E)
+      # 该函数同时检查 terminal role、ledger、count/sequence 和关系状态
+
+      if candidate exists:
+          evidence <- CollectEvidence(candidate)
+          result <- FinalVerifier(P.raw_instruction, candidate, evidence)
+
+          if result.decision == "accept":
+              if MarkTaskProgress(E, candidate, result) == COMPLETE:
+                  return STOP
+              else:
+                  continue
+
+          if result.decision == "need_better_view":
+              PinConfirmedTarget(E, candidate, evidence, result)
+              waypoint <- SelectBetterViewpoint(candidate, result.view_objective)
+              # 语义已确认，只改善视角；不要清空当前目标状态
+              if waypoint is None and HardStopConstraintsHold(evidence, result):
+                  return STOP_WITH_BEST_AVAILABLE_VIEW
+
+          if result.decision == "reject_candidate":
+              MarkRejected(E, candidate)
+              waypoint <- ExploreOrRelocate(R, P, E)
+
+      else:
+          waypoint <- ExploreOrRelocate(R, P, E)
+
+      action <- LowLevelPlanner(waypoint)
+      Env.Step(action)
+
+  return TIMEOUT
+\end{lstlisting}
+
+\begin{lstlisting}[style=pseudo,caption={动态关系验证}]
+Algorithm VerifyRelation(subject, anchor, relation, R, instruction):
+  # subject 是 terminal candidate，anchor 是非终止参考物体
+
+  if RelationLedger.Accepted(subject, anchor, relation):
+      return ACCEPTED_EDGE
+
+  if RelationLedger.Rejected(subject, anchor, relation):
+      return REJECTED_PAIR
+
+  V_shared <- SharedViewpoints(subject, anchor, R)
+  # 只取共同观察过二者的 viewpoint，避免无关图像进入 VLM
+
+  evidence <- SelectRelationEvidence(V_shared, subject, anchor)
+  result <- VLMRelationVerifier(instruction, subject, anchor, relation, evidence)
+
+  if result.verified:
+      edge <- AddDynamicSemanticEdge(R, subject, anchor, relation, result)
+      RelationLedger.MarkAccepted(subject, anchor, relation)
+      return edge
+  else:
+      RelationLedger.MarkRejected(subject, anchor, relation)
+      return REJECTED_PAIR
+\end{lstlisting}
+
+\section{Prompt 模块}
+
+Prompt 被集中管理在 \texttt{prompting/templates.py}，每个 prompt 在
+\texttt{prompting/registry.py} 中拥有稳定的 \texttt{prompt\_id}、trace label
+和 schema 名称。这一设计使得日志、缓存和后续 prompt 版本管理可以一致追踪。
+
+\begin{longtable}{p{0.25\linewidth}p{0.25\linewidth}p{0.40\linewidth}}
+\toprule
+\textbf{Prompt ID} & \textbf{Trace label} & \textbf{用途} \\
+\midrule
+\texttt{instruction.parse.v1} & \texttt{instruction\_parser} & 编译自然语言任务。\\
+\texttt{concept.grounding.v1} & \texttt{concept\_grounding} & 将 concept 映射到 detector vocabulary。\\
+\texttt{execution.strategy.v1} & \texttt{execution\_strategy} & 选择 any-success、sequence、count 或 anchor-first。\\
+\texttt{concept.match.batch.v1} & \texttt{concept\_match\_batch} & 批量判断运行时对象是否满足 concept。\\
+\texttt{relation.verify.v1} & \texttt{relation\_verifier} & 验证 object-object 空间或语义关系。\\
+\texttt{final.verify.v2} & \texttt{final\_instruction\_verifier} & 判断当前候选是否满足原始指令并允许 STOP。\\
+\bottomrule
+\end{longtable}
+
+\subsection{Final verifier prompt 示例}
+
+\begin{lstlisting}[style=pseudo,caption={Final verifier prompt 片段}]
+You are the final instruction-satisfaction verifier for an indoor navigation robot.
+
+Original instruction:
+  "I want to watch movie"
+
+Candidate:
+  uid: tv:c75ccae926db
+  label: tv
+  role: terminal
+
+Evidence:
+  - RGB image with candidate bbox
+  - object crop
+  - geometry facts: distance_to_object, bbox_area_ratio, center_offset
+  - relation edges if any
+  - view-control history if any
+
+Return strict JSON:
+{
+  "satisfied": false,
+  "semantic_satisfied": true,
+  "view_sufficient_for_stop": false,
+  "decision": "need_better_view",
+  "view_feedback": "The candidate is a valid TV, but the final view is weak.",
+  "preferred_view_goal": "Keep the TV visible and obtain a clearer centered view.",
+  "reason": "The object satisfies the instruction, but stop evidence is not strong enough."
+}
+\end{lstlisting}
+
+\subsection{Relation verifier prompt 示例}
+
+\begin{lstlisting}[style=pseudo,caption={Relation verifier prompt 片段}]
+You verify one spatial relation for an indoor navigation robot.
+
+Instruction:
+  "find a book on a shelf"
+
+Subject candidate:
+  uid: book:56e406d1ac42
+  label: book
+
+Anchor candidate:
+  uid: cabinet:39f2a38841f1
+  label: cabinet
+  role: anchor
+
+Relation:
+  on
+
+Use only the provided evidence. Do not rely on generic common-sense priors.
+Return whether the relation is visually or geometrically verified.
+\end{lstlisting}
+
+\section{实物部署接口}
+
+\subsection{系统边界}
+
+实物模式应保持高层语义导航与底层运动控制解耦。STRIVE 负责构建语义地图、
+解析任务、选择房间或目标、验证候选；ROS/机器人控制栈负责 SLAM、局部避障、
+路径跟踪、速度控制和安全停止。
+
+\begin{equation}
+\begin{aligned}
+&\text{Real Sensors}
+\rightarrow \text{Sensor Adapter}
+\rightarrow \text{RealObservation} \\
+&\rightarrow \text{Semantic Mapper}
+\rightarrow \text{NavigationIntent}
+\rightarrow \text{ROS Navigation Bridge}
+\rightarrow \text{Base Controller}.
+\end{aligned}
+\end{equation}
+
+\subsection{硬件与传感器}
+
+论文中的 wheeled robot 采用 Mecanum wheel platform、Ricoh Theta Z1 全景相机
+与 Livox Mid-360 LiDAR。项目计划同时支持 RealSense，作为 pinhole RGB-D
+相机接入：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item Theta Z1 适合房间级全景语义、快速上下文观察和 room-level reasoning。
+  \item RealSense 适合近距离目标确认、小物体 RGB-D 重建和局部几何复核。
+  \item Livox Mid-360 提供主要空间几何，必要时可投影为稀疏 depth map。
+\end{itemize}
+
+相机接口不暴露品牌，而暴露相机模型：
+
+\begin{lstlisting}[style=pseudo,caption={CameraFrame 接口}]
+CameraFrame:
+  rgb: np.ndarray
+  depth: np.ndarray | None
+  camera_model: "panorama" | "pinhole"
+  intrinsics: dict
+  extrinsics: SE3
+  fov: dict
+  timestamp: float
+\end{lstlisting}
+
+\subsection{ROS 输入与输出}
+
+推荐输入 topic：
+
+\begin{lstlisting}[style=pseudo,caption={Real robot 输入 topic 草案}]
+/camera/image                         # Theta panorama 或 RealSense RGB
+/registered_scan                      # Livox Mid-360 registered point cloud
+/camera/aligned_depth_to_color/image  # RealSense aligned depth，可选
+/state_estimation                     # SLAM odometry
+/tf                                   # map, base_link, camera, lidar transforms
+\end{lstlisting}
+
+统一观测结构：
+
+\begin{lstlisting}[style=pseudo,caption={RealObservation 接口}]
+RealObservation:
+  rgb: np.ndarray
+  pointcloud: np.ndarray
+  pose: SE3
+  timestamp: float
+  camera_model: str
+  intrinsics: dict
+  extrinsics: SE3
+  rgb_pano: np.ndarray | None
+  depth_pano: np.ndarray | None
+  depth: np.ndarray | None
+  depth_valid_mask: np.ndarray | None
+  frame_ids: dict[str, str]
+\end{lstlisting}
+
+高层输出不应是速度命令，而应是 navigation intent：
+
+\begin{lstlisting}[style=pseudo,caption={NavigationIntent 接口}]
+NavigationIntent:
+  intent_type: "explore" | "approach_object" | "improve_view" | "stop" | "recover"
+  target_pose: SE2 | None
+  target_object_uid: str
+  target_room_id: str
+  constraints: dict
+  reason: str
+  safety_policy: dict
+\end{lstlisting}
+
+\subsection{LiDAR--Camera 投影}
+
+设 LiDAR 点为 $X_l$，外参为 $T_{c\leftarrow l}$，则相机坐标为
+\begin{equation}
+  X_c = T_{c\leftarrow l}X_l.
+\end{equation}
+
+对于 pinhole 相机：
+\begin{equation}
+  u = f_x\frac{X_c}{Z_c}+c_x,
+  \qquad
+  v = f_y\frac{Y_c}{Z_c}+c_y.
+\end{equation}
+
+对于全景相机，可使用球面投影：
+\begin{equation}
+  \theta=\operatorname{atan2}(Y_c,X_c),
+  \qquad
+  \phi=\operatorname{atan2}(Z_c,\sqrt{X_c^2+Y_c^2}),
+\end{equation}
+\begin{equation}
+  u=W\frac{\theta+\pi}{2\pi},
+  \qquad
+  v=H\frac{\frac{\pi}{2}-\phi}{\pi}.
+\end{equation}
+
+对同一像素保留最近深度：
+\begin{equation}
+  D(u,v)=\min_{X_c\mapsto(u,v)} Z_c.
+\end{equation}
+稀疏深度不应被当作 Habitat dense depth 的完全替代。小物体附近缺失深度应保留
+为 unknown，以免构造虚假的物体表面。
+
+\section{日志、指标与可审计性}
+
+系统需要同时记录 benchmark 指标和 instruction-level 指标。Habitat 原始指标包括
+\texttt{success}、\texttt{spl}、\texttt{distance\_to\_goal} 和
+\texttt{num\_steps}；instruction-aware 指标包括
+\texttt{instruction\_success}、\texttt{instruction\_decision}、
+\texttt{accepted\_candidate\_uid}、\texttt{accepted\_relation\_edge}、
+\texttt{final\_stop\_decision} 和各类 LVLM 调用计数。
+
+核心调试产物包括：
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \texttt{instruction\_adapter/plan.json}：编译后的任务计划。
+  \item \texttt{instruction\_adapter/runtime\_state\_*.json}：执行状态、ledger 和关系缓存。
+  \item \texttt{final\_verifier/result\_*.json}：最终验证结果、失败约束与 view feedback。
+  \item \texttt{lvlm\_calls/*.json}：每次 LLM/VLM 调用记录。
+  \item \texttt{detection/step\_*/}：检测、bbox 与复核图像。
+\end{itemize}
+
+这些产物是分析导航失败的主要依据。对于复杂指令，Habitat
+\texttt{success=0} 不必然表示语义任务失败；应同时检查
+\texttt{instruction\_success} 与 final verifier 的接受步骤。
+
+\section{当前边界与后续工作}
+
+当前项目已经将 benchmark object-goal 与自然语言任务统一到同一 final verifier
+和 view-control 框架，但仍存在进一步研究与工程优化空间。
+
+首先，room-level semantic planning 仍可增强。当前 room evidence 主要来自对象
+列表、frontier 和局部图结构，未来应进一步加入房间代表图、功能 caption 与跨房间
+拓扑摘要。其次，小物体搜索需要更强的 support-region policy；该策略应由
+prompt-first 的 search priors 和运行时 evidence 共同驱动，而不是写入
+\texttt{cup -> table} 之类的静态规则。第三，动态语义边的证据选择还可以更系统，
+特别是多视角共视图像、check-again 图像和 geometry prefilter 之间的优先级。
+最后，实物模式应作为独立 runtime 接入 ROS，不应直接复用 Habitat action loop。
+
+总体原则可以概括为：
+
+\begin{quote}
+语义由 prompt-first 模块声明和验证；几何由 mapper、planner 与 controller 保证；
+状态由 ledger 与 execution state 单调维护；VLM 不承担底层路径规划；benchmark
+与 instruction 共享 verifier 闭环，但保持任务语义隔离。
+\end{quote}
+
+\end{document}

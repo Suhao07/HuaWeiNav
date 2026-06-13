@@ -367,13 +367,17 @@ instruction_decision
 instruction_accept_step
 accepted_candidate_uid
 accepted_relation_edge
+accepted_distance_to_target
+accepted_distance_source
 lvlm_call_count_by_type
 lvml_call_count_by_type
 ```
 
 `success` 仍是 Habitat 原始 ObjectNav 指标；复杂自然语言指令应优先看
 `instruction_success`。例如空间关系任务可能已经通过 final verifier 和动态语义边
-确认，但官方 `success` 仍因原始单目标指标显示为 0。
+确认，但官方 `success` 仍因原始单目标指标显示为 0。距离分析应优先看
+`accepted_distance_to_target`；`distance_to_goal` 是 Habitat 原始 GT 距离，可能不是
+自然语言最终接受的 terminal instance。
 
 可审计日志：
 

@@ -109,6 +109,21 @@ Return strict JSON:
   not too weak. Use the provided geometry facts as factual cues, not as rigid
   thresholds. A view can be semantically correct but still insufficient for
   stopping if a clearer, more centered, less clipped, or closer view is needed.
+  Prefer a stop pose that is as close as the robot can execute while preserving
+  clear visibility of the target and any required relation anchor. Do not ask
+  the robot to move closer if doing so would crop, hide, or confuse the target.
+- hard_constraints: a JSON object. Copy the provided
+  evidence.hard_stop_constraints.satisfied value. Do not invent physical
+  infeasibility from the image or from repeated attempts. Physical reachability,
+  stop distance, collision, and remaining-view feasibility are planner/geometry
+  facts. You may only report infeasible_or_not_applicable=true when the provided
+  hard_stop_constraints already contains a planner_infeasibility_proof or
+  planner_infeasible=true. Include:
+  - satisfied: true or false.
+  - infeasible_or_not_applicable: true only when planner evidence explicitly
+    says the robot cannot execute the hard constraint or the constraint does not
+    apply, with a concrete reason from that evidence.
+  - reason: concise explanation grounded in the provided evidence.
 - decision:
   - accept: all explicit requirements are satisfied.
   - reject_candidate: the candidate is clearly the wrong instance or violates a hard requirement.
@@ -130,16 +145,38 @@ Return strict JSON:
 Important:
 - accept requires satisfied=true, semantic_satisfied=true, and
   view_sufficient_for_stop=true.
+- accept also requires hard_constraints.satisfied=true. If a hard constraint is
+  not satisfied, use need_better_view unless the provided planner/geometry hard
+  constraints explicitly state infeasible_or_not_applicable=true with a concrete
+  planner-owned reason.
 - If the candidate appears to satisfy the instruction but the target is near
   the image border, very small, clipped, mostly low/outside the useful camera
   area, or relation evidence is not jointly visible enough, return
   decision=need_better_view with semantic_satisfied=true.
+- If the current stop evidence is valid but a clearly closer feasible view is
+  available in view_control proposals, prefer decision=need_better_view and
+  describe the closer-but-visible view goal. If no feasible closer/clearer view
+  remains, decide from the best available evidence instead of repeating
+  need_better_view.
 - Do not reject a candidate only because the view is poor; use
   need_better_view unless the candidate clearly violates the instruction.
-- If view_control history is provided, use it. If there are remaining feasible
-  proposals and previous attempts did not substantially improve the evidence,
-  prefer need_better_view over accept. If no better view remains, decide whether
-  limited-view acceptance is justified by the instruction and evidence.
+- If view_control history is provided, use it as a bounded optimization record.
+  If there are remaining feasible proposals and the hard constraints are still
+  unsatisfied, prefer need_better_view over accept. If
+  view_control.budget_exhausted=true or no feasible proposal remains, you may
+  stop optimizing soft visual quality, but you still cannot accept while a
+  planner-owned hard requirement is violated. Hard physical constraints remain
+  blocking unless planner evidence says they are infeasible.
+- If view_control includes pinned_visual_evidence, treat it as the stable visual
+  identity reference that was previously confirmed by the verifier. Compare the
+  current stop evidence against that reference. Do not accept if the current
+  bbox/crop has drifted onto a support object, background surface, surrounding
+  structure, or another non-target region while the true target is clipped,
+  off-center, or only barely visible in the full image.
+- pinned_visual_evidence and best_visual_evidence are not permission to stop by
+  themselves. The current view must still justify STOP, unless the view_control
+  context says the bounded soft-view budget is exhausted and all planner-owned
+  physical stop contracts are satisfied or explicitly infeasible by geometry.
 """
 
 # 目标识别（基于bbox的单目标识别）

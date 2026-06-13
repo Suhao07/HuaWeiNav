@@ -271,6 +271,7 @@ class ConstraintEvaluator:
                 state.start_better_view_for_verified_pair(
                     target=target,
                     candidate_uid=candidate.uid,
+                    candidate_record=candidate.as_dict(),
                     relation_context=(evidence or {}).get("verified_relation_context") or {},
                     result=result,
                     evidence=evidence,

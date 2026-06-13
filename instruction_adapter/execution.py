@@ -133,6 +133,7 @@ class InstructionExecutionState:
         *,
         target: TargetQuery | None,
         candidate_uid: str,
+        candidate_record: dict[str, Any] | None = None,
         relation_context: dict[str, Any] | None,
         result: Any,
         evidence: dict[str, Any] | None = None,
@@ -152,6 +153,7 @@ class InstructionExecutionState:
         self.pending_verified_pair = {
             "target_id": getattr(target, "id", "") if target is not None else "",
             "candidate_uid": str(candidate_uid or edge.get("subject_id", "")),
+            "candidate_record": dict(candidate_record or {}),
             "relation_context": dict(relation_context or {}),
             "edge": edge,
             "decision": getattr(result, "decision", ""),

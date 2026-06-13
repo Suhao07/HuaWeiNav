@@ -1,9 +1,120 @@
 # Instruction Adapter Changelog
 
+## 2026-06-12
+
+### Changed
+
+- final-stop physical authority 收敛：
+  - VLM 只判断 `semantic_satisfied`、关系满足度和 `view_sufficient_for_stop`；
+  - `distance_satisfied`、可达性、碰撞和“是否没有更近可执行视角”只由
+    planner/geometry evidence 决定；
+  - VLM 输出的 `infeasible_or_not_applicable=true` 只作为 report 记录，不能覆盖
+    `within_final_stop_distance`；
+  - 只有 evidence 中存在 `planner_infeasibility_proof.infeasible_by_geometry=true`
+    时，best-available stop 才能绕过未满足的物理距离合同。
+- final-stop hard constraints 结构化：
+  - `distance_to_object` 与 benchmark `success_distance` 生成
+    `hard_stop_constraints.within_final_stop_distance`；
+  - final verifier schema 新增 `hard_constraints`，用于回传 VLM 对 hard contract 的
+    report，但不授予 VLM 物理 override 权限；
+  - 如果 VLM 返回 `accept` 但 hard constraints 未满足且没有 planner-owned 不可达证明，
+    verifier 后处理会降级为 `need_better_view`；
+  - 这是一条通用 stop contract，不写任何目标类别规则。
+- 修正 view-control budget 语义：
+  - `budget_exhausted=true` 只表示 proposal 用完，或软视角优化预算在物理合同已满足/无剩余
+    物理 proposal 时耗尽；
+  - 如果 `within_final_stop_distance` 仍未满足且仍有
+    `remaining_physical_contract_proposals`，attempt/verifier 预算不会被解释为可停止；
+  - `no_improvement_rounds` 只产生 `progress_stalled=true`，用于提示切换 proposal 或重采样，
+    不再等价于“没有可行更好视角”；
+  - view-control context 新增 `remaining_proposals` 和
+    `closest_remaining_proposal_distance`，让 VLM 判断是否真的没有更近且可见的候选视角。
+- 修正 better-view 路径端点：
+  - 当 verifier 的 `view_objective` 要求靠近目标时，check-again path 优先朝当前目标实例的
+    可接近点生成，而不是复用可能偏远的发现 waypoint；
+  - 如果该目标点不可达，再退回 confirmed target waypoint。
+- 统一 final-stop authority：
+  - 当 benchmark object-goal 或自然语言 `InstructionPlan` 已安装时，Habitat `STOP`
+    只能由 `FinalInstructionVerifier` 的 `decision=accept` 触发；
+  - legacy `final_check()` 的 ray/voxel 可见性不再能单独结束 episode，只保留给无 plan
+    的原始 STRIVE 路径；
+  - 若 verifier 返回 `need_better_view` 或其它非 accept 决策，agent 会阻断 stop action，
+    继续执行 view-control 或采集新的当前视角证据。
+- view-control 增加 stable visual reference：
+  - `semantic_satisfied=true` 后，`ViewControlState` pin 首次语义确认的
+    `pinned_visual_evidence`，并单独记录后续 `latest_visual_evidence`；
+  - final verifier 会同时看到当前 stop evidence 与 pinned visual reference，用于判断
+    当前 bbox/crop 是否仍对准同一视觉目标；
+  - 该机制防止近距离时 3D object cluster 投影漂移到支撑物、墙面或背景后误导
+    view-control，但不写任何目标类别规则。
+- final verifier prompt 更新：
+  - 明确 `pinned_visual_evidence` 是目标身份参照，不是自动 stop 许可；
+  - 若当前 evidence 漂移到 support/background，而真实目标被裁切或只弱可见，应返回
+    `need_better_view`，最终是否 limited accept 仍由 VLM 根据 evidence 和 view-control
+    历史判断。
+- view-control 增加 best-available 收敛：
+  - `need_better_view` 后如果仍有可执行 viewpoint proposal，agent 继续改善视角；
+  - `ViewControlState` 现在显式维护 `max_attempts`、`max_verifier_calls` 和
+    `max_no_improvement_rounds`，并记录 `best_visual_evidence`；
+  - 如果 viewpoint proposal 或 verifier 调用达到预算上限，agent 只把
+    `budget_exhausted`、pinned/best evidence、remaining proposal 摘要和 attempt history
+    传回 final verifier；
+  - 连续无改善轮数只产生 `progress_stalled=true`，不再宣称 proposal 已耗尽；
+  - Python 控制层不再把 `need_better_view` 硬改成 `accept`，best available stop 由
+    prompt 根据原始任务、可见证据和预算上下文决定。
+- final verifier prompt 增加 bounded view-control 语义：
+  - VLM 会看到 `budget_exhausted`、`best_visual_evidence`、attempt history 和剩余 proposal；
+  - prompt 明确要求尽量靠近，但必须保持 target 和 relation anchor 清楚可见；
+  - 当预算已耗尽时，prompt 应判断当前/最佳/固定参照证据是否足够作为 best available
+    stop，而不是无限返回 `need_better_view`。
+- 删除控制层冲突规则：
+  - 移除 initial-accept deferral，agent 不再把 VLM 的 `accept` 改写成
+    `need_better_view`；
+  - final view geometry 不再通过 `STRIVE_FINAL_VIEW_*` 阈值改写 VLM 决策；
+  - best available 收敛不再由 Python 合成 accept；
+  - 新增 `STRIVE_FINAL_VERIFIER_MAX_PER_CANDIDATE`，即使某条路径重置了
+    `ViewControlState`，同一 candidate 也不会无限进入 final verifier。
+- metrics 增加 `accepted_distance_to_target` 和 `accepted_distance_source`，用于区分
+  instruction-level terminal instance 距离与 Habitat 原始 `distance_to_goal`。
+- 实验产物增加 run 隔离信息：
+  - `objnav_benchmark_with_process_obs.py` 新增 `--run_id` 和 `--clean_save_dir`；
+  - `run_manifest.json`、`metrics.csv`、final verifier evidence/result 中写入 `run_id`；
+  - 复用同名 `--save_dir` 时建议加 `--clean_save_dir`，避免旧 metrics 和新 verifier 产物混读。
+
+### Tests
+
+- `tests/test_view_control_state.py` 新增 stable visual reference、bounded budget 和 best visual evidence 回归测试，确保后续几何上更大的漂移帧不会覆盖首次语义确认帧，并且同一目标不会无限 view retry。
+- `tests/test_final_stop_verifier.py` 更新为 prompt-first guidance 回归测试，确保距离进入
+  hard stop constraint，投影失败和预算状态作为 VLM prompt facts。
+- 新增 hard stop constraint 和 no-improvement budget 语义测试，防止再次把
+  `distance_to_object > success_distance` 降成普通提示，或把 `progress_stalled` 误当作
+  `budget_exhausted`。
+
 ## 2026-06-11
 
 ### Added
 
+- final-stop confirmed target 闭环修复：
+  - `semantic_satisfied=true + need_better_view` 后，单目标 object-goal 也会进入
+    `InstructionExecutionState.mode=better_view_for_verified_pair`；
+  - pending state 保存 `candidate_record`，mapper uid 漂移时可用 centroid/position
+    继续关联同一局部目标簇；
+  - `ViewControlState` 对同一 candidate 合并 VLM view objective，不再因为 prompt
+    wording 变化清空 attempted proposals；
+  - final-stop proposal 排序先满足 `required_stop_distance`，再比较可见性、居中和尺度；
+  - `after_check_again()` 和 reject recovery 在 pending better-view 时不再 reset
+    `view_control_state`、不再把 `object_final.tag` 改成 `nothing`。
+- benchmark ObjectNav 默认复用 instruction target pipeline：
+  - 普通 benchmark 自动安装 object-goal `InstructionPlan`，例如 `Find the <tv>.`；
+  - 该 plan 复用 mapper 搜索、ledger、check_again evidence、final verifier 和
+    view-control，不再走 benchmark-only final verifier 分支；
+  - 显式 instruction mode 继续使用原始自然语言 prompt 和完整 InstructionPlan；
+  - benchmark object-goal plan 不读取 episode metadata 的复杂自然语言，因此不引入
+    relation、sequence、room、count 等复杂指令语义；
+  - `metrics.csv` 新增 `final_stop_success`、`final_stop_decision`、
+    `final_stop_accept_step` 和 `final_stop_mode`。
+- final-stop evidence 增加 stop-distance facts：`distance_to_object` 和 benchmark
+  provider 的 `success_distance` 会写入 verifier prompt，用于提示 VLM 在可行时继续靠近。
 - 新增 `benchmark/` provider 抽象：
   - `BenchmarkSpec` 统一记录 benchmark、split、dataset path、success distance
     和单 episode materialization provenance；
@@ -336,19 +447,18 @@
   - `need_better_view` 后不再只做一次 retry；
   - 保存 baseline view quality、多个 viewpoint proposals、attempt history；
   - final verifier 会看到 `view_control` 历史；
-  - 如果 evidence 没有相对 baseline 足够改善且仍有 proposal，控制层继续
-    `need_better_view`，避免过早 stop。
-  - 首次 `accept` 前也会执行 initial-accept deferral：若存在明显更好的通用几何
-    proposal，则先采集更好 evidence，再允许最终停止。
+  - 控制层只执行 VLM 给出的 `view_objective`，不再用几何改善阈值覆盖 VLM 的
+    accept/retry 决策。
   - better-view 子目标会 pin 已验证的 `DynamicSemanticEdge`，避免靠近后
     mapper 实例 uid 漂移导致重新验证其它 pair。
 - relation constraint 在 view-control active 时优先复用 `pinned_relation_context`。
 - `check_again` 强视觉证据下，关系几何预筛失败可降级为 VLM override，并绕过旧的
   geometry failure cache。
-- `FinalInstructionVerifier` 新增通用 final view guard：
-  - 只使用 `view_quality_facts` 中的投影、中心偏移、边界余量和 bbox 面积；
-  - 语义正确但停止视角过差时强制转为 `need_better_view`；
-  - 不写目标/anchor 类别规则，阈值可通过 `STRIVE_FINAL_VIEW_*` 环境变量配置。
+- `FinalInstructionVerifier` 新增 prompt-side view guidance：
+  - 使用 `view_quality_facts` 中的投影、中心偏移、边界余量、bbox 面积和距离；
+  - 这些事实只进入 prompt 和 diagnostics，不再由 Python 侧强制转为
+    `need_better_view`；
+  - 不写目标/anchor 类别规则。
 - `whether_to_check_again()` 从旧的早停阈值改为通用候选视角评分：
   - visibility；
   - centerability；

@@ -14,7 +14,13 @@ from loguru import logger
 from cv_utils.gpt_utils import check_again_object_in_bbox
 from cv_utils.visualizer import visualize_mask
 from mapper_with_process_obs import Instruct_Mapper
-from instruction_adapter.verifier import FinalInstructionVerifier, VerificationResult, candidate_from_object
+from instruction_adapter.verifier import (
+    FinalInstructionVerifier,
+    VerificationResult,
+    candidate_from_object,
+    hard_stop_constraints_from_evidence,
+    instruction_hash,
+)
 from instruction_adapter.view_control import ViewControlState
 from mapping_utils.geometry import (gpu_cluster_filter, gpu_merge_pointcloud,
                                     project_to_camera)
@@ -84,8 +90,17 @@ class HM3D_Objnav_Agent:
         self.instruction_success = False
         self.instruction_decision = ""
         self.instruction_accept_step = None
+        self.final_stop_success = False
+        self.final_stop_decision = ""
+        self.final_stop_accept_step = None
+        self.final_stop_mode = ""
         self.accepted_candidate_uid = ""
         self.accepted_relation_edge = {}
+        self.accepted_distance_to_target = None
+        self.accepted_distance_source = ""
+        self.confirmed_target_waypoint = None
+        self.run_id = ""
+        self.final_verifier_attempt_counter = {}
 
     def translate_objnav(self, object_goal):
         if object_goal.lower() == 'plant':
@@ -157,8 +172,16 @@ class HM3D_Objnav_Agent:
         self.instruction_success = False
         self.instruction_decision = ""
         self.instruction_accept_step = None
+        self.final_stop_success = False
+        self.final_stop_decision = ""
+        self.final_stop_accept_step = None
+        self.final_stop_mode = ""
         self.accepted_candidate_uid = ""
+        self.accepted_distance_to_target = None
+        self.accepted_distance_source = ""
+        self.confirmed_target_waypoint = None
         self.accepted_relation_edge = {}
+        self.final_verifier_attempt_counter = {}
 
     def rotate_panoramic(self, rotate_times=12):
         """Collect a panoramic sweep and run segmentation on the collected views."""
@@ -811,6 +834,37 @@ class HM3D_Objnav_Agent:
             ),
         }
 
+    def _augment_final_stop_geometry(self, geometry):
+        """Attach benchmark/instruction independent final-stop geometry.
+
+        The verifier consumes this as a generic stop-quality constraint.  It is
+        deliberately separate from instruction semantics: a natural-language
+        task may ask for "book on shelf", while a benchmark task only asks for
+        "Find the <tv>"; both still need a final view that is close enough to
+        justify STOP.
+        """
+
+        geometry = dict(geometry or {})
+        try:
+            success_distance = float(self.success_distance)
+        except Exception:
+            success_distance = 1.0
+        try:
+            scale = float(os.getenv("STRIVE_FINAL_STOP_DISTANCE_SCALE", "1.0"))
+        except Exception:
+            scale = 1.0
+        required_stop_distance = max(0.0, success_distance * scale)
+        geometry["success_distance"] = success_distance
+        geometry["required_stop_distance"] = required_stop_distance
+        geometry["stop_criterion"] = float(self.stop_criterion)
+        distance = geometry.get("distance_to_object")
+        try:
+            if distance is not None:
+                geometry["distance_margin_to_required_stop"] = required_stop_distance - float(distance)
+        except Exception:
+            pass
+        return geometry
+
     def _estimate_distance_to_object_final(self):
         try:
             positions = self.object_final.pcd.point.positions.cpu().numpy()
@@ -819,6 +873,46 @@ class HM3D_Objnav_Agent:
             return float(np.min(np.linalg.norm(positions[:, :2] - self.mapper.current_position[:2], axis=1)))
         except Exception:
             return None
+
+    @staticmethod
+    def _distance_from_visual_packet(packet):
+        """Read one distance value from a final-verifier visual evidence packet."""
+
+        try:
+            distance = (dict(packet or {}).get("geometry") or {}).get("distance_to_object")
+            if distance is None:
+                return None
+            return float(distance)
+        except Exception:
+            return None
+
+    def _accepted_distance_from_evidence(self, evidence, result):
+        """Return the best logged target distance and its provenance.
+
+        Habitat's `distance_to_goal` can point to the benchmark category goal,
+        while instruction mode may accept a different terminal instance.  Metrics
+        therefore need an instruction-level distance derived from verifier
+        evidence rather than the dataset metric.
+        """
+
+        geometry = dict((evidence or {}).get("geometry") or {})
+        try:
+            if geometry.get("distance_to_object") is not None:
+                source = str(geometry.get("source") or "final_verifier.geometry")
+                return float(geometry["distance_to_object"]), source
+        except Exception:
+            pass
+
+        view_control = self._view_control_context_from(evidence, result)
+        for key in ("latest_visual_evidence", "best_visual_evidence", "pinned_visual_evidence"):
+            distance = self._distance_from_visual_packet(view_control.get(key))
+            if distance is not None:
+                return distance, f"view_control.{key}"
+
+        distance = self._estimate_distance_to_object_final()
+        if distance is not None:
+            return float(distance), "object_final_pointcloud_estimate"
+        return None, ""
 
     def check_again(self, episode_step):
         bbox, geometry = self._project_object_bbox_on_current_view()
@@ -870,6 +964,7 @@ class HM3D_Objnav_Agent:
         }
         if distance is not None:
             geometry_for_evidence["distance_to_object"] = distance
+        geometry_for_evidence = self._augment_final_stop_geometry(geometry_for_evidence)
         # check_again 的 bbox 图通常是目标最清楚的一帧。
         # 成功时直接作为 final verifier 和 relation verifier 的证据，
         # 避免后续几何 stop 流程丢失“book on shelf”这类上下文。
@@ -898,6 +993,14 @@ class HM3D_Objnav_Agent:
         if spec is not None:
             return str(getattr(spec, "raw_instruction", "") or self.mapper.target)
         return str(self.instruct_goal or self.mapper.target or "")
+
+    def _requires_unified_final_stop(self):
+        """Return whether STOP must be authorized by the unified verifier."""
+
+        return (
+            getattr(self.mapper, "instruction_plan", None) is not None
+            or getattr(self.mapper, "instruction_spec", None) is not None
+        )
 
     def _nearby_objects_for_final_evidence(self):
         nearby_objects = []
@@ -945,6 +1048,7 @@ class HM3D_Objnav_Agent:
         distance = float(np.min(np.linalg.norm(positions[:, :2] - self.mapper.current_position[:2], axis=1)))
         geometry = dict(geometry or {})
         geometry["distance_to_object"] = distance
+        geometry = self._augment_final_stop_geometry(geometry)
 
         evidence = {
             "current_rgb_with_bbox_path": current_path,
@@ -987,6 +1091,7 @@ class HM3D_Objnav_Agent:
                     "objective": pending.get("view_objective", {}),
                     "exhausted": False,
                 }
+        evidence["hard_stop_constraints"] = hard_stop_constraints_from_evidence(evidence)
         return evidence
 
     def _pin_verified_relation_from_evidence(self, evidence):
@@ -996,8 +1101,149 @@ class HM3D_Objnav_Agent:
         if context and getattr(self.view_control_state, "active", False):
             self.view_control_state.pin_relation_context(context)
 
+    def _view_control_context_from(self, evidence=None, result=None):
+        """Merge view-control context from evidence, result diagnostics and state."""
+
+        context = {}
+        if isinstance(evidence, dict):
+            context.update(dict(evidence.get("view_control") or {}))
+        diagnostics = getattr(result, "diagnostics", {}) if result is not None else {}
+        if isinstance(diagnostics, dict):
+            context.update(dict(diagnostics.get("view_control") or {}))
+        if getattr(self.view_control_state, "active", False):
+            context.update(self.view_control_state.as_context())
+        return context
+
+    def _view_control_budget_exhausted(self, evidence=None, result=None) -> bool:
+        """Return whether the current confirmed-target view budget is exhausted."""
+
+        context = self._view_control_context_from(evidence, result)
+        return bool(context.get("budget_exhausted", context.get("exhausted", False)))
+
+    def _view_control_has_visual_reference(self, evidence=None, result=None) -> bool:
+        """Return whether a pinned/best visual reference is available."""
+
+        context = self._view_control_context_from(evidence, result)
+        return bool(context.get("pinned_visual_evidence") or context.get("best_visual_evidence"))
+
+    def _planner_hard_stop_allows_accept(self, evidence=None, result=None) -> bool:
+        """Return whether planner-owned stop contracts permit final STOP.
+
+        LVLM/VLM is responsible for semantics and visual evidence quality.  The
+        controller keeps physical contracts such as stop distance, reachability,
+        and collision feasibility under planner authority.  A failed hard
+        contract may be bypassed only when the evidence contains an explicit
+        planner/geometry infeasibility proof.
+        """
+
+        hard = dict(getattr(result, "hard_constraints", {}) or {})
+        if not hard:
+            hard = dict((evidence or {}).get("hard_stop_constraints") or {})
+        if not hard:
+            return True
+        if bool(hard.get("satisfied", True)):
+            return True
+        if bool(hard.get("planner_infeasible", False)) or bool(hard.get("infeasible_by_geometry", False)):
+            return True
+        proof = hard.get("planner_infeasibility_proof") or hard.get("physical_infeasibility_proof")
+        return bool(isinstance(proof, dict) and proof.get("infeasible_by_geometry"))
+
+    def _enforce_planner_hard_stop_contract(self, evidence, result):
+        """Demote semantic accept when physical stop contracts are still open."""
+
+        if not (getattr(result, "satisfied", False) and getattr(result, "decision", "") == "accept"):
+            return result
+        if self._planner_hard_stop_allows_accept(evidence, result):
+            return result
+        hard = dict(getattr(result, "hard_constraints", {}) or {})
+        result.satisfied = False
+        result.decision = "need_better_view"
+        result.view_sufficient_for_stop = False
+        failed = list(getattr(result, "failed_constraints", []) or [])
+        for item in hard.get("failed", []) or []:
+            name = str(item.get("name") or "hard_stop_constraint")
+            if name not in failed:
+                failed.append(name)
+        result.failed_constraints = failed
+        result.view_objective = {
+            **dict(getattr(result, "view_objective", {}) or {}),
+            "hard_stop_constraints": hard,
+            "required_stop_distance": next(
+                (
+                    item.get("required_stop_distance")
+                    for item in hard.get("failed", []) or []
+                    if isinstance(item, dict) and item.get("name") == "within_final_stop_distance"
+                ),
+                None,
+            ),
+            "current_distance_to_object": next(
+                (
+                    item.get("current_distance_to_object")
+                    for item in hard.get("failed", []) or []
+                    if isinstance(item, dict) and item.get("name") == "within_final_stop_distance"
+                ),
+                None,
+            ),
+            "reason": "Planner hard-stop contract is still unsatisfied.",
+        }
+        if not result.view_feedback:
+            result.view_feedback = "Continue approaching the pinned target until planner stop contracts are satisfied."
+        result.reason = (
+            (str(result.reason or "") + " " if result.reason else "")
+            + "Accept demoted because planner hard-stop constraints are not satisfied."
+        )
+        result.diagnostics = {
+            **dict(result.diagnostics or {}),
+            "planner_hard_stop_guard": {
+                "demoted_accept": True,
+                "hard_stop_constraints": hard,
+            },
+        }
+        return result
+
+    def _final_verifier_key(self, raw_instruction: str, candidate_uid: str) -> tuple[str, str]:
+        return instruction_hash(raw_instruction), str(candidate_uid or "")
+
+    def _record_final_verifier_attempt(self, raw_instruction: str, candidate_uid: str) -> int:
+        """Count final-verifier passes for one instruction/candidate pair.
+
+        这是防御性执行预算：即使某个分支意外重置了 ViewControlState，
+        同一候选也不能无限重复进入 final verifier。
+        """
+
+        key = self._final_verifier_key(raw_instruction, candidate_uid)
+        count = int(self.final_verifier_attempt_counter.get(key, 0)) + 1
+        self.final_verifier_attempt_counter[key] = count
+        return count
+
+    def _max_final_verifier_attempts_per_candidate(self) -> int:
+        try:
+            limit = int(os.getenv("STRIVE_FINAL_VERIFIER_MAX_PER_CANDIDATE", "8"))
+        except Exception:
+            limit = 8
+        return max(1, limit)
+
+    def _final_verifier_attempt_budget_exhausted(self, raw_instruction: str, candidate_uid: str) -> bool:
+        limit = self._max_final_verifier_attempts_per_candidate()
+        key = self._final_verifier_key(raw_instruction, candidate_uid)
+        return int(self.final_verifier_attempt_counter.get(key, 0)) >= limit
+
+    def _pin_visual_reference_from_result(self, evidence, result):
+        """Keep the first verifier-confirmed visual target reference stable."""
+
+        if not getattr(self.view_control_state, "active", False):
+            return
+        if not bool(getattr(result, "semantic_satisfied", False)):
+            return
+        self.view_control_state.pin_visual_evidence(
+            evidence,
+            step=self.episode_steps,
+            decision=result.decision,
+            reason=result.reason,
+        )
+
     def _view_control_override_if_needed(self, candidate, evidence, result):
-        """Prevent premature stop while an active view objective can improve evidence."""
+        """Attach active view-control context without overriding verifier decisions."""
 
         if not getattr(self.view_control_state, "active", False):
             return result
@@ -1005,47 +1251,56 @@ class HM3D_Objnav_Agent:
             step=self.episode_steps,
             evidence=evidence,
             decision=result.decision,
+            semantic_satisfied=bool(getattr(result, "semantic_satisfied", False)),
+            reason=str(getattr(result, "reason", "") or ""),
         )
-        if not (result.satisfied and result.decision == "accept"):
-            return result
-        if not self.view_control_state.should_block_accept(evidence):
-            self.view_control_state.reset()
-            return result
-
-        # 如果 verifier 在 better-view 子目标中想 accept，但当前
-        # 证据相对 baseline 没有实质改善，且还有可行视角未尝试，则继续执行
-        # view objective。这里不判断对象类别，只约束执行闭环不能“一步 retry”
-        # 后提前停。
-        improved = self.view_control_state.current_improvement(evidence)
-        context = self.view_control_state.as_context()
-        blocked = VerificationResult(
-            satisfied=False,
-            decision="need_better_view",
-            confidence=result.confidence,
-            semantic_satisfied=result.semantic_satisfied,
-            view_sufficient_for_stop=False,
-            satisfied_constraints=list(result.satisfied_constraints or []),
-            failed_constraints=list(result.failed_constraints or []) + [
-                "view-control evidence did not improve enough over baseline"
-            ],
-            view_feedback=(
-                "The semantic relation may be satisfied, but the better-view subgoal "
-                "has not produced a substantially improved final evidence view yet."
-            ),
-            preferred_view_goal=result.preferred_view_goal or "Try the next feasible viewpoint from the current view objective.",
-            view_objective=dict(result.view_objective or context.get("objective") or {}),
-            reason=(
-                f"View-control blocked final accept: improvement={improved:.3f}, "
-                f"required={self.view_control_state.min_required_improvement():.3f}, "
-                f"remaining_proposals={self.view_control_state.remaining_count()}."
-            ),
-            diagnostics={
+        if result.satisfied and result.decision == "accept":
+            context = self.view_control_state.as_context()
+            result.diagnostics = {
                 **dict(result.diagnostics or {}),
-                "view_control_override": True,
                 "view_control": context,
-            },
+                "view_control_completed_accept": True,
+            }
+            self.view_control_state.reset()
+        else:
+            result.diagnostics = {
+                **dict(result.diagnostics or {}),
+                "view_control": self.view_control_state.as_context(),
+            }
+        return result
+
+    def _annotate_view_budget_if_exhausted(self, candidate, evidence, result, raw_instruction=""):
+        """Annotate exhausted view-control state without changing VLM decisions.
+
+        Earlier versions converted budget-exhausted ``need_better_view`` results
+        into accept in Python.  That conflicted with prompt-first verification.
+        The controller now only exposes budget state to the prompt and records
+        diagnostics; the VLM's parsed decision remains the stop authority.
+        """
+
+        budget_exhausted = (
+            self._view_control_budget_exhausted(evidence, result)
+            or self._final_verifier_attempt_budget_exhausted(raw_instruction, candidate.uid)
         )
-        return blocked
+        if not budget_exhausted:
+            return result
+        context = self._view_control_context_from(evidence, result)
+        result.diagnostics = {
+            **dict(result.diagnostics or {}),
+            "view_control_budget_exhausted": True,
+            "view_control": context,
+        }
+        if result.satisfied and result.decision == "accept":
+            # VLM 已经根据预算上下文接受；控制层只保留诊断并清理状态。
+            result.diagnostics = {
+                **dict(result.diagnostics or {}),
+                "best_available_view_accept": True,
+                "view_control": context,
+            }
+            if getattr(self.view_control_state, "active", False):
+                self.view_control_state.reset()
+            return result
+        return result
 
     def _enter_better_view_control(self, candidate, evidence, result):
         """Start a better-view subgoal from verifier feedback."""
@@ -1055,11 +1310,22 @@ class HM3D_Objnav_Agent:
             objective["preferred_view_goal"] = result.preferred_view_goal
         if result.view_feedback and "view_feedback" not in objective:
             objective["view_feedback"] = result.view_feedback
+        if self.confirmed_target_waypoint is None and self.waypoint is not None:
+            # better-view 会覆盖 self.waypoint；首次进入前先保存稳定的目标靠近点。
+            self.confirmed_target_waypoint = np.array(self.waypoint, dtype=float).copy()
         self.view_control_state.start(candidate.uid, objective, evidence)
+        if bool(getattr(result, "semantic_satisfied", False)):
+            self.view_control_state.pin_visual_evidence(
+                evidence,
+                step=self.episode_steps,
+                decision=result.decision,
+                reason=result.reason,
+            )
         self._pin_verified_relation_from_evidence(evidence)
         self.whether_to_check_again()
         if not self.need_check_again:
             logger.info("View-control could not find a feasible better-view proposal.")
+            self.view_control_state.exhausted = True
             return False
         self.waypoint = self.check_again_postion.copy()
         self.waypoint[2] = self.mapper.current_position[2]
@@ -1067,84 +1333,84 @@ class HM3D_Objnav_Agent:
         self.path_index = 0
         return True
 
-    def _defer_initial_accept_if_better_view_exists(self, candidate, evidence, result, instruction_mode=False):
-        """Give view control one chance before accepting an initially valid stop."""
+    def _pending_better_view_active(self) -> bool:
+        """Return whether a semantically confirmed target is awaiting view control."""
 
-        if not instruction_mode:
-            return result
-        if not (result.satisfied and result.decision == "accept"):
-            return result
-        if getattr(self.view_control_state, "active", False):
-            return result
+        state = getattr(self.mapper, "instruction_execution_state", None)
+        pending = bool(getattr(state, "pending_verified_pair", {}) or {})
+        execution_pending = getattr(state, "mode", "") == "better_view_for_verified_pair" and pending
+        return bool(
+            self.final_stop_decision == "need_better_view"
+            and (getattr(self.view_control_state, "active", False) or execution_pending)
+        )
 
-        objective = dict(result.view_objective or {})
-        if not objective:
-            objective = {
-                "keep_visible_roles": ["candidate"],
-                "improve_goals": ["clarity", "centering", "scale"],
-                "minimum_expected_improvement": "moderate",
-                "accept_if_no_better_view": True,
-                "reason": "Initial accept should still check whether a clearly better final evidence view is feasible.",
-            }
-        self.view_control_state.start(candidate.uid, objective, evidence)
-        self._pin_verified_relation_from_evidence(evidence)
-        self.whether_to_check_again()
+    def _continue_better_view_control(self) -> bool:
+        """Keep the confirmed target pinned after a non-terminal view decision.
+
+        `need_better_view` is not a semantic rejection. The controller should keep
+        approaching/reframing the same target cluster instead of clearing
+        `object_final` and returning to normal exploration.
+        """
+
+        if not self._pending_better_view_active():
+            return False
+        if getattr(self.view_control_state, "active", False) and self.view_control_state.budget_exhausted():
+            logger.info("Better-view budget exhausted for pinned target; wait for final verifier to close it.")
+            return False
+        # 已确认语义目标还没达到 final-stop 条件。这里保留 found_goal，
+        # 让 step loop 继续执行 check_again/view-control，而不是重新探索。
+        self.found_goal = True
         if not self.need_check_again:
-            self.view_control_state.reset()
-            return result
-
-        selected = None
-        if self.view_control_state.last_selected_index is not None:
-            try:
-                selected = self.view_control_state.proposals[self.view_control_state.last_selected_index]
-            except Exception:
-                selected = None
-        baseline_score = self.view_control_state.baseline_quality.get("score", 0.0)
-        predicted_score = selected.score if selected is not None else baseline_score
-        predicted_improvement = predicted_score - baseline_score
-        if predicted_improvement < self.view_control_state.min_required_improvement():
-            # 没有明显更好的几何视角时，不因为控制层保守性阻止 VLM 的 accept。
-            self.view_control_state.reset()
-            self.need_check_again = False
-            return result
-
+            self.whether_to_check_again()
+        if not self.need_check_again:
+            return False
         self.waypoint = self.check_again_postion.copy()
         self.waypoint[2] = self.mapper.current_position[2]
         self.path = np.array([self.waypoint])
         self.path_index = 0
-        return VerificationResult(
-            satisfied=False,
-            decision="need_better_view",
-            confidence=result.confidence,
-            semantic_satisfied=result.semantic_satisfied,
-            view_sufficient_for_stop=False,
-            satisfied_constraints=list(result.satisfied_constraints or []),
-            failed_constraints=list(result.failed_constraints or []) + [
-                "initial accept deferred because a better final evidence viewpoint is feasible"
-            ],
-            view_feedback="A better final evidence viewpoint is geometrically feasible before stopping.",
-            preferred_view_goal=result.preferred_view_goal or "Move to the proposed viewpoint and re-check final instruction satisfaction.",
-            view_objective=objective,
-            reason=(
-                f"Initial accept deferred by view-control: predicted_improvement={predicted_improvement:.3f}, "
-                f"required={self.view_control_state.min_required_improvement():.3f}."
-            ),
-            diagnostics={
-                **dict(result.diagnostics or {}),
-                "view_control_initial_deferral": True,
-                "view_control": self.view_control_state.as_context(),
-            },
+        return True
+
+    def _non_stop_action_after_unaccepted_final_stop(self):
+        """Prevent Habitat STOP when final verifier has not accepted.
+
+        In instruction/benchmark-plan mode, geometric visibility is evidence,
+        not stop authority.  If the unified verifier returns need_better_view or
+        any non-accept decision, the controller must emit a non-stop action and
+        keep collecting evidence instead of ending the episode.
+        """
+
+        if self.final_instruction_accepted_this_step or self.final_stop_success:
+            return 0
+        if self._continue_better_view_control():
+            act = next_action_to_waypoint(self)
+            if act != 0:
+                return act
+        logger.info(
+            "Unified final-stop gate blocked STOP without verifier accept; rotate to collect another view."
         )
+        # 通用兜底动作：只改变视角，不把任何类别常识写进控制层。
+        return 2
 
     def final_instruction_check(self, evidence_override=None):
-        """Run the instruction-mode final verifier, bypassing baseline ObjectNav."""
+        """Run final stop verification for the installed object/instruction plan.
+
+        The benchmark runner also installs a narrow object-goal plan such as
+        ``Find the <tv>.``. That keeps benchmark and free-form instruction
+        navigation on the same verifier/ledger/view-control path without adding
+        a second benchmark-specific stop mode.
+        """
 
         plan = getattr(self.mapper, "instruction_plan", None)
         spec = getattr(self.mapper, "instruction_spec", None)
-        if plan is None and spec is None:
-            # 普通 HM3D ObjectNav benchmark 不启用指令解析层。
-            # 此时 final verifier 完全旁路，保持原始 stop 行为。
+        instruction_mode = plan is not None or spec is not None
+        if not instruction_mode:
             return True
+
+        verifier_plan = plan if plan is not None else spec
+        runtime_source = ""
+        if plan is not None:
+            runtime_source = str((getattr(plan, "diagnostics", {}) or {}).get("runtime_source", ""))
+        self.final_stop_mode = "benchmark" if runtime_source == "benchmark_object_goal" else "instruction"
 
         if getattr(self.object_final, "_instruction_reference_role", "") == "anchor":
             # anchor-first 模式下，anchor 只是局部搜索参考点，
@@ -1171,6 +1437,8 @@ class HM3D_Objnav_Agent:
             return False
 
         raw_instruction = self._raw_instruction_for_verifier()
+        if not instruction_mode:
+            raw_instruction = str((verifier_plan or {}).get("raw_instruction") or raw_instruction)
         candidate = candidate_from_object(
             self.object_final,
             canonical_label=getattr(self.mapper, "target", ""),
@@ -1218,7 +1486,7 @@ class HM3D_Objnav_Agent:
                 evidence = self._attach_view_control_context(evidence, candidate)
                 result = self.final_instruction_verifier.verify(
                     raw_instruction=raw_instruction,
-                    instruction_plan=plan,
+                    instruction_plan=verifier_plan,
                     candidate=candidate,
                     evidence=evidence,
                 )
@@ -1241,11 +1509,14 @@ class HM3D_Objnav_Agent:
                 "geometry": {
                     "projection_failed_in_final_view": True,
                 },
-                "view_quality_facts": self._view_quality_facts({"projection_failed_in_final_view": True}),
+                "view_quality_facts": self._view_quality_facts(
+                    self._augment_final_stop_geometry({"projection_failed_in_final_view": True})
+                ),
                 "nearby_objects": [],
                 "room_context": None,
                 "relation_evidence_paths": [],
             }
+            evidence["geometry"] = self._augment_final_stop_geometry(evidence.get("geometry"))
             if fallback_path and os.path.exists(fallback_path):
                 if plan is not None and target_for_candidate is not None:
                     evidence = self._attach_view_control_context(evidence, candidate)
@@ -1274,7 +1545,7 @@ class HM3D_Objnav_Agent:
                         evidence = self._attach_view_control_context(evidence, candidate)
                         result = self.final_instruction_verifier.verify(
                             raw_instruction=raw_instruction,
-                            instruction_plan=plan,
+                            instruction_plan=verifier_plan,
                             candidate=candidate,
                             evidence=evidence,
                         )
@@ -1283,7 +1554,7 @@ class HM3D_Objnav_Agent:
                     evidence = self._attach_view_control_context(evidence, candidate)
                     result = self.final_instruction_verifier.verify(
                         raw_instruction=raw_instruction,
-                        instruction_plan=plan,
+                        instruction_plan=verifier_plan,
                         candidate=candidate,
                         evidence=evidence,
                     )
@@ -1322,7 +1593,7 @@ class HM3D_Objnav_Agent:
                 evidence = self._attach_view_control_context(evidence, candidate)
                 result = self.final_instruction_verifier.verify(
                     raw_instruction=raw_instruction,
-                    instruction_plan=plan,
+                    instruction_plan=verifier_plan,
                     candidate=candidate,
                     evidence=evidence,
                 )
@@ -1334,14 +1605,24 @@ class HM3D_Objnav_Agent:
                 ] if path
             ]
 
-        instruction_mode = plan is not None or spec is not None
+        attempt_count = self._record_final_verifier_attempt(raw_instruction, candidate.uid)
+        evidence["final_verifier_attempt"] = {
+            "candidate_uid": candidate.uid,
+            "instruction_hash": instruction_hash(raw_instruction),
+            "count": attempt_count,
+            "max_per_candidate": self._max_final_verifier_attempts_per_candidate(),
+            "budget_exhausted": self._final_verifier_attempt_budget_exhausted(raw_instruction, candidate.uid),
+        }
+
+        self._pin_visual_reference_from_result(evidence, result)
         result = self._view_control_override_if_needed(candidate, evidence, result)
-        result = self._defer_initial_accept_if_better_view_exists(
+        result = self._annotate_view_budget_if_exhausted(
             candidate,
             evidence,
             result,
-            instruction_mode=instruction_mode,
+            raw_instruction=raw_instruction,
         )
+        result = self._enforce_planner_hard_stop_contract(evidence, result)
 
         out_dir = f'{self.save_dir}/episode-{self.episode_samples - 1}/final_verifier'
         os.makedirs(out_dir, exist_ok=True)
@@ -1349,6 +1630,7 @@ class HM3D_Objnav_Agent:
             json.dump({
                 "candidate": candidate.as_dict(),
                 "raw_instruction": raw_instruction,
+                "run_id": self.run_id,
                 "evidence": evidence,
             }, f, ensure_ascii=False, indent=2, sort_keys=True)
 
@@ -1366,15 +1648,19 @@ class HM3D_Objnav_Agent:
                 "record": record.as_dict(),
                 "result": result.as_dict(),
                 "ledger": self.mapper.verification_ledger.as_dict(),
+                "run_id": self.run_id,
             }, f, ensure_ascii=False, indent=2, sort_keys=True)
-        self.mapper.instruction_constraint_evaluator.dump_state(
-            mapper=self.mapper,
-            episode_idx=self.episode_samples - 1,
-            step=self.episode_steps,
-        )
+        if instruction_mode:
+            self.mapper.instruction_constraint_evaluator.dump_state(
+                mapper=self.mapper,
+                episode_idx=self.episode_samples - 1,
+                step=self.episode_steps,
+            )
 
-        logger.info("Final instruction verifier decision: {}", result.as_dict())
-        self.instruction_decision = result.decision
+        logger.info("Final stop verifier decision: {}", result.as_dict())
+        if instruction_mode:
+            self.instruction_decision = result.decision
+        self.final_stop_decision = result.decision
         if result.satisfied and result.decision == "accept":
             relation_edges = list((evidence or {}).get("relation_edges") or [])
             if plan is not None:
@@ -1389,11 +1675,18 @@ class HM3D_Objnav_Agent:
                 if not task_done:
                     logger.info("Instruction subgoal accepted but full task is not complete yet.")
                     return False
-            self.instruction_success = True
-            self.instruction_decision = result.decision
-            self.instruction_accept_step = self.episode_steps
+            self.final_stop_success = True
+            self.final_stop_decision = result.decision
+            self.final_stop_accept_step = self.episode_steps
+            if instruction_mode:
+                self.instruction_success = True
+                self.instruction_decision = result.decision
+                self.instruction_accept_step = self.episode_steps
             self.accepted_candidate_uid = candidate.uid
             self.accepted_relation_edge = relation_edges[0] if relation_edges else {}
+            self.accepted_distance_to_target, self.accepted_distance_source = (
+                self._accepted_distance_from_evidence(evidence, result)
+            )
             return True
 
         if plan is not None:
@@ -1488,21 +1781,64 @@ class HM3D_Objnav_Agent:
 
         if not self.env.episode_over:
             if self.found_goal and act == 0 and not self.final_instruction_accepted_this_step:
-                final_check_flag = self.final_check()
-                if final_check_flag:
+                if self._requires_unified_final_stop():
+                    # benchmark object-goal 已被编译成窄 InstructionPlan。
+                    # 此时 legacy final_check 只能作为旧路径能力保留，
+                    # STOP 必须由 unified final verifier 显式 accept。
                     final_instruction_flag = self.final_instruction_check()
                     if not final_instruction_flag:
                         if self.need_check_again:
                             act = next_action_to_waypoint(self)
                             if act == 0:
-                                # 已经没有可移动的更好视角时，不能把 act=0 当成成功 stop。
+                                # need_better_view 是“继续改善视角”，不是 reject。
+                                # 如果当前 proposal 已到达但未 accept，尝试下一个
+                                # view-control proposal；只有没有 pending 目标时才回探索。
                                 self.need_check_again = False
-                                self.after_check_again()
+                                if self._continue_better_view_control():
+                                    act = next_action_to_waypoint(self)
+                                else:
+                                    self.after_check_again()
+                                    act = next_action_to_waypoint(self)
                         else:
-                            self.after_check_again()
-                        act = next_action_to_waypoint(self)
+                            if self._continue_better_view_control():
+                                act = next_action_to_waypoint(self)
+                            else:
+                                self.after_check_again()
+                                act = next_action_to_waypoint(self)
+                    else:
+                        self.final_instruction_accepted_this_step = True
                 else:
-                    act = next_action_to_waypoint(self)
+                    final_check_flag = self.final_check()
+                    if final_check_flag:
+                        final_instruction_flag = self.final_instruction_check()
+                        if not final_instruction_flag:
+                            if self.need_check_again:
+                                act = next_action_to_waypoint(self)
+                                if act == 0:
+                                    # need_better_view 是“继续改善视角”，不是 reject。
+                                    # 如果当前 proposal 已到达但未 accept，尝试下一个
+                                    # view-control proposal；只有没有 pending 目标时才回探索。
+                                    self.need_check_again = False
+                                    if self._continue_better_view_control():
+                                        act = next_action_to_waypoint(self)
+                                    else:
+                                        self.after_check_again()
+                                        act = next_action_to_waypoint(self)
+                            else:
+                                if self._continue_better_view_control():
+                                    act = next_action_to_waypoint(self)
+                                else:
+                                    self.after_check_again()
+                                    act = next_action_to_waypoint(self)
+                    else:
+                        act = next_action_to_waypoint(self)
+
+            if (
+                self._requires_unified_final_stop()
+                and act == 0
+                and not self.final_instruction_accepted_this_step
+            ):
+                act = self._non_stop_action_after_unaccepted_final_stop()
 
             logger.info("Next Action: {}", act)
             self.obs = self.env.step(act)
@@ -1521,6 +1857,15 @@ class HM3D_Objnav_Agent:
         return select_check_again_viewpoint(self)
 
     def after_check_again(self):
+        if self._pending_better_view_active():
+            logger.info(
+                "Keep confirmed target pinned after need_better_view; do not reset verifier/view-control state."
+            )
+            if self._continue_better_view_control():
+                return None
+            logger.info("No better-view proposal is currently available; keep target state for next planning cycle.")
+            self.found_goal = True
+            return None
         # 任何复核失败都必须退出“已找到目标”状态。
         # 否则 STRIVE 的 stop 分支会在后续 step 继续围绕同一候选触发，
         # 即使 final verifier 已经把该实例 hard-reject。
@@ -1537,6 +1882,7 @@ class HM3D_Objnav_Agent:
         self.view_control_state.reset()
         self.found_goal = False
         self.need_check_again = False
+        self.confirmed_target_waypoint = None
         old_tag = str(getattr(self.object_final, "tag", ""))
         old_confidence = getattr(self.object_final, "confidence", torch.tensor(1.0))
         # 这里只是让该实例退出“当前目标候选”状态，不能清空
@@ -1730,6 +2076,7 @@ class HM3D_Objnav_Agent:
                     logger.info(f"Object is visible, {waypoint_tmp} is a valid waypoint")
                     self.waypoint = waypoint_tmp
                     self.waypoint[2] = self.found_goal_position[2]
+                    self.confirmed_target_waypoint = np.array(self.waypoint, dtype=float).copy()
                     self.path = np.array([self.waypoint])
                     self.path_index = 0
                     return
@@ -1754,6 +2101,7 @@ class HM3D_Objnav_Agent:
         logger.info(f"Use waypoint: {waypoint_tmp}")
         self.waypoint = waypoint_tmp
         self.waypoint[2] = self.found_goal_position[2]
+        self.confirmed_target_waypoint = np.array(self.waypoint, dtype=float).copy()
         self.path = np.array([self.waypoint])
         self.path_index = 0
 

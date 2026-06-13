@@ -61,6 +61,7 @@ class VerificationResult:
     confidence: float = 0.0
     semantic_satisfied: bool = False
     view_sufficient_for_stop: bool = True
+    hard_constraints: dict[str, Any] = field(default_factory=dict)
     satisfied_constraints: list[str] = field(default_factory=list)
     failed_constraints: list[str] = field(default_factory=list)
     view_feedback: str = ""
@@ -207,6 +208,109 @@ def _image_block(path: str) -> dict[str, Any] | None:
     return {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{data}"}}
 
 
+def _nested_image_path(payload: dict[str, Any], *keys: str) -> str:
+    """Read one nested image path from a JSON-like evidence packet."""
+
+    cur: Any = payload
+    for key in keys:
+        if not isinstance(cur, dict):
+            return ""
+        cur = cur.get(key)
+    return str(cur or "")
+
+
+def hard_stop_constraints_from_evidence(evidence: dict[str, Any] | None) -> dict[str, Any]:
+    """Evaluate generic stop contracts from verifier evidence.
+
+    These constraints are embodiment/benchmark contracts, not semantic object
+    rules.  They are exposed to the VLM as structured facts and also used as a
+    final consistency check so an `accept` cannot silently ignore distance.
+    """
+
+    evidence = dict(evidence or {})
+    geometry = dict(evidence.get("geometry") or {})
+    constraints: list[dict[str, Any]] = []
+
+    distance = geometry.get("distance_to_object")
+    required = geometry.get("required_stop_distance", geometry.get("success_distance"))
+    if distance is not None and required is not None:
+        try:
+            distance_f = float(distance)
+            required_f = float(required)
+            constraints.append({
+                "name": "within_final_stop_distance",
+                "satisfied": distance_f <= required_f,
+                "current_distance_to_object": distance_f,
+                "required_stop_distance": required_f,
+                "margin": required_f - distance_f,
+                "reason": (
+                    f"current target distance {distance_f:.3f}m "
+                    f"vs required stop distance {required_f:.3f}m"
+                ),
+            })
+        except Exception:
+            constraints.append({
+                "name": "within_final_stop_distance",
+                "satisfied": False,
+                "unknown": True,
+                "reason": "distance_to_object or required_stop_distance is not numeric",
+            })
+
+    projection_failed = bool(geometry.get("projection_failed_in_final_view", False))
+    constraints.append({
+        "name": "target_projected_or_reference_available",
+        "satisfied": not projection_failed or bool(
+            (evidence.get("view_control") or {}).get("pinned_visual_evidence")
+            or (evidence.get("view_control") or {}).get("best_visual_evidence")
+        ),
+        "projection_failed_in_final_view": projection_failed,
+        "reason": "current projection exists or a pinned/best visual reference is available",
+    })
+
+    failed = [item for item in constraints if not bool(item.get("satisfied"))]
+    planner_proof = (
+        evidence.get("planner_infeasibility_proof")
+        or evidence.get("physical_infeasibility_proof")
+        or geometry.get("planner_infeasibility_proof")
+        or geometry.get("physical_infeasibility_proof")
+        or {}
+    )
+    if not isinstance(planner_proof, dict):
+        planner_proof = {}
+    return {
+        "satisfied": len(failed) == 0,
+        "constraints": constraints,
+        "failed": failed,
+        "source": "generic_final_stop_contract",
+        "planner_infeasibility_proof": planner_proof,
+        "planner_infeasible": bool(planner_proof.get("infeasible_by_geometry", False)),
+    }
+
+
+def _planner_hard_constraint_infeasible(hard_constraints: dict[str, Any]) -> tuple[bool, str]:
+    """Return planner-owned proof that a physical stop contract is infeasible.
+
+    The final VLM may judge instruction semantics and evidence quality, but it
+    must not invent physical reachability facts.  A hard final-stop constraint
+    may be bypassed only when the geometry/planning layer explicitly writes an
+    infeasibility proof into the evidence packet.
+    """
+
+    hard = dict(hard_constraints or {})
+    proof = hard.get("planner_infeasibility_proof") or hard.get("physical_infeasibility_proof")
+    if isinstance(proof, dict) and bool(proof.get("infeasible_by_geometry")):
+        reason = str(proof.get("reason", "") or proof.get("source", "") or "planner geometry proof")
+        return True, reason
+    if bool(hard.get("infeasible_by_geometry")) or bool(hard.get("planner_infeasible")):
+        return True, str(hard.get("reason", "") or "planner geometry proof")
+    for item in hard.get("failed", []) or []:
+        if not isinstance(item, dict):
+            continue
+        if bool(item.get("infeasible_by_geometry")) or bool(item.get("planner_infeasible")):
+            return True, str(item.get("reason", "") or item.get("proof", "") or "planner geometry proof")
+    return False, ""
+
+
 class FinalInstructionVerifier:
     """VLM verifier for original-instruction stop decisions."""
 
@@ -214,58 +318,50 @@ class FinalInstructionVerifier:
         self.vlm = vlm
 
     @staticmethod
-    def _view_guard(evidence: dict[str, Any]) -> tuple[bool, list[str], str]:
-        """Generic geometry guard for final stop views.
+    def _view_guidance(evidence: dict[str, Any]) -> tuple[list[str], str]:
+        """Build prompt-side view guidance without overriding the VLM decision.
 
-        这不是目标语义规则，而是相机停止证据的硬约束：目标不能完全投影失败，
-        也不应在最终 stop 图里过度贴边、过小或偏离中心。阈值全部可配置，
-        用于补足 VLM 偶尔把“语义正确但视角很差”的图直接 accept 的问题。
+        Final stop semantics are owned by the verifier prompt.  This helper only
+        converts geometry into readable facts and a generic view objective; it
+        deliberately avoids code thresholds such as "center must be < 0.2" or
+        "distance must be <= 1.5m".
         """
 
-        mode = os.getenv("STRIVE_FINAL_VIEW_GUARD", "1").lower()
-        if mode in ("0", "false", "no", "off"):
-            return True, [], ""
+        geometry = dict((evidence or {}).get("geometry") or {})
         facts = dict((evidence or {}).get("view_quality_facts") or {})
-        failures: list[str] = []
+        view_control = dict((evidence or {}).get("view_control") or {})
+        guidance: list[str] = []
         if bool(facts.get("projection_failed", False)):
-            failures.append("target projection failed in final view")
+            guidance.append("current target projection failed; compare against pinned/best evidence")
         center_offset = facts.get("center_offset_norm")
         border_margin = facts.get("border_margin_norm")
         area = facts.get("bbox_area_ratio")
+        if center_offset is not None:
+            guidance.append(f"center_offset_norm={_safe_float(center_offset):.3f}")
+        if border_margin is not None:
+            guidance.append(f"border_margin_norm={_safe_float(border_margin):.3f}")
+        if area is not None:
+            guidance.append(f"bbox_area_ratio={_safe_float(area):.5f}")
         try:
-            max_center_offset = float(os.getenv("STRIVE_FINAL_VIEW_MAX_CENTER_OFFSET", "0.35"))
-        except Exception:
-            max_center_offset = 0.35
-        try:
-            min_border_margin = float(os.getenv("STRIVE_FINAL_VIEW_MIN_BORDER_MARGIN", "0.08"))
-        except Exception:
-            min_border_margin = 0.08
-        try:
-            min_area = float(os.getenv("STRIVE_FINAL_VIEW_MIN_BBOX_AREA", "0.003"))
-        except Exception:
-            min_area = 0.003
-        try:
-            if center_offset is not None and float(center_offset) > max_center_offset:
-                failures.append("target is too far from the image center")
-        except Exception:
-            pass
-        try:
-            if border_margin is not None and float(border_margin) < min_border_margin:
-                failures.append("target is too close to the image border")
+            distance_to_object = geometry.get("distance_to_object")
+            required_stop_distance = geometry.get("required_stop_distance", geometry.get("success_distance"))
+            if distance_to_object is not None and required_stop_distance is not None:
+                guidance.append(
+                    f"current_distance_to_object={float(distance_to_object):.3f}m; "
+                    f"benchmark_success_distance={float(required_stop_distance):.3f}m"
+                )
         except Exception:
             pass
-        try:
-            if area is not None and float(area) < min_area:
-                failures.append("target projection is too small for final stop evidence")
-        except Exception:
-            pass
-        if not failures:
-            return True, [], ""
+        if view_control:
+            guidance.append(
+                "view_control_budget_exhausted="
+                f"{bool(view_control.get('budget_exhausted', view_control.get('exhausted')))}"
+            )
         preferred = (
-            "Move to a viewpoint where the candidate remains visible, occupies a clearer area, "
-            "and is closer to the image center; keep any required relation anchor visible."
+            "Prefer the closest executable stop view that still keeps the candidate and any "
+            "required relation anchor clearly visible, not clipped, and easy to verify."
         )
-        return False, failures, preferred
+        return guidance, preferred
 
     def _fallback(self, reason: str) -> VerificationResult:
         # When LLM is intentionally unavailable, preserve baseline behavior.
@@ -297,6 +393,8 @@ class FinalInstructionVerifier:
             return self._fallback("pydantic_unavailable")
 
         plan_dict = instruction_plan.as_dict() if hasattr(instruction_plan, "as_dict") else instruction_plan
+        evidence = dict(evidence or {})
+        evidence.setdefault("hard_stop_constraints", hard_stop_constraints_from_evidence(evidence))
         payload = {
             "raw_instruction": raw_instruction,
             "instruction_plan": plan_dict or {},
@@ -306,15 +404,38 @@ class FinalInstructionVerifier:
         content: list[dict[str, Any]] = [
             {"type": "text", "text": json.dumps(payload, ensure_ascii=False, indent=2)},
         ]
+        seen_image_paths: set[str] = set()
         for key in ("current_rgb_with_bbox_path", "object_crop_path", "centered_view_path"):
             block = _image_block(str(evidence.get(key) or ""))
             if block is not None:
+                seen_image_paths.add(str(evidence.get(key) or ""))
                 content.append({"type": "text", "text": key})
                 content.append(block)
         for item in evidence.get("relation_evidence_paths", []) or []:
             block = _image_block(str(item))
             if block is not None:
+                seen_image_paths.add(str(item))
                 content.append({"type": "text", "text": "relation_evidence"})
+                content.append(block)
+        view_control = dict(evidence.get("view_control") or {})
+        for label in ("pinned_visual_evidence", "latest_visual_evidence", "best_visual_evidence"):
+            visual_packet = dict(view_control.get(label) or {})
+            image_path = (
+                _nested_image_path(visual_packet, "image_paths", "current_rgb_with_bbox_path")
+                or _nested_image_path(visual_packet, "image_paths", "centered_view_path")
+            )
+            if not image_path or image_path in seen_image_paths:
+                continue
+            block = _image_block(image_path)
+            if block is not None:
+                seen_image_paths.add(image_path)
+                content.append({
+                    "type": "text",
+                    "text": (
+                        f"{label}: previous VLM-confirmed visual target reference; "
+                        "compare target identity and view quality, but do not treat it as current stop evidence."
+                    ),
+                })
                 content.append(block)
 
         try:
@@ -340,44 +461,81 @@ class FinalInstructionVerifier:
         semantic_satisfied = bool(getattr(parsed, "semantic_satisfied", False))
         view_sufficient = bool(getattr(parsed, "view_sufficient_for_stop", True))
         parsed_satisfied = bool(getattr(parsed, "satisfied", False))
+        parsed_hard_constraints = dict(getattr(parsed, "hard_constraints", {}) or {})
+        hard_constraints = dict(evidence.get("hard_stop_constraints") or hard_stop_constraints_from_evidence(evidence))
+        planner_infeasible, planner_infeasible_reason = _planner_hard_constraint_infeasible(hard_constraints)
         if parsed_satisfied:
             semantic_satisfied = True
         if decision == "accept" and not view_sufficient:
             decision = "need_better_view"
-        view_guard_ok, view_guard_failures, view_guard_goal = self._view_guard(evidence)
-        if semantic_satisfied and decision == "accept" and not view_guard_ok:
+        if decision == "accept" and not bool(hard_constraints.get("satisfied", True)) and not planner_infeasible:
             decision = "need_better_view"
             view_sufficient = False
             parsed_satisfied = False
+        view_guidance, view_guidance_goal = self._view_guidance(evidence)
         failed_constraints = list(getattr(parsed, "failed_constraints", []) or [])
-        for failure in view_guard_failures:
-            if failure not in failed_constraints:
-                failed_constraints.append(failure)
+        if decision == "need_better_view" and not bool(hard_constraints.get("satisfied", True)):
+            for item in hard_constraints.get("failed", []) or []:
+                name = str(item.get("name") or "hard_stop_constraint")
+                if name not in failed_constraints:
+                    failed_constraints.append(name)
         view_feedback = str(getattr(parsed, "view_feedback", "") or "")
         preferred_view_goal = str(getattr(parsed, "preferred_view_goal", "") or "")
         reason = str(getattr(parsed, "reason", "") or "")
-        if view_guard_failures and not view_feedback:
-            view_feedback = "; ".join(view_guard_failures)
-        if view_guard_goal and not preferred_view_goal:
-            preferred_view_goal = view_guard_goal
+        if view_guidance and not view_feedback and decision == "need_better_view":
+            view_feedback = "; ".join(view_guidance)
+        if view_guidance_goal and not preferred_view_goal and decision == "need_better_view":
+            preferred_view_goal = view_guidance_goal
         view_objective = dict(getattr(parsed, "view_objective", {}) or {})
         if decision == "need_better_view" and not view_objective:
             view_objective = {
                 "keep_visible_roles": ["candidate"],
-                "improve_goals": ["clarity", "centering", "scale"],
+                "improve_goals": [
+                    "move closer when executable",
+                    "keep target visible",
+                    "keep relation anchor visible if required",
+                    "avoid clipping",
+                    "improve clarity",
+                ],
                 "minimum_expected_improvement": "moderate",
                 "accept_if_no_better_view": False,
                 "reason": view_feedback or reason or "Need stronger final stop evidence.",
             }
-        if view_guard_failures:
-            suffix = "Generic view guard requested a better final stop view: " + "; ".join(view_guard_failures)
-            reason = f"{reason} {suffix}".strip()
+        if decision == "need_better_view":
+            geometry = dict((evidence or {}).get("geometry") or {})
+            try:
+                required_stop_distance = float(
+                    geometry.get("required_stop_distance", geometry.get("success_distance"))
+                )
+            except Exception:
+                required_stop_distance = 0.0
+            try:
+                current_distance = float(geometry.get("distance_to_object"))
+            except Exception:
+                current_distance = 0.0
+            if required_stop_distance > 0:
+                view_objective["required_stop_distance"] = required_stop_distance
+                view_objective["current_distance_to_object"] = current_distance
+                goals = list(view_objective.get("improve_goals") or [])
+                if "move closer while preserving visibility" not in goals:
+                    goals.append("move closer while preserving visibility")
+                view_objective["improve_goals"] = goals
+        if decision == "need_better_view" and not bool(hard_constraints.get("satisfied", True)):
+            view_objective["hard_stop_constraints"] = hard_constraints
+            if not view_feedback:
+                view_feedback = "Hard final-stop constraints are not yet satisfied; continue the view/approach objective."
         return VerificationResult(
             satisfied=parsed_satisfied and decision == "accept" and view_sufficient,
             decision=decision,
             confidence=confidence,
             semantic_satisfied=semantic_satisfied,
             view_sufficient_for_stop=view_sufficient,
+            hard_constraints={
+                **hard_constraints,
+                "vlm_report": parsed_hard_constraints,
+                "planner_infeasible": planner_infeasible,
+                "planner_infeasible_reason": planner_infeasible_reason,
+            },
             satisfied_constraints=list(getattr(parsed, "satisfied_constraints", []) or []),
             failed_constraints=failed_constraints,
             view_feedback=view_feedback,
@@ -387,10 +545,16 @@ class FinalInstructionVerifier:
             diagnostics={
                 "source": "vlm",
                 "model_provider": self.vlm,
-                "view_guard": {
-                    "ok": view_guard_ok,
-                    "failures": view_guard_failures,
-                    "enabled": os.getenv("STRIVE_FINAL_VIEW_GUARD", "1").lower() not in ("0", "false", "no", "off"),
+                "view_guidance": {
+                    "facts": view_guidance,
+                    "preferred_view_goal": view_guidance_goal,
+                    "enforced_by_code": False,
+                },
+                "hard_stop_constraints": {
+                    **hard_constraints,
+                    "vlm_report": parsed_hard_constraints,
+                    "planner_infeasible": planner_infeasible,
+                    "planner_infeasible_reason": planner_infeasible_reason,
                 },
             },
         )

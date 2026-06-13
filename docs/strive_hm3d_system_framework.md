@@ -526,23 +526,18 @@ uncertain: 不终止，按 soft rejection 继续
 ```text
 semantic_satisfied == true
 view_sufficient_for_stop == true
+hard_stop_constraints.satisfied == true
 ```
 
-`view_sufficient_for_stop` 先由 VLM 根据 `bbox_center_norm`、
-`bbox_area_ratio`、`visible_projected_points`、距离和关系证据做软判断；随后
-`FinalInstructionVerifier` 会执行一层可配置的通用 view guard：
-
-```text
-projection must exist
-center_offset_norm should not be too large
-border_margin_norm should not be too small
-bbox_area_ratio should not be too small
-```
-
-这些是相机停止证据的几何硬约束，不是目标语义规则。默认阈值可通过
-`STRIVE_FINAL_VIEW_MAX_CENTER_OFFSET`、`STRIVE_FINAL_VIEW_MIN_BORDER_MARGIN`、
-`STRIVE_FINAL_VIEW_MIN_BBOX_AREA` 调整，也可用 `STRIVE_FINAL_VIEW_GUARD=0`
-关闭。
+`view_sufficient_for_stop` 由 VLM 根据 `bbox_center_norm`、
+`bbox_area_ratio`、`visible_projected_points`、关系证据和 view-control 历史做判断。
+代码不再用中心偏移或 bbox 面积阈值改写 VLM 的 `decision`。但 final-stop 距离属于
+结构化 hard stop contract：`distance_to_object` 必须满足 benchmark `success_distance`，
+否则 `accept` 会被降级为 `need_better_view`。VLM 不再拥有物理约束 override 权限；
+只有 planner/geometry 在 evidence 中写入 `planner_infeasibility_proof` 时，best-available
+stop 才能绕过未满足的距离合同。prompt 要求：若存在更近且仍清楚可见的可执行视角，
+返回 `need_better_view`；若只是软视角质量预算耗尽，但 hard stop contract 仍未满足，
+仍不能返回 `accept`。
 
 如果 verifier 返回 `need_better_view`，agent 进入 `ViewControlState`。这不是
 物体规则状态机，而是围绕 verifier 给出的 `view_objective` 执行通用视角控制：
@@ -562,15 +557,29 @@ score = visibility + centerability + border margin + projected area + distance s
 ```
 
 `ViewControlState` 记录 baseline、已尝试 proposal、观测质量和剩余候选。若
-verifier 想 accept，但当前 evidence 相对 baseline 没有达到
-`STRIVE_VIEW_CONTROL_MIN_IMPROVEMENT` 且还有候选未尝试，控制层会继续
-`need_better_view`。这只约束执行闭环，最终是否满足原始指令仍由 relation
-verifier 和 FinalInstructionVerifier 决定。
+连续若干次没有改善，控制层只标记 `progress_stalled=true`，并继续尝试剩余 proposal
+或重采样；它不会把 stalled 解释成 `budget_exhausted`。真正的 exhausted 只来自 proposal
+用完、总 attempts 用完或 verifier 调用预算用完。但如果 `within_final_stop_distance`
+仍未满足，并且仍有 `remaining_physical_contract_proposals`，attempt/verifier 预算只表示
+软视角优化耗尽，不会允许 final stop。
 
-为避免 VLM 在弱远景上第一次就过度自信 `accept`，instruction mode 的首次
-accept 也会经过 initial-accept deferral：如果通用几何 proposal 预测可得到明显更好的
-final evidence，agent 会先执行该 better-view 子目标；如果没有明显改善空间，则保留
-verifier 的 accept。
+一旦 verifier 给出 `semantic_satisfied=true`，控制层会 pin 首次语义确认的
+`pinned_visual_evidence`，并把后续观察写入 `latest_visual_evidence`。前者作为稳定视觉
+身份参照，后者作为当前停止证据。这样即使 3D object cluster 在近距离投影到支撑物或
+背景，final verifier 仍能比较“已确认目标长什么样”和“当前 bbox/crop 是否仍对准它”。
+这是一种证据组织方式，不是类别规则；是否接受仍由 VLM 对当前证据输出。
+
+`ViewControlState` 对同一 candidate 是单调状态：VLM 反复返回语义等价但措辞不同的
+`view_objective` 时，控制层只合并 objective，不清空已尝试 proposal。final-stop
+距离由 verifier evidence 提供为 planner-owned hard stop contract。若该合同未满足，
+proposal 排序会优先选择能够满足或接近合同的可见视角，再比较通用视觉质量。控制层仍把
+`closest_remaining_proposal_distance`、`remaining_proposals` 传回 VLM，但是否满足距离、
+是否仍有更近可执行 proposal、是否存在不可达证明，都由 planner/geometry 决定。
+
+在安装 `InstructionPlan` 或 benchmark object-goal plan 后，`STOP` 权限只属于
+FinalInstructionVerifier。legacy `final_check()` 的 ray/voxel 可见性不再单独结束 episode；
+它只保留给无 plan 的原始 STRIVE 路径。若 final verifier 没有返回 accept，agent 会阻断
+Habitat stop action，继续执行 view-control 或采集新的当前视角证据。
 
 better-view 子目标会 pin 已验证的 `DynamicSemanticEdge`。例如
 `book_uid on cabinet_uid` 已经通过后，后续视角优化只重新评估视角质量，不重新把关系发现
@@ -582,7 +591,7 @@ better-view 子目标会 pin 已验证的 `DynamicSemanticEdge`。例如
 ```text
 semantic_satisfied=true + need_better_view
   -> mode = better_view_for_verified_pair
-  -> pending_verified_pair = {candidate_uid, relation_context, edge, view_objective}
+  -> pending_verified_pair = {candidate_uid, candidate_record, relation_context, edge, view_objective}
 ```
 
 这条状态有两个不变量：
@@ -594,7 +603,8 @@ semantic_satisfied=true + need_better_view
 ```
 
 因此“语义已经确认但视角不足”会形成闭环视角控制，而不是被误当成失败后继续寻找
-新的 book / shelf。
+新的 book / shelf / tv。对没有 relation edge 的单目标 object-goal，`candidate_record`
+中的 centroid/position 提供同簇关联，抵抗 mapper 靠近目标后产生的新 uid。
 
 对 `check_again` 产生的强视觉证据，关系几何预筛失败不再直接 hard reject；系统会允许
 VLM relation verifier 覆盖几何不确定性，并在缓存层绕过旧的 geometry failure。
@@ -666,12 +676,50 @@ logs/<save_dir>/episode-*/final_verifier/
 开关：
 
 ```bash
-export STRIVE_FINAL_VERIFIER=auto  # 默认：仅在指令模式存在 InstructionPlan/InstructionSpec 时介入
+export STRIVE_FINAL_VERIFIER=auto  # 默认：调用侧传入 plan 时启用 verifier
 export STRIVE_FINAL_VERIFIER=1     # 强制开启，要求调用侧传入 instruction plan
 export STRIVE_FINAL_VERIFIER=0     # 关闭，恢复旧停止行为
+export STRIVE_FINAL_STOP_DISTANCE_SCALE=1.0
 ```
 
-普通 benchmark 模式不传 `--enable_instruction_adapter` / `--custom_instruction` 时没有 `InstructionPlan`，final verifier 在 agent 层直接旁路，不额外调用 VLM，也不改变原始 STRIVE 停止条件。
+普通 benchmark 模式不传 `--enable_instruction_adapter` / `--custom_instruction` 时，
+runner 会安装一个 object-goal `InstructionPlan`：
+
+```text
+Find the <target>.
+target role = terminal
+constraint = within_success_distance
+```
+
+该 plan 通过 `instruction_adapter` 的同一条 mapper 搜索、ledger、
+check_again evidence 和 final verifier 链路执行，但 `runtime_source` 标记为
+`benchmark_object_goal`，且不读取 episode metadata 的复杂自然语言。显式
+instruction mode 才使用原始自然语言 prompt 和完整 InstructionPlan。两种模式
+共用 view-control 与 final-stop evidence。bbox 贴边、过小、投影失败或
+`distance_to_object > success_distance` 会作为结构化 evidence 提供给 VLM；其中距离是
+hard stop contract，不是对象类别规则。
+
+`need_better_view` 的执行闭环是有限的。系统先生成一组通用几何 viewpoint
+proposal，按物理 stop contract、可见性、居中、bbox 面积、边界余量和距离适配性排序；
+只要 hard stop contract 未满足且还有更近的物理 proposal，STOP 会被 unified final-stop
+gate 阻断并继续采集证据。预算包含三类通用资源边界：
+
+```text
+max_view_attempts_per_target
+max_final_verifier_calls_per_target
+max_no_improvement_rounds
+max_final_verifier_calls_per_candidate
+```
+
+每次尝试都会写入 `ViewAttempt`，并维护当前最高质量的 `best_visual_evidence`。若
+proposal 或 verifier 调用达到上限，控制层把预算耗尽状态传给
+`FinalInstructionVerifier`，但不直接把 `need_better_view` 改成 `accept`。连续无改善只作为
+`progress_stalled` 反馈，不会宣称“没有更好视角”。best available stop 只覆盖软视觉质量；
+未满足的物理 hard constraint 必须由 planner/geometry 证明不可执行，否则继续 approach。
+
+此外，同一 instruction/candidate 还有独立的 final verifier 调用硬预算。它不改变语义
+判断，只防止工程状态被重置时绕过 `ViewControlState` 预算，导致同一候选反复上传
+相同或相近证据。
 
 ### Instruction-Level Metrics
 
@@ -690,8 +738,14 @@ steps
 instruction_success
 instruction_decision
 instruction_accept_step
+final_stop_success
+final_stop_decision
+final_stop_accept_step
+final_stop_mode
 accepted_candidate_uid
 accepted_relation_edge
+accepted_distance_to_target
+accepted_distance_source
 lvlm_call_count_by_type
 lvml_call_count_by_type
 ```
@@ -704,6 +758,10 @@ success:
 
 instruction_success:
   原始自然语言指令、实例约束、动态语义边和 final verifier 的执行结果。
+
+final_stop_success:
+  benchmark/instruction 共用的最终停止 verifier 结果。benchmark mode 下它只表示
+  结构化目标和 final-stop 几何通过，不代表复杂自然语言指令成功。
 ```
 
 例如 `book on shelf` 在指令链路中可以 `instruction_success=True`，但 Habitat

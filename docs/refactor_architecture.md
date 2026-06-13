@@ -244,8 +244,9 @@ mapper objects + optional InstructionPlan
 ```text
 benchmark mode:
   只做 target alias / detector tag 匹配；
-  不调用 LLM/VLM；
-  不启用 relation/final verifier。
+  不启用 instruction parser / relation verifier；
+  final verifier 只接收结构化目标 plan，例如 Find the <tv>；
+  共用 view-control 和 success_distance final-stop 几何。
 
 instruction mode:
   注册 mapper objects 到 instruction spatial graph；

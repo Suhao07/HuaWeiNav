@@ -130,7 +130,15 @@ class InstructionObjectSearchPolicy:
         best_distance = float("inf")
         desired_label = normalize_term(candidate_uid.split(":", 1)[0]) if ":" in candidate_uid else ""
         subject_record = dict((pending.get("relation_context") or {}).get("subject_record") or {})
-        center = subject_record.get("center") or subject_record.get("centroid") or subject_record.get("position") or []
+        candidate_record = dict(pending.get("candidate_record") or {})
+        center = (
+            subject_record.get("center")
+            or subject_record.get("centroid")
+            or subject_record.get("position")
+            or candidate_record.get("centroid")
+            or candidate_record.get("position")
+            or []
+        )
 
         for obj in getattr(mapper, "objects", []) or []:
             candidate = candidate_from_object(
@@ -154,7 +162,7 @@ class InstructionObjectSearchPolicy:
         if best_distance > _pending_pair_association_radius():
             return None
 
-        # pending verified pair 已经由 VLM 证明语义成立。
+        # pending verified target/pair 已经由 VLM 证明语义成立。
         # 此处只把同一实例/同一局部簇重新交给 view-control，不重新启动
         # 全图搜索，也不把 anchor 当成终止目标。
         if target is not None:

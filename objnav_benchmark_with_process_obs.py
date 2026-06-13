@@ -2,6 +2,8 @@ import argparse
 import csv
 import json
 import os
+import shutil
+import time
 
 import habitat
 from loguru import logger
@@ -9,7 +11,6 @@ from tqdm import tqdm
 
 from benchmark import available_benchmarks, get_provider
 from constants import *
-from cv_utils.gpt_utils import ask_gpt_similar_objects
 #指令解析模块
 from instruction_adapter import (
     StriveInstructionParser,
@@ -121,6 +122,8 @@ def get_args():
     parser.add_argument("--grid_size", type=int, default=500)
     parser.add_argument("--grid_height", type=int, default=30)
     parser.add_argument("--save_dir", type=str, default="default")
+    parser.add_argument("--run_id", type=str, default="")
+    parser.add_argument("--clean_save_dir", default=False, action="store_true")
     parser.add_argument("--not_do_seg", default=True, action="store_false")
     parser.add_argument("--no_gpt_seg", default=True, action="store_false")
     parser.add_argument("--relocate", default=False, action="store_true")
@@ -133,11 +136,83 @@ def get_args():
     return parser.parse_known_args()[0]
 
 
+def _install_instruction_plan(
+    *,
+    habitat_mapper,
+    habitat_agent,
+    instruction_parser,
+  raw_instruction,
+    dataset_target,
+    episode_info,
+    episode_dir,
+    source,
+):
+    """Compile and install the canonical object/instruction plan for one episode.
+
+    Benchmark ObjectNav and free-form instruction navigation intentionally share
+    this runtime contract. The only difference is the prompt source: benchmark
+    mode uses a narrow object prompt, while custom instruction mode may use the
+    user instruction or dataset metadata.
+    """
+
+    instruction_plan = instruction_parser.parse_plan(
+        raw_instruction=raw_instruction,
+        dataset_target=dataset_target,
+        available_classes=habitat_mapper.object_perceiver.classes,
+        episode_info=episode_info,
+    )
+    instruction_plan.diagnostics.setdefault("source", [])
+    instruction_plan.diagnostics["runtime_source"] = source
+    instruction_spec = instruction_plan.to_legacy_spec()
+
+    habitat_mapper.instruction_plan = instruction_plan
+    habitat_mapper.instruction_spec = instruction_spec
+    habitat_mapper.instruction_execution_state = None
+    habitat_mapper.instruction_constraint_evaluator.ensure_state(habitat_mapper, instruction_plan)
+
+    # Perception can use both terminal detector terms and non-terminal concept
+    # detector terms. Stop remains controlled by terminal target + verifier.
+    habitat_mapper.target_list = list(
+        instruction_spec.target_detector_prompts
+        or [instruction_spec.canonical_target or dataset_target]
+    )
+    perception_terms = list(habitat_mapper.target_list)
+    for concept in getattr(instruction_plan, "concept_queries", []) or []:
+        perception_terms.extend(list(getattr(concept, "detector_terms", []) or []))
+    habitat_mapper.perception_target_list = list(dict.fromkeys([term for term in perception_terms if term]))
+    habitat_mapper.target = instruction_spec.canonical_target or habitat_mapper.target_list[0]
+    habitat_mapper.target_aliases = list(instruction_spec.target_match_terms)
+    habitat_agent.instruct_goal = render_instruction_context(instruction_plan)
+
+    instruction_dir = os.path.join(episode_dir, "instruction_adapter")
+    os.makedirs(instruction_dir, exist_ok=True)
+    with open(os.path.join(instruction_dir, "plan.json"), "w", encoding="utf-8") as f:
+        json.dump(instruction_plan.as_dict(), f, ensure_ascii=False, indent=2, sort_keys=True)
+    with open(os.path.join(instruction_dir, "spec.json"), "w", encoding="utf-8") as f:
+        json.dump(instruction_spec.as_dict(), f, ensure_ascii=False, indent=2, sort_keys=True)
+    return instruction_plan, instruction_spec
+
+
 if __name__ == "__main__":
     args = get_args()
-
     args.save_dir = "logs/" + args.save_dir
+    run_id = args.run_id or time.strftime("%Y%m%d_%H%M%S")
+    if args.clean_save_dir and os.path.isdir(args.save_dir):
+        shutil.rmtree(args.save_dir)
     os.makedirs(args.save_dir, exist_ok=True)
+    with open(os.path.join(args.save_dir, "run_manifest.json"), "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "clean_save_dir": bool(args.clean_save_dir),
+                "run_id": run_id,
+                "save_dir": args.save_dir,
+                "started_at_local": time.strftime("%Y-%m-%d %H:%M:%S"),
+            },
+            f,
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
 
     benchmark_provider = get_provider(args)
     benchmark_spec = benchmark_provider.prepare(args)
@@ -167,6 +242,11 @@ if __name__ == "__main__":
                                       relocate=args.relocate,
                                       gpt_relocate=not args.no_gpt_relocate,
                                       vlm=args.vlm)
+    habitat_agent.run_id = run_id
+    # Provider-specific success distance must reach the agent as well as Habitat.
+    # 否则 final-stop verifier 和靠近控制会沿用 HM3D 默认 1.0m，
+    # 与 OVON 等 benchmark 的 1.5m 成功半径不一致。
+    habitat_agent.success_distance = benchmark_spec.success_distance
     evaluation_metrics = []
     instruction_parser = StriveInstructionParser(
         backend=args.instruction_adapter_backend,
@@ -193,64 +273,35 @@ if __name__ == "__main__":
 
         target = habitat_agent.instruct_goal
         dataset_target = extract_dataset_target(target)
-        if args.enable_instruction_adapter or str(args.custom_instruction or "").strip():
-            # 指令模式：先把自然语言编译成 plan/spec，再把 detector prompt、
-            # runtime verifier 和 mapper 搜索策略都接到同一个 plan 上。
-            current_episode = getattr(habitat_agent.env, "current_episode", None)
-            custom_instruction = str(args.custom_instruction or "").strip()
-            episode_info = {} if custom_instruction else (getattr(current_episode, "info", None) or {})
-            raw_instruction = (
-                custom_instruction
-                or str(episode_info.get("instruction", "")).strip()
-                or target
-            )
-            instruction_plan = instruction_parser.parse_plan(
-                raw_instruction=raw_instruction,
-                dataset_target=dataset_target,
-                available_classes=habitat_mapper.object_perceiver.classes,
-                episode_info=episode_info,
-            )
-            instruction_spec = instruction_plan.to_legacy_spec()
-            habitat_mapper.instruction_plan = instruction_plan
-            habitat_mapper.instruction_spec = instruction_spec
-            habitat_mapper.instruction_execution_state = None
-            habitat_mapper.instruction_constraint_evaluator.ensure_state(habitat_mapper, instruction_plan)
-
-            # perception_target_list 可以包含 terminal 和 anchor 的 detector terms，
-            # 但最终 stop 只能由 terminal target + verifier 决定。
-            habitat_mapper.target_list = list(
-                instruction_spec.target_detector_prompts
-                or [instruction_spec.canonical_target or dataset_target]
-            )
-            perception_terms = list(habitat_mapper.target_list)
-            for concept in getattr(instruction_plan, "concept_queries", []) or []:
-                perception_terms.extend(list(getattr(concept, "detector_terms", []) or []))
-            habitat_mapper.perception_target_list = list(dict.fromkeys([term for term in perception_terms if term]))
-            habitat_mapper.target = instruction_spec.canonical_target or habitat_mapper.target_list[0]
-            habitat_mapper.target_aliases = list(instruction_spec.target_match_terms)
-            habitat_agent.instruct_goal = render_instruction_context(instruction_plan)
-
-            instruction_dir = os.path.join(args.save_dir, f"episode-{i}", "instruction_adapter")
-            os.makedirs(instruction_dir, exist_ok=True)
-            with open(os.path.join(instruction_dir, "plan.json"), "w", encoding="utf-8") as f:
-                json.dump(instruction_plan.as_dict(), f, ensure_ascii=False, indent=2, sort_keys=True)
-            with open(os.path.join(instruction_dir, "spec.json"), "w", encoding="utf-8") as f:
-                json.dump(instruction_spec.as_dict(), f, ensure_ascii=False, indent=2, sort_keys=True)
+        current_episode = getattr(habitat_agent.env, "current_episode", None)
+        custom_instruction = str(args.custom_instruction or "").strip()
+        if custom_instruction:
+            raw_instruction = custom_instruction
+            episode_info = {}
+            plan_source = "custom_instruction"
+        elif args.enable_instruction_adapter:
+            episode_info = getattr(current_episode, "info", None) or {}
+            raw_instruction = str(episode_info.get("instruction", "")).strip() or target
+            plan_source = "episode_instruction"
         else:
-            # benchmark 模式：关闭 instruction adapter，保持 STRIVE 原始
-            # ObjectNav 流程，只做目标类别同义扩展。
-            habitat_mapper.instruction_plan = None
-            habitat_mapper.instruction_spec = None
-            habitat_mapper.instruction_execution_state = None
-            habitat_mapper.target = dataset_target
+            # benchmark 默认也走同一套目标指令链路。这里故意不读取
+            # episode.info 的复杂自然语言，只生成 ObjectNav 的窄目标 prompt；
+            # 这样 check_again、ledger、view-control 都与指令模式复用，
+            # 但 benchmark 语义仍是“找到这个类别”。
+            raw_instruction = target
+            episode_info = {}
+            plan_source = "benchmark_object_goal"
 
-            # 先用 LLM 扩展目标同义/相关类别，再初始化 GroundingDINO+SAM 的文本提示。
-            habitat_mapper.target_list = ask_gpt_similar_objects(
-                habitat_mapper.object_perceiver.classes,
-                habitat_mapper.target,
-                args.vlm
-            )
-            habitat_mapper.target_aliases = list(habitat_mapper.target_list)
+        instruction_plan, instruction_spec = _install_instruction_plan(
+            habitat_mapper=habitat_mapper,
+            habitat_agent=habitat_agent,
+            instruction_parser=instruction_parser,
+            raw_instruction=raw_instruction,
+            dataset_target=dataset_target,
+            episode_info=episode_info,
+            episode_dir=episode_dir,
+            source=plan_source,
+        )
 
         logger.info(f"Target: {habitat_mapper.target}")
         logger.info(f"Target list: {habitat_mapper.target_list}")
@@ -273,6 +324,7 @@ if __name__ == "__main__":
             # success/spl 是 Habitat 原始目标类别指标；instruction_success
             # 是自然语言指令 verifier 的终止结果，两者不能混读。
             'Episode': i,
+            'run_id': run_id,
             'benchmark': benchmark_spec.benchmark,
             'benchmark_split': benchmark_spec.split,
             'benchmark_dataset_path': benchmark_spec.dataset_path,
@@ -289,13 +341,22 @@ if __name__ == "__main__":
             'instruction_success': habitat_agent.instruction_success,
             'instruction_decision': habitat_agent.instruction_decision,
             'instruction_accept_step': habitat_agent.instruction_accept_step,
+            'final_stop_success': habitat_agent.final_stop_success,
+            'final_stop_decision': habitat_agent.final_stop_decision,
+            'final_stop_accept_step': habitat_agent.final_stop_accept_step,
+            'final_stop_mode': habitat_agent.final_stop_mode,
             'accepted_candidate_uid': habitat_agent.accepted_candidate_uid,
             'accepted_relation_edge': json.dumps(habitat_agent.accepted_relation_edge, ensure_ascii=False, sort_keys=True),
+            'accepted_distance_to_target': habitat_agent.accepted_distance_to_target,
+            'accepted_distance_source': habitat_agent.accepted_distance_source,
             'lvlm_call_count_by_type': counts_compact(),
             # 兼容前期文档/脚本中的拼写；规范字段是 lvlm_call_count_by_type。
             'lvml_call_count_by_type': counts_compact(),
             'End': 1,
-            'object_goal': habitat_agent.instruct_goal,
+            'object_goal': (
+                getattr(getattr(habitat_mapper, "instruction_plan", None), "raw_instruction", "")
+                or habitat_agent.instruct_goal
+            ),
         })
         write_metrics(evaluation_metrics, path=f"./{args.save_dir}/metrics.csv")
         logger.info('\n')

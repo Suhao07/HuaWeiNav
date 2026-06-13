@@ -545,6 +545,7 @@ VerificationResult:
 ```text
 semantic_satisfied == true
 view_sufficient_for_stop == true
+hard_stop_constraints.satisfied == true
 decision == accept
 ```
 
@@ -586,18 +587,51 @@ attempted proposals
 observed_quality
 improvement_over_baseline
 remaining_feasible_proposals
+pinned_visual_evidence
+latest_visual_evidence
+best_visual_evidence
+attempt_count / max_attempts
+max_verifier_calls
+no_improvement_rounds / max_no_improvement_rounds
+budget_exhausted
 ```
 
-如果 verifier 在 better-view 子目标中想 `accept`，但本次证据相对 baseline
-没有足够改善且还有未尝试 proposal，agent 会把结果转回 `need_better_view`。
-这一步是通用执行闭环，不是语义判断；`book/shelf/chair` 等对象语义仍由
-InstructionPlan、ConceptMatcher、relation verifier 和 final verifier 决定。final verifier
-在下一次调用时会看到完整 `view_control` 历史，并可在 proposal exhausted 时决定是否 limited accept。
+同一个 `candidate_uid` 的 better-view 子任务是单调执行状态。VLM 每次
+`need_better_view` 可能会用不同文字描述 `view_objective`，但这些文案变化不会重置
+`attempted proposals`；控制器会合并 objective 并继续尝试剩余 proposal，避免反复
+选择同一视角。
 
-如果 final verifier 第一次就 `accept`，agent 仍会做一次通用 initial-accept
-deferral：几何层预测仍存在明显更好的可达证据视角时，先进入 `ViewControlState`
-采集更好 evidence；如果没有明显更好视角，才保留 verifier 的 accept。这个机制只比较
-通用 view quality，不写目标类别规则。
+final-stop 距离会作为 prompt fact 进入 `FinalInstructionVerifier`，并写入
+`view_objective` 供 view-control 生成更近且仍可见的候选视角。这里采用明确的
+authority split：
+
+```text
+VLM:
+  semantic_satisfied
+  relation_satisfied
+  view_sufficient_for_stop
+
+Planner / geometry:
+  distance_satisfied
+  path_reachable
+  collision_free
+  no_remaining_feasible_view
+```
+
+因此 `required_stop_distance` 是 planner-owned hard stop contract，不是 VLM
+可以自行覆盖的自然语言建议。VLM 可以说明当前视角是否清楚、目标和 anchor 是否共同可见；
+但它不能把“多次尝试后视角仍不好”解释成物理距离约束不可执行。
+
+当 VLM 第一次确认 `semantic_satisfied=true` 时，`ViewControlState` 会保存一份
+`pinned_visual_evidence`。它是“目标身份参照”，不是 stop 许可。后续靠近过程中，
+如果 3D object cluster 的投影漂移到支撑物、墙面或背景，final verifier 仍会同时看到
+当前 stop evidence 与该稳定视觉参照，从而判断当前 bbox/crop 是否还对准同一目标。
+`latest_visual_evidence` 只记录最近一次观察，不覆盖首次语义确认的参照。
+
+如果 verifier 在 better-view 子目标中输出 `accept`，agent 不会再用 baseline
+改善阈值把结果转回 `need_better_view`。如果 verifier 认为当前证据仍可改善，应由 prompt
+直接返回 `need_better_view` 并给出 `view_objective`。这样 control loop 只负责执行
+VLM 的视角目标，而不是在代码中二次裁决 stop。
 
 进入 better-view 后，`ViewControlState` 会 pin 已经验证过的动态语义边：
 
@@ -608,26 +642,62 @@ candidate_uid + relation + anchor_uid
 后续换视角时，如果 mapper 把同一语义区域切成新的 object uid，约束层会优先复用
 `pinned_relation_context`，把当前证据视为“同一已接受语义区域的新视角”，只重新判断
 view sufficiency。这样不会因为靠近后实例重分割而丢掉 51 步已经确认的
-`book on shelf`。
+语义关系。
+
+单目标 object-goal 没有 relation edge，因此 pending state 还会保存
+`candidate_record`。当 mapper 在靠近过程中产生新的 object uid 时，object search 会先用
+已确认 candidate 的 centroid/position 做同簇关联，再决定是否继续 view-control，而不是
+重新启动普通探索。
+
+在 benchmark object-goal 或 instruction plan 已安装时，Habitat `STOP` 只能由
+`FinalInstructionVerifier` 的 `decision=accept` 触发。legacy `final_check()` 的几何
+ray/voxel 可见性只服务于无 plan 的原始 STRIVE 路径；在统一 verifier 路径中，几何事实
+会进入 evidence，但不能单独结束 episode。若 verifier 返回 `need_better_view`、
+`uncertain` 或 `reject_candidate`，agent 会发出非 STOP 动作继续收集证据或恢复搜索。
+
+`need_better_view` 是一个有预算的可执行子任务，不是无限等待状态。若
+`ViewControlState` 仍有未尝试 proposal，agent 会继续围绕同一 pinned candidate
+采集证据。预算被分成两层：软视角质量预算和物理 stop contract。总 attempt 数或
+verifier 调用数达到上限，只能结束“继续优化中心度/边界余量/bbox 大小”这类软目标；
+如果 `within_final_stop_distance` 仍未满足，并且 `remaining_physical_contract_proposals > 0`，
+则 `budget_exhausted` 不会被置为 true，agent 会继续执行更接近 hard stop contract 的
+proposal。连续无改善只会写成 `progress_stalled=true`，用于提示切换 proposal 或重采样，
+不等价于“没有更好视角”。
+agent 会把 `remaining_proposals`、`closest_remaining_proposal_distance`、
+`best_visual_evidence` 和 attempt history 继续传给 `FinalInstructionVerifier`。
+best available 只适用于软视觉质量目标。若 hard stop contract 未满足，必须继续靠近；
+只有 planner/geometry 明确写入 `planner_infeasibility_proof` 时，才允许从最优可达证据
+中接受停止。
+
+同样，控制层不再实现 initial-accept deferral：如果当前证据可接受但仍有明显更近、
+更清晰且可执行的视角，final verifier prompt 应返回 `need_better_view` 并给出
+`preferred_view_goal`。如果 verifier 返回 `accept`，agent 不会再用几何阈值把它改写成
+retry。
 
 另外，`check_again` 图像是强视觉证据；当它存在时，object-object 几何预筛失败会降级为
 `geometry_inconclusive` 并允许 VLM relation verifier 覆盖，而不是直接
 `reject_relation`。旧的 geometry failure cache 在这种情况下也会被绕过。
 
-为了防止 VLM 把“语义正确但目标贴边/太小/太偏”的证据直接 accept，final verifier
-后还有一个可配置的通用 view guard。它只读取 `view_quality_facts`，默认要求最终
-stop 证据不要投影失败、不要过度偏离中心、不要过度贴边、不要过小。相关环境变量：
+final verifier 会接收两类结构化信息。第一类是 `hard_stop_constraints`，例如
+`within_final_stop_distance`，由 `distance_to_object` 和 benchmark `success_distance`
+构成；如果该约束未满足，`accept` 会被降级为 `need_better_view`。VLM 输出中的
+`infeasible_or_not_applicable` 只会被记录为 report，不再能覆盖 planner hard contract。
+只有 evidence 中存在 planner/geometry 写入的 `planner_infeasibility_proof` 时，控制层
+才允许 best-available stop。第二类是 view guidance：bbox 面积、中心偏移、边界余量、
+投影是否失败，以及 view-control budget。
+这些视觉质量事实只服务于 prompt，不由 Python 阈值决定语义是否成立。
 
 ```bash
-export STRIVE_FINAL_VIEW_GUARD=1
-export STRIVE_FINAL_VIEW_MAX_CENTER_OFFSET=0.35
-export STRIVE_FINAL_VIEW_MIN_BORDER_MARGIN=0.08
-export STRIVE_FINAL_VIEW_MIN_BBOX_AREA=0.003
 export STRIVE_VIEW_CONTROL_MIN_IMPROVEMENT=0.08
+export STRIVE_VIEW_CONTROL_MAX_ATTEMPTS=5
+export STRIVE_VIEW_CONTROL_MAX_VERIFIER_CALLS=5
+export STRIVE_VIEW_CONTROL_MAX_NO_IMPROVEMENT_ROUNDS=2
+export STRIVE_FINAL_VERIFIER_MAX_PER_CANDIDATE=8
 ```
 
-这些阈值不是目标规则；它们是相机停止证据的几何硬约束，和 SysNav 中“几何硬约束 +
-VLM 软推理”的分层原则一致。
+这些预算不是目标规则；它们是机器人执行资源边界。VLM 判断语义、关系和视觉证据质量；
+控制层执行 verifier 给出的 `view_objective`，并维护 planner-owned hard stop contract。
+这避免了“语义已确认但还没靠近目标，却因为 verifier 调用预算耗尽而提前 stop”的问题。
 
 如果 `decision=reject_candidate`，ledger 只 hard-reject 当前 `candidate_uid`。
 
@@ -644,14 +714,28 @@ book 不满足关系”导致所有 book 被屏蔽。
 ### 开关
 
 ```bash
-export STRIVE_FINAL_VERIFIER=auto  # 默认：仅在存在 InstructionPlan/InstructionSpec 时介入
+export STRIVE_FINAL_VERIFIER=auto  # 默认：调用侧传入 plan 时启用 verifier
 export STRIVE_FINAL_VERIFIER=1     # 强制开启，要求调用侧传入 instruction plan
 export STRIVE_FINAL_VERIFIER=0     # 关闭后保持旧 STRIVE 行为
+export STRIVE_FINAL_STOP_DISTANCE_SCALE=1.0  # final-stop 距离门槛相对 success_distance 的倍率
 ```
 
-普通 HM3D ObjectNav benchmark 不传 `--enable_instruction_adapter` / `--custom_instruction` 时，mapper 不会设置 `InstructionPlan`，agent 会直接旁路 final verifier，不额外调用 VLM，也不改变原始 STRIVE 停止逻辑。
+普通 HM3D ObjectNav / OVON benchmark 不传 `--enable_instruction_adapter` /
+`--custom_instruction` 时，benchmark runner 会自动安装一个窄化的 object-goal
+`InstructionPlan`，例如 `Find the <tv>.`。该 plan 与自然语言指令模式走同一套
+mapper 搜索、ledger、check_again evidence 和 final verifier；区别是
+`runtime_source=benchmark_object_goal`，且不读取 episode metadata 的复杂自然语言。
+因此 benchmark 不会引入 relation、sequence、room、count 等复杂指令语义。
 
-当 `LLM_OFFLINE=1` 或 LLM client 不可用时，final verifier 会 fallback accept，以免离线 smoke test 被外部服务阻断。
+instruction mode 与 benchmark object-goal mode 共用 view-control 和 final-stop 合同。
+其中 `success_distance` 来自 benchmark provider，并写入 verifier evidence；
+如果候选目标视觉上正确但 `distance_to_object > success_distance`，
+`hard_stop_constraints.satisfied=false` 会进入 final verifier prompt，并由 verifier
+后处理保护：除非 planner/geometry 在 evidence 中写入
+`planner_infeasibility_proof.infeasible_by_geometry=true`，否则不能 stop。
+
+当 `LLM_OFFLINE=1` 或 LLM client 不可用时，final verifier 会 fallback accept，以免离线
+smoke test 被外部服务阻断；该路径只用于离线工程验证，不代表在线 final-stop 语义。
 
 ## 可观测性和 Metrics
 
@@ -701,17 +785,44 @@ logs/<save_dir>/episode-*/detection/object_box_cache.json
 
 ### metrics.csv
 
-Habitat 原始 `success` 仍保留，表示 ObjectNav 距离目标的官方指标。指令模式额外写入：
+Habitat 原始 `success` 仍保留，表示 ObjectNav 距离目标的官方指标。final-stop
+verifier 和指令模式额外写入：
 
 ```text
+run_id                   # 本次运行 ID，用于区分复用同一 save_dir 的多次实验
+final_stop_success       # benchmark/instruction 共用 final-stop verifier 是否接受
+final_stop_decision      # 最后一次 final-stop verifier 决策
+final_stop_accept_step   # final-stop verifier accept 的 step
+final_stop_mode          # benchmark 或 instruction
 instruction_success       # final verifier + 约束执行链是否接受原始指令
 instruction_decision      # 最后一次 final verifier 决策
 instruction_accept_step   # 指令级成功发生的 step
 accepted_candidate_uid    # 被接受的 terminal instance uid
 accepted_relation_edge    # 被接受的动态语义边，JSON 字符串
+accepted_distance_to_target # verifier 接受的目标实例距离，优先来自 final evidence
+accepted_distance_source  # accepted_distance_to_target 的证据来源
 lvlm_call_count_by_type   # calls/cache_hits/total_calls/total_cache_hits，JSON 字符串
 lvml_call_count_by_type   # 兼容旧拼写的别名，内容同上
 ```
 
 因此复杂指令实验要优先看 `instruction_success`。`success=0` 可能只是 Habitat
-原始目标类别指标未命中，并不代表自然语言指令验证失败。
+原始目标类别指标未命中，并不代表自然语言指令验证失败。距离分析应优先看
+`accepted_distance_to_target`；`distance_to_goal` 仍是 Habitat 原始 GT 距离，可能与
+自然语言接受的 terminal instance 不一致。
+
+### 运行产物隔离
+
+默认情况下，`--save_dir` 会写到 `logs/<save_dir>`。如果复用同一个目录，旧的
+`metrics.csv`、`final_verifier/result_*.json` 和 `lvlm_calls/*.json` 可能与新实验混在
+一起。推荐调试时使用：
+
+```bash
+bash docker/run_scene_object_nav.sh ... \
+  --save_dir hm3d_debug_run \
+  --clean_save_dir \
+  --run_id book_on_shelf_001
+```
+
+`--clean_save_dir` 会在启动前删除该输出目录；`--run_id` 会写入
+`run_manifest.json`、`metrics.csv` 和 final verifier 的 evidence/result，便于后续按 run
+追踪产物。

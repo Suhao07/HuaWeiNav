@@ -106,6 +106,7 @@ class ParsedVerification(BaseModel):
     satisfied: bool = False
     semantic_satisfied: bool = False
     view_sufficient_for_stop: bool = True
+    hard_constraints: dict[str, Any] = Field(default_factory=dict)
     decision: str = "uncertain"
     confidence: float = 0.0
     satisfied_constraints: list[str] = Field(default_factory=list)

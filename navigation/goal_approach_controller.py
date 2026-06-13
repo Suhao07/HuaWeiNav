@@ -56,11 +56,15 @@ def action_after_instruction_reject(agent: Any) -> int:
     """Recover from a failed final-instruction check and return the next action."""
 
     _ = habitat_waypoint(agent)
+    continue_better_view = getattr(agent, "_continue_better_view_control", None)
+    if callable(continue_better_view) and continue_better_view():
+        return next_action_to_waypoint(agent)
     if agent.need_check_again:
         act = next_action_to_waypoint(agent)
         if act == 0:
             agent.need_check_again = False
-            agent.after_check_again()
+            if not (callable(continue_better_view) and continue_better_view()):
+                agent.after_check_again()
             _ = habitat_waypoint(agent)
     else:
         agent.after_check_again()
