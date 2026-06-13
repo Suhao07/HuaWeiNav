@@ -17,3 +17,28 @@ debug*
 run.sh
 *.png
 .vscode/
+
+# Real-robot ROS overlay build products.
+real_robot/ros2_ws/build/
+real_robot/ros2_ws/install/
+real_robot/ros2_ws/log/
+
+# Vendored SAM2 runtime only needs the sam2 Python package/configs.
+# Keep demo/training/notebook assets out of repository history.
+real_robot/ros2_ws/src/semantic_mapping/semantic_mapping/external/sam2/.github/
+real_robot/ros2_ws/src/semantic_mapping/semantic_mapping/external/sam2/*
+!real_robot/ros2_ws/src/semantic_mapping/semantic_mapping/external/sam2/LICENSE
+!real_robot/ros2_ws/src/semantic_mapping/semantic_mapping/external/sam2/LICENSE_cctorch
+!real_robot/ros2_ws/src/semantic_mapping/semantic_mapping/external/sam2/checkpoints/
+!real_robot/ros2_ws/src/semantic_mapping/semantic_mapping/external/sam2/checkpoints/download_ckpts.sh
+!real_robot/ros2_ws/src/semantic_mapping/semantic_mapping/external/sam2/sam2/
+!real_robot/ros2_ws/src/semantic_mapping/semantic_mapping/external/sam2/sam2/**
+real_robot/ros2_ws/src/semantic_mapping/semantic_mapping/external/sam2/assets/
+real_robot/ros2_ws/src/semantic_mapping/semantic_mapping/external/sam2/demo/
+real_robot/ros2_ws/src/semantic_mapping/semantic_mapping/external/sam2/notebooks/
+real_robot/ros2_ws/src/semantic_mapping/semantic_mapping/external/sam2/sav_dataset/
+real_robot/ros2_ws/src/semantic_mapping/semantic_mapping/external/sam2/tools/
+real_robot/ros2_ws/src/semantic_mapping/semantic_mapping/external/sam2/training/
+real_robot/ros2_ws/src/semantic_mapping/semantic_mapping/pyproject.toml
+real_robot/ros2_ws/src/semantic_mapping/semantic_mapping/setup.cfg
+real_robot/ros2_ws/src/semantic_mapping/semantic_mapping/tools/

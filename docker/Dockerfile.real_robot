@@ -1,0 +1,55 @@
+FROM ros:humble-ros-base
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG INSTALL_ML_DEPS=0
+ARG INSTALL_LLM_DEPS=1
+
+SHELL ["/bin/bash", "-lc"]
+
+ENV STRIVE_WS=/workspace/STRIVE
+ENV STRIVE_REAL_ROBOT_WS=/workspace/STRIVE/real_robot/ros2_ws
+ENV PYTHONPATH=/workspace/STRIVE
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      python3-colcon-common-extensions \
+      python3-pip \
+      python3-opencv \
+      python3-yaml \
+      ros-humble-cv-bridge \
+      ros-humble-pcl-conversions \
+      ros-humble-pcl-ros \
+      ros-humble-tf2-geometry-msgs \
+      ros-humble-tf2-ros \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN if [[ "${INSTALL_LLM_DEPS}" == "1" ]]; then \
+      python3 -m pip install --no-cache-dir \
+        "pydantic>=2,<3" openai ; \
+    fi
+
+# Optional runtime deps for launching the vendored SysNav detector/mapping
+# nodes. Keep this switch explicit because torch/ultralytics/open3d are heavy
+# and may be provided by the robot image or mounted environment instead.
+RUN if [[ "${INSTALL_ML_DEPS}" == "1" ]]; then \
+      python3 -m pip install --no-cache-dir \
+        pyyaml pillow scipy open3d supervision ultralytics opencv-python-headless ; \
+    fi
+
+WORKDIR ${STRIVE_WS}
+
+# Copy the full STRIVE source tree for single-container real-robot deployment.
+# .dockerignore excludes HM3D data, logs, checkpoints, and ROS build products.
+COPY . ${STRIVE_WS}
+
+# 核心：实物镜像内同时包含 STRIVE 上层和 SysNav ROS overlay；
+# 权重仍通过 volume/env 挂载，避免把大模型文件固化进镜像。
+RUN source /opt/ros/humble/setup.bash \
+ && cd ${STRIVE_REAL_ROBOT_WS} \
+ && colcon build --symlink-install --packages-up-to tare_planner semantic_mapping strive_sysnav_bringup
+
+RUN chmod +x ${STRIVE_WS}/scripts/build_real_robot_ros_ws.sh \
+             ${STRIVE_WS}/scripts/run_sysnav_detection_mapping.sh \
+             ${STRIVE_WS}/docker/run_real_robot_sysnav_stack.sh
+
+CMD ["/bin/bash"]

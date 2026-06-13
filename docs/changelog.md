@@ -11,17 +11,48 @@
   - `NavigationIntent`、`MotionGoal`、`ViewpointGoal`、`NavigationStatus` 明确 STRIVE 高层与下层运动控制的异步边界；
   - `ViewEvidence` 和 `RuntimeDecision` 为 final verifier、relation verifier 和实物运行复盘提供结构化记录。
 - 新增 `real_robot/__init__.py`，集中导出实物 contract，后续 ROS/SysNav/bag replay adapter 都应依赖该包。
+- 新增 `real_robot/detector_vocabulary.py`，用于彻底复用 SysNav detector 词表配置：
+  - `DetectorVocabularyAdapter` 读取 SysNav `semantic_mapping/config/objects.yaml`；
+  - `DetectorVocabulary` 暴露 `label_space`、`prompt_space`、`is_instance` 和 config path；
+  - `label_provenance` 记录 raw detector label、canonical label、prompt labels、matched_by 和 detector name；
+  - adapter 只记录 config provenance，不把 detector label 静默改写成任务概念。
+- 新增 `real_robot/ros2_ws`，将 SysNav detector/mapping 迁入本仓库可构建 overlay：
+  - `src/tare_planner` 是 message-only 兼容包，提供 SysNav `DetectionResult`、`ObjectNode`、`RoomNode` 等消息；
+  - `src/semantic_mapping` vendor 了 SysNav `detection_node` 和 `semantic_mapping_node`；
+  - `src/strive_sysnav_bringup` 提供 `sysnav_detection_mapping.launch.py`，统一启动 detector 与 semantic mapping；
+  - vendor `detection_node` 增加 `detector_model_path` 和 `detector_model_type` 参数，避免模型路径写死；
+  - vendor `semantic_mapping_node` 改为 package-local SAM2 路径，并在缺少 `line_profiler` 时自动退化为 no-op。
 - 新增 `real_robot/sysnav_ros_adapters.py`，作为第一版 SysNav ROS 复用层：
   - `RosDetectionResultAdapter` 将 SysNav `/detection_result` 转为 `DetectionFrame`；
   - `RosObjectNodeAdapter` 将 `/object_nodes_list` 转为 `ObjectNodeSnapshot`；
   - `RosRoomNodeAdapter` 将 `/room_nodes_list` 转为 `RoomSnapshot`；
   - `RosWaypointController` 将 `MotionGoal` 发布为 SysNav `/way_point`；
   - `build_semantic_map_snapshot()` 将 SysNav object/room list 组装为 STRIVE 高层 planner 可消费的只读地图快照。
+- 新增 `real_robot/sysnav_runtime.py`，实现第一版 SysNav-backed 实物运行闭环：
+  - `SysNavSemanticMapBridge` 缓存 `/object_nodes_list` 与 `/room_nodes_list`，并构建 `SemanticMapSnapshot`；
+  - `SysNavInstructionRuntime` 将 `SemanticMapSnapshot` 交给高层策略，得到 `NavigationIntent` 后通过 motion controller 发布 waypoint；
+  - `ViewpointEvidenceLoop` 执行 `ViewpointGoal -> /way_point -> wait reached -> evidence -> final verifier`；
+  - `LatestObservationEvidenceProvider` 从最新 `RealObservation` 和 crop provider 构造 `ViewEvidence`。
 - 更新 `docs/real_robot_deployment.md`：
   - 明确 contract 层只保存 JSON-friendly metadata、image/path reference 和几何状态；
   - 明确 VLM/verifier、mapper/planner、motion controller 和 runtime 的职责划分；
   - 将初始 runtime skeleton 更新为异步 `MotionGoal -> NavigationStatus -> ViewEvidence` 形式。
   - 补充第一版 SysNav 复用链路：`/camera/image -> detection_node -> /detection_result -> semantic_mapping_node -> /object_nodes_list -> STRIVE instruction_adapter`。
+  - 补充 `SysNavSemanticMapBridge`、`SysNavInstructionRuntime` 和 `ViewpointEvidenceLoop` 的最小闭环伪代码。
+  - 补充 detector vocabulary / label provenance 边界，明确词表差异由 concept grounding / verifier 处理。
+- 新增构建/运行脚本：
+  - `scripts/build_real_robot_ros_ws.sh` 构建 `real_robot/ros2_ws` overlay；
+  - `scripts/run_sysnav_detection_mapping.sh` source overlay 并启动 `strive_sysnav_bringup`。
+- 更新 `docker/Dockerfile.real_robot` 和 `docker/build_real_robot.sh`：
+  - 实物镜像改为复制完整 STRIVE workspace，而不是只复制 ROS overlay；
+  - 设置 `PYTHONPATH=/workspace/STRIVE`，保证 real_robot、instruction_adapter、llm_utils 可在同一容器内导入；
+  - 新增 `INSTALL_LLM_DEPS` 构建开关，默认安装 Pydantic v2 与 OpenAI-compatible client；
+  - 保留 `INSTALL_ML_DEPS` 开关，区分轻量 ROS 验证镜像和完整 detector/mapping runtime 镜像；
+  - 明确实物部署是单镜像方案，HM3D benchmark 镜像仅用于仿真回归，不参与真机部署。
+- 更新 `docker/run_real_robot_sysnav_stack.sh`：
+  - 自动只读挂载 `SYSNAV_DETECTOR_MODEL_PATH` 和 `SYSNAV_SAM2_CHECKPOINT` 所在目录；
+  - 透传 MAP/LLM/Ark/Gemini/CogNav 运行时环境变量；
+  - 保证真机部署时一个 `strive-real-robot:*` 容器即可承载 ROS detector/mapping 与 STRIVE 上层策略。
 
 ### Tests
 
@@ -34,6 +65,15 @@
   - 使用 fake ROS message 验证 DetectionResult、ObjectNode、RoomNode 的字段映射；
   - 验证 SysNav object/room list 可组装为 `SemanticMapSnapshot`；
   - 验证 `RosWaypointController` 发布 `PointStamped` 兼容 waypoint，且 stop/wait 类 goal 不误发布 waypoint。
+- 新增 `tests/test_detector_vocabulary.py`：
+  - 验证 SysNav `objects.yaml` 的 canonical label、prompt label 和 `is_instance` 解析；
+  - 验证 detector 输出 prompt label 时保留 raw label，并记录 canonical config match；
+  - 验证未知 detector label 会显式记录 `known_in_detector_vocabulary=false`。
+- 新增 `tests/test_sysnav_runtime.py`：
+  - 验证 runtime 在 `/object_nodes_list` 未到达时返回 WAIT；
+  - 验证 `NavigationIntent` 能通过 motion controller 下发为 waypoint goal；
+  - 验证 viewpoint evidence loop 只在 motion reached 后采集证据并调用 final verifier；
+  - 验证 blocked/timeout 类 motion 结果不会伪造 final verifier 证据。
 
 ## 2026-06-12
 

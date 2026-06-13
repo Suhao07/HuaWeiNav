@@ -651,7 +651,9 @@ robot_stable_or_goal_reached:
 real_robot/
   __init__.py
   contracts.py
+  detector_vocabulary.py
   sysnav_ros_adapters.py
+  sysnav_runtime.py
   camera_adapter.py
   observation_adapter.py
   depth_projection.py
@@ -660,6 +662,11 @@ real_robot/
   motion_controller.py
   navigation_bridge.py
   runtime_node.py
+  ros2_ws/
+    src/
+      tare_planner/
+      semantic_mapping/
+      strive_sysnav_bringup/
 
 docs/
   real_robot_deployment.md
@@ -675,12 +682,23 @@ contracts.py
   NavigationStatus, ViewEvidence, RuntimeDecision。
   该层只依赖 Python 标准库，不引入 ROS、Habitat、numpy 或 detector 实现。
 
+detector_vocabulary.py
+  读取 SysNav objects.yaml，生成 DetectorVocabulary；
+  记录 detector_name、label_space、prompt_space、is_instance 和 label provenance；
+  只做 detector config 内的 canonical/prompt 字面匹配，不做自然语言 alias 推断。
+
 sysnav_ros_adapters.py
   第一版 SysNav 复用层：
   RosDetectionResultAdapter 将 /detection_result 转为 DetectionFrame；
   RosObjectNodeAdapter 将 /object_nodes_list 转为 ObjectNodeSnapshot；
   RosRoomNodeAdapter 将 /room_nodes_list 转为 RoomSnapshot；
   RosWaypointController 将 MotionGoal 发布为 /way_point。
+
+sysnav_runtime.py
+  SysNavSemanticMapBridge 缓存 /object_nodes_list 和 /room_nodes_list；
+  SysNavInstructionRuntime 将 SemanticMapSnapshot 交给高层策略并发布 waypoint；
+  ViewpointEvidenceLoop 执行 ViewpointGoal 的异步证据采集和 final verifier；
+  LatestObservationEvidenceProvider 从最新 RealObservation 和 crop provider 构造 ViewEvidence。
 
 camera_adapter.py
   封装 Theta panorama 与 RealSense pinhole RGB-D 相机差异。
@@ -706,6 +724,19 @@ motion_controller.py
 
 runtime_node.py
   实物模式主循环。
+
+ros2_ws/src/tare_planner
+  message-only SysNav 兼容包，提供 DetectionResult、ObjectNode、RoomNode 等消息。
+  第一版不编译完整 TARE C++ planner，避免检测/建图迁移被局部规划依赖阻塞。
+
+ros2_ws/src/semantic_mapping
+  已迁入 SysNav detection_node 和 semantic_mapping_node。
+  detection_node 订阅 /camera/image，发布 /detection_result；
+  semantic_mapping_node 订阅 /detection_result、/registered_scan、/state_estimation，
+  发布 /object_nodes_list。
+
+ros2_ws/src/strive_sysnav_bringup
+  启动 detection_node 和 semantic_mapping_node 的 launch-only 包。
 ```
 
 ## 10. 实施路线
@@ -783,6 +814,52 @@ tests/test_real_robot_contracts.py
 semantic_mapping。STRIVE 只接收 SysNav 已经稳定维护的 object node / room node，
 再做 prompt-first 指令解析、concept grounding、relation verifier 和 final verifier。
 
+检测器词表处理：
+
+```text
+SysNav objects.yaml
+  -> DetectorVocabularyAdapter
+  -> DetectorVocabulary(label_space, prompt_space, is_instance)
+  -> RosDetectionResultAdapter / RosObjectNodeAdapter metadata
+  -> STRIVE concept grounding context
+```
+
+重要边界：
+
+```text
+adapter 不把 raw detector label 静默改成任务概念。
+adapter 只记录 label_provenance：
+  raw_detector_label
+  detector_name
+  config_path
+  known_in_detector_vocabulary
+  canonical_label
+  prompt_labels
+  matched_by
+  is_instance
+
+例如 detector 输出 "trash can"：
+  ObjectNodeSnapshot.label 仍是 "trash can"；
+  metadata.label_provenance.canonical_label 可以记录为 "garbage_bin"；
+  是否满足用户说的 "bin" / "garbage can" 仍由 concept matcher / verifier 判断。
+```
+
+已实现模块：
+
+```text
+RosDetectionResultAdapter
+  /detection_result -> DetectionFrame，并写入 detector_vocabulary 与 per-bbox label_provenance
+
+RosObjectNodeAdapter
+  /object_nodes_list -> ObjectNodeSnapshot，并写入 label_provenance
+
+RosRoomNodeAdapter
+  /room_nodes_list -> RoomSnapshot
+
+SysNavSemanticMapBridge
+  缓存 object/room list topic，并构建只读 SemanticMapSnapshot。
+```
+
 验收：
 
 ```text
@@ -795,6 +872,24 @@ ObjectNode uid 稳定。
 
 目标：让 STRIVE 输出 `NavigationIntent`，通过 bridge 发布 `/way_point`。
 
+已实现模块：
+
+```text
+SysNavInstructionRuntime
+  SemanticMapSnapshot -> high_level_policy.decide()
+  -> NavigationIntent
+  -> MotionGoal
+  -> RosWaypointController.send_goal()
+  -> /way_point
+```
+
+核心边界：
+
+```text
+STRIVE 只输出语义 intent 和 waypoint。
+SysNav localPlanner/pathFollower 继续负责局部避障、路径跟踪和速度控制。
+```
+
 验收：
 
 ```text
@@ -806,6 +901,47 @@ STRIVE 不直接控制 cmd_vel。
 ### Phase 3.5: MotionController 与异步 viewpoint 执行
 
 目标：把 STRIVE 当前的同步 action loop 抽象为平台无关的 motion contract。
+
+已实现模块：
+
+```text
+ViewpointEvidenceLoop
+  ViewpointGoal
+    -> goal.as_motion_goal()
+    -> motion_controller.send_goal()
+    -> poll NavigationStatus until reached / blocked / timeout
+    -> evidence_provider.capture()
+    -> final_verifier.verify()
+    -> ViewpointResult
+
+LatestObservationEvidenceProvider
+  latest RealObservation + object crop provider
+    -> ViewEvidence
+```
+
+伪代码：
+
+```python
+goal_id = motion_controller.send_goal(viewpoint_goal.as_motion_goal())
+status = motion_controller.poll_status(goal_id)
+
+while not status.is_terminal():
+    status = motion_controller.poll_status(goal_id)
+
+if status.succeeded():
+    evidence = evidence_provider.capture(viewpoint_goal, status)
+    decision = final_verifier.verify(evidence, context)
+else:
+    decision = {"decision": "motion_failed", "status": status.status}
+```
+
+关键原则：
+
+```text
+只有 motion layer 报告 reached 后，才采集 final verifier evidence。
+blocked / timeout 不能伪造成成功视角。
+VLM 判断语义与视觉证据质量；motion layer 判断是否到达和是否可执行。
+```
 
 验收：
 
@@ -823,6 +959,23 @@ final verifier 只在 evidence acquisition 之后调用。
 ### Phase 4: 目标确认闭环
 
 目标：复用 instruction verifier、relation verifier、view-control。
+
+第一版接口已经保留闭环入口：
+
+```text
+ViewEvidence.for_verifier()
+  提供 image_ref、bbox、pose、target uid、anchor uid、relation edge id、
+  view quality、verifier payload。
+
+ViewpointEvidenceLoop.final_verifier
+  可接现有 FinalInstructionVerifier 的薄封装，
+  也可接 SysNav/CogNav 的独立 verifier node。
+```
+
+当前实现没有把现有 Habitat agent 的 `final_instruction_check()` 直接搬到实物
+runtime。原因是该函数依赖仿真 agent 状态、日志路径和 mapper 内部对象。实物模式应
+通过薄 wrapper 把 `ViewEvidence` 转成现有 verifier 需要的 candidate/evidence
+payload，而不是让 real-robot runtime 继承 Habitat agent。
 
 验收：
 
@@ -1003,15 +1156,22 @@ controller”，而不是把 ROS 逻辑扩散到 STRIVE instruction planner。
 当前 adapter：
 
 ```text
+DetectorVocabularyAdapter
+  输入：SysNav semantic_mapping/config/objects.yaml
+  输出：DetectorVocabulary
+  作用：向 concept grounding 暴露 detector label_space / prompt_space / is_instance。
+
 RosDetectionResultAdapter
   输入：tare_planner/DetectionResult
   输出：DetectionFrame
-  映射字段：track_id, x1/y1/x2/y2, label, confidence, inline image summary。
+  映射字段：track_id, x1/y1/x2/y2, label, confidence, inline image summary,
+  label_provenance。
 
 RosObjectNodeAdapter
   输入：tare_planner/ObjectNode 或 ObjectNodeList
   输出：ObjectNodeSnapshot
-  映射字段：object_id, label, position, bbox3d, img_path, viewpoint_id, status。
+  映射字段：object_id, label, position, bbox3d, img_path, viewpoint_id, status,
+  label_provenance。
 
 RosRoomNodeAdapter
   输入：tare_planner/RoomNode 或 RoomNodeList
@@ -1050,6 +1210,7 @@ STRIVE 不直接订阅 /camera/image 做第一版实物检测。
 STRIVE 不直接发布 /cmd_vel。
 STRIVE 不修改 SysNav semantic_mapping_node 内部对象融合逻辑。
 STRIVE 只消费 ObjectNodeSnapshot / RoomSnapshot，并发布 MotionGoal。
+STRIVE adapter 不做 detector label alias；语义映射进入 concept grounding / verifier。
 ```
 
 如果后续需要把 STRIVE detector 迁移到 SysNav，应作为替换
@@ -1107,6 +1268,148 @@ RuntimeDecision:
     lower_planner_state: dict | None
 ```
 
+### 12.4 已实现的最小闭环
+
+当前最小闭环已经能用 fake ROS message / fake controller 在单元测试中跑通：
+
+```text
+SysNav object/room list
+  -> SysNavSemanticMapBridge.build_snapshot()
+  -> high_level_policy.decide(snapshot, instruction)
+  -> NavigationIntent.to_motion_goal()
+  -> RosWaypointController.send_goal()
+  -> NavigationStatus
+  -> RuntimeDecision
+```
+
+viewpoint 证据闭环：
+
+```text
+ViewpointGoal
+  -> RosWaypointController / MotionController
+  -> wait NavigationStatus.REACHED
+  -> LatestObservationEvidenceProvider.capture()
+  -> final_verifier.verify(ViewEvidence, context)
+  -> ViewpointResult
+```
+
+这两条链路对应下一步 ROS live node 的最小实现：
+
+```text
+subscribe /object_nodes_list
+subscribe /room_nodes_list
+read latest RealObservation
+call STRIVE policy / verifier
+publish /way_point
+write RuntimeDecision and ViewpointResult logs
+```
+
+### 12.5 本仓库内 ROS overlay
+
+SysNav detector/mapping 已作为 vendor ROS overlay 迁入当前 workspace：
+
+```text
+real_robot/ros2_ws/src/tare_planner
+real_robot/ros2_ws/src/semantic_mapping
+real_robot/ros2_ws/src/strive_sysnav_bringup
+```
+
+构建：
+
+```bash
+bash scripts/build_real_robot_ros_ws.sh
+```
+
+运行：
+
+```bash
+export SYSNAV_DETECTOR_MODEL_TYPE=yoloe
+export SYSNAV_DETECTOR_MODEL_PATH=/path/to/yoloe-26x-seg.engine
+export SYSNAV_SAM2_CHECKPOINT=/path/to/sam2.1_hiera_base_plus.pt
+
+bash scripts/run_sysnav_detection_mapping.sh
+```
+
+这条链路启动后，STRIVE 侧期望看到：
+
+```text
+/detection_result
+/object_nodes_list
+/room_nodes_list
+```
+
+其中 `/room_nodes_list` 仍取决于是否同时启动 room segmentation / local planner
+相关节点。第一版 overlay 已保证 detector 和 semantic mapping 可在 STRIVE
+workspace 内构建；完整 SysNav C++ local planner 后续应作为单独迁移阶段处理。
+
+### 12.6 单镜像实物部署
+
+实物部署不应依赖两个运行中的容器。当前仓库提供的实物镜像是单镜像方案：
+
+```text
+strive-real-robot:humble
+  contains STRIVE high-level code
+  contains real_robot adapters and runtime contracts
+  contains vendored SysNav semantic_mapping overlay
+  contains tare_planner ROS message definitions
+  contains strive_sysnav_bringup launch package
+```
+
+仿真 benchmark 镜像和实物镜像的职责不同：
+
+```text
+strive-hm3d:local
+  用于 Habitat / HM3D / OVON benchmark
+  保留原始仿真依赖，避免被 ROS Humble / Ubuntu 22.04 依赖污染
+
+strive-real-robot:humble
+  用于真实机器人部署
+  基于 ROS2 Humble，运行 SysNav detector/mapping 和 STRIVE 上层语义策略
+```
+
+也就是说，真机部署只启动 `strive-real-robot:humble` 一个容器；不需要同时启动
+HM3D benchmark 容器。两个镜像只是开发阶段的不同运行目标，不是部署时的双容器架构。
+
+构建单实物镜像：
+
+```bash
+IMAGE_TAG=strive-real-robot:humble \
+INSTALL_LLM_DEPS=1 \
+INSTALL_ML_DEPS=0 \
+bash docker/build_real_robot.sh
+```
+
+`INSTALL_ML_DEPS=0` 是轻量验证模式，可用于确认 ROS overlay、topic adapter 和
+launch 包是否完整。真机运行 detector/mapping 时需要安装或挂载相应模型运行依赖：
+
+```bash
+IMAGE_TAG=strive-real-robot:humble-runtime \
+INSTALL_LLM_DEPS=1 \
+INSTALL_ML_DEPS=1 \
+bash docker/build_real_robot.sh
+```
+
+权重不建议写入镜像层，而应通过 volume 和环境变量传入：
+
+```bash
+export SYSNAV_DETECTOR_MODEL_TYPE=yoloe
+export SYSNAV_DETECTOR_MODEL_PATH=/abs/path/to/models/yoloe-26x-seg.engine
+export SYSNAV_SAM2_CHECKPOINT=/abs/path/to/models/sam2.1_hiera_base_plus.pt
+
+IMAGE_TAG=strive-real-robot:humble-runtime \
+bash docker/run_real_robot_sysnav_stack.sh
+```
+
+`docker/run_real_robot_sysnav_stack.sh` 会把上述权重文件所在目录只读挂载进容器，
+并在容器内使用相同绝对路径读取模型。脚本也会透传 `LLM_PROVIDER`、
+`ARK_API_KEY`、`LLM_MODEL`、`LLM_API_BASE_URL`、`MAP_PROVIDER`、`AMAP_KEY`
+等运行时环境变量，因此真机部署不需要同时启动另一个 STRIVE 容器。
+
+这种边界的原因是：Habitat 仿真栈和 ROS2 Humble 真机栈的系统依赖不同。强行把
+Habitat、ROS、SysNav detector、SAM2、TensorRT 全部塞进同一个“万能镜像”，会让
+CUDA、OpenCV、PCL、PyTorch 和 Python ABI 的冲突不可控。单实物镜像已经满足部署
+需求；仿真镜像仅保留为 benchmark 开发和回归验证环境。
+
 ## 13. 当前结论
 
 实物模式的核心路线是：
@@ -1118,7 +1421,9 @@ STRIVE high-level semantic navigation
 
 STRIVE 不需要重写底层局部规划，也不应该直接控制速度。它应输出可解释的语义子目标；真实机器人底层负责安全、连续、实时地到达该子目标。
 
-`real_robot/contracts.py` 和 `real_robot/sysnav_ros_adapters.py` 已完成第一步。
+`real_robot/contracts.py`、`real_robot/sysnav_ros_adapters.py`、
+`real_robot/sysnav_runtime.py` 和 `real_robot/ros2_ws` 已完成第一版实物接口骨架
+和 SysNav detector/mapping 本仓库迁移。
 下一步建议实现一个最小 ROS runtime 或离线 bag replay：
 
 ```text

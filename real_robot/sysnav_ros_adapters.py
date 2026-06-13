@@ -26,6 +26,11 @@ from real_robot.contracts import (
     RoomSnapshot,
     SemanticMapSnapshot,
 )
+from real_robot.detector_vocabulary import (
+    DetectorVocabulary,
+    merge_label_provenance,
+    vocabulary_context,
+)
 
 
 @dataclass(frozen=True)
@@ -43,8 +48,13 @@ class SysNavTopicConfig:
 class RosDetectionResultAdapter:
     """Convert SysNav ``tare_planner/DetectionResult`` messages to STRIVE detections."""
 
-    def __init__(self, topic: str = SysNavTopicConfig.detection_result) -> None:
+    def __init__(
+        self,
+        topic: str = SysNavTopicConfig.detection_result,
+        detector_vocabulary: Optional[DetectorVocabulary] = None,
+    ) -> None:
         self.topic = topic
+        self.detector_vocabulary = detector_vocabulary
 
     def from_msg(self, msg: Any, image_ref: Optional[str] = None) -> DetectionFrame:
         """Return a platform-neutral detection frame for one SysNav message."""
@@ -60,6 +70,7 @@ class RosDetectionResultAdapter:
         confidences = tuple(float(conf) for conf in _as_sequence(getattr(msg, "confidence", ())))
         track_ids = tuple(str(track_id) for track_id in _as_sequence(getattr(msg, "track_id", ())))
         stamp = _stamp_from_header(getattr(msg, "header", None), default=0.0)
+        label_provenance = tuple(_label_provenance(self.detector_vocabulary, label) for label in labels)
 
         inline_image = getattr(msg, "image", None)
         metadata = {
@@ -67,6 +78,8 @@ class RosDetectionResultAdapter:
             "frame_id": _frame_id_from_header(getattr(msg, "header", None)),
             # 内联图像只记录摘要；真实图像落盘/缓存由 observation 或 runtime 层负责。
             "image": _image_summary(inline_image),
+            "detector_vocabulary": vocabulary_context(self.detector_vocabulary),
+            "label_provenance": label_provenance,
         }
 
         return DetectionFrame(
@@ -84,8 +97,13 @@ class RosDetectionResultAdapter:
 class RosObjectNodeAdapter:
     """Convert SysNav ``ObjectNode`` and ``ObjectNodeList`` messages."""
 
-    def __init__(self, topic: str = SysNavTopicConfig.object_nodes_list) -> None:
+    def __init__(
+        self,
+        topic: str = SysNavTopicConfig.object_nodes_list,
+        detector_vocabulary: Optional[DetectorVocabulary] = None,
+    ) -> None:
         self.topic = topic
+        self.detector_vocabulary = detector_vocabulary
 
     def from_msg(self, msg: Any) -> ObjectNodeSnapshot:
         """Return a STRIVE object snapshot for one SysNav object node."""
@@ -102,7 +120,8 @@ class RosObjectNodeAdapter:
         bbox_center, bbox_extent = _bbox3d_center_extent(bbox3d)
         viewpoint_id = getattr(msg, "viewpoint_id", None)
         visible_viewpoints = (str(viewpoint_id),) if viewpoint_id is not None and int(viewpoint_id) >= 0 else ()
-        uid = _object_uid(object_ids, getattr(msg, "label", ""), position)
+        raw_label = str(getattr(msg, "label", ""))
+        uid = _object_uid(object_ids, raw_label, position)
 
         metadata = {
             "ros_topic": self.topic,
@@ -114,11 +133,13 @@ class RosObjectNodeAdapter:
             "viewpoint_id": viewpoint_id,
             "bbox3d_corners": bbox3d,
             "cloud_present": getattr(msg, "cloud", None) is not None,
+            "detector_vocabulary": vocabulary_context(self.detector_vocabulary),
         }
+        metadata = merge_label_provenance(metadata, _label_provenance(self.detector_vocabulary, raw_label))
 
         return ObjectNodeSnapshot(
             uid=uid,
-            label=str(getattr(msg, "label", "")),
+            label=raw_label,
             position=position,
             confidence=1.0 if bool(getattr(msg, "status", False)) else 0.0,
             bbox3d_center=bbox_center,
@@ -318,6 +339,7 @@ def build_semantic_map_snapshot(
             "object_count": len(objects),
             "room_count": len(rooms),
             "sysnav_topics": SysNavTopicConfig().__dict__,
+            "detector_vocabulary": vocabulary_context(getattr(object_adapter, "detector_vocabulary", None)),
         },
     )
 
@@ -442,6 +464,19 @@ def _object_uid(object_ids: Tuple[int, ...], label: Any, position: Optional[Tupl
     if position is not None:
         return f"sysnav_object:{label}:{position[0]:.3f}:{position[1]:.3f}:{position[2]:.3f}"
     return f"sysnav_object:{label}:unknown"
+
+
+def _label_provenance(vocabulary: Optional[DetectorVocabulary], raw_label: str) -> Dict[str, Any]:
+    """Return detector label provenance for one raw SysNav label."""
+
+    if vocabulary is None:
+        return {
+            "raw_detector_label": raw_label,
+            "known_in_detector_vocabulary": None,
+            "detector_name": None,
+            "config_path": None,
+        }
+    return vocabulary.provenance_for(raw_label)
 
 
 def _none_if_empty(value: Any) -> Optional[str]:

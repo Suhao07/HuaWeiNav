@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 from real_robot.contracts import MotionGoal, MotionGoalMode, NavigationStatusCode, Pose3D
+from real_robot.detector_vocabulary import DetectorVocabularyAdapter
 from real_robot.sysnav_ros_adapters import (
     RosDetectionResultAdapter,
     RosObjectNodeAdapter,
@@ -18,7 +19,30 @@ def _header(sec=1, nanosec=250_000_000, frame_id="map"):
     return SimpleNamespace(stamp=SimpleNamespace(sec=sec, nanosec=nanosec), frame_id=frame_id)
 
 
-def test_detection_result_adapter_maps_sysnav_message() -> None:
+def _vocabulary(tmp_path):
+    config = tmp_path / "objects.yaml"
+    config.write_text(
+        """
+prompts:
+  book:
+    prompts:
+      - book
+    is_instance: true
+  garbage_bin:
+    prompts:
+      - trash can
+    is_instance: true
+  cabinet:
+    prompts:
+      - cabinet
+    is_instance: true
+""",
+        encoding="utf-8",
+    )
+    return DetectorVocabularyAdapter.from_sysnav_objects_yaml(str(config), detector_name="sysnav_test_detector")
+
+
+def test_detection_result_adapter_maps_sysnav_message(tmp_path) -> None:
     msg = SimpleNamespace(
         header=_header(),
         track_id=[7, 8],
@@ -31,16 +55,19 @@ def test_detection_result_adapter_maps_sysnav_message() -> None:
         image=SimpleNamespace(height=480, width=640, encoding="bgr8", step=1920),
     )
 
-    frame = RosDetectionResultAdapter().from_msg(msg)
+    frame = RosDetectionResultAdapter(detector_vocabulary=_vocabulary(tmp_path)).from_msg(msg)
 
     assert frame.timestamp == 1.25
     assert frame.boxes_xyxy == ((10.0, 11.0, 30.0, 31.0), (20.0, 21.0, 40.0, 41.0))
     assert frame.labels == ("book", "shelf")
     assert frame.track_ids == ("7", "8")
     assert frame.metadata["image"]["encoding"] == "bgr8"
+    assert frame.metadata["detector_vocabulary"]["detector_name"] == "sysnav_test_detector"
+    assert frame.metadata["label_provenance"][0]["canonical_label"] == "book"
+    assert frame.metadata["label_provenance"][1]["known_in_detector_vocabulary"] is False
 
 
-def test_object_node_adapter_maps_identity_geometry_and_evidence() -> None:
+def test_object_node_adapter_maps_identity_geometry_and_evidence(tmp_path) -> None:
     bbox = (
         _point(0, 0, 0),
         _point(2, 0, 0),
@@ -64,7 +91,7 @@ def test_object_node_adapter_maps_identity_geometry_and_evidence() -> None:
         viewpoint_id=3,
     )
 
-    snapshot = RosObjectNodeAdapter().from_msg(msg)
+    snapshot = RosObjectNodeAdapter(detector_vocabulary=_vocabulary(tmp_path)).from_msg(msg)
 
     assert snapshot.uid == "sysnav_object:42"
     assert snapshot.label == "cabinet"
@@ -73,6 +100,8 @@ def test_object_node_adapter_maps_identity_geometry_and_evidence() -> None:
     assert snapshot.bbox3d_extent == (2.0, 4.0, 6.0)
     assert snapshot.visible_viewpoints == ("3",)
     assert snapshot.verified_state == "active"
+    assert snapshot.metadata["label_provenance"]["raw_detector_label"] == "cabinet"
+    assert snapshot.metadata["label_provenance"]["canonical_label"] == "cabinet"
 
 
 def test_room_node_adapter_maps_topology_summary() -> None:
@@ -97,7 +126,7 @@ def test_room_node_adapter_maps_topology_summary() -> None:
     assert room.metadata["polygon_point_count"] == 2
 
 
-def test_build_semantic_map_snapshot_uses_sysnav_object_and_room_lists() -> None:
+def test_build_semantic_map_snapshot_uses_sysnav_object_and_room_lists(tmp_path) -> None:
     object_msg = SimpleNamespace(
         header=_header(sec=2),
         nodes=[
@@ -134,12 +163,14 @@ def test_build_semantic_map_snapshot_uses_sysnav_object_and_room_lists() -> None
         object_list_msg=object_msg,
         room_list_msg=room_msg,
         robot_pose=Pose3D(position=(0.0, 0.0, 0.0)),
+        object_adapter=RosObjectNodeAdapter(detector_vocabulary=_vocabulary(tmp_path)),
     )
 
     assert snapshot.source == "sysnav_ros"
     assert snapshot.object_by_uid("sysnav_object:1").label == "chair"
     assert snapshot.room_by_uid("sysnav_room:9").centroid == (5.0, 0.0, 0.0)
     assert snapshot.frontiers[0].room_id == "sysnav_room:9"
+    assert snapshot.metadata["detector_vocabulary"]["detector_name"] == "sysnav_test_detector"
 
 
 class FakePointStamped:
