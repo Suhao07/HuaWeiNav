@@ -87,6 +87,7 @@ class Pose3D:
 class CameraFrame:
     """RGB/RGB-D camera evidence without binding to a concrete image type."""
 
+    # 核心：contract 层只保存引用和标定信息，图像数组由 adapter/runtime 缓存管理。
     image_ref: str
     camera_model: CameraModel = CameraModel.UNKNOWN
     timestamp: Optional[float] = None
@@ -104,6 +105,7 @@ class CameraFrame:
 class RealObservation:
     """Synchronized sensor snapshot delivered to STRIVE real-robot runtime."""
 
+    # 核心：一次 observation 必须绑定同一个 robot_pose，避免 RGB/LiDAR/odom 时序漂移。
     timestamp: float
     robot_pose: Pose3D
     camera_frames: Tuple[CameraFrame, ...] = ()
@@ -135,6 +137,7 @@ class DetectionFrame:
     def __post_init__(self) -> None:
         """Validate parallel detector arrays early."""
 
+        # 检测输出进入 mapper 前先做结构校验，避免后续 bbox/label 错位污染对象图。
         n = len(self.boxes_xyxy)
         if len(self.labels) != n or len(self.confidences) != n:
             raise ValueError("boxes_xyxy, labels, and confidences must have the same length")
@@ -189,6 +192,7 @@ class ObjectNodeSnapshot:
     def concept_payload(self) -> Dict[str, Any]:
         """Return a compact payload for concept grounding prompts."""
 
+        # 只给 concept matcher 必要字段；大图、点云等重证据通过 image_ref/pointcloud_ref 查取。
         return {
             "uid": self.uid,
             "label": self.label,
@@ -282,6 +286,7 @@ class NavigationIntent:
     def to_motion_goal(self) -> "MotionGoal":
         """Convert the high-level intent to a lower-level motion request."""
 
+        # 核心：planner 输出的是语义意图，bridge 才负责翻译成具体平台可执行的 motion goal。
         return MotionGoal(
             mode=self.mode,
             goal_pose=self.goal_pose,
@@ -310,6 +315,7 @@ class MotionGoal:
     def requires_motion(self) -> bool:
         """Return whether this goal should be sent to the motion layer."""
 
+        # STOP/WAIT 是高层控制状态，不应该被误发布成底层 waypoint。
         return self.mode not in {MotionGoalMode.STOP, MotionGoalMode.WAIT} and self.goal_pose is not None
 
 
@@ -331,6 +337,7 @@ class ViewpointGoal:
     def as_motion_goal(self) -> MotionGoal:
         """Return the executable motion goal for this viewpoint."""
 
+        # 视角目标携带 evidence_requirements，底层只执行 pose，证据是否足够由 verifier 判断。
         return MotionGoal(
             mode=self.purpose,
             goal_pose=self.pose,
@@ -364,6 +371,7 @@ class NavigationStatus:
     def is_terminal(self) -> bool:
         """Return whether the controller finished this goal attempt."""
 
+        # 真实机器人是异步执行；terminal 表示这次 motion attempt 已有明确结果。
         return self.status in {
             NavigationStatusCode.REACHED,
             NavigationStatusCode.BLOCKED,
@@ -404,6 +412,7 @@ class ViewEvidence:
     def for_verifier(self) -> Dict[str, Any]:
         """Return a prompt/verifier-friendly evidence dictionary."""
 
+        # 核心：verifier 消费结构化证据，不直接依赖 ROS msg 或相机驱动对象。
         return {
             "source": self.source.value,
             "timestamp": self.timestamp,

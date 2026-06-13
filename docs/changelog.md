@@ -11,10 +11,17 @@
   - `NavigationIntent`、`MotionGoal`、`ViewpointGoal`、`NavigationStatus` 明确 STRIVE 高层与下层运动控制的异步边界；
   - `ViewEvidence` 和 `RuntimeDecision` 为 final verifier、relation verifier 和实物运行复盘提供结构化记录。
 - 新增 `real_robot/__init__.py`，集中导出实物 contract，后续 ROS/SysNav/bag replay adapter 都应依赖该包。
+- 新增 `real_robot/sysnav_ros_adapters.py`，作为第一版 SysNav ROS 复用层：
+  - `RosDetectionResultAdapter` 将 SysNav `/detection_result` 转为 `DetectionFrame`；
+  - `RosObjectNodeAdapter` 将 `/object_nodes_list` 转为 `ObjectNodeSnapshot`；
+  - `RosRoomNodeAdapter` 将 `/room_nodes_list` 转为 `RoomSnapshot`；
+  - `RosWaypointController` 将 `MotionGoal` 发布为 SysNav `/way_point`；
+  - `build_semantic_map_snapshot()` 将 SysNav object/room list 组装为 STRIVE 高层 planner 可消费的只读地图快照。
 - 更新 `docs/real_robot_deployment.md`：
   - 明确 contract 层只保存 JSON-friendly metadata、image/path reference 和几何状态；
   - 明确 VLM/verifier、mapper/planner、motion controller 和 runtime 的职责划分；
   - 将初始 runtime skeleton 更新为异步 `MotionGoal -> NavigationStatus -> ViewEvidence` 形式。
+  - 补充第一版 SysNav 复用链路：`/camera/image -> detection_node -> /detection_result -> semantic_mapping_node -> /object_nodes_list -> STRIVE instruction_adapter`。
 
 ### Tests
 
@@ -23,6 +30,10 @@
   - 验证 detection frame 并行字段和 bbox 合法性；
   - 验证 `NavigationIntent -> MotionGoal`、`ViewpointGoal -> MotionGoal` 转换；
   - 验证 map snapshot lookup、view evidence verifier payload 和 navigation status 终止语义。
+- 新增 `tests/test_sysnav_ros_adapters.py`：
+  - 使用 fake ROS message 验证 DetectionResult、ObjectNode、RoomNode 的字段映射；
+  - 验证 SysNav object/room list 可组装为 `SemanticMapSnapshot`；
+  - 验证 `RosWaypointController` 发布 `PointStamped` 兼容 waypoint，且 stop/wait 类 goal 不误发布 waypoint。
 
 ## 2026-06-12
 

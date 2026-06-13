@@ -30,6 +30,14 @@ from real_robot.contracts import (
     ViewpointResult,
     ViewpointSnapshot,
 )
+from real_robot.sysnav_ros_adapters import (
+    RosDetectionResultAdapter,
+    RosObjectNodeAdapter,
+    RosRoomNodeAdapter,
+    RosWaypointController,
+    SysNavTopicConfig,
+    build_semantic_map_snapshot,
+)
 
 __all__ = [
     "BBox2D",
@@ -55,4 +63,10 @@ __all__ = [
     "ViewpointGoal",
     "ViewpointResult",
     "ViewpointSnapshot",
+    "RosDetectionResultAdapter",
+    "RosObjectNodeAdapter",
+    "RosRoomNodeAdapter",
+    "RosWaypointController",
+    "SysNavTopicConfig",
+    "build_semantic_map_snapshot",
 ]

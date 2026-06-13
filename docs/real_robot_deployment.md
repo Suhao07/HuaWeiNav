@@ -651,6 +651,7 @@ robot_stable_or_goal_reached:
 real_robot/
   __init__.py
   contracts.py
+  sysnav_ros_adapters.py
   camera_adapter.py
   observation_adapter.py
   depth_projection.py
@@ -673,6 +674,13 @@ contracts.py
   SemanticMapSnapshot, NavigationIntent, MotionGoal, ViewpointGoal,
   NavigationStatus, ViewEvidence, RuntimeDecision。
   该层只依赖 Python 标准库，不引入 ROS、Habitat、numpy 或 detector 实现。
+
+sysnav_ros_adapters.py
+  第一版 SysNav 复用层：
+  RosDetectionResultAdapter 将 /detection_result 转为 DetectionFrame；
+  RosObjectNodeAdapter 将 /object_nodes_list 转为 ObjectNodeSnapshot；
+  RosRoomNodeAdapter 将 /room_nodes_list 转为 RoomSnapshot；
+  RosWaypointController 将 MotionGoal 发布为 /way_point。
 
 camera_adapter.py
   封装 Theta panorama 与 RealSense pinhole RGB-D 相机差异。
@@ -757,6 +765,23 @@ tests/test_real_robot_contracts.py
 ### Phase 2: 检测与对象图接入
 
 目标：先复用 SysNav `/detection_result` 或 STRIVE detector 生成 `DetectionFrame`。
+
+第一版直接复用 SysNav detector + semantic mapping：
+
+```text
+/camera/image
+  -> SysNav detection_node
+  -> /detection_result
+  -> SysNav semantic_mapping_node
+  -> /object_nodes_list
+  -> RosObjectNodeAdapter
+  -> SemanticMapSnapshot
+  -> STRIVE instruction_adapter / concept matcher / final verifier
+```
+
+这条链路不把 STRIVE detector 迁移到 SysNav，也不让 STRIVE 重写 SysNav
+semantic_mapping。STRIVE 只接收 SysNav 已经稳定维护的 object node / room node，
+再做 prompt-first 指令解析、concept grounding、relation verifier 和 final verifier。
 
 验收：
 
@@ -969,7 +994,69 @@ contract 层不保存 numpy array 或 ROS message，只保存 image_ref、pointc
 这样可以让 live ROS、rosbag replay、离线日志和仿真 adapter 共用同一套
 高层 planner / verifier 接口。
 
-### 12.2 Runtime skeleton
+### 12.2 SysNav ROS adapter
+
+`real_robot/sysnav_ros_adapters.py` 已实现第一版 SysNav 适配器。该模块的
+设计目标是“复用 SysNav 已有 detector、semantic mapping 和 waypoint
+controller”，而不是把 ROS 逻辑扩散到 STRIVE instruction planner。
+
+当前 adapter：
+
+```text
+RosDetectionResultAdapter
+  输入：tare_planner/DetectionResult
+  输出：DetectionFrame
+  映射字段：track_id, x1/y1/x2/y2, label, confidence, inline image summary。
+
+RosObjectNodeAdapter
+  输入：tare_planner/ObjectNode 或 ObjectNodeList
+  输出：ObjectNodeSnapshot
+  映射字段：object_id, label, position, bbox3d, img_path, viewpoint_id, status。
+
+RosRoomNodeAdapter
+  输入：tare_planner/RoomNode 或 RoomNodeList
+  输出：RoomSnapshot
+  映射字段：id, centroid, neighbors, area, is_connected, room_mask reference。
+
+RosWaypointController
+  输入：MotionGoal / ViewpointGoal.as_motion_goal()
+  输出：geometry_msgs/PointStamped on /way_point
+  状态：返回 NavigationStatus，第一版可接入外部 status_provider。
+```
+
+SysNav 侧 topic 约定：
+
+```text
+/camera/image
+  SysNav detection_node 订阅。
+
+/detection_result
+  SysNav detection_node 发布，semantic_mapping_node 订阅。
+
+/object_nodes_list
+  SysNav semantic_mapping_node 发布，STRIVE RosObjectNodeAdapter 订阅或离线读取。
+
+/room_nodes_list
+  SysNav room_segmentation 发布，STRIVE RosRoomNodeAdapter 订阅或离线读取。
+
+/way_point
+  STRIVE RosWaypointController 发布，SysNav local planner/path follower 执行。
+```
+
+关键边界：
+
+```text
+STRIVE 不直接订阅 /camera/image 做第一版实物检测。
+STRIVE 不直接发布 /cmd_vel。
+STRIVE 不修改 SysNav semantic_mapping_node 内部对象融合逻辑。
+STRIVE 只消费 ObjectNodeSnapshot / RoomSnapshot，并发布 MotionGoal。
+```
+
+如果后续需要把 STRIVE detector 迁移到 SysNav，应作为替换
+`detection_node` 的独立 ROS node，而不是塞进 `RosDetectionResultAdapter`。
+adapter 层只做消息转换，不承载模型推理。
+
+### 12.3 Runtime skeleton
 
 ```python
 class RealRobotNavigator:
@@ -1031,6 +1118,15 @@ STRIVE high-level semantic navigation
 
 STRIVE 不需要重写底层局部规划，也不应该直接控制速度。它应输出可解释的语义子目标；真实机器人底层负责安全、连续、实时地到达该子目标。
 
-`real_robot/contracts.py` 已完成第一步。下一步建议实现离线
-`RealObservationAdapter`，用 bag replay 验证 RGB / LiDAR / pose 的同步和投影，
-再接 ROS live topics。
+`real_robot/contracts.py` 和 `real_robot/sysnav_ros_adapters.py` 已完成第一步。
+下一步建议实现一个最小 ROS runtime 或离线 bag replay：
+
+```text
+read /object_nodes_list and /room_nodes_list
+  -> build_semantic_map_snapshot()
+  -> instruction_adapter.decide()
+  -> NavigationIntent.to_motion_goal()
+  -> RosWaypointController.send_goal()
+```
+
+在这条链路稳定前，不建议迁移 STRIVE detector 或重写 SysNav semantic mapping。
