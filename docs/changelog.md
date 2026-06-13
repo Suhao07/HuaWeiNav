@@ -1,5 +1,29 @@
 # Instruction Adapter Changelog
 
+## 2026-06-13
+
+### Added
+
+- 新增 `real_robot/contracts.py`，作为 STRIVE 实物模式的第一层平台无关接口：
+  - `RealObservation` / `CameraFrame` 描述真实 RGB、深度引用、点云引用和位姿；
+  - `DetectionFrame` 统一 detector bbox、label、confidence、track id 和 mask 引用；
+  - `ObjectNodeSnapshot`、`RoomSnapshot`、`SemanticMapSnapshot` 提供高层 planner 的只读地图视图；
+  - `NavigationIntent`、`MotionGoal`、`ViewpointGoal`、`NavigationStatus` 明确 STRIVE 高层与下层运动控制的异步边界；
+  - `ViewEvidence` 和 `RuntimeDecision` 为 final verifier、relation verifier 和实物运行复盘提供结构化记录。
+- 新增 `real_robot/__init__.py`，集中导出实物 contract，后续 ROS/SysNav/bag replay adapter 都应依赖该包。
+- 更新 `docs/real_robot_deployment.md`：
+  - 明确 contract 层只保存 JSON-friendly metadata、image/path reference 和几何状态；
+  - 明确 VLM/verifier、mapper/planner、motion controller 和 runtime 的职责划分；
+  - 将初始 runtime skeleton 更新为异步 `MotionGoal -> NavigationStatus -> ViewEvidence` 形式。
+
+### Tests
+
+- 新增 `tests/test_real_robot_contracts.py`：
+  - 约束 contract 层不引入 ROS、Habitat、numpy 等平台依赖；
+  - 验证 detection frame 并行字段和 bbox 合法性；
+  - 验证 `NavigationIntent -> MotionGoal`、`ViewpointGoal -> MotionGoal` 转换；
+  - 验证 map snapshot lookup、view evidence verifier payload 和 navigation status 终止语义。
+
 ## 2026-06-12
 
 ### Changed

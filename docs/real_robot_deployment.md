@@ -668,8 +668,11 @@ docs/
 
 ```text
 contracts.py
-  定义 RealObservation, DetectionFrame, SemanticMapSnapshot,
-  NavigationIntent 等数据结构。
+  已定义平台无关 contract：
+  RealObservation, DetectionFrame, ObjectNodeSnapshot, RoomSnapshot,
+  SemanticMapSnapshot, NavigationIntent, MotionGoal, ViewpointGoal,
+  NavigationStatus, ViewEvidence, RuntimeDecision。
+  该层只依赖 Python 标准库，不引入 ROS、Habitat、numpy 或 detector 实现。
 
 camera_adapter.py
   封装 Theta panorama 与 RealSense pinhole RGB-D 相机差异。
@@ -730,6 +733,18 @@ mapper 不崩溃。
 ### Phase 1: 真实观测适配
 
 目标：实现 `RealObservationAdapter`。
+
+已完成的基础边界：
+
+```text
+real_robot/contracts.py
+  定义 sensor, detection, semantic map, motion intent, viewpoint,
+  navigation status, evidence, runtime decision 的统一数据契约。
+
+tests/test_real_robot_contracts.py
+  约束 contract 层保持平台无关，并验证 detection / viewpoint /
+  verifier evidence 的基础语义。
+```
 
 验收：
 
@@ -889,6 +904,73 @@ watchdog timeout
 
 ## 12. 初始接口草案
 
+### 12.1 已落地的 contract 边界
+
+`real_robot/contracts.py` 目前只表达跨模块数据边界，不负责订阅 topic、
+调用 detector、构图或控制底盘。后续任何实物 adapter 都应先把平台相关数据
+转成这些 contract，再交给 STRIVE 高层模块：
+
+```text
+RealObservation
+  一次同步观测，包含 robot_pose、CameraFrame、pointcloud_ref 和 frame id。
+
+DetectionFrame
+  某个 camera frame 上的 detector 输出，包含 bbox、label、confidence、
+  track id 和可选 mask 引用。
+
+SemanticMapSnapshot
+  高层 planner 的只读地图视图，包含 ObjectNodeSnapshot、RoomSnapshot、
+  ViewpointSnapshot 和 FrontierSnapshot。
+
+NavigationIntent
+  STRIVE planner 输出的语义动作意图，例如 go_to_object、go_to_anchor、
+  improve_view、verify_relation、stop。
+
+MotionGoal / ViewpointGoal
+  navigation bridge 消费的运动目标。ViewpointGoal 额外携带 look_at、
+  target uid、anchor uid 和 evidence requirements。
+
+NavigationStatus
+  下层运动控制返回的异步状态：running、reached、blocked、timeout、
+  preempted、failed。
+
+ViewEvidence
+  到达 viewpoint 后采集的图像、bbox、pose 和质量信息，供 final verifier
+  或 relation verifier 使用。
+
+RuntimeDecision
+  每轮实物 runtime 的可回放决策记录，连接 intent、motion goal、
+  lower planner status 和 verifier decision。
+```
+
+该边界对应的职责划分是：
+
+```text
+VLM / verifier:
+  判断 semantic_satisfied、relation_satisfied、view_evidence_quality。
+
+Mapper / planner:
+  维护对象、房间、frontier、候选 viewpoint 和目标状态。
+
+Motion controller:
+  判断 reached、blocked、timeout、path progress、collision feasibility。
+
+Runtime:
+  把上述证据组织成 RuntimeDecision 并落盘。
+```
+
+关键实现原则：
+
+```text
+contract 层不保存 numpy array 或 ROS message，只保存 image_ref、pointcloud_ref
+和 JSON-friendly metadata。
+```
+
+这样可以让 live ROS、rosbag replay、离线日志和仿真 adapter 共用同一套
+高层 planner / verifier 接口。
+
+### 12.2 Runtime skeleton
+
 ```python
 class RealRobotNavigator:
     def __init__(
@@ -901,16 +983,27 @@ class RealRobotNavigator:
     ):
         ...
 
-    def step(self, instruction: str | None = None) -> RuntimeDecision:
+    def step(self, instruction=None) -> RuntimeDecision:
         observation = self.observation_adapter.read()
         if observation is None:
-            return RuntimeDecision(mode="wait", reason="waiting for synchronized observation")
+            wait_intent = NavigationIntent(
+                mode=MotionGoalMode.WAIT,
+                reason="waiting for synchronized observation",
+            )
+            return RuntimeDecision(timestamp=time.time(), intent=wait_intent)
 
         detections = self.detector_adapter.detect(observation)
         snapshot = self.mapper.update_real(observation, detections)
         intent = self.high_level_policy.decide(snapshot, instruction)
-        self.navigation_bridge.execute(intent)
-        return RuntimeDecision(snapshot=snapshot, intent=intent)
+        motion_goal = intent.to_motion_goal()
+        goal_id = self.navigation_bridge.send_goal(motion_goal)
+        status = self.navigation_bridge.poll_status(goal_id)
+        return RuntimeDecision(
+            timestamp=observation.timestamp,
+            intent=intent,
+            motion_goal=motion_goal,
+            navigation_status=status,
+        )
 ```
 
 `RuntimeDecision` 需要落盘，便于复盘：
@@ -918,10 +1011,11 @@ class RealRobotNavigator:
 ```python
 RuntimeDecision:
     timestamp: float
-    mode: str
     intent: NavigationIntent
+    motion_goal: MotionGoal | None
+    navigation_status: NavigationStatus | None
     accepted_candidate_uid: str | None
-    accepted_relation_edge: dict | None
+    accepted_relation_edge_id: str | None
     verifier_decision: dict | None
     lower_planner_state: dict | None
 ```
@@ -937,4 +1031,6 @@ STRIVE high-level semantic navigation
 
 STRIVE 不需要重写底层局部规划，也不应该直接控制速度。它应输出可解释的语义子目标；真实机器人底层负责安全、连续、实时地到达该子目标。
 
-下一步建议先实现 `real_robot/contracts.py` 和离线 `RealObservationAdapter`，用 bag replay 验证数据契约，再接 ROS live topics。
+`real_robot/contracts.py` 已完成第一步。下一步建议实现离线
+`RealObservationAdapter`，用 bag replay 验证 RGB / LiDAR / pose 的同步和投影，
+再接 ROS live topics。
