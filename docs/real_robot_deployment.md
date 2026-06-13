@@ -425,6 +425,169 @@ cmd_vel 需要实时安全控制。
 语义层调用 VLM/LLM，延迟不可控，不适合直接控制底盘。
 ```
 
+### 6.1 STRIVE 仿真 action API 与实物 motion API 的差异
+
+当前 STRIVE/Habitat runtime 使用同步离散控制接口。高层 planner 先生成
+连续空间中的 waypoint 或 better-view viewpoint，然后通过 Habitat
+shortest-path follower 转成离散动作：
+
+```text
+STRIVE selected waypoint/viewpoint
+  -> habitat_waypoint()
+  -> Habitat shortest-path follower
+  -> discrete action: STOP / MOVE_FORWARD / TURN_LEFT / TURN_RIGHT
+  -> env.step(action)
+  -> synchronous RGB-D observation
+```
+
+这套接口成立依赖 Habitat 提供的几个仿真假设：
+
+```text
+global navmesh is available
+shortest-path query is reliable
+agent motion is discretized and deterministic enough
+env.step(action) immediately returns synchronized RGB / depth / pose
+collision and kinematic details are absorbed by the simulator
+```
+
+真实机器人不具备这个同步 `env.step` 抽象。SysNav 的底层是连续控制链路：
+
+```text
+semantic / exploration planner
+  -> geometry_msgs/PointStamped on /way_point
+  -> localPlanner selects a collision-aware local path
+  -> nav_msgs/Path on /path
+  -> pathFollower tracks path and publishes /cmd_vel
+  -> robot moves asynchronously
+  -> sensors publish RGB / LiDAR / odom with latency
+```
+
+因此实物模式不能复刻 Habitat discrete action。STRIVE 应保留
+“生成可解释语义子目标和视角目标”的能力，但必须把“执行目标”的责任交给
+一个异步 motion layer。
+
+### 6.2 MotionController contract
+
+建议在 real-robot runtime 中新增 `MotionController` 抽象，统一仿真和实物
+两种执行模型：
+
+```python
+class MotionController:
+    def send_goal(self, goal: MotionGoal) -> str:
+        """Submit a navigation or viewpoint goal and return a goal id."""
+
+    def poll_status(self, goal_id: str) -> NavigationStatus:
+        """Return reached / running / blocked / timeout / preempted."""
+
+    def cancel(self, goal_id: str) -> None:
+        """Cancel the active lower-level motion goal."""
+
+    def hold(self) -> None:
+        """Ask the lower layer to stop safely without taking over velocity control."""
+```
+
+仿真实现可以包装当前 Habitat action loop：
+
+```text
+HabitatDiscreteController
+  MotionGoal -> self.waypoint
+  poll_status -> repeated planner.get_next_action() and env.step(action)
+```
+
+实物实现应包装 SysNav ROS 接口：
+
+```text
+RosWaypointController
+  MotionGoal -> /way_point
+  poll_status -> /state_estimation + /path + timeout + progress monitor
+  hold -> /stop or controller-specific safe hold
+```
+
+上层 planner 只看到 `MotionGoal` 和 `NavigationStatus`，不关心底层是离散
+action、ROS waypoint，还是某个实物平台的自定义导航接口。
+
+### 6.3 ViewpointGoal 与异步证据采集
+
+STRIVE 的 better-view 逻辑会生成多个候选 viewpoint。仿真中这些 viewpoint
+可以直接通过 Habitat pathfinder 可达性检查和离散动作执行；实物中 viewpoint
+必须被建模为一个异步目标：
+
+```python
+ViewpointGoal:
+    pose: Pose2D | Pose3D
+    look_at: Point3D | None
+    target_uid: str | None
+    anchor_uid: str | None
+    relation_edge_id: str | None
+    purpose: explore | verify_target | verify_relation | improve_view
+    tolerance: dict
+```
+
+执行结果也必须显式返回：
+
+```python
+ViewpointResult:
+    status: reached | blocked | timeout | preempted
+    final_pose: Pose
+    evidence: ViewEvidence | None
+    path_length: float | None
+    reason: str
+```
+
+真实机器人最终确认流程应是：
+
+```text
+send ViewpointGoal
+  -> wait for NavigationStatus
+  -> if reached or best available: acquire RGB / LiDAR / pose snapshot
+  -> project target / anchor evidence
+  -> final verifier checks semantic, relation, and view quality
+  -> accept / try next viewpoint / abandon this instance
+```
+
+这里的关键边界是：VLM 负责判断语义、关系和视觉证据质量；motion layer 负责
+判断是否到达、是否可达、是否被障碍阻断、是否超时。VLM 不应直接声明物理
+可达性，motion layer 也不应直接判断自然语言任务是否满足。
+
+### 6.4 与 SysNav 的对接方式
+
+SysNav 已经把真实机器人底层拆成可复用链路：
+
+```text
+/way_point -> localPlanner -> /path -> pathFollower -> /cmd_vel / serial
+```
+
+STRIVE 实物模式应先对接这个最小公共接口，而不是复制 SysNav 的整套 planner。
+推荐桥接：
+
+```text
+NavigationIntent(mode="go_to_object" / "improve_view")
+  -> MotionGoal / ViewpointGoal
+  -> RosWaypointController publishes /way_point
+  -> SysNav localPlanner/pathFollower executes continuous motion
+  -> bridge monitors odom/path progress
+  -> STRIVE acquires evidence and updates verifier state
+```
+
+如果后续接入不同实物平台，只需要替换 `MotionController` 和 sensor adapters：
+
+```text
+Mecanum + SysNav localPlanner:
+  RosWaypointController
+
+Nav2-based platform:
+  Nav2ActionController
+
+Quadruped / humanoid:
+  PlatformMotionController
+
+Offline bag replay:
+  ReplayMotionController
+```
+
+这样 STRIVE 的 instruction parser、concept grounding、relation verifier、
+final verifier 和 view-control state 都可以保持平台无关。
+
 ## 7. 上下层闭环
 
 推荐真实机器人闭环：
@@ -493,6 +656,7 @@ real_robot/
   depth_projection.py
   detector_adapter.py
   semantic_map_adapter.py
+  motion_controller.py
   navigation_bridge.py
   runtime_node.py
 
@@ -523,7 +687,11 @@ semantic_map_adapter.py
   将 real observation + detection 转成 mapper update 输入或 map snapshot。
 
 navigation_bridge.py
-  NavigationIntent -> /way_point，读取 path/odom/stop 状态。
+  NavigationIntent -> MotionGoal / ViewpointGoal，读取 path/odom/stop 状态。
+
+motion_controller.py
+  定义 MotionController，并实现 RosWaypointController、ReplayMotionController
+  等底层执行适配。高层不直接依赖 Habitat discrete action 或 ROS topic。
 
 runtime_node.py
   实物模式主循环。
@@ -594,6 +762,23 @@ localPlanner 收到 waypoint。
 pathFollower 能跟踪 path。
 STRIVE 不直接控制 cmd_vel。
 ```
+
+### Phase 3.5: MotionController 与异步 viewpoint 执行
+
+目标：把 STRIVE 当前的同步 action loop 抽象为平台无关的 motion contract。
+
+验收：
+
+```text
+HabitatDiscreteController 可以包装原仿真 step loop。
+RosWaypointController 可以发布 /way_point 并轮询到达状态。
+ViewpointGoal 可以携带 look_at / target_uid / relation_edge_id。
+ViewpointResult 可以记录 reached / blocked / timeout 和最终 evidence。
+final verifier 只在 evidence acquisition 之后调用。
+```
+
+该阶段完成后，STRIVE 的 better-view 逻辑就不再依赖 Habitat discrete action；
+实物模式只需要替换底层 controller 和 observation adapter。
 
 ### Phase 4: 目标确认闭环
 
