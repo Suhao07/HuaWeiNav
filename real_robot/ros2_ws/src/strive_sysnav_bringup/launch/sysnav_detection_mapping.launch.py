@@ -20,6 +20,15 @@ def launch_setup(context, *args, **kwargs):
     sam2_checkpoint = LaunchConfiguration("sam2_checkpoint").perform(context)
     platform = LaunchConfiguration("platform").perform(context)
     use_sim_time = LaunchConfiguration("use_sim_time").perform(context).lower() in ("1", "true", "yes", "on")
+    camera_topic = LaunchConfiguration("camera_topic").perform(context)
+    cloud_topic = LaunchConfiguration("cloud_topic").perform(context)
+    odom_topic = LaunchConfiguration("odom_topic").perform(context)
+    viewpoint_topic = LaunchConfiguration("viewpoint_topic").perform(context)
+    start_usb_cam = LaunchConfiguration("start_usb_cam").perform(context).lower() in ("1", "true", "yes", "on")
+    usb_video_device = LaunchConfiguration("usb_video_device").perform(context)
+    usb_image_width = int(LaunchConfiguration("usb_image_width").perform(context))
+    usb_image_height = int(LaunchConfiguration("usb_image_height").perform(context))
+    usb_pixel_format = LaunchConfiguration("usb_pixel_format").perform(context)
 
     if not _non_empty(mapping_config):
         mapping_config = os.path.join(semantic_share, "mapping_mecanum_real.yaml")
@@ -54,12 +63,39 @@ def launch_setup(context, *args, **kwargs):
 
     actions.extend(
         [
+            *(
+                [
+                    Node(
+                        package="usb_cam",
+                        executable="usb_cam_node_exe",
+                        name="strive_usb_cam",
+                        output="screen",
+                        parameters=[
+                            {
+                                "video_device": usb_video_device,
+                                "image_width": usb_image_width,
+                                "image_height": usb_image_height,
+                                "pixel_format": usb_pixel_format,
+                            }
+                        ],
+                        remappings=[
+                            ("image_raw", camera_topic),
+                            ("/image_raw", camera_topic),
+                        ],
+                    )
+                ]
+                if start_usb_cam
+                else []
+            ),
             Node(
                 package="semantic_mapping",
                 executable="detection_node",
                 name="detection_node",
                 output="screen",
                 parameters=detection_parameters,
+                remappings=[
+                    ("/camera/image", camera_topic),
+                ],
             ),
             Node(
                 package="semantic_mapping",
@@ -67,6 +103,11 @@ def launch_setup(context, *args, **kwargs):
                 name="semantic_mapping_node",
                 output="screen",
                 parameters=mapping_parameters,
+                remappings=[
+                    ("/registered_scan", cloud_topic),
+                    ("/state_estimation", odom_topic),
+                    ("/viewpoint_rep_header", viewpoint_topic),
+                ],
             ),
         ]
     )
@@ -83,6 +124,15 @@ def generate_launch_description():
             DeclareLaunchArgument("detector_model_type", default_value="yoloe"),
             DeclareLaunchArgument("detector_model_path", default_value=""),
             DeclareLaunchArgument("sam2_checkpoint", default_value=""),
+            DeclareLaunchArgument("camera_topic", default_value="/camera/image"),
+            DeclareLaunchArgument("cloud_topic", default_value="/registered_scan"),
+            DeclareLaunchArgument("odom_topic", default_value="/state_estimation"),
+            DeclareLaunchArgument("viewpoint_topic", default_value="/viewpoint_rep_header"),
+            DeclareLaunchArgument("start_usb_cam", default_value="false"),
+            DeclareLaunchArgument("usb_video_device", default_value="/dev/video0"),
+            DeclareLaunchArgument("usb_image_width", default_value="1280"),
+            DeclareLaunchArgument("usb_image_height", default_value="720"),
+            DeclareLaunchArgument("usb_pixel_format", default_value="yuyv"),
             OpaqueFunction(function=launch_setup),
         ]
     )

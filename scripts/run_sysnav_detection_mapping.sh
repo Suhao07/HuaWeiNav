@@ -18,8 +18,10 @@ if [[ ! -f "${OVERLAY_SETUP}" ]]; then
   exit 2
 fi
 
+set +u
 source "${ROS_SETUP}"
 source "${OVERLAY_SETUP}"
+set -u
 
 MODEL_ARGS=()
 if [[ -n "${SYSNAV_DETECTOR_MODEL_PATH:-}" ]]; then

@@ -3,12 +3,25 @@ FROM ros:humble-ros-base
 ARG DEBIAN_FRONTEND=noninteractive
 ARG INSTALL_ML_DEPS=0
 ARG INSTALL_LLM_DEPS=1
+ARG UBUNTU_PORTS_MIRROR=https://mirrors.tuna.tsinghua.edu.cn/ubuntu-ports
 
 SHELL ["/bin/bash", "-lc"]
 
 ENV STRIVE_WS=/workspace/STRIVE
 ENV STRIVE_REAL_ROBOT_WS=/workspace/STRIVE/real_robot/ros2_ws
 ENV PYTHONPATH=/workspace/STRIVE
+
+RUN set -euo pipefail; \
+    for file in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do \
+      [[ -e "${file}" ]] || continue; \
+      sed -i -E \
+        -e "s#http://ports.ubuntu.com/ubuntu-ports/?#${UBUNTU_PORTS_MIRROR}#g" \
+        -e "s#http://ports.ubuntu.com/?#${UBUNTU_PORTS_MIRROR}#g" \
+        "${file}"; \
+    done; \
+    printf 'Acquire::Retries "5";\nAcquire::http::Timeout "30";\nAcquire::https::Timeout "30";\n' \
+      > /etc/apt/apt.conf.d/80-strive-retries; \
+    grep -R "${UBUNTU_PORTS_MIRROR}" /etc/apt/sources.list /etc/apt/sources.list.d || true
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
@@ -21,6 +34,13 @@ RUN apt-get update \
       ros-humble-pcl-ros \
       ros-humble-tf2-geometry-msgs \
       ros-humble-tf2-ros \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      ros-humble-topic-tools \
+      ros-humble-usb-cam \
+      v4l-utils \
  && rm -rf /var/lib/apt/lists/*
 
 RUN if [[ "${INSTALL_LLM_DEPS}" == "1" ]]; then \
@@ -50,6 +70,9 @@ RUN source /opt/ros/humble/setup.bash \
 
 RUN chmod +x ${STRIVE_WS}/scripts/build_real_robot_ros_ws.sh \
              ${STRIVE_WS}/scripts/run_sysnav_detection_mapping.sh \
+             ${STRIVE_WS}/scripts/start_real_robot_framework.sh \
+             ${STRIVE_WS}/scripts/start_orin_lio_for_strive.sh \
+             ${STRIVE_WS}/scripts/smoke_real_robot_orin.sh \
              ${STRIVE_WS}/docker/run_real_robot_sysnav_stack.sh
 
 CMD ["/bin/bash"]

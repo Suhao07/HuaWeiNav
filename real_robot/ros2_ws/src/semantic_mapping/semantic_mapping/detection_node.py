@@ -104,6 +104,8 @@ class DetectNode(Node):
             self.grounding_model = YOLO(detector_model_path, task='detect')
         else:
             self.grounding_model = YOLOE(detector_model_path, task="segment")
+            if detector_model_path.suffix.lower() in (".pt", ".pth") and hasattr(self.grounding_model, "set_classes"):
+                self.grounding_model.set_classes(self.text_prompt_list.tolist())
 
         self.device = device
 

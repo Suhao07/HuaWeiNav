@@ -1,7 +1,6 @@
 import cv2
 import numpy as np
 import open3d as o3d
-from pytorch3d.ops import box3d_overlap
 from scipy.spatial import cKDTree
 from sklearn.cluster import DBSCAN
 from scipy.spatial.transform import Rotation
@@ -30,10 +29,30 @@ try:
 except ModuleNotFoundError:
     captioner_not_found = True
 
-from line_profiler import profile
+try:
+    from line_profiler import profile
+except ModuleNotFoundError:
+    def profile(fn):
+        return fn
 
 import copy
 import time
+
+
+def _to_python_int(value):
+    if isinstance(value, np.generic):
+        return int(value.item())
+    return int(value)
+
+
+def _to_ros_int32_sequence(values):
+    if values is None:
+        return []
+    if isinstance(values, np.ndarray):
+        values = values.reshape(-1).tolist()
+    elif not isinstance(values, (list, tuple, set)):
+        values = [values]
+    return [_to_python_int(value) for value in values]
 
 
 def serialize_objs_to_bag(writer, obj_mapper, stamp: float, raw_cloud=None, odom=None):
@@ -503,7 +522,7 @@ class ObjMapper():
         delete_msg = ObjectNode()
         delete_msg.header.stamp = Time(seconds=seconds, nanoseconds=nanoseconds).to_msg()
         delete_msg.header.frame_id = 'map'
-        delete_msg.object_id = single_obj.obj_id
+        delete_msg.object_id = _to_ros_int32_sequence(single_obj.obj_id)
         delete_msg.label = single_obj.get_dominant_label()
         delete_msg.status = False
 
@@ -677,7 +696,7 @@ class ObjMapper():
             object_node_msg.header.frame_id = 'map'
             
             # Get the dominant id
-            object_node_msg.object_id = single_obj.obj_id
+            object_node_msg.object_id = _to_ros_int32_sequence(single_obj.obj_id)
 
             # if this object is target object and haven't been checked by the vlm, we give it a fake label
             if label == self.target_object and not single_obj.is_asked_vlm:
@@ -771,5 +790,3 @@ class ObjMapper():
                 single_obj.is_asked_vlm = True
                 single_obj.updated = True # force publish after VLM update
                 single_obj.updated_by_vlm = True
-
-

@@ -7,6 +7,8 @@
 thirdparty
 tmp*
 logs
+logs/
+output/
 *.pth
 *.pyc
 *.ply
@@ -17,6 +19,11 @@ debug*
 run.sh
 *.png
 .vscode/
+
+# Local/private deployment env files. Keep real API keys out of git.
+.env*
+docker/*.env
+!docker/*.env.example
 
 # Real-robot ROS overlay build products.
 real_robot/ros2_ws/build/
@@ -41,4 +48,3 @@ real_robot/ros2_ws/src/semantic_mapping/semantic_mapping/external/sam2/tools/
 real_robot/ros2_ws/src/semantic_mapping/semantic_mapping/external/sam2/training/
 real_robot/ros2_ws/src/semantic_mapping/semantic_mapping/pyproject.toml
 real_robot/ros2_ws/src/semantic_mapping/semantic_mapping/setup.cfg
-real_robot/ros2_ws/src/semantic_mapping/semantic_mapping/tools/

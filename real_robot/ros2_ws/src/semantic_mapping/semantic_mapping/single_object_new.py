@@ -5,7 +5,11 @@ from scipy.spatial.transform import Rotation
 from .utils import normalize_angles_to_pi, R_to_yaw, discretize_angles
 import open3d as o3d
 
-from line_profiler import profile
+try:
+    from line_profiler import profile
+except ModuleNotFoundError:
+    def profile(fn):
+        return fn
 
 import os
 import time

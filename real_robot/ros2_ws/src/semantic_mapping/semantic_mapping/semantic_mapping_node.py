@@ -813,7 +813,8 @@ def main(args=None):
 
     # Initialize your main MappingNode
     semantic_node = MappingNode(mask_predictor)
-    executor = SingleThreadedExecutor()
+    executor_threads = int(os.getenv("SYSNAV_MAPPING_EXECUTOR_THREADS", "4"))
+    executor = MultiThreadedExecutor(num_threads=executor_threads)
     executor.add_node(semantic_node)
 
     try:

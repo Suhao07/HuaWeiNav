@@ -1,4 +1,7 @@
 import colorsys
+import os
+from pathlib import Path
+
 import numpy as np
 from bisect import bisect_left
 import open3d as o3d
@@ -7,8 +10,29 @@ from scipy.spatial import cKDTree
 import yaml
 
 
-object_file_path = 'src/semantic_mapping/semantic_mapping/config/objects.yaml'
-with open(object_file_path, "r") as file:
+PACKAGE_DIR = Path(__file__).resolve().parent
+
+
+def resolve_semantic_config_path(path_value=None):
+    path_text = path_value or os.getenv("SYSNAV_OBJECTS_YAML") or "config/objects.yaml"
+    path = Path(str(path_text)).expanduser()
+    if path.is_absolute() or path.exists():
+        return path
+
+    marker = Path("src/semantic_mapping/semantic_mapping")
+    parts = path.parts
+    marker_parts = marker.parts
+    for index in range(0, max(0, len(parts) - len(marker_parts) + 1)):
+        if parts[index:index + len(marker_parts)] == marker_parts:
+            relocated = PACKAGE_DIR / Path(*parts[index + len(marker_parts):])
+            if relocated.exists():
+                return relocated
+
+    return PACKAGE_DIR / path
+
+
+object_file_path = resolve_semantic_config_path()
+with object_file_path.open("r", encoding="utf-8") as file:
     object_config = yaml.safe_load(file)
 label_template = object_config['prompts']
 object_list = {}
