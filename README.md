@@ -90,3 +90,33 @@ python objnav_benchmark_with_process_obs.py
 ```
 
 ---
+
+## Technical Report Figure Notes
+
+The main technical report is maintained in
+[`docs/project_technical_whitepaper.md`](docs/project_technical_whitepaper.md).
+When drawing figures in draw.io, use the following placement plan so the
+visuals match the report structure.
+
+| Figure | Suggested Section | Main Content |
+| --- | --- | --- |
+| Teaser / overall pipeline | Document beginning and Section 3 | Task input, perception, Room-Viewpoint-Object graph, VLM reasoning, planning, final verification, Habitat action / real-robot waypoint |
+| Multi-layer scene graph | Section 5 | Room nodes, viewpoint nodes, object nodes, graph edges, explored/frontier states, dynamic object-object relation edges |
+| Instruction adapter and concept grounding | Section 4 | Raw instruction, `InstructionPlan`, terminal/anchor/support `ConceptQuery`, detector vocabulary, runtime concept matcher, ledgers |
+| Final verifier and view-control loop | Section 6.6 | Candidate confirmation, context-aware verification, better-view subgoal, evidence capture, accept/retry/reject, geometry/VLM responsibility split |
+| Real-robot SysNav deployment | Section 8 | ROS sensors, SysNav `detection_node`, `semantic_mapping_node`, STRIVE adapters, `SemanticMapSnapshot`, `NavigationIntent`, `/way_point`, local planner |
+
+Recommended priority:
+
+```text
+1. Teaser / overall pipeline
+2. Multi-layer scene graph
+3. Final verifier and view-control loop
+4. Real-robot SysNav deployment
+5. Instruction adapter and concept grounding
+```
+
+Keep the figures concept-level rather than code-level. The strongest message is
+the division of labor: VLM handles semantic reasoning and verification, while
+mapping, reachability, distance, and motion execution remain geometry/controller
+responsibilities.
