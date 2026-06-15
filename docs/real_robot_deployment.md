@@ -643,9 +643,10 @@ robot_stable_or_goal_reached:
 | 局部规划 | localPlanner | Habitat SPF | ROSNavigationBridge |
 | 底盘控制 | pathFollower / serial | env.step | pathFollower / cmd_vel |
 
-## 9. 推荐代码结构
+## 9. 实物模块结构
 
-建议在 `robotic` 分支新增：
+当前仓库已经完成第一版 SysNav-backed 实物骨架。下面的树只列出已存在模块；
+相机同步、LiDAR 投影、真机 status provider 等平台相关文件仍属于后续适配点。
 
 ```text
 real_robot/
@@ -654,14 +655,6 @@ real_robot/
   detector_vocabulary.py
   sysnav_ros_adapters.py
   sysnav_runtime.py
-  camera_adapter.py
-  observation_adapter.py
-  depth_projection.py
-  detector_adapter.py
-  semantic_map_adapter.py
-  motion_controller.py
-  navigation_bridge.py
-  runtime_node.py
   ros2_ws/
     src/
       tare_planner/
@@ -672,7 +665,7 @@ docs/
   real_robot_deployment.md
 ```
 
-模块职责：
+已实现模块职责：
 
 ```text
 contracts.py
@@ -738,6 +731,54 @@ ros2_ws/src/semantic_mapping
 ros2_ws/src/strive_sysnav_bringup
   启动 detection_node 和 semantic_mapping_node 的 launch-only 包。
 ```
+
+后续预留模块建议保持接口级实现，而不是直接耦合到某个实物平台：
+
+```text
+camera_adapter.py
+  封装 Theta panorama、RealSense pinhole RGB-D 或其他相机驱动；
+  输出 CameraFrame，不直接调用 detector 或 planner。
+
+observation_adapter.py
+  管理 ROS topic buffer、timestamp sync、pose extraction；
+  输出 RealObservation，保证 RGB/LiDAR/odom 绑定同一 robot_pose。
+
+depth_projection.py
+  LiDAR point cloud -> panorama/pinhole sparse depth；
+  只做几何投影，不把 sparse depth 当作 dense Habitat depth。
+
+status_provider.py
+  从 odom、path progress、局部规划器状态和急停状态生成 NavigationStatus；
+  这是实车闭环必须补齐的模块，RosWaypointController 本身不猜测是否到达。
+
+runtime_node.py
+  实物模式主循环：
+  SemanticMapSnapshot -> InstructionPolicy -> NavigationIntent -> MotionGoal
+  -> RosWaypointController -> NavigationStatus -> ViewpointEvidenceLoop。
+```
+
+第一版 SysNav-backed STRIVE 的实物数据流应读作：
+
+```text
+/camera/image
+  -> SysNav detection_node
+  -> /detection_result
+  -> SysNav semantic_mapping_node
+  -> /object_nodes_list, /room_nodes_list
+  -> SysNavSemanticMapBridge
+  -> SemanticMapSnapshot
+  -> STRIVE instruction policy / concept grounding / verifier
+  -> NavigationIntent
+  -> MotionGoal
+  -> RosWaypointController
+  -> /way_point
+  -> SysNav lower planner / robot controller
+```
+
+这条链路中，STRIVE 不写 SysNav map，也不在 ROS adapter 层做同义词推断。
+`/object_nodes_list` 中的对象 ID 是 ledger/cache 的主键来源；目标、anchor、
+support role 的判断仍由 `InstructionPlan`、`ConceptQuery`、词表 provenance
+和视觉证据共同完成。
 
 ## 10. 实施路线
 

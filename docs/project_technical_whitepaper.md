@@ -1163,6 +1163,160 @@ flowchart TB
 | `real_robot/ros2_ws/src/semantic_mapping` | 迁移 SysNav detector 与 semantic mapping | 发布 SysNav-compatible object/room topics |
 | `real_robot/ros2_ws/src/strive_sysnav_bringup` | 启动检测与建图链路 | 不包含高层语义规划逻辑 |
 
+#### 8.1.1 模块分层与运行职责
+
+实物模式采用“SysNav 管底层闭环，STRIVE 管语义决策”的分层。该分层不是简单的
+ROS topic 转发，而是将对象身份、检测词表、运动状态和证据采集拆成可替换的
+contract。这样做的直接好处是：更换相机、检测器或底盘控制器时，不需要改
+instruction parser、concept grounding 和 final verifier。
+
+| 层级 | 当前实现 | 输入 | 输出 | 失败/降级语义 |
+| --- | --- | --- | --- | --- |
+| Contract layer | `real_robot/contracts.py` | 相机、LiDAR、对象、房间、视点、导航状态的结构化字段 | `RealObservation`、`SemanticMapSnapshot`、`NavigationIntent`、`MotionGoal`、`ViewEvidence` | 不推断语义；字段不完整时保留 `UNKNOWN` 或 `None` |
+| Vocabulary layer | `real_robot/detector_vocabulary.py` | SysNav `objects.yaml`、detector label、prompt term | label provenance 与 grounding context | 不写隐藏 alias；词表差异交给 grounding prompt |
+| ROS adapter layer | `real_robot/sysnav_ros_adapters.py` | `/detection_result`、`/object_nodes_list`、`/room_nodes_list`、`MotionGoal` | `DetectionFrame`、`ObjectNodeSnapshot`、`RoomSnapshot`、`/way_point` | 只做字段适配；STOP/WAIT 不发布 waypoint |
+| Semantic-map bridge | `SysNavSemanticMapBridge` | SysNav object/room list 最新消息 | `SemanticMapSnapshot` | 未收到对象图时返回 `None`，高层进入 `WAIT` |
+| Instruction runtime | `SysNavInstructionRuntime` | `SemanticMapSnapshot` 与自然语言指令 | `NavigationIntent -> MotionGoal` | 策略无法决策时输出 `WAIT` 或探索意图 |
+| Motion bridge | `RosWaypointController` | `MotionGoal` | `/way_point` 与 `NavigationStatus` | 可接入真实 status provider；adapter 本身不猜测到达 |
+| Evidence loop | `ViewpointEvidenceLoop` | `ViewpointGoal`、运动状态、当前观测 | `ViewEvidence` 与 verifier decision | 只有 `REACHED` 后采集证据；`BLOCKED/TIMEOUT` 回到策略层 |
+| ROS overlay | `real_robot/ros2_ws` | Robot ROS topics、SysNav detector/mapping 依赖 | SysNav-compatible semantic topics | 第一版复用 SysNav 节点，后续 detector 可替换为兼容 publisher |
+
+运行时数据流如下。这里的每一步都对应当前仓库中的一个可测试接口，而不是伪接口。
+
+```text
+Robot sensor topics
+  -> SysNav detection_node
+     # 检测器在 SysNav ROS 链路内运行，STRIVE 第一版不直接接管 detector。
+
+SysNav /detection_result
+  -> RosDetectionResultAdapter
+  -> DetectionFrame
+     # 保留原始 label、confidence、track_id 和 label provenance。
+
+SysNav /object_nodes_list, /room_nodes_list
+  -> RosObjectNodeAdapter / RosRoomNodeAdapter
+  -> ObjectNodeSnapshot / RoomSnapshot
+     # object uid 进入 STRIVE ledger/cache；room label 不在 adapter 层硬编码。
+
+ObjectNodeSnapshot + RoomSnapshot + robot pose
+  -> build_semantic_map_snapshot()
+  -> SemanticMapSnapshot
+     # 这是 STRIVE 高层策略看到的只读世界状态。
+
+SemanticMapSnapshot + instruction
+  -> high_level_policy.decide()
+  -> NavigationIntent
+     # Instruction policy 负责 terminal/anchor/support 角色和下一步语义意图。
+
+NavigationIntent.to_motion_goal()
+  -> MotionGoal
+  -> RosWaypointController.send_goal()
+  -> /way_point
+     # 底层局部规划、避障、速度控制和急停仍归 SysNav/机器人控制栈。
+
+ViewpointGoal
+  -> MotionGoal(IMPROVE_VIEW / VERIFY_TARGET / VERIFY_RELATION)
+  -> NavigationStatus.REACHED
+  -> EvidenceProvider.capture()
+  -> ViewEvidence
+  -> FinalVerifier.verify()
+     # 到达视点后才采集证据，避免用未执行视角伪造 final verifier 输入。
+```
+
+这个设计的关键约束是：adapter 层不能替上层做语义判断。比如
+`RosObjectNodeAdapter` 可以把 SysNav 的 `ObjectNode.label="cabinet"` 转成
+`ObjectNodeSnapshot(label="cabinet")`，但不能在这里判断它是否满足
+“shelf anchor”。这种判断必须由 `ConceptQuery + DetectorVocabulary + 视觉证据`
+共同进入 grounding/verifier。类似地，`RosRoomNodeAdapter` 不把 room node 写成
+bedroom 或 living room；SysNav 的 room 几何节点只作为空间区域，语义房间名由
+STRIVE 的 room policy 或 VLM 推断。
+
+#### 8.1.2 对象身份、缓存与检测词表
+
+实物系统中 detector track id、分割 mask 和对象融合结果都会随时间变化。因此
+STRIVE 不应直接用 bbox 或 label 作为长期身份。当前实现采用如下优先级：
+
+```text
+Object identity key:
+  1. SysNav mapper object uid / object_id
+     # 首选对象图中的稳定实例身份。
+  2. detector track_id
+     # 可辅助短时关联，但不保证跨遮挡稳定。
+  3. label + 3D position
+     # 离线回放或缺少 mapper uid 时的降级 key。
+```
+
+检测词表通过 `DetectorVocabularyAdapter` 读入 SysNav `objects.yaml`。它输出的不是
+“同义词表”，而是 provenance：
+
+```python
+DetectorVocabulary:
+    labels: tuple[str, ...]          # detector 实际可输出的标签集合
+    prompt_terms: tuple[str, ...]    # detector prompt 或 objects.yaml 中的候选词
+    source: str                      # 词表来源，如 sysnav_objects_yaml
+    metadata: dict                   # 模型、配置路径、加载时间等附加信息
+
+LabelProvenance:
+    raw_label: str                   # SysNav/检测器原始标签
+    normalized_label: str            # 仅做格式规范化，不表达语义等价
+    in_detector_vocab: bool          # 该标签是否来自当前 detector 词表
+    detector_source: str             # 便于回放时追踪标签来源
+```
+
+这些字段会进入 concept grounding prompt。也就是说，`book/books/shelf/bookcase`
+这类泛化仍然由 prompt-first grounding 和证据验证处理，而不是在 ROS adapter
+中静默写规则。
+
+#### 8.1.3 运动闭环与证据闭环的边界
+
+实物模式中，`NavigationIntent` 是高层语义决策，`MotionGoal` 是底层可执行请求。
+二者不能合并，否则 final verifier 很容易越权决定底盘状态。
+
+```text
+NavigationIntent:
+  mode = GO_TO_OBJECT | GO_TO_ANCHOR | IMPROVE_VIEW | VERIFY_TARGET | STOP | WAIT
+  target_object_uid
+  anchor_object_uid
+  relation_edge_id
+  reason
+  # 表达“为什么要移动”，不直接绑定具体 ROS message 类型。
+
+MotionGoal:
+  mode
+  goal_pose
+  look_at
+  tolerance
+  target_object_uid
+  anchor_object_uid
+  relation_edge_id
+  # 表达“移动到哪里、以什么容差到达”，由 MotionController 执行。
+
+NavigationStatus:
+  status = RUNNING | REACHED | BLOCKED | TIMEOUT | FAILED
+  distance_to_goal
+  current_pose
+  metadata
+  # 真实机器人是否到达只能由底层控制/状态监控给出。
+```
+
+因此 final verifier 的输入应是已经到达某个 viewpoint 后的 `ViewEvidence`：
+
+```text
+ViewEvidence:
+  image_ref
+  pose
+  target_object_uid
+  anchor_object_uid
+  bbox_xyxy
+  quality
+  source = VIEWPOINT_CAPTURE
+  # 证据来自实际执行后的当前视角，而不是 planner 预测视角。
+```
+
+如果 `NavigationStatus` 是 `BLOCKED` 或 `TIMEOUT`，`ViewpointEvidenceLoop` 不会调用
+`EvidenceProvider.capture()`。这条约束使语义验证和真实运动执行保持一致：VLM
+可以评价“当前证据是否满足任务”，但不能把一个没有到达的 waypoint 解释成成功。
+
 ### 8.2 SysNav 复用链路
 
 第一版实物部署采用 topic 级复用，而不是将 SysNav detector/mapping 代码揉进
