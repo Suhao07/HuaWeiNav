@@ -109,6 +109,43 @@ PriorMapMemory is runtime memory, not planner state.
 PriorMapData is map input, not observed truth.
 ```
 
+### 3.3 实物部署接入点
+
+实物模式通过 runtime 参数接入先验地图，入口保持在高层 policy context，不进入
+ROS adapter 或底层控制器：
+
+```text
+STRIVE_PRIOR_MAP_PATH=/abs/path/to/prior_map.json
+  -> docker_en.sh 只读挂载该文件所在目录
+  -> strive_instruction_runtime prior_map_path 参数
+  -> SemanticMapSnapshotPolicyContext / prior ranking context
+```
+
+示例：
+
+```bash
+START_STRIVE_RUNTIME=1 \
+STRIVE_INSTRUCTION="find a book near the table" \
+STRIVE_DATASET_TARGET=book \
+STRIVE_POLICY_MODE=semantic_snapshot \
+STRIVE_INSTRUCTION_PLAN_BACKEND=rules \
+STRIVE_PRIOR_MAP_PATH=/home/orin26/maps/lab_prior_map.json \
+STRIVE_DRY_RUN=true \
+SUDO_STDIN_PASSWORD=1 ./docker_en.sh start
+```
+
+边界：
+
+```text
+prior_map_path 只能提供搜索排序、房间/区域提示、debug context。
+prior map 不能直接生成 /way_point。
+prior map 不能绕过 SemanticMapSnapshot 的 live observation。
+prior map 不能触发 STOP；STOP 仍只来自 final verifier accept。
+```
+
+若 prior map 和 live SysNav snapshot 冲突，live snapshot 优先；prior map 降级为
+hypothesis，并应写入 `RuntimeDecision.metadata` 便于复盘。
+
 ## 4. 建议模块结构
 
 新增目录建议如下：

@@ -186,6 +186,27 @@ BAG_DETECTION_TOPIC=/detection_result
 BAG_PATH_TOPIC=/path
 ```
 
+### Offline Acceptance
+
+Run this before Orin deployment or before replaying a new bag:
+
+```bash
+bash scripts/check_real_robot_acceptance.sh
+```
+
+Current local acceptance coverage:
+
+```text
+fake object/room messages -> SemanticMapSnapshot
+semantic dry-run -> NavigationIntent without waypoint publisher
+fake waypoint controller -> RUNNING / REACHED
+REACHED -> ViewEvidence + verifier_payload
+snapshot -> waypoint -> final verifier accept -> STOP
+```
+
+This is not a hardware run. Real `/way_point`, local planner, and chassis smoke
+must still be run on the robot.
+
 ### High-Level Runtime Test Commands
 
 The high-level runtime node subscribes `/object_nodes_list`,

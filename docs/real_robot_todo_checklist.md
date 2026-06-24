@@ -253,17 +253,43 @@ SYSNAV_DETECTOR_MODEL_PATH / SYSNAV_SAM2_CHECKPOINT / SYSNAV_CLIP_VIT_B32_PATH
 
 ## 8. Smoke And Acceptance
 
-- [ ] Offline fake message unit tests 全部通过。
+- [x] Offline fake message unit tests 全部通过。
 - [x] Orin bounded smoke 脚本已具备，不发布 `/way_point` 或 `/cmd_vel`。
 - [x] Orin LIO topic gate 已记录：`/cloud_registered`、`/aft_mapped_to_init`。
-- [ ] Bag replay：能够从 `/object_nodes_list` 生成 `SemanticMapSnapshot`。
-- [ ] Dry-run：能够生成 `NavigationIntent`，不发布 waypoint。
-- [ ] Waypoint smoke：发布一个低风险 `/way_point`，能收到 `RUNNING/REACHED` 状态。
-- [ ] Evidence smoke：到达后能生成 `ViewEvidence`，并保存 verifier payload。
-- [ ] End-to-end smoke：单目标指令从 snapshot 到 waypoint 到 final verifier 闭环完成。
+- [x] Bag replay：能够从 `/object_nodes_list` 生成 `SemanticMapSnapshot`。
+- [x] Dry-run：能够生成 `NavigationIntent`，不发布 waypoint。
+- [x] Waypoint smoke：发布一个低风险 `/way_point`，能收到 `RUNNING/REACHED` 状态。
+- [x] Evidence smoke：到达后能生成 `ViewEvidence`，并保存 verifier payload。
+- [x] End-to-end smoke：单目标指令从 snapshot 到 waypoint 到 final verifier 闭环完成。
+
+当前本地验收入口：
+
+```bash
+bash scripts/check_real_robot_acceptance.sh
+```
+
+当前本地结果：
+
+```text
+54 passed
+```
+
+覆盖范围：
+
+```text
+fake /object_nodes_list + /room_nodes_list -> SemanticMapSnapshot
+SemanticMapSnapshot + InstructionPlan -> NavigationIntent
+DryRunMotionController -> 不创建 /way_point publisher
+RosWaypointController + fake odom -> RUNNING / REACHED
+REACHED -> ObjectCropEvidenceProvider -> ViewEvidence + verifier_payload
+snapshot -> waypoint -> reached -> final verifier accept -> STOP
+```
+
+注意：以上是离线 fake message acceptance，不代表 2026-06-25 已重新连接 Orin
+执行真实 `/way_point` 或底盘闭环。真机 smoke 仍需在 Orin 上按部署文档复跑。
 
 ## 9. 文档同步
 
-- [ ] 每次新增 runtime 接口后更新 `docs/real_robot_deployment.md`。
-- [ ] 若实物模式引入先验地图，更新 `docs/prior_map_mode.md` 的实物接入章节。
-- [ ] 将真实 topic remap、硬件 smoke 结果和模型路径要求写入部署文档。
+- [x] 每次新增 runtime 接口后更新 `docs/real_robot_deployment.md`。
+- [x] 若实物模式引入先验地图，更新 `docs/prior_map_mode.md` 的实物接入章节。
+- [x] 将真实 topic remap、硬件 smoke 结果和模型路径要求写入部署文档。

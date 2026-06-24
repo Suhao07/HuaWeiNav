@@ -69,6 +69,7 @@ RUN source /opt/ros/humble/setup.bash \
  && colcon build --symlink-install --packages-up-to tare_planner semantic_mapping strive_sysnav_bringup
 
 RUN chmod +x ${STRIVE_WS}/scripts/build_real_robot_ros_ws.sh \
+             ${STRIVE_WS}/scripts/check_real_robot_acceptance.sh \
              ${STRIVE_WS}/scripts/export_code_only.sh \
              ${STRIVE_WS}/scripts/run_sysnav_detection_mapping.sh \
              ${STRIVE_WS}/scripts/run_real_robot_bag_replay.sh \

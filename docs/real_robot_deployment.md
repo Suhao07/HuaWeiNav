@@ -1860,6 +1860,70 @@ real_robot/ros2_ws/log/
 docs/Zhu et al. - 2025 - STRIVE Structured Representation Integrating VLM Reasoning for Efficient Object Navigation.pdf
 ```
 
+### 12.7 Smoke and acceptance
+
+本地离线验收入口：
+
+```bash
+bash scripts/check_real_robot_acceptance.sh
+```
+
+当前 2026-06-25 本地结果：
+
+```text
+54 passed
+```
+
+覆盖范围：
+
+```text
+fake /object_nodes_list + /room_nodes_list
+  -> SysNavSemanticMapBridge
+  -> SemanticMapSnapshot
+
+SemanticMapSnapshot + InstructionPlan
+  -> SemanticMapSnapshotIntentAdapter
+  -> NavigationIntent
+
+DryRunMotionController
+  -> 不创建 /way_point publisher
+
+RosWaypointController + fake odom/path status
+  -> RUNNING / REACHED
+
+NavigationStatus.REACHED
+  -> ObjectCropEvidenceProvider
+  -> ViewEvidence + verifier_payload
+
+snapshot -> waypoint -> reached -> final verifier accept
+  -> STOP
+```
+
+这组 acceptance 是本地 fake message 验收，不等价于真机底盘验收。2026-06-25
+没有重新连接 Orin，因此真实 `/way_point` 发布、底层 local planner、path follower、
+底盘安全链和 final verifier 实物闭环仍需要在机器人上按以下顺序复跑：
+
+```bash
+# 1. 只观察，不发布 /way_point 或 /cmd_vel
+SUDO_STDIN_PASSWORD=1 ./docker_en.sh smoke
+
+# 2. detector/mapping + 高层 dry-run
+START_STRIVE_RUNTIME=1 \
+STRIVE_INSTRUCTION="find a book" \
+STRIVE_DATASET_TARGET=book \
+STRIVE_POLICY_MODE=semantic_snapshot \
+STRIVE_INSTRUCTION_PLAN_BACKEND=rules \
+STRIVE_DRY_RUN=true \
+SUDO_STDIN_PASSWORD=1 ./docker_en.sh start
+
+# 3. 明确启用底层控制后，才允许真实 /way_point handoff
+BLOCK_LOWER_CONTROLLER=0 \
+ENABLE_LOWER_CONTROLLER=1 \
+STRIVE_DRY_RUN=false \
+STRIVE_LOWER_CONTROLLER_ENABLED=true \
+SUDO_STDIN_PASSWORD=1 ./docker_en.sh start
+```
+
 这种边界的原因是：Habitat 仿真栈和 ROS2 Humble 真机栈的系统依赖不同。强行把
 Habitat、ROS、SysNav detector、SAM2、TensorRT 全部塞进同一个“万能镜像”，会让
 CUDA、OpenCV、PCL、PyTorch 和 Python ABI 的冲突不可控。Orin 单实物镜像已经满足
