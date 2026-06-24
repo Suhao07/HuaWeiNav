@@ -37,6 +37,10 @@ from real_robot.detector_vocabulary import (
     merge_label_provenance,
     vocabulary_context,
 )
+from real_robot.observation_cache import (
+    ObjectCropEvidenceProvider,
+    RosObservationCache,
+)
 from real_robot.sysnav_ros_adapters import (
     RosDetectionResultAdapter,
     RosNavigationStatusProvider,
@@ -88,6 +92,8 @@ __all__ = [
     "DetectorVocabularyAdapter",
     "merge_label_provenance",
     "vocabulary_context",
+    "ObjectCropEvidenceProvider",
+    "RosObservationCache",
     "RosDetectionResultAdapter",
     "RosNavigationStatusProvider",
     "RosObjectNodeAdapter",

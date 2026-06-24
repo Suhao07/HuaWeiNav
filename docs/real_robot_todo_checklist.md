@@ -68,13 +68,34 @@ SysNav waypoint z offset 与真实 odometry z 近似为 0 的情况。
 
 ## 4. Observation Cache And Evidence
 
-- [ ] 新增 `RosObservationCache`，缓存最新 RGB、pose、detection frame 和可选 point cloud/depth 引用。
-- [ ] 实现图像落盘或内存引用策略，contract 中只保存 `image_ref`。
-- [ ] 新增 `ObjectCropEvidenceProvider`，根据 object uid、track id、bbox 或 image path 构造 `ViewEvidence`。
-- [ ] 支持 full image evidence 和 bbox crop evidence 两种模式。
-- [ ] 为 evidence 增加 view quality facts：bbox area、center score、border margin、source timestamp。
-- [ ] 确保 `ViewpointEvidenceLoop` 只有在 `NavigationStatus.REACHED` 后调用 provider。
-- [ ] 增加测试：blocked/timeout 不调用 final verifier，不生成伪 evidence。
+- [x] 新增 `RosObservationCache`，缓存最新 RGB、pose、detection frame 和可选 point cloud/depth 引用。
+- [x] 实现图像落盘或内存引用策略，contract 中只保存 `image_ref`。
+- [x] 新增 `ObjectCropEvidenceProvider`，根据 object uid、track id、bbox 或 image path 构造 `ViewEvidence`。
+- [x] 支持 full image evidence 和 bbox crop evidence 两种模式。
+- [x] 为 evidence 增加 view quality facts：bbox area、center score、border margin、source timestamp。
+- [x] 确保 `ViewpointEvidenceLoop` 只有在 `NavigationStatus.REACHED` 后调用 provider。
+- [x] 增加测试：blocked/timeout 不调用 final verifier，不生成伪 evidence。
+
+当前实现：
+
+```text
+RosObservationCache
+  pose + RGB image + DetectionFrame + optional depth/pointcloud refs
+  -> RealObservation(camera.image_ref, depth_ref, pointcloud_ref)
+
+ObjectCropEvidenceProvider
+  target_object_uid / anchor_object_uid
+  -> object bbox2d 或 detection track bbox
+  -> ViewEvidence(full_image 或 bbox_crop)
+```
+
+默认 `persist_observation_images=false`，图像引用使用 `ros://...` URI，避免真机高频
+相机数据持续写盘。需要复盘 evidence 时可设置：
+
+```text
+persist_observation_images=true
+observation_image_directory:=/tmp/strive_real_robot_runtime/observations
+```
 
 ## 5. SemanticSnapshotInstructionPolicy
 

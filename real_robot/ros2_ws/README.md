@@ -158,6 +158,20 @@ and `/camera/image`. By default it only writes
 overlay, then adds the repository root to `PYTHONPATH` for the shared STRIVE
 `real_robot` package.
 
+The node also keeps a lightweight observation cache for evidence acquisition.
+By default image refs stay as ROS URI strings and no camera bytes are written:
+
+```text
+detection_topic:=/detection_result
+depth_topic:=
+pointcloud_topic:=
+persist_observation_images:=false
+observation_image_directory:=
+```
+
+Set `persist_observation_images:=true` only when replay/debug evidence files are
+needed. The contract still records only `image_ref` and sidecar metadata paths.
+
 When `dry_run:=false`, the node injects `RosNavigationStatusProvider` into the
 waypoint controller. It reads `/aft_mapped_to_init` and `/path`, plus an
 optional string `planner_status_topic`, then writes distance, elapsed time,

@@ -1408,6 +1408,55 @@ bash scripts/run_real_robot_instruction_runtime.sh \
 `SemanticMapSnapshot -> NavigationIntent -> MotionGoal` 的线缆级链路；它不会
 理解自然语言，也不能作为最终实物策略。
 
+live node 同时维护 `RosObservationCache`，用于后续 viewpoint evidence 和 final
+verifier：
+
+```text
+/aft_mapped_to_init
+  -> Pose3D
+
+/camera/image
+  -> image_ref
+
+/detection_result
+  -> DetectionFrame
+
+optional depth_topic
+  -> depth_ref
+
+optional pointcloud_topic
+  -> pointcloud_ref
+
+RosObservationCache.latest_observation()
+  -> RealObservation
+```
+
+默认 `persist_observation_images=false`，`RealObservation` 只保存 `ros://...`
+形式的 `image_ref`，不把图像数组放进 contract，也不持续写盘。需要落盘复盘时，
+显式设置：
+
+```bash
+bash scripts/run_real_robot_instruction_runtime.sh \
+  persist_observation_images:=true \
+  observation_image_directory:=/tmp/strive_real_robot_runtime/observations
+```
+
+`ObjectCropEvidenceProvider` 可以基于 object uid、object track id、object
+`bbox2d_xyxy`、`DetectionFrame.track_ids` 或 SysNav object `image_ref` 构造
+`ViewEvidence`。它支持 `full_image` 与 `bbox_crop` 两种证据模式，并写入：
+
+```text
+bbox_area_px / bbox_area_ratio
+center_score
+border_margin_px / border_margin_ratio
+source_timestamp
+bbox_source
+```
+
+`ViewpointEvidenceLoop` 仍然只在 `NavigationStatus.REACHED` 后调用 evidence
+provider；`BLOCKED/TIMEOUT/PREEMPTED/FAILED` 不会生成伪 evidence，也不会调用
+final verifier。
+
 非 dry-run 模式下，`RosWaypointController` 会接入
 `RosNavigationStatusProvider`，用只读 topic 估计底层执行状态：
 

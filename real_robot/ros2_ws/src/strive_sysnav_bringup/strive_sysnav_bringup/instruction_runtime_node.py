@@ -8,10 +8,11 @@ from typing import Optional
 import rclpy
 from nav_msgs.msg import Odometry, Path as NavPath
 from rclpy.node import Node
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import Image, PointCloud2
 from std_msgs.msg import String
-from tare_planner.msg import ObjectNodeList, RoomNodeList
+from tare_planner.msg import DetectionResult, ObjectNodeList, RoomNodeList
 
+from real_robot.observation_cache import RosObservationCache
 from real_robot.contracts import Pose3D
 from real_robot.sysnav_ros_adapters import RosNavigationStatusProvider, RosWaypointController
 from real_robot.sysnav_runtime import (
@@ -42,11 +43,23 @@ class StriveInstructionRuntimeNode(Node):
         self.require_pose = _param_bool(self.get_parameter("require_pose").value)
         self.policy_mode = str(self.get_parameter("policy_mode").value or "wait")
         self.prior_map_path = str(self.get_parameter("prior_map_path").value or "")
+        self.image_topic = str(self.get_parameter("image_topic").value)
+        self.detection_topic = str(self.get_parameter("detection_topic").value)
         self._latest_pose: Optional[Pose3D] = None
         self._latest_image_stamp: Optional[float] = None
 
         run_directory = Path(str(self.get_parameter("run_directory").value or "/tmp/strive_real_robot_runtime"))
         self._decision_writer = RuntimeDecisionJsonlWriter(run_directory / "runtime_decisions.jsonl")
+        image_directory_param = str(self.get_parameter("observation_image_directory").value or "")
+        image_directory = Path(image_directory_param) if image_directory_param else run_directory / "observations"
+        self.observation_cache = RosObservationCache(
+            image_directory=image_directory,
+            persist_images=_param_bool(self.get_parameter("persist_observation_images").value),
+            rgb_topic=self.image_topic,
+            depth_topic=str(self.get_parameter("depth_topic").value or ""),
+            pointcloud_topic=str(self.get_parameter("pointcloud_topic").value or ""),
+            now_fn=self._now_seconds,
+        )
         self.navigation_status_provider = RosNavigationStatusProvider(
             xy_tolerance_m=float(self.get_parameter("xy_goal_tolerance_m").value),
             z_tolerance_m=float(self.get_parameter("z_goal_tolerance_m").value),
@@ -105,10 +118,32 @@ class StriveInstructionRuntimeNode(Node):
             )
         self.create_subscription(
             Image,
-            str(self.get_parameter("image_topic").value),
+            self.image_topic,
             self._update_image,
             queue_size,
         )
+        self.create_subscription(
+            DetectionResult,
+            self.detection_topic,
+            self.observation_cache.update_detection_result,
+            queue_size,
+        )
+        depth_topic = str(self.get_parameter("depth_topic").value or "")
+        if depth_topic:
+            self.create_subscription(
+                Image,
+                depth_topic,
+                self.observation_cache.update_depth_image,
+                queue_size,
+            )
+        pointcloud_topic = str(self.get_parameter("pointcloud_topic").value or "")
+        if pointcloud_topic:
+            self.create_subscription(
+                PointCloud2,
+                pointcloud_topic,
+                self.observation_cache.update_pointcloud,
+                queue_size,
+            )
 
         period_s = float(self.get_parameter("decision_period_s").value)
         self.create_timer(period_s, self._tick)
@@ -128,6 +163,9 @@ class StriveInstructionRuntimeNode(Node):
         self.declare_parameter("path_topic", "/path")
         self.declare_parameter("planner_status_topic", "")
         self.declare_parameter("image_topic", "/camera/image")
+        self.declare_parameter("detection_topic", "/detection_result")
+        self.declare_parameter("depth_topic", "")
+        self.declare_parameter("pointcloud_topic", "")
         self.declare_parameter("waypoint_topic", "/way_point")
         self.declare_parameter("world_frame", "map")
         self.declare_parameter("policy_mode", "wait")
@@ -144,6 +182,8 @@ class StriveInstructionRuntimeNode(Node):
         self.declare_parameter("no_progress_timeout_s", 12.0)
         self.declare_parameter("min_progress_delta_m", 0.05)
         self.declare_parameter("path_stale_timeout_s", 5.0)
+        self.declare_parameter("persist_observation_images", False)
+        self.declare_parameter("observation_image_directory", "")
 
     def _build_policy(self, policy_mode: str):
         """Build the selected high-level policy implementation."""
@@ -184,11 +224,13 @@ class StriveInstructionRuntimeNode(Node):
             stamp=_stamp_to_seconds(msg.header.stamp),
         )
         self.navigation_status_provider.update_pose(self._latest_pose)
+        self.observation_cache.update_pose(self._latest_pose)
 
     def _update_image(self, msg: Image) -> None:
         """Cache the latest image timestamp as readiness evidence."""
 
-        self._latest_image_stamp = _stamp_to_seconds(msg.header.stamp)
+        record = self.observation_cache.update_rgb_image(msg, topic=self.image_topic)
+        self._latest_image_stamp = record.timestamp
 
     def _current_pose(self) -> Pose3D:
         """Return the latest pose or a safe placeholder pose."""
