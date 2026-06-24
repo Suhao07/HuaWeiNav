@@ -17,15 +17,15 @@ summary，不能直接发布导航目标或绕过 final verifier。
 
 ## 2. Loaders
 
-- [ ] 新增 `prior_map/loaders.py`。
-- [ ] 实现 `PriorMapLoader.load(path, source_format="auto")`。
-- [ ] 支持标准 floorplan JSON。
-- [ ] 支持 FloorPlan-VLN JSON。
-- [ ] 支持 OSM/XML 简化格式。
-- [ ] 支持 HM3D top-down / generated prior map JSON。
-- [ ] 为 VLM reconstruction 输出预留 loader。
-- [ ] 增加最小 fixture 测试，覆盖 room、object、topology 和 metadata。
-- [ ] 明确 loader 只解析文件，不进行 runtime 坐标对齐和导航决策。
+- [x] 新增 `prior_map/loaders.py`。
+- [x] 实现 `PriorMapLoader.load(path, source_format="auto")`。
+- [x] 支持标准 floorplan JSON。
+- [x] 支持 FloorPlan-VLN JSON。
+- [x] 支持 OSM/XML 简化格式。
+- [x] 支持 HM3D top-down / generated prior map JSON。
+- [x] 为 VLM reconstruction 输出预留 loader。
+- [x] 增加最小 fixture 测试，覆盖 room、object、topology 和 metadata。
+- [x] 明确 loader 只解析文件，不进行 runtime 坐标对齐和导航决策。
 
 ## 3. Alignment
 

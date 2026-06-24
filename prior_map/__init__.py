@@ -12,10 +12,13 @@ from .contracts import (
     SearchPriorResult,
     SupportRegionPrior,
 )
+from .loaders import PriorMapLoader, PriorMapLoaderError
 
 __all__ = [
     "FrontierPrior",
     "ObjectPrior",
+    "PriorMapLoader",
+    "PriorMapLoaderError",
     "PriorMapData",
     "PriorObject",
     "PriorObservationRecord",
