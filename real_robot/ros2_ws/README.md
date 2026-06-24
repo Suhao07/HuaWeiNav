@@ -276,6 +276,8 @@ dry_run still prevents /way_point publication
 Run this only after `/path`, `/aft_mapped_to_init`, and the local planner are
 healthy, and only when the robot safety boundary is already handled outside
 STRIVE. This publishes `/way_point`; STRIVE still never publishes `/cmd_vel`.
+The launch will reject this mode unless `lower_controller_enabled:=true` is
+set, or unless `waypoint_topic` is changed to the configured test topic.
 
 ```bash
 bash scripts/run_real_robot_instruction_runtime.sh \
@@ -284,8 +286,11 @@ bash scripts/run_real_robot_instruction_runtime.sh \
   policy_mode:=semantic_snapshot \
   instruction_plan_backend:=rules \
   dry_run:=false \
+  lower_controller_enabled:=true \
   enable_final_verifier:=false \
   waypoint_topic:=/way_point \
+  hold_topic:=/platform/safe_hold \
+  cancel_topic:=/local_planner/cancel \
   path_topic:=/path \
   odom_topic:=/aft_mapped_to_init \
   run_directory:=/tmp/strive_real_robot_runtime_waypoint
@@ -314,6 +319,22 @@ dry_run_status:=idle | queued | running | reached | blocked | timeout | preempte
 enable_final_verifier:=false | true
 evidence_mode:=auto | full_image | bbox_crop
 run_directory:=/tmp/strive_real_robot_runtime
+lower_controller_enabled:=false | true
+waypoint_topic:=/way_point
+test_waypoint_topic:=/strive/test_way_point
+hold_topic:=
+cancel_topic:=
+emergency_stop_topic:=
+allow_emergency_stop_publish:=false | true
+```
+
+Safety defaults:
+
+```text
+dry_run:=true never publishes /way_point.
+dry_run:=false requires lower_controller_enabled:=true unless waypoint_topic is the test topic.
+emergency_stop_topic is never published unless allow_emergency_stop_publish:=true.
+Any /cmd_vel or */cmd_vel publish topic is rejected before publishers are created.
 ```
 
 The node also keeps a lightweight observation cache for evidence acquisition.

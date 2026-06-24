@@ -163,11 +163,46 @@ terminal / anchor / relation / verifier 状态机。
 
 ## 6. Safety Boundary
 
-- [ ] 为 `RosWaypointController.hold()` 接入平台安全 hold/stop topic。
-- [ ] 为 `cancel()` 接入 lower planner cancel 或 stop 机制。
-- [ ] 增加 emergency stop 参数，默认不自动覆盖底层安全系统。
-- [ ] 确认 STRIVE 永远不直接发布 `/cmd_vel`。
-- [ ] 记录 lower controller 是否启用；未启用时只能 dry-run 或发布到测试 topic。
+- [x] 为 `RosWaypointController.hold()` 接入平台安全 hold/stop topic。
+- [x] 为 `cancel()` 接入 lower planner cancel 或 stop 机制。
+- [x] 增加 emergency stop 参数，默认不自动覆盖底层安全系统。
+- [x] 确认 STRIVE 永远不直接发布 `/cmd_vel`。
+- [x] 记录 lower controller 是否启用；未启用时只能 dry-run 或发布到测试 topic。
+
+当前实现：
+
+```text
+RosWaypointController
+  MotionGoal -> /way_point
+  hold() -> optional std_msgs/Empty on hold_topic
+  cancel() -> optional std_msgs/Empty on cancel_topic
+           -> fallback std_msgs/Empty on hold_topic
+  emergency_stop_topic 只有 allow_emergency_stop_publish=true 时才发布
+```
+
+安全边界：
+
+```text
+dry_run=true
+  不创建 /way_point publisher，不发布 motion goal。
+
+dry_run=false + lower_controller_enabled=false
+  只允许 waypoint_topic == test_waypoint_topic。
+
+dry_run=false + lower_controller_enabled=true
+  允许发布 waypoint_topic，但仍禁止任何 /cmd_vel 或 */cmd_vel topic。
+```
+
+每条 `RuntimeDecision` JSONL 都记录：
+
+```text
+runtime_safety.lower_controller_enabled
+runtime_safety.waypoint_topic
+runtime_safety.hold_topic
+runtime_safety.cancel_topic
+runtime_safety.emergency_stop_topic
+runtime_safety.allow_emergency_stop_publish
+```
 
 ## 7. Deployment And Scripts
 

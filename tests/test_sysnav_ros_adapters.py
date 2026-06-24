@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 
+import pytest
+
 from real_robot.contracts import MotionGoal, MotionGoalMode, NavigationStatusCode, Pose3D
 from real_robot.detector_vocabulary import DetectorVocabularyAdapter
 from real_robot.sysnav_ros_adapters import (
@@ -202,6 +204,10 @@ class FakePointStamped:
         self.point = SimpleNamespace(x=0.0, y=0.0, z=0.0)
 
 
+class FakeEmpty:
+    pass
+
+
 class FakePublisher:
     def __init__(self):
         self.published = []
@@ -247,6 +253,128 @@ def test_waypoint_controller_does_not_publish_stop_goal() -> None:
 
     assert publisher.published == []
     assert controller.poll_status(goal_id).status == NavigationStatusCode.REACHED
+
+
+def test_waypoint_controller_rejects_direct_cmd_vel_topics() -> None:
+    with pytest.raises(ValueError, match="direct velocity"):
+        RosWaypointController(
+            node=SimpleNamespace(),
+            waypoint_topic="/cmd_vel",
+            publisher=FakePublisher(),
+            point_stamped_type=FakePointStamped,
+        )
+
+    with pytest.raises(ValueError, match="direct velocity"):
+        RosWaypointController(
+            node=SimpleNamespace(),
+            publisher=FakePublisher(),
+            point_stamped_type=FakePointStamped,
+            hold_topic="/robot/cmd_vel",
+            hold_publisher=FakePublisher(),
+            empty_type=FakeEmpty,
+        )
+
+
+def test_waypoint_controller_hold_publishes_hold_without_emergency_by_default() -> None:
+    waypoint_publisher = FakePublisher()
+    hold_publisher = FakePublisher()
+    emergency_publisher = FakePublisher()
+    controller = RosWaypointController(
+        node=SimpleNamespace(),
+        publisher=waypoint_publisher,
+        point_stamped_type=FakePointStamped,
+        hold_topic="/platform/safe_hold",
+        emergency_stop_topic="/platform/emergency_stop",
+        hold_publisher=hold_publisher,
+        emergency_stop_publisher=emergency_publisher,
+        empty_type=FakeEmpty,
+    )
+    goal = MotionGoal(mode=MotionGoalMode.GO_TO_OBJECT, goal_pose=Pose3D(position=(1.0, 0.0, 0.0)))
+
+    goal_id = controller.send_goal(goal)
+    controller.hold()
+    status = controller.poll_status(goal_id)
+
+    assert len(hold_publisher.published) == 1
+    assert emergency_publisher.published == []
+    assert status.status == NavigationStatusCode.IDLE
+    assert status.metadata["hold_signal_published"] is True
+    assert status.metadata["emergency_stop_publish_allowed"] is False
+    assert status.metadata["emergency_stop_published"] is False
+
+
+def test_waypoint_controller_hold_can_publish_emergency_when_explicitly_allowed() -> None:
+    hold_publisher = FakePublisher()
+    emergency_publisher = FakePublisher()
+    controller = RosWaypointController(
+        node=SimpleNamespace(),
+        publisher=FakePublisher(),
+        point_stamped_type=FakePointStamped,
+        hold_topic="/platform/safe_hold",
+        emergency_stop_topic="/platform/emergency_stop",
+        allow_emergency_stop_publish=True,
+        hold_publisher=hold_publisher,
+        emergency_stop_publisher=emergency_publisher,
+        empty_type=FakeEmpty,
+    )
+    goal_id = controller.send_goal(
+        MotionGoal(mode=MotionGoalMode.GO_TO_OBJECT, goal_pose=Pose3D(position=(1.0, 0.0, 0.0)))
+    )
+
+    controller.hold()
+    status = controller.poll_status(goal_id)
+
+    assert len(hold_publisher.published) == 1
+    assert len(emergency_publisher.published) == 1
+    assert status.metadata["emergency_stop_published"] is True
+
+
+def test_waypoint_controller_cancel_publishes_cancel_signal() -> None:
+    cancel_publisher = FakePublisher()
+    hold_publisher = FakePublisher()
+    controller = RosWaypointController(
+        node=SimpleNamespace(),
+        publisher=FakePublisher(),
+        point_stamped_type=FakePointStamped,
+        cancel_topic="/local_planner/cancel",
+        hold_topic="/platform/safe_hold",
+        cancel_publisher=cancel_publisher,
+        hold_publisher=hold_publisher,
+        empty_type=FakeEmpty,
+    )
+    goal = MotionGoal(mode=MotionGoalMode.GO_TO_OBJECT, goal_pose=Pose3D(position=(1.0, 0.0, 0.0)))
+
+    goal_id = controller.send_goal(goal)
+    controller.cancel(goal_id)
+    status = controller.poll_status(goal_id)
+
+    assert len(cancel_publisher.published) == 1
+    assert hold_publisher.published == []
+    assert status.status == NavigationStatusCode.PREEMPTED
+    assert status.metadata["cancel_signal_published"] is True
+    assert status.metadata["hold_fallback_published"] is False
+
+
+def test_waypoint_controller_cancel_uses_hold_fallback_without_cancel_topic() -> None:
+    hold_publisher = FakePublisher()
+    controller = RosWaypointController(
+        node=SimpleNamespace(),
+        publisher=FakePublisher(),
+        point_stamped_type=FakePointStamped,
+        hold_topic="/platform/safe_hold",
+        hold_publisher=hold_publisher,
+        empty_type=FakeEmpty,
+    )
+    goal = MotionGoal(mode=MotionGoalMode.GO_TO_OBJECT, goal_pose=Pose3D(position=(1.0, 0.0, 0.0)))
+
+    goal_id = controller.send_goal(goal)
+    controller.cancel(goal_id)
+    status = controller.poll_status(goal_id)
+
+    assert len(hold_publisher.published) == 1
+    assert status.status == NavigationStatusCode.PREEMPTED
+    assert status.metadata["cancel_signal_published"] is False
+    assert status.metadata["hold_fallback_published"] is True
 
 
 def test_navigation_status_provider_reports_running_and_reached_from_odom_and_path() -> None:

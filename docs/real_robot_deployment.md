@@ -541,10 +541,30 @@ RosWaypointController
   MotionGoal -> /way_point
   poll_status -> /state_estimation + /path + timeout + progress monitor
   hold -> /stop or controller-specific safe hold
+  cancel -> lower-planner cancel topic or hold fallback
 ```
 
 上层 planner 只看到 `MotionGoal` 和 `NavigationStatus`，不关心底层是离散
 action、ROS waypoint，还是某个实物平台的自定义导航接口。
+
+当前 `RosWaypointController` 的安全边界已经固定：
+
+```text
+waypoint_topic
+  只能是 waypoint/test waypoint，不允许 /cmd_vel 或 */cmd_vel。
+
+hold_topic
+  可选 std_msgs/Empty 信号，由平台安全节点解释。
+
+cancel_topic
+  可选 std_msgs/Empty 信号；未配置时 cancel() 回退到 hold_topic。
+
+emergency_stop_topic
+  可选 std_msgs/Empty 信号；默认不发布。
+  只有 allow_emergency_stop_publish=true 时，hold() 才会同时发布该 topic。
+```
+
+这意味着 STRIVE 高层不会绕过平台 local planner / safety controller 直接接管速度控制。
 
 ### 6.3 ViewpointGoal 与异步证据采集
 
@@ -1642,6 +1662,35 @@ BLOCK_LOWER_CONTROLLER=0 \
 ENABLE_LOWER_CONTROLLER=1 \
 LOWER_CONTROLLER_CMD='<controller launch command>' \
 SUDO_STDIN_PASSWORD=1 ./docker_en.sh start
+```
+
+STRIVE 高层 runtime 还会在 ROS node 参数层做二次保护：
+
+```text
+dry_run=true
+  只写 RuntimeDecision JSONL，不创建 waypoint publisher。
+
+dry_run=false + lower_controller_enabled=false
+  只能发布到 test_waypoint_topic，默认 /strive/test_way_point。
+
+dry_run=false + lower_controller_enabled=true
+  才允许发布 /way_point，但仍拒绝 /cmd_vel 或 */cmd_vel。
+```
+
+真实 waypoint handoff 示例：
+
+```bash
+bash scripts/run_real_robot_instruction_runtime.sh \
+  instruction:="find a book" \
+  dataset_target:=book \
+  policy_mode:=semantic_snapshot \
+  instruction_plan_backend:=rules \
+  dry_run:=false \
+  lower_controller_enabled:=true \
+  waypoint_topic:=/way_point \
+  hold_topic:=/platform/safe_hold \
+  cancel_topic:=/local_planner/cancel \
+  allow_emergency_stop_publish:=false
 ```
 
 Orin LIO 启动使用宿主侧 helper，确保 Point-LIO 发布 STRIVE 需要的点云：

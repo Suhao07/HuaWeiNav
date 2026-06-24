@@ -17,6 +17,8 @@ Starts only the STRIVE high-level instruction runtime node.
 Safe defaults are defined in the launch file:
   dry_run:=true
   policy_mode:=wait
+  lower_controller_enabled:=false
+  allow_emergency_stop_publish:=false
 
 Example:
   scripts/run_real_robot_instruction_runtime.sh \\
@@ -45,6 +47,30 @@ Final verifier dry-run:
     instruction_plan_backend:=llm \\
     enable_final_verifier:=true \\
     run_directory:=/tmp/strive_real_robot_runtime_verifier
+
+Test waypoint without lower controller:
+  scripts/run_real_robot_instruction_runtime.sh \\
+    instruction:="find a book" \\
+    dataset_target:=book \\
+    policy_mode:=semantic_snapshot \\
+    instruction_plan_backend:=rules \\
+    dry_run:=false \\
+    lower_controller_enabled:=false \\
+    waypoint_topic:=/strive/test_way_point \\
+    run_directory:=/tmp/strive_real_robot_runtime_test_waypoint
+
+Real waypoint handoff:
+  scripts/run_real_robot_instruction_runtime.sh \\
+    instruction:="find a book" \\
+    dataset_target:=book \\
+    policy_mode:=semantic_snapshot \\
+    instruction_plan_backend:=rules \\
+    dry_run:=false \\
+    lower_controller_enabled:=true \\
+    waypoint_topic:=/way_point \\
+    hold_topic:=/platform/safe_hold \\
+    cancel_topic:=/local_planner/cancel \\
+    run_directory:=/tmp/strive_real_robot_runtime_waypoint
 EOF
 }
 

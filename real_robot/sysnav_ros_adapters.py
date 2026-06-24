@@ -617,12 +617,30 @@ class RosWaypointController:
         publisher: Optional[Any] = None,
         point_stamped_type: Optional[Any] = None,
         status_provider: Optional[Callable[[str, MotionGoal], NavigationStatus]] = None,
+        hold_topic: str = "",
+        cancel_topic: str = "",
+        emergency_stop_topic: str = "",
+        allow_emergency_stop_publish: bool = False,
+        hold_publisher: Optional[Any] = None,
+        cancel_publisher: Optional[Any] = None,
+        emergency_stop_publisher: Optional[Any] = None,
+        empty_type: Optional[Any] = None,
         queue_size: int = 10,
     ) -> None:
         self.node = node
-        self.waypoint_topic = waypoint_topic
+        self.waypoint_topic = validate_non_velocity_publish_topic(waypoint_topic, role="waypoint")
         self.world_frame = world_frame
         self.status_provider = status_provider
+        self.hold_topic = validate_non_velocity_publish_topic(hold_topic, role="hold") if hold_topic else ""
+        self.cancel_topic = validate_non_velocity_publish_topic(cancel_topic, role="cancel") if cancel_topic else ""
+        self.emergency_stop_topic = (
+            validate_non_velocity_publish_topic(emergency_stop_topic, role="emergency_stop")
+            if emergency_stop_topic
+            else ""
+        )
+        # 默认不发布 emergency stop；平台急停系统必须由现场安全链路显式授权。
+        self.allow_emergency_stop_publish = bool(allow_emergency_stop_publish)
+        self._empty_type = empty_type
         self._last_goal_id: Optional[str] = None
         self._last_goal: Optional[MotionGoal] = None
         self._last_status = NavigationStatus(NavigationStatusCode.IDLE, message="no goal submitted")
@@ -634,7 +652,14 @@ class RosWaypointController:
         else:
             # 核心：ROS message 类型延迟导入，保证非 ROS 环境仍可 import adapter 做离线分析。
             self._point_stamped_type = point_stamped_type or _import_point_stamped_type()
-            self.publisher = node.create_publisher(self._point_stamped_type, waypoint_topic, queue_size)
+            self.publisher = node.create_publisher(self._point_stamped_type, self.waypoint_topic, queue_size)
+
+        self.hold_publisher = hold_publisher or self._create_empty_publisher(self.hold_topic, queue_size)
+        self.cancel_publisher = cancel_publisher or self._create_empty_publisher(self.cancel_topic, queue_size)
+        self.emergency_stop_publisher = emergency_stop_publisher or self._create_empty_publisher(
+            self.emergency_stop_topic,
+            queue_size,
+        )
 
     def send_goal(self, goal: MotionGoal) -> str:
         """Submit one STRIVE motion goal to SysNav and return a stable goal id."""
@@ -679,34 +704,45 @@ class RosWaypointController:
         return self._last_status
 
     def cancel(self, goal_id: Optional[str] = None) -> None:
-        """Mark the active goal as preempted.
-
-        SysNav's existing `/way_point` interface has no universal cancel topic, so
-        platform-specific stop/cancel wiring should be added by a subclass.
-        """
+        """Cancel the active goal and emit the configured platform cancel signal."""
 
         target_goal_id = goal_id or self._last_goal_id
         if self.status_provider is not None and hasattr(self.status_provider, "cancel"):
             # 如果有状态 provider，它也要同步 preempted，避免下一次 poll 又返回 RUNNING。
             self.status_provider.cancel(target_goal_id)
+        cancel_published = self._publish_empty(self.cancel_publisher)
+        # 没有 cancel topic 时退化为 hold topic，保证“撤销目标”和“停止继续推进”仍有硬件出口。
+        hold_fallback_published = False if cancel_published else self._publish_empty(self.hold_publisher)
         self._last_status = NavigationStatus(
             NavigationStatusCode.PREEMPTED,
             goal_id=target_goal_id,
             message="goal cancelled by STRIVE bridge",
+            metadata={
+                "cancel_topic": self.cancel_topic,
+                "hold_topic": self.hold_topic,
+                "cancel_signal_published": cancel_published,
+                "hold_fallback_published": hold_fallback_published,
+            },
         )
 
     def hold(self) -> None:
-        """Request a safe hold at the bridge level.
+        """Request a platform safe hold without taking over the emergency-stop chain."""
 
-        The first implementation only updates bridge state. A live robot adapter
-        should override this method to publish SysNav's platform-specific stop
-        or hold signal.
-        """
-
+        hold_published = self._publish_empty(self.hold_publisher)
+        emergency_stop_published = False
+        if self.allow_emergency_stop_publish:
+            emergency_stop_published = self._publish_empty(self.emergency_stop_publisher)
         self._last_status = NavigationStatus(
             NavigationStatusCode.IDLE,
             goal_id=self._last_goal_id,
             message="safe hold requested at STRIVE bridge",
+            metadata={
+                "hold_topic": self.hold_topic,
+                "hold_signal_published": hold_published,
+                "emergency_stop_topic": self.emergency_stop_topic,
+                "emergency_stop_publish_allowed": self.allow_emergency_stop_publish,
+                "emergency_stop_published": emergency_stop_published,
+            },
         )
 
     def _make_point_stamped(self, goal: MotionGoal) -> Any:
@@ -723,6 +759,25 @@ class RosWaypointController:
         msg.point.y = float(goal.goal_pose.position[1])
         msg.point.z = float(goal.goal_pose.position[2])
         return msg
+
+    def _create_empty_publisher(self, topic: str, queue_size: int) -> Optional[Any]:
+        """Create a ROS Empty publisher for a configured safety signal topic."""
+
+        if not topic:
+            return None
+        # hold/cancel/emergency topic 只发 Empty 信号，具体语义由平台底层安全节点解释。
+        empty_type = self._empty_type or _import_empty_type()
+        self._empty_type = empty_type
+        return self.node.create_publisher(empty_type, topic, queue_size)
+
+    def _publish_empty(self, publisher: Optional[Any]) -> bool:
+        """Publish one Empty signal and return whether a publisher was configured."""
+
+        if publisher is None:
+            return False
+        empty_type = self._empty_type or _import_empty_type()
+        publisher.publish(empty_type())
+        return True
 
 
 def build_semantic_map_snapshot(
@@ -1005,6 +1060,35 @@ def _planner_status_code(status: Optional[Dict[str, Any]]) -> Optional[Navigatio
     return None
 
 
+def normalize_ros_topic_name(topic: str) -> str:
+    """Return a normalized absolute ROS topic name for safety checks."""
+
+    text = str(topic or "").strip()
+    if not text:
+        return ""
+    while "//" in text:
+        text = text.replace("//", "/")
+    if not text.startswith("/"):
+        text = "/" + text
+    return text.rstrip("/") or "/"
+
+
+def is_direct_velocity_topic(topic: str) -> bool:
+    """Return whether a topic points at a direct ``cmd_vel`` velocity channel."""
+
+    normalized = normalize_ros_topic_name(topic)
+    return normalized == "/cmd_vel" or normalized.endswith("/cmd_vel")
+
+
+def validate_non_velocity_publish_topic(topic: str, role: str = "publish") -> str:
+    """Reject direct velocity topics and return the normalized topic."""
+
+    normalized = normalize_ros_topic_name(topic)
+    if is_direct_velocity_topic(normalized):
+        raise ValueError(f"STRIVE must not publish direct velocity commands: {role} topic={normalized}")
+    return normalized
+
+
 def _import_point_stamped_type() -> Any:
     """Import ``geometry_msgs.msg.PointStamped`` lazily."""
 
@@ -1045,6 +1129,16 @@ def _import_string_type() -> Any:
     except ImportError as exc:
         raise RuntimeError("std_msgs is required for ROS planner status subscriptions") from exc
     return String
+
+
+def _import_empty_type() -> Any:
+    """Import ``std_msgs.msg.Empty`` lazily."""
+
+    try:
+        from std_msgs.msg import Empty
+    except ImportError as exc:
+        raise RuntimeError("std_msgs is required for ROS safety signal publishers") from exc
+    return Empty
 
 
 def _set_stamp_now(point_stamped_msg: Any, node: Any) -> None:

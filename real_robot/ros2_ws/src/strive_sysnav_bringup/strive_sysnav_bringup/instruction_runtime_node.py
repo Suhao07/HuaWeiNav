@@ -19,7 +19,12 @@ from planning.semantic_snapshot_context import (
 )
 from real_robot.observation_cache import ObjectCropEvidenceProvider, RosObservationCache
 from real_robot.contracts import NavigationStatusCode, Pose3D
-from real_robot.sysnav_ros_adapters import RosNavigationStatusProvider, RosWaypointController
+from real_robot.sysnav_ros_adapters import (
+    RosNavigationStatusProvider,
+    RosWaypointController,
+    normalize_ros_topic_name,
+    validate_non_velocity_publish_topic,
+)
 from real_robot.sysnav_runtime import (
     DryRunMotionController,
     FinalInstructionVerifierAdapter,
@@ -59,6 +64,14 @@ class StriveInstructionRuntimeNode(Node):
         self.prior_map_path = str(self.get_parameter("prior_map_path").value or "")
         self.image_topic = str(self.get_parameter("image_topic").value)
         self.detection_topic = str(self.get_parameter("detection_topic").value)
+        self.waypoint_topic = str(self.get_parameter("waypoint_topic").value or "/way_point")
+        self.test_waypoint_topic = str(self.get_parameter("test_waypoint_topic").value or "/strive/test_way_point")
+        self.hold_topic = str(self.get_parameter("hold_topic").value or "")
+        self.cancel_topic = str(self.get_parameter("cancel_topic").value or "")
+        self.emergency_stop_topic = str(self.get_parameter("emergency_stop_topic").value or "")
+        self.allow_emergency_stop_publish = _param_bool(self.get_parameter("allow_emergency_stop_publish").value)
+        self.lower_controller_enabled = _param_bool(self.get_parameter("lower_controller_enabled").value)
+        self._validate_motion_safety()
         self._latest_pose: Optional[Pose3D] = None
         self._latest_image_stamp: Optional[float] = None
 
@@ -167,6 +180,7 @@ class StriveInstructionRuntimeNode(Node):
         self.get_logger().info(
             "STRIVE instruction runtime started: "
             f"dry_run={self.dry_run}, policy_mode={self.policy_mode}, "
+            f"lower_controller_enabled={self.lower_controller_enabled}, waypoint_topic={self.waypoint_topic}, "
             f"run_directory={run_directory}, prior_map_path={self.prior_map_path or '<disabled>'}"
         )
 
@@ -184,6 +198,12 @@ class StriveInstructionRuntimeNode(Node):
         self.declare_parameter("depth_topic", "")
         self.declare_parameter("pointcloud_topic", "")
         self.declare_parameter("waypoint_topic", "/way_point")
+        self.declare_parameter("test_waypoint_topic", "/strive/test_way_point")
+        self.declare_parameter("hold_topic", "")
+        self.declare_parameter("cancel_topic", "")
+        self.declare_parameter("emergency_stop_topic", "")
+        self.declare_parameter("allow_emergency_stop_publish", False)
+        self.declare_parameter("lower_controller_enabled", False)
         self.declare_parameter("world_frame", "map")
         self.declare_parameter("policy_mode", "wait")
         self.declare_parameter("dataset_target", "")
@@ -246,9 +266,13 @@ class StriveInstructionRuntimeNode(Node):
             return DryRunMotionController(status_code=_navigation_status_code(self.dry_run_status))
         return RosWaypointController(
             node=self,
-            waypoint_topic=str(self.get_parameter("waypoint_topic").value),
+            waypoint_topic=self.waypoint_topic,
             world_frame=self.world_frame,
             status_provider=self.navigation_status_provider,
+            hold_topic=self.hold_topic,
+            cancel_topic=self.cancel_topic,
+            emergency_stop_topic=self.emergency_stop_topic,
+            allow_emergency_stop_publish=self.allow_emergency_stop_publish,
         )
 
     def _build_viewpoint_evidence_loop(self):
@@ -333,6 +357,7 @@ class StriveInstructionRuntimeNode(Node):
                     "has_pose": self._latest_pose is not None,
                     "has_image": self._latest_image_stamp is not None,
                     "dry_run": self.dry_run,
+                    "runtime_safety": self._runtime_safety_metadata(),
                 },
             )
         return RuntimeReadiness(
@@ -343,6 +368,7 @@ class StriveInstructionRuntimeNode(Node):
                 "has_pose": self._latest_pose is not None,
                 "has_image": self._latest_image_stamp is not None,
                 "dry_run": self.dry_run,
+                "runtime_safety": self._runtime_safety_metadata(),
             },
         )
 
@@ -350,6 +376,9 @@ class StriveInstructionRuntimeNode(Node):
         """Run one high-level runtime step and log the decision."""
 
         decision = self.runtime.step(self.instruction)
+        # 每条决策日志都携带控制边界，便于复盘时确认有没有启用真实底盘链路。
+        decision.metadata.setdefault("runtime_safety", self._runtime_safety_metadata())
+        decision.lower_planner_state.setdefault("runtime_safety", self._runtime_safety_metadata())
         payload = self._decision_writer.write(decision)
         intent = payload.get("intent", {})
         mode = intent.get("mode", "unknown")
@@ -367,6 +396,57 @@ class StriveInstructionRuntimeNode(Node):
 
         msg = self.get_clock().now().to_msg()
         return _stamp_to_seconds(msg)
+
+    def _validate_motion_safety(self) -> None:
+        """Validate live motion parameters before any publisher is created."""
+
+        self.waypoint_topic = validate_non_velocity_publish_topic(self.waypoint_topic, role="waypoint")
+        self.test_waypoint_topic = validate_non_velocity_publish_topic(
+            self.test_waypoint_topic,
+            role="test_waypoint",
+        )
+        if self.hold_topic:
+            self.hold_topic = validate_non_velocity_publish_topic(self.hold_topic, role="hold")
+        if self.cancel_topic:
+            self.cancel_topic = validate_non_velocity_publish_topic(self.cancel_topic, role="cancel")
+        if self.emergency_stop_topic:
+            self.emergency_stop_topic = validate_non_velocity_publish_topic(
+                self.emergency_stop_topic,
+                role="emergency_stop",
+            )
+
+        if self.dry_run:
+            return
+        if self.lower_controller_enabled:
+            return
+        if _same_topic(self.waypoint_topic, self.test_waypoint_topic):
+            self.get_logger().warning(
+                "lower_controller_enabled=false; publishing only to configured test waypoint topic "
+                f"{self.test_waypoint_topic}"
+            )
+            return
+        raise RuntimeError(
+            "Refusing live waypoint publication: dry_run=false requires lower_controller_enabled=true "
+            f"or waypoint_topic:={self.test_waypoint_topic}"
+        )
+
+    def _runtime_safety_metadata(self) -> dict:
+        """Return JSON-friendly safety boundary metadata for decision logs."""
+
+        motion_output = "dry_run"
+        if not self.dry_run:
+            motion_output = "lower_controller" if self.lower_controller_enabled else "test_waypoint"
+        return {
+            "motion_output": motion_output,
+            "dry_run": self.dry_run,
+            "lower_controller_enabled": self.lower_controller_enabled,
+            "waypoint_topic": self.waypoint_topic,
+            "test_waypoint_topic": self.test_waypoint_topic,
+            "hold_topic": self.hold_topic,
+            "cancel_topic": self.cancel_topic,
+            "emergency_stop_topic": self.emergency_stop_topic,
+            "allow_emergency_stop_publish": self.allow_emergency_stop_publish,
+        }
 
 
 def _stamp_to_seconds(stamp) -> float:
@@ -390,6 +470,12 @@ def _navigation_status_code(value) -> NavigationStatusCode:
         return NavigationStatusCode(str(value or "").strip().lower())
     except ValueError:
         return NavigationStatusCode.IDLE
+
+
+def _same_topic(left: str, right: str) -> bool:
+    """Return whether two ROS topic strings refer to the same normalized topic."""
+
+    return normalize_ros_topic_name(left) == normalize_ros_topic_name(right)
 
 
 def main(args: Optional[list[str]] = None) -> None:
