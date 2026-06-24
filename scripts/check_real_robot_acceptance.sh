@@ -6,8 +6,9 @@ cd "${ROOT_DIR}"
 
 export PYTHONPYCACHEPREFIX="${PYTHONPYCACHEPREFIX:-/tmp/pycache_strive_real_robot_acceptance}"
 export PYTEST_DISABLE_PLUGIN_AUTOLOAD="${PYTEST_DISABLE_PLUGIN_AUTOLOAD:-1}"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
 
-python -m py_compile \
+"${PYTHON_BIN}" -m py_compile \
   real_robot/contracts.py \
   real_robot/sysnav_ros_adapters.py \
   real_robot/sysnav_runtime.py \
@@ -17,7 +18,7 @@ python -m py_compile \
   real_robot/ros2_ws/src/strive_sysnav_bringup/launch/strive_instruction_runtime.launch.py \
   real_robot/ros2_ws/src/strive_sysnav_bringup/launch/sysnav_detection_mapping.launch.py
 
-PYTHONPATH=. pytest -q \
+PYTHONPATH=. "${PYTHON_BIN}" -m pytest -q \
   tests/test_real_robot_acceptance.py \
   tests/test_sysnav_ros_adapters.py \
   tests/test_sysnav_runtime.py \
