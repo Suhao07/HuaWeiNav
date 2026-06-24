@@ -34,7 +34,9 @@ Robot sensor topics
   -> /detection_result, /object_nodes_list, /room_nodes_list
   -> RosDetectionResultAdapter / RosObjectNodeAdapter / RosRoomNodeAdapter
   -> SemanticMapSnapshot
-  -> SemanticSnapshotInstructionPolicy.decide(...)
+  -> SemanticMapSnapshotPolicyContext
+  -> planning.select_target_candidate(...)
+  -> existing upper instruction policy / intent adapter
   -> NavigationIntent
   -> MotionGoal
   -> RosWaypointController
@@ -54,10 +56,11 @@ Robot sensor topics
 | Motion bridge | `MotionGoal` | `/way_point`、`NavigationStatus` | 不能调用 VLM，不能判断自然语言任务是否成功 |
 | Evidence loop | `ViewpointGoal`、`NavigationStatus`、当前观测 | `ViewEvidence`、verifier decision | 未到达视点时不能伪造 final verifier 证据 |
 
-当前仓库已经具备 contract、SysNav ROS adapter、motion goal 和 evidence loop
-骨架。仍需补齐 live ROS node、真实 `NavigationStatus` provider、观测缓存、
-crop evidence provider，以及消费 `SemanticMapSnapshot` 的高层 instruction policy。
-详细待做项见 `docs/real_robot_todo_checklist.md`。
+当前仓库已经具备 contract、SysNav ROS adapter、motion goal、live ROS node、
+`NavigationStatus` provider、观测缓存、crop evidence provider，以及消费
+`SemanticMapSnapshot` 的高层策略适配上下文。后续重点是安全边界、真实
+`InstructionPlan` provider、final verifier 接线和端到端 smoke。详细待做项见
+`docs/real_robot_todo_checklist.md`。
 
 ## 2. 硬件与传感器
 
@@ -1407,6 +1410,63 @@ bash scripts/run_real_robot_instruction_runtime.sh \
 `policy_mode=first_object_smoke` 只用于验证
 `SemanticMapSnapshot -> NavigationIntent -> MotionGoal` 的线缆级链路；它不会
 理解自然语言，也不能作为最终实物策略。
+
+`policy_mode=semantic_snapshot` 是第 5 项接入的真实指令适配模式：
+
+```bash
+bash scripts/run_real_robot_instruction_runtime.sh \
+  instruction:="find a book" \
+  dataset_target:=book \
+  policy_mode:=semantic_snapshot \
+  instruction_plan_backend:=llm \
+  dry_run:=true \
+  enable_final_verifier:=false \
+  run_directory:=/tmp/strive_real_robot_runtime
+```
+
+该模式在 node 初始化时调用现有
+`instruction_adapter.compiler.compile_instruction_plan()` 生成 `InstructionPlan`，
+再通过 `SemanticMapSnapshotIntentAdapter` 复用
+`planning.select_target_candidate()`。`enable_final_verifier:=true` 时，active goal
+到达后会用 `ViewpointEvidenceLoop.verify_reached()` 采集 evidence，并通过
+`FinalInstructionVerifierAdapter` 调用现有 `FinalInstructionVerifier`；只有 verifier
+`accept` 才会返回 `STOP`。
+
+第 5 项已经从“实物侧新策略”改回“现有策略适配”。实物模式不再在
+`real_robot` 目录维护一份 terminal / anchor / relation / verifier 状态机，而是通过
+`SemanticMapSnapshotPolicyContext` 复用现有上层目标选择和指令导航逻辑：
+
+```text
+SemanticMapSnapshot + InstructionPlan
+  -> SemanticMapSnapshotPolicyContext
+  -> planning.select_target_candidate(...)
+  -> SemanticMapSnapshotIntentAdapter
+  -> NavigationIntent / MotionGoal
+```
+
+当前已经实现的边界：
+
+```text
+planning/semantic_snapshot_context.py
+  ObjectNodeSnapshot -> mapper-like object adapter
+  SemanticMapSnapshot -> mapper-like policy context
+  select_target_candidate_from_snapshot(...)
+
+real_robot/sysnav_runtime.py
+  RealInstructionRuntimeState
+  active goal tracking
+  completed-goal suppress until verifier/policy state advances
+```
+
+后续接入顺序：
+
+```text
+InstructionPlan provider
+  -> SemanticMapSnapshotPolicyContext
+  -> existing policy / intent adapter
+  -> ViewpointEvidenceLoop after NavigationStatus.REACHED
+  -> final verifier
+```
 
 live node 同时维护 `RosObservationCache`，用于后续 viewpoint evidence 和 final
 verifier：

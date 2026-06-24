@@ -361,10 +361,12 @@ class RosNavigationStatusProvider:
         now = self.now_fn()
         state = self._goal_states.get(goal_id)
         if state is None:
+            # 每个 /way_point 目标独立维护进度，避免新目标继承旧目标的 timeout/no-progress 状态。
             state = _GoalProgressState(goal_id=goal_id, started_at=now, last_progress_at=now)
             self._goal_states[goal_id] = state
 
         if state.preempted:
+            # cancel/hold 只改变 STRIVE bridge 状态；真正急停仍应由平台安全系统处理。
             return NavigationStatus(
                 NavigationStatusCode.PREEMPTED,
                 goal_id=goal_id,
@@ -375,6 +377,7 @@ class RosNavigationStatusProvider:
             )
 
         if not goal.requires_motion():
+            # WAIT/STOP 不进入底层规划器，防止高层语义状态被误发布成机器人运动目标。
             status = NavigationStatusCode.REACHED if goal.mode == MotionGoalMode.STOP else NavigationStatusCode.IDLE
             return NavigationStatus(
                 status,
@@ -396,6 +399,7 @@ class RosNavigationStatusProvider:
             )
 
         if self.latest_pose is None:
+            # 没有 odom 时不能估计距离或进度，只能保持 QUEUED，不能盲目判定 blocked。
             return NavigationStatus(
                 NavigationStatusCode.QUEUED,
                 goal_id=goal_id,
@@ -408,6 +412,7 @@ class RosNavigationStatusProvider:
         self._record_progress_sample(state, now, distances["distance_3d_m"])
 
         if state.initial_distance_m is None:
+            # 首次拿到距离时建立 baseline，后续 progress/no-progress 都相对它计算。
             state.initial_distance_m = distances["distance_3d_m"]
             state.best_distance_m = distances["distance_3d_m"]
         elif state.best_distance_m is None or distances["distance_3d_m"] < state.best_distance_m - self.min_progress_delta_m:
@@ -419,6 +424,7 @@ class RosNavigationStatusProvider:
         progress = self._progress_fraction(state, distances["distance_3d_m"])
 
         if self._is_reached(distances):
+            # REACHED 先由几何阈值确认；是否语义成功必须交给 final verifier。
             return NavigationStatus(
                 NavigationStatusCode.REACHED,
                 goal_id=goal_id,
@@ -439,6 +445,7 @@ class RosNavigationStatusProvider:
             NavigationStatusCode.PREEMPTED,
             NavigationStatusCode.FAILED,
         }:
+            # 下层 planner 的显式终态优先于 timeout/no-progress 推断，但只接受 fresh status。
             return NavigationStatus(
                 planner_status,
                 goal_id=goal_id,
@@ -453,6 +460,7 @@ class RosNavigationStatusProvider:
 
         elapsed_s = now - state.started_at
         if elapsed_s >= self.timeout_s:
+            # timeout 是本次 motion attempt 的执行超时，不代表语义任务失败。
             return NavigationStatus(
                 NavigationStatusCode.TIMEOUT,
                 goal_id=goal_id,
@@ -467,6 +475,7 @@ class RosNavigationStatusProvider:
 
         no_progress_elapsed_s = now - state.last_progress_at
         if no_progress_elapsed_s >= self.no_progress_timeout_s:
+            # no-progress 用距离下降判断局部阻塞，后续可由上层策略重新选点或换目标。
             return NavigationStatus(
                 NavigationStatusCode.BLOCKED,
                 goal_id=goal_id,
@@ -559,6 +568,7 @@ class RosNavigationStatusProvider:
             if self.latest_planner_status is None
             else max(0.0, now - float(self.latest_planner_status.get("received_at", now)))
         )
+        # metadata 是复盘定位问题的主入口，尽量保留原始距离、路径、planner 状态和进度采样。
         return {
             "goal_mode": goal.mode.value,
             "goal_frame_id": goal.goal_pose.frame_id if goal.goal_pose else None,
@@ -591,6 +601,7 @@ class RosNavigationStatusProvider:
             return None
         received_at = float(self.latest_planner_status.get("received_at", now))
         if now - received_at > self.path_stale_timeout_s:
+            # 过期的 blocked/timeout 不能污染后续新目标。
             return None
         return _planner_status_code(self.latest_planner_status)
 
@@ -629,6 +640,7 @@ class RosWaypointController:
         """Submit one STRIVE motion goal to SysNav and return a stable goal id."""
 
         goal_id = f"sysnav_goal:{uuid.uuid4().hex}"
+        # goal_id 是 STRIVE 侧的跟踪 id；SysNav /way_point 本身没有 action goal id。
         self._last_goal_id = goal_id
         self._last_goal = goal
 
@@ -662,6 +674,7 @@ class RosWaypointController:
             # live robot 可接入 odom/path/progress monitor；adapter 本身不推断可达性。
             return self.status_provider(goal_id, self._last_goal)
         if goal_id != self._last_goal_id:
+            # 未知 goal_id 说明 runtime 状态和 bridge 状态已经错位，直接暴露 FAILED 便于排查。
             return NavigationStatus(NavigationStatusCode.FAILED, goal_id=goal_id, message="unknown goal id")
         return self._last_status
 
@@ -674,6 +687,7 @@ class RosWaypointController:
 
         target_goal_id = goal_id or self._last_goal_id
         if self.status_provider is not None and hasattr(self.status_provider, "cancel"):
+            # 如果有状态 provider，它也要同步 preempted，避免下一次 poll 又返回 RUNNING。
             self.status_provider.cancel(target_goal_id)
         self._last_status = NavigationStatus(
             NavigationStatusCode.PREEMPTED,

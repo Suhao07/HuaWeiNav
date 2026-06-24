@@ -97,16 +97,69 @@ persist_observation_images=true
 observation_image_directory:=/tmp/strive_real_robot_runtime/observations
 ```
 
-## 5. SemanticSnapshotInstructionPolicy
+## 5. SemanticMapSnapshotPolicyContext
 
-- [ ] 新增 `SemanticSnapshotInstructionPolicy`，消费 `SemanticMapSnapshot` 和 `InstructionPlan`。
-- [ ] 将 `ObjectNodeSnapshot` 转成 concept matcher 可消费的 lightweight object payload。
-- [ ] 支持 terminal target 选择，输出 `GO_TO_OBJECT` 或 `VERIFY_TARGET` intent。
-- [ ] 支持 anchor-first relation search，anchor 只能输出 `GO_TO_ANCHOR`，不能触发成功。
-- [ ] 接入 `ConstraintEvaluator` 的关系/属性/房间约束证据。
-- [ ] 接入 final verifier：只有 verifier `accept` 且物理合同满足时输出 `STOP`。
-- [ ] 接入 view-control：`need_better_view` 时输出 `IMPROVE_VIEW` 或 `VERIFY_RELATION`。
-- [ ] 增加 fake snapshot 测试：anchor 不可 stop、hard rejected instance 不屏蔽同类其它实例。
+- [x] 废弃实物侧重复语义策略设计。
+- [x] 新增 `planning/semantic_snapshot_context.py`，只做 `SemanticMapSnapshot -> mapper-like context` 适配。
+- [x] 将 `ObjectNodeSnapshot` 包装成现有 `select_target_candidate()` 可消费的 object payload。
+- [x] 复用现有 `InstructionObjectSearchPolicy`、`RuntimeConceptMatcher`、`VerificationLedger` 和 anchor-first 逻辑。
+- [x] 保留 hard rejected instance 只屏蔽单个 uid 的语义，不屏蔽同类其它实例。
+- [x] 增加 fake snapshot 测试：terminal target、anchor-first、instance-scoped hard reject。
+- [x] 新增 `RealInstructionRuntimeState`，避免 live runtime 在 lower planner 仍执行同一 goal 时重复 dispatch。
+- [x] 将真实 `InstructionPlan` provider 接入 live ROS node。
+- [x] 将 context selection result 转成现有上层策略的 `NavigationIntent`，不要在 `real_robot` 重写导航状态机。
+- [x] 在 `NavigationStatus.REACHED` 后接入 `ViewpointEvidenceLoop` / final verifier。
+
+当前边界：
+
+```text
+SemanticMapSnapshot + InstructionPlan
+  -> SemanticMapSnapshotPolicyContext
+  -> planning.select_target_candidate(...)
+  -> SemanticMapSnapshotIntentAdapter
+  -> NavigationIntent
+```
+
+当前实现：
+
+```text
+policy_mode:=semantic_snapshot
+  -> compile_instruction_plan(instruction, dataset_target, backend, vlm)
+  -> StaticInstructionPlanProvider
+  -> SemanticMapSnapshotIntentAdapter.decide(snapshot)
+  -> GO_TO_OBJECT / GO_TO_ANCHOR / WAIT
+  -> SysNavInstructionRuntime
+  -> /way_point
+  -> NavigationStatus.REACHED
+  -> ObjectCropEvidenceProvider
+  -> ViewpointEvidenceLoop.verify_reached(...)
+  -> optional FinalInstructionVerifierAdapter
+  -> verifier accept => STOP
+```
+
+安全默认：
+
+```text
+policy_mode:=wait
+dry_run:=true
+enable_final_verifier:=false
+```
+
+`enable_final_verifier:=false` 时仍会保留 reached evidence loop 接线，但不会产生
+`STOP`；真机启用 final verifier 前应先用 `dry_run:=true` 检查
+`runtime_decisions.jsonl`。
+
+关键原则：
+
+```text
+real_robot owns ROS/SysNav adaptation, observation cache, status provider, waypoint bridge.
+planning owns target/anchor/relation candidate selection.
+instruction_adapter owns concept matching, constraints, ledgers, final verification state.
+final verifier owns STOP authority.
+```
+
+也就是说，实物模式替换的是输入输出边界，不应该在 `real_robot` 目录再实现一份
+terminal / anchor / relation / verifier 状态机。
 
 ## 6. Safety Boundary
 

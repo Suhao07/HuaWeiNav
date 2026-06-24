@@ -180,6 +180,138 @@ def test_instruction_runtime_dispatches_navigation_intent_to_motion_controller()
     assert decision.lower_planner_state["object_count"] == 1
 
 
+def test_instruction_runtime_tracks_active_goal_without_redispatching() -> None:
+    bridge = SysNavSemanticMapBridge(robot_pose_provider=lambda: Pose3D(position=(0.0, 0.0, 0.0)))
+    bridge.update_object_nodes(_object_list_msg())
+    policy = FakePolicy()
+    controller = FakeMotionController(
+        [
+            NavigationStatus(NavigationStatusCode.RUNNING, message="accepted"),
+            NavigationStatus(NavigationStatusCode.RUNNING, message="still moving"),
+        ]
+    )
+    runtime = SysNavInstructionRuntime(
+        semantic_map_bridge=bridge,
+        high_level_policy=policy,
+        motion_controller=controller,
+        now_fn=lambda: 4.0,
+    )
+
+    first = runtime.step("find a book")
+    second = runtime.step("find a book")
+
+    assert first.navigation_status.status == NavigationStatusCode.RUNNING
+    assert second.navigation_status.status == NavigationStatusCode.RUNNING
+    assert second.lower_planner_state["tracking_active_goal"] is True
+    assert len(controller.goals) == 1
+    assert len(policy.calls) == 1
+
+
+def test_instruction_runtime_suppresses_reached_goal_until_policy_state_advances() -> None:
+    bridge = SysNavSemanticMapBridge(robot_pose_provider=lambda: Pose3D(position=(0.0, 0.0, 0.0)))
+    bridge.update_object_nodes(_object_list_msg())
+    policy = FakePolicy()
+    controller = FakeMotionController(
+        [
+            NavigationStatus(NavigationStatusCode.RUNNING, message="accepted"),
+            NavigationStatus(NavigationStatusCode.REACHED, message="reached waypoint"),
+        ]
+    )
+    runtime = SysNavInstructionRuntime(
+        semantic_map_bridge=bridge,
+        high_level_policy=policy,
+        motion_controller=controller,
+        now_fn=lambda: 4.0,
+    )
+
+    runtime.step("find a book")
+    reached = runtime.step("find a book")
+    suppressed = runtime.step("find a book")
+
+    assert reached.navigation_status.status == NavigationStatusCode.REACHED
+    assert reached.lower_planner_state["tracking_active_goal"] is False
+    assert suppressed.intent.mode == MotionGoalMode.WAIT
+    assert suppressed.lower_planner_state["suppressed_completed_goal"] is True
+    assert len(controller.goals) == 1
+    assert len(policy.calls) == 2
+
+
+def test_instruction_runtime_verifies_reached_goal_and_emits_stop() -> None:
+    bridge = SysNavSemanticMapBridge(robot_pose_provider=lambda: Pose3D(position=(0.0, 0.0, 0.0)))
+    bridge.update_object_nodes(_object_list_msg())
+    policy = FakePolicy()
+    controller = FakeMotionController(
+        [
+            NavigationStatus(NavigationStatusCode.RUNNING, goal_id="goal-1", message="accepted"),
+            NavigationStatus(
+                NavigationStatusCode.REACHED,
+                goal_id="goal-1",
+                current_pose=Pose3D(position=(1.0, 2.0, -0.8)),
+                message="reached waypoint",
+            ),
+        ]
+    )
+    evidence_provider = FakeEvidenceProvider()
+    verifier = FakeVerifier()
+    runtime = SysNavInstructionRuntime(
+        semantic_map_bridge=bridge,
+        high_level_policy=policy,
+        motion_controller=controller,
+        viewpoint_evidence_loop=ViewpointEvidenceLoop(
+            motion_controller=controller,
+            evidence_provider=evidence_provider,
+            final_verifier=verifier,
+        ),
+        now_fn=lambda: 4.0,
+    )
+
+    first = runtime.step("find a book")
+    second = runtime.step("find a book")
+
+    assert first.navigation_status.status == NavigationStatusCode.RUNNING
+    assert second.intent.mode == MotionGoalMode.STOP
+    assert second.navigation_status.status == NavigationStatusCode.REACHED
+    assert second.verifier_decision["decision"] == "accept"
+    assert evidence_provider.calls
+    assert verifier.calls
+    assert len(controller.goals) == 1
+
+
+def test_instruction_runtime_verifies_immediate_reached_goal() -> None:
+    bridge = SysNavSemanticMapBridge(robot_pose_provider=lambda: Pose3D(position=(0.0, 0.0, 0.0)))
+    bridge.update_object_nodes(_object_list_msg())
+    policy = FakePolicy()
+    controller = FakeMotionController(
+        [
+            NavigationStatus(
+                NavigationStatusCode.REACHED,
+                goal_id="goal-1",
+                current_pose=Pose3D(position=(1.0, 2.0, -0.8)),
+                message="already reached",
+            )
+        ]
+    )
+    evidence_provider = FakeEvidenceProvider()
+    runtime = SysNavInstructionRuntime(
+        semantic_map_bridge=bridge,
+        high_level_policy=policy,
+        motion_controller=controller,
+        viewpoint_evidence_loop=ViewpointEvidenceLoop(
+            motion_controller=controller,
+            evidence_provider=evidence_provider,
+            final_verifier=FakeVerifier(),
+        ),
+        now_fn=lambda: 4.0,
+    )
+
+    decision = runtime.step("find a book")
+
+    assert decision.intent.mode == MotionGoalMode.STOP
+    assert decision.navigation_status.status == NavigationStatusCode.REACHED
+    assert evidence_provider.calls
+    assert len(controller.goals) == 1
+
+
 def test_dry_run_motion_controller_records_goal_without_running_waypoint() -> None:
     controller = DryRunMotionController()
     goal = MotionGoal(

@@ -52,8 +52,10 @@ from real_robot.sysnav_ros_adapters import (
 )
 from real_robot.sysnav_runtime import (
     DryRunMotionController,
+    FinalInstructionVerifierAdapter,
     FirstObjectSmokePolicy,
     LatestObservationEvidenceProvider,
+    RealInstructionRuntimeState,
     RuntimeDecisionJsonlWriter,
     RuntimeReadiness,
     SysNavInstructionRuntime,
@@ -102,8 +104,10 @@ __all__ = [
     "SysNavTopicConfig",
     "build_semantic_map_snapshot",
     "DryRunMotionController",
+    "FinalInstructionVerifierAdapter",
     "FirstObjectSmokePolicy",
     "LatestObservationEvidenceProvider",
+    "RealInstructionRuntimeState",
     "RuntimeDecisionJsonlWriter",
     "RuntimeReadiness",
     "SysNavInstructionRuntime",

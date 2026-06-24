@@ -141,6 +141,7 @@ class RosObservationCache:
     def update_rgb_image(self, msg: Any, topic: Optional[str] = None) -> _CachedImageRecord:
         """Cache the latest RGB image and return its lightweight record."""
 
+        # 高频相机 topic 只缓存最新引用；默认不把图像字节持续写盘。
         record = self._cache_image(msg, topic or self.rgb_topic, prefix="rgb")
         self.latest_rgb = record
         self.image_records.append(record)
@@ -172,6 +173,7 @@ class RosObservationCache:
     def update_detection_result(self, msg: Any, image_ref: Optional[str] = None) -> DetectionFrame:
         """Convert and cache a SysNav `DetectionResult` message."""
 
+        # detection frame 要绑定当前 RGB 引用，后续 evidence 才能追溯 bbox 来自哪一帧。
         frame = self.detection_adapter.from_msg(
             msg,
             image_ref=image_ref or (self.latest_rgb.image_ref if self.latest_rgb is not None else None),
@@ -193,6 +195,7 @@ class RosObservationCache:
         """Return the latest `RealObservation`, or None when pose/RGB is missing."""
 
         if self.latest_pose is None or self.latest_rgb is None:
+            # RealObservation 必须至少有 pose + RGB；缺任意一个都交给 runtime readiness 等待。
             return None
         camera = self.latest_rgb.as_camera_frame(
             camera_model=self.camera_model,
@@ -214,6 +217,7 @@ class RosObservationCache:
             )
             if value is not None
         )
+        # observation timestamp 取已缓存输入中的最新时间，用于标记这是一组“最近值”融合快照。
         return RealObservation(
             timestamp=float(timestamp),
             robot_pose=self.latest_pose,
@@ -244,6 +248,7 @@ class RosObservationCache:
         storage = "ros_uri"
         image_ref = f"ros://{topic}/image/{stamp:.9f}"
         if self.persist_images:
+            # 只有显式 persist_images 时才写原始 bytes；真机默认避免高频写盘。
             raw_path, metadata_path = self._write_image_payload(msg, prefix, stamp, topic)
             image_ref = raw_path
             storage = "file"
@@ -322,10 +327,12 @@ class ObjectCropEvidenceProvider:
     def capture(self, goal: ViewpointGoal, status: NavigationStatus) -> ViewEvidence:
         """Capture evidence for a reached viewpoint goal."""
 
+        # 这里假设 caller 已确认 REACHED；provider 只负责把最新观测包装成 verifier evidence。
         observation = self.observation_provider()
         camera = observation.primary_camera() if observation is not None else None
         objects = _objects_from_provider(self.object_provider())
         target_uid = goal.target_object_uid or goal.anchor_object_uid
+        # target uid 可以来自 terminal target，也可以来自 anchor-first 的 anchor 视点。
         target_object = _find_object(objects, target_uid)
         detection = self.detection_provider() if self.detection_provider is not None else None
 
@@ -398,6 +405,7 @@ def _select_bbox(
 
     if target_object is not None:
         if target_object.bbox2d_xyxy is not None:
+            # object node 自带 bbox 时优先使用，因为它和 mapper uid 绑定最强。
             return target_object.bbox2d_xyxy, "object_node"
         metadata_bbox = target_object.metadata.get("bbox2d_xyxy") if isinstance(target_object.metadata, dict) else None
         if metadata_bbox is not None:
@@ -406,10 +414,12 @@ def _select_bbox(
         if detection is not None and track_ids and detection.track_ids:
             for idx, track_id in enumerate(detection.track_ids):
                 if str(track_id) in track_ids and idx < len(detection.boxes_xyxy):
+                    # track id 次优先，能把 detector bbox 和 SysNav object uid 对齐。
                     return detection.boxes_xyxy[idx], "detection_track"
         if detection is not None:
             for idx, label in enumerate(detection.labels):
                 if label == target_object.label and idx < len(detection.boxes_xyxy):
+                    # label fallback 只用于弱证据；多个同类物体时需要 verifier 再判断。
                     return detection.boxes_xyxy[idx], "detection_label"
     return None, None
 
@@ -423,8 +433,10 @@ def _select_image_ref(
     """Return image reference and source label for the evidence mode."""
 
     if mode in {"auto", "bbox_crop"} and target_object is not None and target_object.image_ref:
+        # SysNav object image_ref 通常是对象裁剪或标注图，优先给 verifier 看目标局部。
         return target_object.image_ref, "object_image_ref"
     if camera is not None:
+        # 没有对象图像时退回当前整帧 RGB，避免伪造 crop。
         return camera.image_ref, "camera_frame"
     if target_object is not None and target_object.image_ref:
         return target_object.image_ref, "object_image_ref"
@@ -457,6 +469,7 @@ def _evidence_quality(
         area_px = max(0.0, x2 - x1) * max(0.0, y2 - y1)
         quality["bbox_area_px"] = area_px
         if width and height and width > 0 and height > 0:
+            # 这些 view quality facts 只作为 verifier prompt/日志事实，不在这里硬编码成功阈值。
             quality["bbox_area_ratio"] = area_px / float(width * height)
             quality["center_score"] = _center_score(bbox, width, height)
             margin_px = min(x1, y1, width - x2, height - y2)

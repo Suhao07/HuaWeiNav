@@ -141,22 +141,180 @@ STRIVE consumes `/object_nodes_list` and `/room_nodes_list` through
 `real_robot.sysnav_runtime.SysNavSemanticMapBridge`, then publishes waypoint
 goals with `real_robot.sysnav_ros_adapters.RosWaypointController`.
 
-The high-level runtime node is available through:
+### High-Level Runtime Test Commands
+
+The high-level runtime node subscribes `/object_nodes_list`,
+`/room_nodes_list`, `/aft_mapped_to_init`, `/camera/image`, and
+`/detection_result`. The wrapper script sources ROS and the overlay, then adds
+the repository root to `PYTHONPATH` for the shared STRIVE `real_robot` package.
+
+Run tests in this order. Do not skip directly to `dry_run:=false`.
+
+#### 1. Safe WAIT Smoke
+
+This verifies launch, subscriptions, readiness gates, and JSONL logging. It
+does not compile an instruction plan and never publishes `/way_point`.
+
+```bash
+cd /home/ubuntu/WorkSpace/project/Huawei\ Nav/Code/STRIVE
+bash scripts/run_real_robot_instruction_runtime.sh \
+  instruction:="find a book" \
+  policy_mode:=wait \
+  dry_run:=true \
+  run_directory:=/tmp/strive_real_robot_runtime_wait
+```
+
+Inspect the decisions:
+
+```bash
+tail -n 20 /tmp/strive_real_robot_runtime_wait/runtime_decisions.jsonl
+```
+
+Expected result:
+
+```text
+intent.mode == "wait"
+motion_goal == null
+no /way_point publication
+```
+
+#### 2. Semantic Snapshot Dry-Run
+
+This compiles the instruction into an `InstructionPlan`, adapts
+`SemanticMapSnapshot` through `SemanticMapSnapshotPolicyContext`, and emits a
+`NavigationIntent`. It still does not publish `/way_point`.
+
+Use `instruction_plan_backend:=rules` for offline wiring tests. Use
+`instruction_plan_backend:=llm` only when the LLM/VLM runtime is configured.
 
 ```bash
 bash scripts/run_real_robot_instruction_runtime.sh \
   instruction:="find a book" \
+  dataset_target:=book \
+  policy_mode:=semantic_snapshot \
+  instruction_plan_backend:=rules \
   dry_run:=true \
-  policy_mode:=wait \
-  run_directory:=/tmp/strive_real_robot_runtime
+  enable_final_verifier:=false \
+  run_directory:=/tmp/strive_real_robot_runtime_semantic_dry
 ```
 
-It subscribes `/object_nodes_list`, `/room_nodes_list`, `/aft_mapped_to_init`,
-and `/camera/image`. By default it only writes
-`/tmp/strive_real_robot_runtime/runtime_decisions.jsonl`; it does not publish
-`/way_point` unless `dry_run:=false` is set. The script sources ROS and the
-overlay, then adds the repository root to `PYTHONPATH` for the shared STRIVE
-`real_robot` package.
+Inspect:
+
+```bash
+tail -n 20 /tmp/strive_real_robot_runtime_semantic_dry/runtime_decisions.jsonl
+```
+
+Expected result after object snapshots arrive:
+
+```text
+intent.mode in {"go_to_object", "go_to_anchor", "wait"}
+motion_goal is present only for go_to_* intents
+navigation_status.metadata.dry_run == true for dispatched dry-run goals
+no /way_point publication
+```
+
+#### 3. Semantic Dry-Run With Evidence Files
+
+This is useful before enabling final verifier. It persists observation images
+for replay/debug. It still does not publish `/way_point`, and it does not run
+the final verifier unless a reached status is reported.
+
+```bash
+bash scripts/run_real_robot_instruction_runtime.sh \
+  instruction:="find a book" \
+  dataset_target:=book \
+  policy_mode:=semantic_snapshot \
+  instruction_plan_backend:=rules \
+  dry_run:=true \
+  enable_final_verifier:=false \
+  persist_observation_images:=true \
+  observation_image_directory:=/tmp/strive_real_robot_runtime_semantic_evidence/observations \
+  run_directory:=/tmp/strive_real_robot_runtime_semantic_evidence
+```
+
+Inspect:
+
+```bash
+tail -n 20 /tmp/strive_real_robot_runtime_semantic_evidence/runtime_decisions.jsonl
+find /tmp/strive_real_robot_runtime_semantic_evidence -maxdepth 3 -type f | sort | head -50
+```
+
+#### 4. Final Verifier Dry-Run
+
+Enable this only after semantic dry-run produces reasonable target intents and
+the evidence cache is available. Verifier `accept` is the only semantic STOP
+authority. `dry_run_status:=reached` simulates the lower planner reporting
+`NavigationStatus.REACHED`, so `ViewpointEvidenceLoop.verify_reached(...)` runs
+without publishing `/way_point`.
+
+```bash
+bash scripts/run_real_robot_instruction_runtime.sh \
+  instruction:="find a book" \
+  dataset_target:=book \
+  policy_mode:=semantic_snapshot \
+  instruction_plan_backend:=llm \
+  dry_run:=true \
+  dry_run_status:=reached \
+  enable_final_verifier:=true \
+  evidence_mode:=auto \
+  persist_observation_images:=true \
+  observation_image_directory:=/tmp/strive_real_robot_runtime_verifier/observations \
+  run_directory:=/tmp/strive_real_robot_runtime_verifier
+```
+
+Expected result:
+
+```text
+NavigationStatus.REACHED -> ViewpointEvidenceLoop.verify_reached(...)
+verifier_decision appears in runtime_decisions.jsonl
+verifier accept -> intent.mode == "stop"
+dry_run still prevents /way_point publication
+```
+
+#### 5. Publish Waypoints To Lower Planner
+
+Run this only after `/path`, `/aft_mapped_to_init`, and the local planner are
+healthy, and only when the robot safety boundary is already handled outside
+STRIVE. This publishes `/way_point`; STRIVE still never publishes `/cmd_vel`.
+
+```bash
+bash scripts/run_real_robot_instruction_runtime.sh \
+  instruction:="find a book" \
+  dataset_target:=book \
+  policy_mode:=semantic_snapshot \
+  instruction_plan_backend:=rules \
+  dry_run:=false \
+  enable_final_verifier:=false \
+  waypoint_topic:=/way_point \
+  path_topic:=/path \
+  odom_topic:=/aft_mapped_to_init \
+  run_directory:=/tmp/strive_real_robot_runtime_waypoint
+```
+
+Inspect from another terminal:
+
+```bash
+ros2 topic echo /way_point --once
+tail -n 20 /tmp/strive_real_robot_runtime_waypoint/runtime_decisions.jsonl
+```
+
+Only after the waypoint path is verified should `enable_final_verifier:=true`
+be used with `dry_run:=false`.
+
+#### Useful Runtime Parameters
+
+```text
+policy_mode:=wait | first_object_smoke | semantic_snapshot
+instruction:=...
+dataset_target:=...
+instruction_plan_backend:=rules | llm
+vlm:=cognav
+dry_run:=true | false
+dry_run_status:=idle | queued | running | reached | blocked | timeout | preempted | failed
+enable_final_verifier:=false | true
+evidence_mode:=auto | full_image | bbox_crop
+run_directory:=/tmp/strive_real_robot_runtime
+```
 
 The node also keeps a lightweight observation cache for evidence acquisition.
 By default image refs stay as ROS URI strings and no camera bytes are written:

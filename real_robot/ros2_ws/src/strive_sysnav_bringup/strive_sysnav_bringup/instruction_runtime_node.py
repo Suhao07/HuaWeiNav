@@ -12,12 +12,19 @@ from sensor_msgs.msg import Image, PointCloud2
 from std_msgs.msg import String
 from tare_planner.msg import DetectionResult, ObjectNodeList, RoomNodeList
 
-from real_robot.observation_cache import RosObservationCache
-from real_robot.contracts import Pose3D
+from instruction_adapter.compiler import compile_instruction_plan
+from planning.semantic_snapshot_context import (
+    SemanticMapSnapshotIntentAdapter,
+    StaticInstructionPlanProvider,
+)
+from real_robot.observation_cache import ObjectCropEvidenceProvider, RosObservationCache
+from real_robot.contracts import NavigationStatusCode, Pose3D
 from real_robot.sysnav_ros_adapters import RosNavigationStatusProvider, RosWaypointController
 from real_robot.sysnav_runtime import (
     DryRunMotionController,
+    FinalInstructionVerifierAdapter,
     FirstObjectSmokePolicy,
+    ViewpointEvidenceLoop,
     RuntimeDecisionJsonlWriter,
     RuntimeReadiness,
     SysNavInstructionRuntime,
@@ -38,10 +45,17 @@ class StriveInstructionRuntimeNode(Node):
 
         self.instruction = str(self.get_parameter("instruction").value or "")
         self.world_frame = str(self.get_parameter("world_frame").value or "map")
+        # 安全默认：dry_run=true 时只写 runtime_decisions.jsonl，不发布 /way_point。
         self.dry_run = _param_bool(self.get_parameter("dry_run").value)
+        self.dry_run_status = str(self.get_parameter("dry_run_status").value or "idle")
         self.require_image = _param_bool(self.get_parameter("require_image").value)
         self.require_pose = _param_bool(self.get_parameter("require_pose").value)
         self.policy_mode = str(self.get_parameter("policy_mode").value or "wait")
+        self.dataset_target = str(self.get_parameter("dataset_target").value or "")
+        self.instruction_plan_backend = str(self.get_parameter("instruction_plan_backend").value or "llm")
+        self.vlm = str(self.get_parameter("vlm").value or "cognav")
+        self.enable_final_verifier = _param_bool(self.get_parameter("enable_final_verifier").value)
+        self.evidence_mode = str(self.get_parameter("evidence_mode").value or "auto")
         self.prior_map_path = str(self.get_parameter("prior_map_path").value or "")
         self.image_topic = str(self.get_parameter("image_topic").value)
         self.detection_topic = str(self.get_parameter("detection_topic").value)
@@ -75,10 +89,13 @@ class StriveInstructionRuntimeNode(Node):
         self.semantic_bridge = SysNavSemanticMapBridge(robot_pose_provider=self._current_pose)
         self.high_level_policy = self._build_policy(self.policy_mode)
         self.motion_controller = self._build_motion_controller()
+        # evidence loop 只在 semantic_snapshot 模式下启用；wait/smoke 不需要 verifier 链路。
+        self.viewpoint_evidence_loop = self._build_viewpoint_evidence_loop()
         self.runtime = SysNavInstructionRuntime(
             semantic_map_bridge=self.semantic_bridge,
             high_level_policy=self.high_level_policy,
             motion_controller=self.motion_controller,
+            viewpoint_evidence_loop=self.viewpoint_evidence_loop,
             readiness_provider=self._readiness,
             now_fn=self._now_seconds,
         )
@@ -169,11 +186,17 @@ class StriveInstructionRuntimeNode(Node):
         self.declare_parameter("waypoint_topic", "/way_point")
         self.declare_parameter("world_frame", "map")
         self.declare_parameter("policy_mode", "wait")
+        self.declare_parameter("dataset_target", "")
+        self.declare_parameter("instruction_plan_backend", "llm")
+        self.declare_parameter("vlm", "cognav")
+        self.declare_parameter("enable_final_verifier", False)
+        self.declare_parameter("evidence_mode", "auto")
         self.declare_parameter("prior_map_path", "")
         self.declare_parameter("run_directory", "/tmp/strive_real_robot_runtime")
         self.declare_parameter("decision_period_s", 1.0)
         self.declare_parameter("queue_size", 10)
         self.declare_parameter("dry_run", True)
+        self.declare_parameter("dry_run_status", "idle")
         self.declare_parameter("require_pose", True)
         self.declare_parameter("require_image", True)
         self.declare_parameter("xy_goal_tolerance_m", 0.35)
@@ -191,6 +214,25 @@ class StriveInstructionRuntimeNode(Node):
         normalized = policy_mode.strip().lower()
         if normalized == "first_object_smoke":
             return FirstObjectSmokePolicy()
+        if normalized in {"semantic_snapshot", "semantic_map_snapshot", "instruction", "instruction_plan"}:
+            if not self.instruction.strip():
+                return WaitInstructionPolicy("semantic_snapshot policy requires non-empty instruction")
+            # InstructionPlan 只在显式 semantic_snapshot 模式编译，避免 wait/smoke 启动时触发 LLM。
+            plan = compile_instruction_plan(
+                raw_instruction=self.instruction,
+                dataset_target=self.dataset_target,
+                backend=self.instruction_plan_backend,
+                vlm=self.vlm,
+            )
+            self.get_logger().info(
+                "compiled InstructionPlan for semantic_snapshot policy: "
+                f"valid={plan.valid}, targets={plan.target_detector_prompts}, "
+                f"backend={self.instruction_plan_backend}, vlm={self.vlm}"
+            )
+            return SemanticMapSnapshotIntentAdapter(
+                StaticInstructionPlanProvider(plan),
+                vlm=self.vlm,
+            )
         if normalized in {"wait", "disabled", ""}:
             return WaitInstructionPolicy("high-level semantic policy is disabled")
         self.get_logger().warning(f"unknown policy_mode={policy_mode}; falling back to WAIT")
@@ -200,12 +242,45 @@ class StriveInstructionRuntimeNode(Node):
         """Build either dry-run or waypoint-publishing motion controller."""
 
         if self.dry_run:
-            return DryRunMotionController()
+            # dry_run_status 可模拟 reached/blocked 等状态，用于不接底盘时测试 verifier 分支。
+            return DryRunMotionController(status_code=_navigation_status_code(self.dry_run_status))
         return RosWaypointController(
             node=self,
             waypoint_topic=str(self.get_parameter("waypoint_topic").value),
             world_frame=self.world_frame,
             status_provider=self.navigation_status_provider,
+        )
+
+    def _build_viewpoint_evidence_loop(self):
+        """Build reached-view evidence and optional final verifier loop."""
+
+        if self.policy_mode.strip().lower() not in {
+            "semantic_snapshot",
+            "semantic_map_snapshot",
+            "instruction",
+            "instruction_plan",
+        }:
+            return None
+        # ObjectCropEvidenceProvider 复用 observation cache，不直接订阅 ROS topic。
+        evidence_provider = ObjectCropEvidenceProvider(
+            observation_provider=self.observation_cache.latest_observation,
+            object_provider=lambda: self.semantic_bridge.build_snapshot(timestamp=self._now_seconds()),
+            detection_provider=lambda: self.observation_cache.latest_detection_frame,
+            mode=self.evidence_mode,
+            now_fn=self._now_seconds,
+        )
+        final_verifier = FinalInstructionVerifierAdapter(vlm=self.vlm) if self.enable_final_verifier else None
+        if final_verifier is None:
+            # 可先跑 evidence loop dry-run，不给 STOP 权限；打开 verifier 前先确认证据可用。
+            self.get_logger().warning(
+                "semantic_snapshot evidence loop is enabled without final verifier; "
+                "reached goals will not produce STOP"
+            )
+        return ViewpointEvidenceLoop(
+            motion_controller=self.motion_controller,
+            evidence_provider=evidence_provider,
+            final_verifier=final_verifier,
+            now_fn=self._now_seconds,
         )
 
     def _update_odom(self, msg: Odometry) -> None:
@@ -248,6 +323,7 @@ class StriveInstructionRuntimeNode(Node):
         if self.require_image and self._latest_image_stamp is None:
             missing.append("image")
         if missing:
+            # readiness gate 是最后一道保护：输入未齐时 runtime 不会调用 policy 或发布 waypoint。
             return RuntimeReadiness(
                 ready=False,
                 reason="waiting for live inputs: " + ", ".join(missing),
@@ -305,6 +381,15 @@ def _param_bool(value) -> bool:
     if isinstance(value, bool):
         return value
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _navigation_status_code(value) -> NavigationStatusCode:
+    """Return a navigation status code from a launch parameter string."""
+
+    try:
+        return NavigationStatusCode(str(value or "").strip().lower())
+    except ValueError:
+        return NavigationStatusCode.IDLE
 
 
 def main(args: Optional[list[str]] = None) -> None:

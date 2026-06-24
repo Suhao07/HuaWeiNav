@@ -92,7 +92,8 @@ Instruction
   -> SemanticMapSnapshot
   -> PriorMapMemory.update_from_snapshot(snapshot)
   -> PriorMapQueryService.query(plan, snapshot, memory)
-  -> SemanticSnapshotInstructionPolicy.decide(..., prior_context)
+  -> SemanticMapSnapshotPolicyContext(..., prior_context)
+  -> existing planning policy / intent adapter
   -> NavigationIntent
   -> MotionGoal
   -> /way_point
@@ -420,7 +421,7 @@ real snapshot replay:
 2. `PriorMapMemory`，接入 mapper/snapshot 的只读 update。
 3. `PriorMapQueryService`，生成 `SearchPriorResult`。
 4. 仿真接入 room/frontier/object ranking。
-5. 实物接入 `SemanticSnapshotInstructionPolicy` 的 prior context。
+5. 实物接入 `SemanticMapSnapshotPolicyContext` / 现有 planning policy 的 prior ranking context。
 6. SoM/debug artifact。
 7. 仿真和 bag replay smoke。
 

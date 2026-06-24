@@ -24,6 +24,27 @@ Example:
     dry_run:=true \\
     policy_mode:=wait \\
     run_directory:=/tmp/strive_real_robot_runtime
+
+Semantic snapshot dry-run:
+  scripts/run_real_robot_instruction_runtime.sh \\
+    instruction:="find a book" \\
+    dataset_target:=book \\
+    dry_run:=true \\
+    policy_mode:=semantic_snapshot \\
+    instruction_plan_backend:=llm \\
+    enable_final_verifier:=false \\
+    run_directory:=/tmp/strive_real_robot_runtime
+
+Final verifier dry-run:
+  scripts/run_real_robot_instruction_runtime.sh \\
+    instruction:="find a book" \\
+    dataset_target:=book \\
+    dry_run:=true \\
+    dry_run_status:=reached \\
+    policy_mode:=semantic_snapshot \\
+    instruction_plan_backend:=llm \\
+    enable_final_verifier:=true \\
+    run_directory:=/tmp/strive_real_robot_runtime_verifier
 EOF
 }
 
