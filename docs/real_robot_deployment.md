@@ -1594,6 +1594,23 @@ export SYSNAV_SAM2_CHECKPOINT=/path/to/sam2.1_hiera_base_plus.pt
 bash scripts/run_sysnav_detection_mapping.sh
 ```
 
+`scripts/run_sysnav_detection_mapping.sh` 默认只启动 SysNav detector 和
+semantic mapping。只有显式设置 `START_STRIVE_RUNTIME=1` 时，它才会同时启动
+`strive_instruction_runtime`：
+
+```bash
+START_STRIVE_RUNTIME=1 \
+STRIVE_INSTRUCTION="find a book" \
+STRIVE_DATASET_TARGET=book \
+STRIVE_POLICY_MODE=semantic_snapshot \
+STRIVE_INSTRUCTION_PLAN_BACKEND=rules \
+STRIVE_DRY_RUN=true \
+bash scripts/run_sysnav_detection_mapping.sh \
+  cloud_topic:=/cloud_registered \
+  odom_topic:=/aft_mapped_to_init \
+  camera_topic:=/camera/image
+```
+
 这条链路启动后，STRIVE 侧期望看到：
 
 ```text
@@ -1605,6 +1622,43 @@ bash scripts/run_sysnav_detection_mapping.sh
 其中 `/room_nodes_list` 仍取决于是否同时启动 room segmentation / local planner
 相关节点。第一版 overlay 已保证 detector 和 semantic mapping 可在 STRIVE
 workspace 内构建；完整 SysNav C++ local planner 后续应作为单独迁移阶段处理。
+
+### 12.5.1 Bag replay runtime
+
+离线 bag replay 不启动 detector/mapping，而是直接回放已经录制好的
+STRIVE-facing topic：
+
+```text
+/object_nodes_list
+/room_nodes_list
+/aft_mapped_to_init
+/camera/image
+/detection_result
+/path
+```
+
+入口：
+
+```bash
+bash scripts/run_real_robot_bag_replay.sh /path/to/bag \
+  instruction:="find a book" \
+  dataset_target:=book \
+  policy_mode:=semantic_snapshot \
+  instruction_plan_backend:=rules \
+  dry_run:=true \
+  run_directory:=/tmp/strive_real_robot_bag_replay
+```
+
+topic 名不一致时，通过环境变量改映射：
+
+```text
+BAG_OBJECT_TOPIC
+BAG_ROOM_TOPIC
+BAG_ODOM_TOPIC
+BAG_IMAGE_TOPIC
+BAG_DETECTION_TOPIC
+BAG_PATH_TOPIC
+```
 
 ### 12.6 单镜像实物部署
 
@@ -1653,6 +1707,35 @@ CONTAINER_NAME=huawei-nav-real
 BLOCK_LOWER_CONTROLLER=1
 ENABLE_LOWER_CONTROLLER=0
 ```
+
+`docker_en.sh` 会透传 detector/mapping、instruction runtime、LLM/provider、
+prior map 和安全边界相关环境变量。常用项：
+
+```text
+SYSNAV_DETECTOR_MODEL_PATH
+SYSNAV_SAM2_CHECKPOINT
+SYSNAV_CLIP_VIT_B32_PATH
+SYSNAV_MOBILECLIP_BLT_TS_PATH
+
+START_STRIVE_RUNTIME
+STRIVE_INSTRUCTION
+STRIVE_DATASET_TARGET
+STRIVE_POLICY_MODE
+STRIVE_INSTRUCTION_PLAN_BACKEND
+STRIVE_VLM
+STRIVE_PRIOR_MAP_PATH
+STRIVE_OBJECT_TOPIC / STRIVE_ROOM_TOPIC / STRIVE_ODOM_TOPIC / STRIVE_IMAGE_TOPIC
+STRIVE_WAYPOINT_TOPIC / STRIVE_HOLD_TOPIC / STRIVE_CANCEL_TOPIC
+
+LLM_PROVIDER
+LLM_MODEL
+LLM_API_BASE_URL
+ARK_API_KEY
+GEMINI_API_KEY
+```
+
+如果 `STRIVE_PRIOR_MAP_PATH` 指向宿主文件，`docker_en.sh` 会把该文件所在
+目录只读挂载进容器，容器内仍按相同绝对路径读取。
 
 因此默认只启动 LIO 检查、相机、detector 和 semantic mapping；底层控制器被阻塞，
 不会主动启动 `/cmd_vel` 发布链路。需要联调底盘时，必须显式设置：
@@ -1755,6 +1838,27 @@ export SYSNAV_MOBILECLIP_BLT_TS_PATH=/home/orin26/code/HuaWeiNav/real_robot/ros2
 只读挂载进容器，并在容器内使用相同绝对路径读取模型。脚本也会透传 `LLM_PROVIDER`、
 `ARK_API_KEY`、`LLM_MODEL`、`LLM_API_BASE_URL`、`MAP_PROVIDER`、`AMAP_KEY`
 等运行时环境变量，因此真机部署不需要同时启动另一个 STRIVE 容器。
+
+代码导出使用：
+
+```bash
+bash scripts/export_code_only.sh
+```
+
+该脚本默认导出到父目录下的 `STRIVE_code_only_<timestamp>`，并排除：
+
+```text
+.git
+.env*
+weights/ checkpoints/
+*.pt *.pth *.engine *.onnx
+*.bag *.db3 *.mcap
+logs/ output/ outputs/ data/ datasets/
+real_robot/ros2_ws/build/
+real_robot/ros2_ws/install/
+real_robot/ros2_ws/log/
+docs/Zhu et al. - 2025 - STRIVE Structured Representation Integrating VLM Reasoning for Efficient Object Navigation.pdf
+```
 
 这种边界的原因是：Habitat 仿真栈和 ROS2 Humble 真机栈的系统依赖不同。强行把
 Habitat、ROS、SysNav detector、SAM2、TensorRT 全部塞进同一个“万能镜像”，会让

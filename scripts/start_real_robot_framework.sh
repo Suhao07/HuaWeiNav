@@ -33,6 +33,9 @@ Usage: scripts/start_real_robot_framework.sh [ros2 launch args...]
 Starts the real-robot STRIVE/SysNav framework inside the container:
   Livox/Point-LIO input topics -> camera -> detection -> semantic mapping.
 
+High-level STRIVE instruction runtime is not started by default. Set
+START_STRIVE_RUNTIME=1 to launch it together with detector/mapping.
+
 Safety defaults:
   BLOCK_LOWER_CONTROLLER=1
   ENABLE_LOWER_CONTROLLER=0
@@ -102,6 +105,7 @@ preflight() {
   echo "camera_topic=${CAMERA_TOPIC}"
   echo "start_usb_cam=${START_USB_CAM}"
   echo "block_lower_controller=${BLOCK_LOWER_CONTROLLER}"
+  echo "start_strive_runtime=${START_STRIVE_RUNTIME:-0}"
 
   if is_true "${WAIT_FOR_LIO}"; then
     wait_for_topic "${CLOUD_TOPIC}" "sensor_msgs/msg/PointCloud2" "${PREFLIGHT_TIMEOUT_S}"
@@ -156,7 +160,8 @@ main() {
   maybe_start_lower_controller
 
   section "Start STRIVE Real-Robot Framework"
-  echo "Launching detection + semantic mapping. Control output remains blocked unless explicitly enabled."
+  echo "Launching detection + semantic mapping. High-level runtime starts only when START_STRIVE_RUNTIME=1."
+  echo "Control output remains blocked unless explicitly enabled."
   exec "${REPO_ROOT}/scripts/run_sysnav_detection_mapping.sh" \
     "platform:=${PLATFORM}" \
     "cloud_topic:=${CLOUD_TOPIC}" \

@@ -27,3 +27,8 @@ real_robot/ros2_ws/log
 *.pth
 *.engine
 *.onnx
+*.npy
+*.npz
+*.bag
+*.db3
+*.mcap

@@ -215,6 +215,7 @@ class StriveInstructionRuntimeNode(Node):
         self.declare_parameter("run_directory", "/tmp/strive_real_robot_runtime")
         self.declare_parameter("decision_period_s", 1.0)
         self.declare_parameter("queue_size", 10)
+        self.declare_parameter("use_sim_time", False)
         self.declare_parameter("dry_run", True)
         self.declare_parameter("dry_run_status", "idle")
         self.declare_parameter("require_pose", True)

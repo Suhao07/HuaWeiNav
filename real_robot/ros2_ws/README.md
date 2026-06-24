@@ -95,6 +95,23 @@ bash scripts/run_sysnav_detection_mapping.sh \
   use_sim_time:=false
 ```
 
+`run_sysnav_detection_mapping.sh` does not start the STRIVE instruction runtime
+unless explicitly requested:
+
+```bash
+START_STRIVE_RUNTIME=1 \
+STRIVE_INSTRUCTION="find a book" \
+STRIVE_DATASET_TARGET=book \
+STRIVE_POLICY_MODE=semantic_snapshot \
+STRIVE_INSTRUCTION_PLAN_BACKEND=rules \
+STRIVE_DRY_RUN=true \
+bash scripts/run_sysnav_detection_mapping.sh \
+  platform:=mecanum \
+  cloud_topic:=/cloud_registered \
+  odom_topic:=/aft_mapped_to_init \
+  camera_topic:=/camera/image
+```
+
 On the current Orin/Mid-360 robot, Point-LIO publishes the registered cloud
 and odometry under its native topic names. Start the STRIVE overlay with
 explicit remaps:
@@ -140,6 +157,34 @@ Output:
 STRIVE consumes `/object_nodes_list` and `/room_nodes_list` through
 `real_robot.sysnav_runtime.SysNavSemanticMapBridge`, then publishes waypoint
 goals with `real_robot.sysnav_ros_adapters.RosWaypointController`.
+
+### Bag Replay Runtime
+
+Use bag replay when the recorded bag already contains STRIVE-facing topics such
+as `/object_nodes_list`, `/room_nodes_list`, `/aft_mapped_to_init`, and
+`/camera/image`. This path does not start detector/mapping.
+
+```bash
+bash scripts/run_real_robot_bag_replay.sh /path/to/recorded_bag \
+  instruction:="find a book" \
+  dataset_target:=book \
+  policy_mode:=semantic_snapshot \
+  instruction_plan_backend:=rules \
+  dry_run:=true \
+  run_directory:=/tmp/strive_real_robot_bag_replay
+```
+
+If the bag used different topic names, set the corresponding env vars before
+launch:
+
+```text
+BAG_OBJECT_TOPIC=/object_nodes_list
+BAG_ROOM_TOPIC=/room_nodes_list
+BAG_ODOM_TOPIC=/aft_mapped_to_init
+BAG_IMAGE_TOPIC=/camera/image
+BAG_DETECTION_TOPIC=/detection_result
+BAG_PATH_TOPIC=/path
+```
 
 ### High-Level Runtime Test Commands
 
@@ -524,6 +569,31 @@ The real-robot Docker runner defaults `FASTDDS_BUILTIN_TRANSPORTS=UDPv4`.
 On this Orin, ROS graph discovery worked from the container without it, but
 host-published LIO data did not cross the Docker boundary until FastDDS shared
 memory transport was disabled for the container.
+
+Docker runtime envs used by `docker_en.sh` include:
+
+```text
+START_STRIVE_RUNTIME
+STRIVE_INSTRUCTION
+STRIVE_DATASET_TARGET
+STRIVE_POLICY_MODE
+STRIVE_INSTRUCTION_PLAN_BACKEND
+STRIVE_VLM
+STRIVE_PRIOR_MAP_PATH
+STRIVE_OBJECT_TOPIC / STRIVE_ROOM_TOPIC / STRIVE_ODOM_TOPIC / STRIVE_IMAGE_TOPIC
+STRIVE_WAYPOINT_TOPIC / STRIVE_HOLD_TOPIC / STRIVE_CANCEL_TOPIC
+LLM_PROVIDER / LLM_MODEL / LLM_API_BASE_URL / ARK_API_KEY / GEMINI_API_KEY
+SYSNAV_DETECTOR_MODEL_PATH / SYSNAV_SAM2_CHECKPOINT / SYSNAV_CLIP_VIT_B32_PATH
+```
+
+For code-only transfer, use:
+
+```bash
+bash scripts/export_code_only.sh
+```
+
+The export script excludes `.git`, local env files, model weights, rosbag
+files, runtime output, caches, and `real_robot/ros2_ws/{build,install,log}`.
 
 ## Motion Interface
 

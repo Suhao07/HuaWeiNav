@@ -210,11 +210,46 @@ runtime_safety.allow_emergency_stop_publish
 - [x] 提供 `scripts/start_real_robot_framework.sh`，启动前检查 `/cloud_registered` 和 `/aft_mapped_to_init`。
 - [x] 提供 `scripts/start_orin_lio_for_strive.sh`，覆盖 Point-LIO `publish.scan_publish_en:=true`。
 - [x] 提供 `scripts/smoke_real_robot_orin.sh`，做 LIO、相机、容器 DDS、CUDA/ML、detector 初始化检查。
-- [ ] 更新 `scripts/run_sysnav_detection_mapping.sh`，明确高层 node 是否一起启动。
+- [x] 更新 `scripts/run_sysnav_detection_mapping.sh`，明确高层 node 是否一起启动。
 - [x] 新增 `scripts/run_real_robot_instruction_runtime.sh`，只启动 STRIVE 高层 runtime。
-- [ ] 增加 bag replay 入口，读取录制的 object/room/odom/image topic。
-- [ ] 更新 Docker run 环境变量：instruction、topic remap、model paths、LLM provider、prior map path。
-- [ ] 确保权重、bag、缓存和 build/install/log 产物不进入代码导出。
+- [x] 增加 bag replay 入口，读取录制的 object/room/odom/image topic。
+- [x] 更新 Docker run 环境变量：instruction、topic remap、model paths、LLM provider、prior map path。
+- [x] 确保权重、bag、缓存和 build/install/log 产物不进入代码导出。
+
+当前实现：
+
+```text
+scripts/run_sysnav_detection_mapping.sh
+  默认只启动 detector + semantic_mapping。
+  START_STRIVE_RUNTIME=1 时才并行启动 strive_instruction_runtime。
+
+scripts/run_real_robot_instruction_runtime.sh
+  只启动 STRIVE 高层 runtime。
+
+scripts/run_real_robot_bag_replay.sh BAG_PATH
+  ros2 bag play --clock
+  -> strive_instruction_runtime(use_sim_time=true, dry_run=true)
+  -> 读取 object/room/odom/image/detection/path topic。
+
+scripts/export_code_only.sh [DEST_DIR]
+  导出代码，不包含 .git、权重、bag、缓存、ROS build/install/log、runtime output。
+```
+
+Docker/env 边界：
+
+```text
+START_STRIVE_RUNTIME
+STRIVE_INSTRUCTION
+STRIVE_DATASET_TARGET
+STRIVE_POLICY_MODE
+STRIVE_INSTRUCTION_PLAN_BACKEND
+STRIVE_VLM
+STRIVE_PRIOR_MAP_PATH
+STRIVE_OBJECT_TOPIC / STRIVE_ROOM_TOPIC / STRIVE_ODOM_TOPIC / STRIVE_IMAGE_TOPIC
+STRIVE_WAYPOINT_TOPIC / STRIVE_HOLD_TOPIC / STRIVE_CANCEL_TOPIC
+LLM_PROVIDER / LLM_MODEL / LLM_API_BASE_URL / ARK_API_KEY / GEMINI_API_KEY
+SYSNAV_DETECTOR_MODEL_PATH / SYSNAV_SAM2_CHECKPOINT / SYSNAV_CLIP_VIT_B32_PATH
+```
 
 ## 8. Smoke And Acceptance
 
