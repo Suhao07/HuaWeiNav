@@ -8,9 +8,10 @@ module remains importable in unit tests and offline analysis environments.
 
 from __future__ import annotations
 
+import math
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, Optional, Sequence, Tuple
 
 from real_robot.contracts import (
@@ -42,6 +43,8 @@ class SysNavTopicConfig:
     object_nodes_list: str = "/object_nodes_list"
     room_nodes_list: str = "/room_nodes_list"
     waypoint: str = "/way_point"
+    odometry: str = "/aft_mapped_to_init"
+    path: str = "/path"
     world_frame: str = "map"
 
 
@@ -197,6 +200,401 @@ class RosRoomNodeAdapter:
         return tuple(self.from_msg(node) for node in _as_sequence(getattr(msg, "nodes", ())))
 
 
+@dataclass
+class _GoalProgressState:
+    goal_id: str
+    started_at: float
+    last_progress_at: float
+    initial_distance_m: Optional[float] = None
+    best_distance_m: Optional[float] = None
+    preempted: bool = False
+    progress_samples: list[Dict[str, float]] = field(default_factory=list)
+
+
+class RosNavigationStatusProvider:
+    """Infer `NavigationStatus` from odometry, path, and planner status topics.
+
+    The provider does not publish control commands and does not own path
+    planning. It is a read-only progress monitor that can be passed to
+    `RosWaypointController(status_provider=...)`.
+    """
+
+    def __init__(
+        self,
+        xy_tolerance_m: float = 0.35,
+        z_tolerance_m: Optional[float] = 1.0,
+        heading_tolerance_rad: Optional[float] = None,
+        timeout_s: float = 60.0,
+        no_progress_timeout_s: float = 12.0,
+        min_progress_delta_m: float = 0.05,
+        path_stale_timeout_s: float = 5.0,
+        max_progress_samples: int = 20,
+        world_frame: str = SysNavTopicConfig.world_frame,
+        now_fn: Callable[[], float] = time.monotonic,
+    ) -> None:
+        """Initialize the status provider.
+
+        Args:
+            xy_tolerance_m: Goal reached threshold in the horizontal plane.
+            z_tolerance_m: Optional vertical threshold. Set to `None` to ignore
+                z. The default is permissive because SysNav waypoints may carry
+                a ground-relative z offset while odometry z stays near zero.
+            heading_tolerance_rad: Optional heading threshold. The first
+                `/way_point` interface carries only a point, so heading is
+                ignored unless a future controller supplies it explicitly.
+            timeout_s: Maximum wall/ROS time for one goal attempt.
+            no_progress_timeout_s: Time without meaningful distance decrease
+                before reporting `BLOCKED`.
+            min_progress_delta_m: Minimum distance improvement considered real
+                progress.
+            path_stale_timeout_s: Age after which a cached path is treated as
+                stale for metadata.
+            max_progress_samples: Number of recent distance samples to keep.
+            world_frame: Default frame for pose messages without header frame.
+            now_fn: Time source used for elapsed/progress calculations.
+        """
+
+        self.xy_tolerance_m = float(xy_tolerance_m)
+        self.z_tolerance_m = None if z_tolerance_m is None else float(z_tolerance_m)
+        self.heading_tolerance_rad = heading_tolerance_rad
+        self.timeout_s = float(timeout_s)
+        self.no_progress_timeout_s = float(no_progress_timeout_s)
+        self.min_progress_delta_m = float(min_progress_delta_m)
+        self.path_stale_timeout_s = float(path_stale_timeout_s)
+        self.max_progress_samples = int(max_progress_samples)
+        self.world_frame = world_frame
+        self.now_fn = now_fn
+
+        self.latest_pose: Optional[Pose3D] = None
+        self.latest_path_points: Tuple[Tuple[float, float, float], ...] = ()
+        self.latest_path_stamp: Optional[float] = None
+        self.latest_path_received_at: Optional[float] = None
+        self.latest_planner_status: Optional[Dict[str, Any]] = None
+        self._goal_states: Dict[str, _GoalProgressState] = {}
+
+    def update_odometry(self, msg: Any) -> None:
+        """Cache the latest odometry pose from a ROS-like message."""
+
+        self.latest_pose = _pose3d_from_odometry_msg(msg, default_frame=self.world_frame)
+
+    def update_pose(self, pose: Pose3D) -> None:
+        """Cache a platform-neutral pose for offline replay or tests."""
+
+        self.latest_pose = pose
+
+    def update_path(self, msg: Any) -> None:
+        """Cache the latest local planner path from a ROS-like Path message."""
+
+        self.latest_path_points = _path_points_from_msg(msg)
+        self.latest_path_stamp = _stamp_from_header(getattr(msg, "header", None), default=self.now_fn())
+        self.latest_path_received_at = self.now_fn()
+
+    def update_local_planner_status(self, msg: Any) -> None:
+        """Cache a generic local planner status message.
+
+        String-like values such as `blocked`, `timeout`, `preempted`, and
+        `reached` are mapped into terminal navigation states. Boolean `False`
+        means no executable path is currently available.
+        """
+
+        value = getattr(msg, "data", msg)
+        self.latest_planner_status = {
+            "raw": value,
+            "text": str(value).strip().lower(),
+            "received_at": self.now_fn(),
+        }
+
+    def create_ros_subscriptions(
+        self,
+        node: Any,
+        odometry_type: Optional[Any] = None,
+        path_type: Optional[Any] = None,
+        planner_status_type: Optional[Any] = None,
+        odom_topic: str = SysNavTopicConfig.odometry,
+        path_topic: str = SysNavTopicConfig.path,
+        planner_status_topic: str = "",
+        queue_size: int = 10,
+    ) -> Dict[str, Any]:
+        """Create ROS subscriptions and return their handles.
+
+        ROS message types are injectable to keep unit tests independent from a
+        ROS installation.
+        """
+
+        subscriptions = {
+            "odometry": node.create_subscription(
+                odometry_type or _import_odometry_type(),
+                odom_topic,
+                self.update_odometry,
+                queue_size,
+            ),
+            "path": node.create_subscription(
+                path_type or _import_path_type(),
+                path_topic,
+                self.update_path,
+                queue_size,
+            ),
+        }
+        if planner_status_topic:
+            subscriptions["planner_status"] = node.create_subscription(
+                planner_status_type or _import_string_type(),
+                planner_status_topic,
+                self.update_local_planner_status,
+                queue_size,
+            )
+        return subscriptions
+
+    def cancel(self, goal_id: Optional[str] = None) -> None:
+        """Mark one active goal, or all goals, as preempted."""
+
+        if goal_id is None:
+            for state in self._goal_states.values():
+                state.preempted = True
+            return
+        state = self._goal_states.get(goal_id)
+        if state is not None:
+            state.preempted = True
+
+    def __call__(self, goal_id: str, goal: MotionGoal) -> NavigationStatus:
+        """Return the latest status for one active motion goal."""
+
+        now = self.now_fn()
+        state = self._goal_states.get(goal_id)
+        if state is None:
+            state = _GoalProgressState(goal_id=goal_id, started_at=now, last_progress_at=now)
+            self._goal_states[goal_id] = state
+
+        if state.preempted:
+            return NavigationStatus(
+                NavigationStatusCode.PREEMPTED,
+                goal_id=goal_id,
+                current_pose=self.latest_pose,
+                stamp=now,
+                message="goal preempted by STRIVE waypoint controller",
+                metadata=self._metadata(goal, state, now),
+            )
+
+        if not goal.requires_motion():
+            status = NavigationStatusCode.REACHED if goal.mode == MotionGoalMode.STOP else NavigationStatusCode.IDLE
+            return NavigationStatus(
+                status,
+                goal_id=goal_id,
+                current_pose=self.latest_pose,
+                stamp=now,
+                message=f"{goal.mode.value} does not require motion",
+                metadata=self._metadata(goal, state, now),
+            )
+
+        if goal.goal_pose is None:
+            return NavigationStatus(
+                NavigationStatusCode.FAILED,
+                goal_id=goal_id,
+                current_pose=self.latest_pose,
+                stamp=now,
+                message="motion goal has no goal_pose",
+                metadata=self._metadata(goal, state, now),
+            )
+
+        if self.latest_pose is None:
+            return NavigationStatus(
+                NavigationStatusCode.QUEUED,
+                goal_id=goal_id,
+                stamp=now,
+                message="waiting for odometry before evaluating navigation status",
+                metadata=self._metadata(goal, state, now),
+            )
+
+        distances = self._distances_to_goal(goal)
+        self._record_progress_sample(state, now, distances["distance_3d_m"])
+
+        if state.initial_distance_m is None:
+            state.initial_distance_m = distances["distance_3d_m"]
+            state.best_distance_m = distances["distance_3d_m"]
+        elif state.best_distance_m is None or distances["distance_3d_m"] < state.best_distance_m - self.min_progress_delta_m:
+            state.best_distance_m = distances["distance_3d_m"]
+            state.last_progress_at = now
+
+        path_length = self._path_length_remaining()
+        metadata = self._metadata(goal, state, now, distances=distances, path_length_remaining=path_length)
+        progress = self._progress_fraction(state, distances["distance_3d_m"])
+
+        if self._is_reached(distances):
+            return NavigationStatus(
+                NavigationStatusCode.REACHED,
+                goal_id=goal_id,
+                current_pose=self.latest_pose,
+                distance_to_goal=distances["distance_3d_m"],
+                path_length_remaining=path_length,
+                progress=1.0,
+                stamp=now,
+                message="goal reached within configured tolerance",
+                metadata=metadata,
+            )
+
+        planner_status = self._fresh_planner_status_code(now)
+        if planner_status in {
+            NavigationStatusCode.REACHED,
+            NavigationStatusCode.BLOCKED,
+            NavigationStatusCode.TIMEOUT,
+            NavigationStatusCode.PREEMPTED,
+            NavigationStatusCode.FAILED,
+        }:
+            return NavigationStatus(
+                planner_status,
+                goal_id=goal_id,
+                current_pose=self.latest_pose,
+                distance_to_goal=distances["distance_3d_m"],
+                path_length_remaining=path_length,
+                progress=progress,
+                stamp=now,
+                message=f"local planner reported {planner_status.value}",
+                metadata=metadata,
+            )
+
+        elapsed_s = now - state.started_at
+        if elapsed_s >= self.timeout_s:
+            return NavigationStatus(
+                NavigationStatusCode.TIMEOUT,
+                goal_id=goal_id,
+                current_pose=self.latest_pose,
+                distance_to_goal=distances["distance_3d_m"],
+                path_length_remaining=path_length,
+                progress=progress,
+                stamp=now,
+                message="navigation goal timed out before reaching target",
+                metadata=metadata,
+            )
+
+        no_progress_elapsed_s = now - state.last_progress_at
+        if no_progress_elapsed_s >= self.no_progress_timeout_s:
+            return NavigationStatus(
+                NavigationStatusCode.BLOCKED,
+                goal_id=goal_id,
+                current_pose=self.latest_pose,
+                distance_to_goal=distances["distance_3d_m"],
+                path_length_remaining=path_length,
+                progress=progress,
+                stamp=now,
+                message="navigation made no measurable progress",
+                metadata=metadata,
+            )
+
+        return NavigationStatus(
+            NavigationStatusCode.RUNNING,
+            goal_id=goal_id,
+            current_pose=self.latest_pose,
+            distance_to_goal=distances["distance_3d_m"],
+            path_length_remaining=path_length,
+            progress=progress,
+            stamp=now,
+            message="navigation goal is running",
+            metadata=metadata,
+        )
+
+    def _distances_to_goal(self, goal: MotionGoal) -> Dict[str, float]:
+        """Return x/y/z/3-D distance facts from latest pose to goal."""
+
+        assert self.latest_pose is not None
+        assert goal.goal_pose is not None
+        current = self.latest_pose.position
+        target = goal.goal_pose.position
+        dx = float(target[0] - current[0])
+        dy = float(target[1] - current[1])
+        dz = float(target[2] - current[2])
+        return {
+            "dx_m": dx,
+            "dy_m": dy,
+            "dz_m": dz,
+            "xy_distance_m": math.hypot(dx, dy),
+            "z_distance_m": abs(dz),
+            "distance_3d_m": math.sqrt(dx * dx + dy * dy + dz * dz),
+        }
+
+    def _is_reached(self, distances: Dict[str, float]) -> bool:
+        """Return whether distance facts satisfy configured reach thresholds."""
+
+        if distances["xy_distance_m"] > self.xy_tolerance_m:
+            return False
+        if self.z_tolerance_m is not None and distances["z_distance_m"] > self.z_tolerance_m:
+            return False
+        return True
+
+    def _path_length_remaining(self) -> Optional[float]:
+        """Return path length from current pose through cached path points."""
+
+        if self.latest_pose is None or not self.latest_path_points:
+            return None
+        return _path_length((self.latest_pose.position, *self.latest_path_points))
+
+    def _record_progress_sample(self, state: _GoalProgressState, stamp: float, distance_m: float) -> None:
+        """Append one bounded progress sample."""
+
+        state.progress_samples.append({"stamp": float(stamp), "distance_3d_m": float(distance_m)})
+        if len(state.progress_samples) > self.max_progress_samples:
+            del state.progress_samples[: len(state.progress_samples) - self.max_progress_samples]
+
+    def _progress_fraction(self, state: _GoalProgressState, current_distance_m: float) -> Optional[float]:
+        """Return normalized progress based on initial distance."""
+
+        if state.initial_distance_m is None or state.initial_distance_m <= 1e-6:
+            return None
+        return max(0.0, min(1.0, (state.initial_distance_m - current_distance_m) / state.initial_distance_m))
+
+    def _metadata(
+        self,
+        goal: MotionGoal,
+        state: _GoalProgressState,
+        now: float,
+        distances: Optional[Dict[str, float]] = None,
+        path_length_remaining: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Return detailed status diagnostics for logs and JSONL output."""
+
+        path_age_s = None if self.latest_path_received_at is None else max(0.0, now - self.latest_path_received_at)
+        path_available = bool(self.latest_path_points) and (
+            path_age_s is None or path_age_s <= self.path_stale_timeout_s
+        )
+        planner_status_age_s = (
+            None
+            if self.latest_planner_status is None
+            else max(0.0, now - float(self.latest_planner_status.get("received_at", now)))
+        )
+        return {
+            "goal_mode": goal.mode.value,
+            "goal_frame_id": goal.goal_pose.frame_id if goal.goal_pose else None,
+            "elapsed_s": max(0.0, now - state.started_at),
+            "timeout_s": self.timeout_s,
+            "no_progress_timeout_s": self.no_progress_timeout_s,
+            "no_progress_elapsed_s": max(0.0, now - state.last_progress_at),
+            "min_progress_delta_m": self.min_progress_delta_m,
+            "xy_tolerance_m": self.xy_tolerance_m,
+            "z_tolerance_m": self.z_tolerance_m,
+            "heading_tolerance_rad": self.heading_tolerance_rad,
+            "heading_checked": self.heading_tolerance_rad is not None,
+            "initial_distance_m": state.initial_distance_m,
+            "best_distance_m": state.best_distance_m,
+            "distance": distances or {},
+            "path_available": path_available,
+            "path_pose_count": len(self.latest_path_points),
+            "path_age_s": path_age_s,
+            "path_length_remaining": path_length_remaining,
+            "planner_status": self.latest_planner_status,
+            "planner_status_age_s": planner_status_age_s,
+            "planner_status_fresh": planner_status_age_s is not None and planner_status_age_s <= self.path_stale_timeout_s,
+            "progress_samples": list(state.progress_samples),
+        }
+
+    def _fresh_planner_status_code(self, now: float) -> Optional[NavigationStatusCode]:
+        """Return a planner status only when the cached status is fresh."""
+
+        if self.latest_planner_status is None:
+            return None
+        received_at = float(self.latest_planner_status.get("received_at", now))
+        if now - received_at > self.path_stale_timeout_s:
+            return None
+        return _planner_status_code(self.latest_planner_status)
+
+
 class RosWaypointController:
     """Publish STRIVE motion goals to SysNav's ``/way_point`` interface."""
 
@@ -275,6 +673,8 @@ class RosWaypointController:
         """
 
         target_goal_id = goal_id or self._last_goal_id
+        if self.status_provider is not None and hasattr(self.status_provider, "cancel"):
+            self.status_provider.cancel(target_goal_id)
         self._last_status = NavigationStatus(
             NavigationStatusCode.PREEMPTED,
             goal_id=target_goal_id,
@@ -498,6 +898,99 @@ def _polygon_points(polygon_stamped: Any) -> Tuple[Tuple[float, float, float], .
     return tuple(point for point in (_point_to_vector3(point_msg) for point_msg in points) if point is not None)
 
 
+def _pose3d_from_odometry_msg(msg: Any, default_frame: str) -> Pose3D:
+    """Return `Pose3D` from a ROS-like `nav_msgs/Odometry` message."""
+
+    pose_with_covariance = getattr(msg, "pose", None)
+    pose_msg = getattr(pose_with_covariance, "pose", pose_with_covariance)
+    return _pose3d_from_pose_msg(pose_msg, getattr(msg, "header", None), default_frame)
+
+
+def _pose3d_from_pose_stamped_msg(msg: Any, default_frame: str) -> Pose3D:
+    """Return `Pose3D` from a ROS-like `geometry_msgs/PoseStamped` message."""
+
+    return _pose3d_from_pose_msg(getattr(msg, "pose", None), getattr(msg, "header", None), default_frame)
+
+
+def _pose3d_from_pose_msg(pose_msg: Any, header: Any, default_frame: str) -> Pose3D:
+    """Return `Pose3D` from a ROS-like pose and header."""
+
+    position = _point_to_vector3(getattr(pose_msg, "position", None)) or (0.0, 0.0, 0.0)
+    return Pose3D(
+        position=position,
+        orientation_xyzw=_orientation_to_xyzw(getattr(pose_msg, "orientation", None)),
+        frame_id=_frame_id_from_header(header) or default_frame,
+        stamp=_stamp_from_header(header, default=0.0),
+    )
+
+
+def _orientation_to_xyzw(orientation: Any) -> Tuple[float, float, float, float]:
+    """Return a quaternion tuple from a ROS-like orientation."""
+
+    if orientation is None:
+        return (0.0, 0.0, 0.0, 1.0)
+    return (
+        float(getattr(orientation, "x", 0.0)),
+        float(getattr(orientation, "y", 0.0)),
+        float(getattr(orientation, "z", 0.0)),
+        float(getattr(orientation, "w", 1.0)),
+    )
+
+
+def _path_points_from_msg(msg: Any) -> Tuple[Tuple[float, float, float], ...]:
+    """Return path pose positions from a ROS-like `nav_msgs/Path` message."""
+
+    points = []
+    for pose_stamped in _as_sequence(getattr(msg, "poses", ())):
+        pose = _pose3d_from_pose_stamped_msg(pose_stamped, default_frame=_frame_id_from_header(getattr(msg, "header", None)) or SysNavTopicConfig.world_frame)
+        points.append(pose.position)
+    return tuple(points)
+
+
+def _path_length(points: Sequence[Tuple[float, float, float]]) -> float:
+    """Return cumulative Euclidean length for a sequence of 3-D points."""
+
+    if len(points) < 2:
+        return 0.0
+    return sum(_euclidean_distance(prev, curr) for prev, curr in zip(points[:-1], points[1:]))
+
+
+def _euclidean_distance(a: Tuple[float, float, float], b: Tuple[float, float, float]) -> float:
+    """Return Euclidean distance between two 3-D points."""
+
+    dx = float(a[0] - b[0])
+    dy = float(a[1] - b[1])
+    dz = float(a[2] - b[2])
+    return math.sqrt(dx * dx + dy * dy + dz * dz)
+
+
+def _planner_status_code(status: Optional[Dict[str, Any]]) -> Optional[NavigationStatusCode]:
+    """Map a generic local planner status record to a navigation status code."""
+
+    if status is None:
+        return None
+    raw = status.get("raw")
+    if isinstance(raw, bool):
+        return None if raw else NavigationStatusCode.BLOCKED
+
+    text = str(status.get("text", "")).strip().lower()
+    if text in {"", "running", "active", "ok", "true", "path", "path_available"}:
+        return None
+    if text in {"reached", "success", "succeeded", "done"}:
+        return NavigationStatusCode.REACHED
+    if text in {"blocked", "no_path", "no path", "path_blocked", "stuck"}:
+        return NavigationStatusCode.BLOCKED
+    if text in {"timeout", "timed_out", "time out"}:
+        return NavigationStatusCode.TIMEOUT
+    if text in {"preempted", "cancelled", "canceled", "preempt"}:
+        return NavigationStatusCode.PREEMPTED
+    if text in {"failed", "failure", "error"}:
+        return NavigationStatusCode.FAILED
+    if text == "false":
+        return NavigationStatusCode.BLOCKED
+    return None
+
+
 def _import_point_stamped_type() -> Any:
     """Import ``geometry_msgs.msg.PointStamped`` lazily."""
 
@@ -508,6 +1001,36 @@ def _import_point_stamped_type() -> Any:
             "geometry_msgs is required for RosWaypointController without an injected point_stamped_type"
         ) from exc
     return PointStamped
+
+
+def _import_odometry_type() -> Any:
+    """Import ``nav_msgs.msg.Odometry`` lazily."""
+
+    try:
+        from nav_msgs.msg import Odometry
+    except ImportError as exc:
+        raise RuntimeError("nav_msgs is required for ROS odometry subscriptions") from exc
+    return Odometry
+
+
+def _import_path_type() -> Any:
+    """Import ``nav_msgs.msg.Path`` lazily."""
+
+    try:
+        from nav_msgs.msg import Path
+    except ImportError as exc:
+        raise RuntimeError("nav_msgs is required for ROS path subscriptions") from exc
+    return Path
+
+
+def _import_string_type() -> Any:
+    """Import ``std_msgs.msg.String`` lazily."""
+
+    try:
+        from std_msgs.msg import String
+    except ImportError as exc:
+        raise RuntimeError("std_msgs is required for ROS planner status subscriptions") from exc
+    return String
 
 
 def _set_stamp_now(point_stamped_msg: Any, node: Any) -> None:

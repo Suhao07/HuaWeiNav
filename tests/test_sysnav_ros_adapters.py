@@ -4,6 +4,7 @@ from real_robot.contracts import MotionGoal, MotionGoalMode, NavigationStatusCod
 from real_robot.detector_vocabulary import DetectorVocabularyAdapter
 from real_robot.sysnav_ros_adapters import (
     RosDetectionResultAdapter,
+    RosNavigationStatusProvider,
     RosObjectNodeAdapter,
     RosRoomNodeAdapter,
     RosWaypointController,
@@ -17,6 +18,28 @@ def _point(x, y, z):
 
 def _header(sec=1, nanosec=250_000_000, frame_id="map"):
     return SimpleNamespace(stamp=SimpleNamespace(sec=sec, nanosec=nanosec), frame_id=frame_id)
+
+
+def _orientation(x=0.0, y=0.0, z=0.0, w=1.0):
+    return SimpleNamespace(x=x, y=y, z=z, w=w)
+
+
+def _pose_msg(x, y, z):
+    return SimpleNamespace(position=_point(x, y, z), orientation=_orientation())
+
+
+def _odom_msg(x, y, z, sec=1):
+    return SimpleNamespace(header=_header(sec=sec), pose=SimpleNamespace(pose=_pose_msg(x, y, z)))
+
+
+def _path_msg(*points):
+    return SimpleNamespace(
+        header=_header(sec=1),
+        poses=[
+            SimpleNamespace(header=_header(sec=1), pose=_pose_msg(point[0], point[1], point[2]))
+            for point in points
+        ],
+    )
 
 
 def _vocabulary(tmp_path):
@@ -224,3 +247,116 @@ def test_waypoint_controller_does_not_publish_stop_goal() -> None:
 
     assert publisher.published == []
     assert controller.poll_status(goal_id).status == NavigationStatusCode.REACHED
+
+
+def test_navigation_status_provider_reports_running_and_reached_from_odom_and_path() -> None:
+    clock = {"t": 0.0}
+    provider = RosNavigationStatusProvider(
+        xy_tolerance_m=0.25,
+        z_tolerance_m=1.0,
+        timeout_s=30.0,
+        no_progress_timeout_s=10.0,
+        now_fn=lambda: clock["t"],
+    )
+    provider.update_odometry(_odom_msg(0.0, 0.0, 0.0))
+    provider.update_path(_path_msg((0.5, 0.0, 0.0), (1.0, 0.0, 0.0)))
+    goal = MotionGoal(mode=MotionGoalMode.GO_TO_OBJECT, goal_pose=Pose3D(position=(1.0, 0.0, 0.0)))
+
+    running = provider("goal-1", goal)
+
+    assert running.status == NavigationStatusCode.RUNNING
+    assert running.distance_to_goal == 1.0
+    assert running.path_length_remaining == 1.0
+    assert running.metadata["path_available"] is True
+    assert running.metadata["heading_checked"] is False
+
+    clock["t"] = 1.0
+    provider.update_odometry(_odom_msg(0.8, 0.0, 0.0, sec=2))
+    reached = provider("goal-1", goal)
+
+    assert reached.status == NavigationStatusCode.REACHED
+    assert reached.distance_to_goal < 0.25
+    assert reached.progress == 1.0
+
+
+def test_navigation_status_provider_reports_timeout_before_no_progress() -> None:
+    clock = {"t": 0.0}
+    provider = RosNavigationStatusProvider(
+        xy_tolerance_m=0.1,
+        timeout_s=2.0,
+        no_progress_timeout_s=30.0,
+        now_fn=lambda: clock["t"],
+    )
+    provider.update_odometry(_odom_msg(0.0, 0.0, 0.0))
+    goal = MotionGoal(mode=MotionGoalMode.GO_TO_OBJECT, goal_pose=Pose3D(position=(2.0, 0.0, 0.0)))
+
+    assert provider("goal-timeout", goal).status == NavigationStatusCode.RUNNING
+
+    clock["t"] = 3.0
+    status = provider("goal-timeout", goal)
+
+    assert status.status == NavigationStatusCode.TIMEOUT
+    assert status.metadata["elapsed_s"] == 3.0
+
+
+def test_navigation_status_provider_reports_blocked_on_no_progress() -> None:
+    clock = {"t": 0.0}
+    provider = RosNavigationStatusProvider(
+        xy_tolerance_m=0.1,
+        timeout_s=30.0,
+        no_progress_timeout_s=2.0,
+        min_progress_delta_m=0.05,
+        now_fn=lambda: clock["t"],
+    )
+    provider.update_odometry(_odom_msg(0.0, 0.0, 0.0))
+    goal = MotionGoal(mode=MotionGoalMode.GO_TO_OBJECT, goal_pose=Pose3D(position=(2.0, 0.0, 0.0)))
+
+    assert provider("goal-blocked", goal).status == NavigationStatusCode.RUNNING
+
+    clock["t"] = 3.0
+    provider.update_odometry(_odom_msg(0.0, 0.0, 0.0, sec=4))
+    status = provider("goal-blocked", goal)
+
+    assert status.status == NavigationStatusCode.BLOCKED
+    assert status.metadata["no_progress_elapsed_s"] == 3.0
+    assert status.metadata["progress_samples"][-1]["distance_3d_m"] == 2.0
+
+
+def test_navigation_status_provider_respects_local_planner_blocked_status() -> None:
+    clock = {"t": 0.0}
+    provider = RosNavigationStatusProvider(path_stale_timeout_s=5.0, now_fn=lambda: clock["t"])
+    provider.update_odometry(_odom_msg(0.0, 0.0, 0.0))
+    provider.update_local_planner_status(SimpleNamespace(data="blocked"))
+    goal = MotionGoal(mode=MotionGoalMode.GO_TO_OBJECT, goal_pose=Pose3D(position=(2.0, 0.0, 0.0)))
+
+    status = provider("goal-planner-blocked", goal)
+
+    assert status.status == NavigationStatusCode.BLOCKED
+    assert status.metadata["planner_status"]["text"] == "blocked"
+    assert status.metadata["planner_status_fresh"] is True
+
+    clock["t"] = 6.0
+    stale = provider("goal-planner-stale", goal)
+
+    assert stale.status == NavigationStatusCode.RUNNING
+    assert stale.metadata["planner_status_fresh"] is False
+
+
+def test_waypoint_controller_cancel_marks_status_provider_preempted() -> None:
+    provider = RosNavigationStatusProvider(now_fn=lambda: 0.0)
+    provider.update_odometry(_odom_msg(0.0, 0.0, 0.0))
+    publisher = FakePublisher()
+    controller = RosWaypointController(
+        node=SimpleNamespace(),
+        publisher=publisher,
+        point_stamped_type=FakePointStamped,
+        status_provider=provider,
+    )
+    goal = MotionGoal(mode=MotionGoalMode.GO_TO_OBJECT, goal_pose=Pose3D(position=(1.0, 0.0, 0.0)))
+
+    goal_id = controller.send_goal(goal)
+    assert controller.poll_status(goal_id).status == NavigationStatusCode.RUNNING
+
+    controller.cancel(goal_id)
+
+    assert controller.poll_status(goal_id).status == NavigationStatusCode.PREEMPTED

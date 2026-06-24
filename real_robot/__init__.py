@@ -39,6 +39,7 @@ from real_robot.detector_vocabulary import (
 )
 from real_robot.sysnav_ros_adapters import (
     RosDetectionResultAdapter,
+    RosNavigationStatusProvider,
     RosObjectNodeAdapter,
     RosRoomNodeAdapter,
     RosWaypointController,
@@ -88,6 +89,7 @@ __all__ = [
     "merge_label_provenance",
     "vocabulary_context",
     "RosDetectionResultAdapter",
+    "RosNavigationStatusProvider",
     "RosObjectNodeAdapter",
     "RosRoomNodeAdapter",
     "RosWaypointController",

@@ -41,14 +41,30 @@ bash scripts/run_real_robot_instruction_runtime.sh \
 
 ## 3. NavigationStatus Provider
 
-- [ ] 新增 `RosNavigationStatusProvider`。
-- [ ] 订阅 odometry topic，计算当前 pose 与 active `MotionGoal.goal_pose` 的距离。
-- [ ] 订阅 path/local planner 状态，记录是否存在可执行路径。
-- [ ] 实现 timeout 判断。
-- [ ] 实现 no-progress 判断：连续一段时间距离无下降时返回 `BLOCKED` 或 `TIMEOUT`。
-- [ ] 明确 `REACHED` 阈值：xy tolerance、z tolerance、heading 是否参与判断。
-- [ ] 将 `NavigationStatus.metadata` 写入 distance、elapsed、path length、progress samples。
-- [ ] 增加 fake odom/path 单元测试，覆盖 `RUNNING/REACHED/BLOCKED/TIMEOUT/PREEMPTED`。
+- [x] 新增 `RosNavigationStatusProvider`。
+- [x] 订阅 odometry topic，计算当前 pose 与 active `MotionGoal.goal_pose` 的距离。
+- [x] 订阅 path/local planner 状态，记录是否存在可执行路径。
+- [x] 实现 timeout 判断。
+- [x] 实现 no-progress 判断：连续一段时间距离无下降时返回 `BLOCKED` 或 `TIMEOUT`。
+- [x] 明确 `REACHED` 阈值：xy tolerance、z tolerance、heading 是否参与判断。
+- [x] 将 `NavigationStatus.metadata` 写入 distance、elapsed、path length、progress samples。
+- [x] 增加 fake odom/path 单元测试，覆盖 `RUNNING/REACHED/BLOCKED/TIMEOUT/PREEMPTED`。
+
+当前默认阈值：
+
+```text
+xy_goal_tolerance_m=0.35
+z_goal_tolerance_m=1.0
+navigation_timeout_s=60.0
+no_progress_timeout_s=12.0
+min_progress_delta_m=0.05
+path_stale_timeout_s=5.0
+heading_tolerance_rad=None
+```
+
+heading 暂不参与 `REACHED` 判断，因为当前 SysNav `/way_point` 接口只消费
+`geometry_msgs/PointStamped`，不携带目标朝向。z 阈值默认较宽，用于兼容
+SysNav waypoint z offset 与真实 odometry z 近似为 0 的情况。
 
 ## 4. Observation Cache And Evidence
 

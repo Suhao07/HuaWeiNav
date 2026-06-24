@@ -6,13 +6,14 @@ from pathlib import Path
 from typing import Optional
 
 import rclpy
-from nav_msgs.msg import Odometry
+from nav_msgs.msg import Odometry, Path as NavPath
 from rclpy.node import Node
 from sensor_msgs.msg import Image
+from std_msgs.msg import String
 from tare_planner.msg import ObjectNodeList, RoomNodeList
 
 from real_robot.contracts import Pose3D
-from real_robot.sysnav_ros_adapters import RosWaypointController
+from real_robot.sysnav_ros_adapters import RosNavigationStatusProvider, RosWaypointController
 from real_robot.sysnav_runtime import (
     DryRunMotionController,
     FirstObjectSmokePolicy,
@@ -46,6 +47,17 @@ class StriveInstructionRuntimeNode(Node):
 
         run_directory = Path(str(self.get_parameter("run_directory").value or "/tmp/strive_real_robot_runtime"))
         self._decision_writer = RuntimeDecisionJsonlWriter(run_directory / "runtime_decisions.jsonl")
+        self.navigation_status_provider = RosNavigationStatusProvider(
+            xy_tolerance_m=float(self.get_parameter("xy_goal_tolerance_m").value),
+            z_tolerance_m=float(self.get_parameter("z_goal_tolerance_m").value),
+            heading_tolerance_rad=None,
+            timeout_s=float(self.get_parameter("navigation_timeout_s").value),
+            no_progress_timeout_s=float(self.get_parameter("no_progress_timeout_s").value),
+            min_progress_delta_m=float(self.get_parameter("min_progress_delta_m").value),
+            path_stale_timeout_s=float(self.get_parameter("path_stale_timeout_s").value),
+            world_frame=self.world_frame,
+            now_fn=self._now_seconds,
+        )
 
         self.semantic_bridge = SysNavSemanticMapBridge(robot_pose_provider=self._current_pose)
         self.high_level_policy = self._build_policy(self.policy_mode)
@@ -78,6 +90,20 @@ class StriveInstructionRuntimeNode(Node):
             queue_size,
         )
         self.create_subscription(
+            NavPath,
+            str(self.get_parameter("path_topic").value),
+            self.navigation_status_provider.update_path,
+            queue_size,
+        )
+        planner_status_topic = str(self.get_parameter("planner_status_topic").value or "")
+        if planner_status_topic:
+            self.create_subscription(
+                String,
+                planner_status_topic,
+                self.navigation_status_provider.update_local_planner_status,
+                queue_size,
+            )
+        self.create_subscription(
             Image,
             str(self.get_parameter("image_topic").value),
             self._update_image,
@@ -99,6 +125,8 @@ class StriveInstructionRuntimeNode(Node):
         self.declare_parameter("object_topic", "/object_nodes_list")
         self.declare_parameter("room_topic", "/room_nodes_list")
         self.declare_parameter("odom_topic", "/aft_mapped_to_init")
+        self.declare_parameter("path_topic", "/path")
+        self.declare_parameter("planner_status_topic", "")
         self.declare_parameter("image_topic", "/camera/image")
         self.declare_parameter("waypoint_topic", "/way_point")
         self.declare_parameter("world_frame", "map")
@@ -110,6 +138,12 @@ class StriveInstructionRuntimeNode(Node):
         self.declare_parameter("dry_run", True)
         self.declare_parameter("require_pose", True)
         self.declare_parameter("require_image", True)
+        self.declare_parameter("xy_goal_tolerance_m", 0.35)
+        self.declare_parameter("z_goal_tolerance_m", 1.0)
+        self.declare_parameter("navigation_timeout_s", 60.0)
+        self.declare_parameter("no_progress_timeout_s", 12.0)
+        self.declare_parameter("min_progress_delta_m", 0.05)
+        self.declare_parameter("path_stale_timeout_s", 5.0)
 
     def _build_policy(self, policy_mode: str):
         """Build the selected high-level policy implementation."""
@@ -131,6 +165,7 @@ class StriveInstructionRuntimeNode(Node):
             node=self,
             waypoint_topic=str(self.get_parameter("waypoint_topic").value),
             world_frame=self.world_frame,
+            status_provider=self.navigation_status_provider,
         )
 
     def _update_odom(self, msg: Odometry) -> None:
@@ -148,6 +183,7 @@ class StriveInstructionRuntimeNode(Node):
             frame_id=msg.header.frame_id or self.world_frame,
             stamp=_stamp_to_seconds(msg.header.stamp),
         )
+        self.navigation_status_provider.update_pose(self._latest_pose)
 
     def _update_image(self, msg: Image) -> None:
         """Cache the latest image timestamp as readiness evidence."""

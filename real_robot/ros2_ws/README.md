@@ -158,6 +158,27 @@ and `/camera/image`. By default it only writes
 overlay, then adds the repository root to `PYTHONPATH` for the shared STRIVE
 `real_robot` package.
 
+When `dry_run:=false`, the node injects `RosNavigationStatusProvider` into the
+waypoint controller. It reads `/aft_mapped_to_init` and `/path`, plus an
+optional string `planner_status_topic`, then writes distance, elapsed time,
+path length, and progress samples into `NavigationStatus.metadata`.
+
+Useful launch parameters:
+
+```text
+path_topic:=/path
+planner_status_topic:=
+xy_goal_tolerance_m:=0.35
+z_goal_tolerance_m:=1.0
+navigation_timeout_s:=60.0
+no_progress_timeout_s:=12.0
+min_progress_delta_m:=0.05
+path_stale_timeout_s:=5.0
+```
+
+The same stale timeout is used for `planner_status_topic`, so an old
+`blocked`/`timeout` message does not permanently affect later goals.
+
 Observed hardware topics on the Orin robot:
 
 ```text

@@ -1408,6 +1408,37 @@ bash scripts/run_real_robot_instruction_runtime.sh \
 `SemanticMapSnapshot -> NavigationIntent -> MotionGoal` 的线缆级链路；它不会
 理解自然语言，也不能作为最终实物策略。
 
+非 dry-run 模式下，`RosWaypointController` 会接入
+`RosNavigationStatusProvider`，用只读 topic 估计底层执行状态：
+
+```text
+/aft_mapped_to_init
+  -> latest robot Pose3D
+
+/path
+  -> path_available、path_pose_count、path_length_remaining
+
+optional planner_status_topic
+  -> blocked / timeout / preempted / reached / failed
+
+active MotionGoal.goal_pose
+  -> distance、elapsed、progress、RUNNING/REACHED/BLOCKED/TIMEOUT/PREEMPTED
+```
+
+默认 `REACHED` 判断只使用 xy 和 z 距离：
+
+```text
+xy_goal_tolerance_m=0.35
+z_goal_tolerance_m=1.0
+heading_tolerance_rad=None
+```
+
+heading 暂不参与判断，因为当前 `/way_point` 是 `geometry_msgs/PointStamped`，
+不包含目标朝向。状态 provider 只读 odom/path/status，不发布 `/cmd_vel`，
+也不替代 SysNav localPlanner/pathFollower。`planner_status_topic` 的状态会按
+`path_stale_timeout_s` 做 freshness gate，避免旧的 blocked/timeout 状态污染
+新的 motion goal。
+
 ### 12.5 本仓库内 ROS overlay
 
 SysNav detector/mapping 已作为 vendor ROS overlay 迁入当前 workspace：
