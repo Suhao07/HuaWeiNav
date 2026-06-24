@@ -22,6 +22,43 @@ Real sensors / ROS topics
   -> local planner / path follower / robot base
 ```
 
+### 1.1 固定主链
+
+实物主链应固定为下面这条路径。后续新增相机、底盘、检测器或先验地图时，
+只能替换链路中的 adapter、provider 或 policy，不能绕过 `NavigationIntent`
+直接发布底层控制命令。
+
+```text
+Robot sensor topics
+  -> SysNav detection_node / semantic_mapping_node
+  -> /detection_result, /object_nodes_list, /room_nodes_list
+  -> RosDetectionResultAdapter / RosObjectNodeAdapter / RosRoomNodeAdapter
+  -> SemanticMapSnapshot
+  -> SemanticSnapshotInstructionPolicy.decide(...)
+  -> NavigationIntent
+  -> MotionGoal
+  -> RosWaypointController
+  -> /way_point
+  -> lower planner / path follower / robot controller
+  -> NavigationStatus
+  -> ViewEvidence
+  -> FinalInstructionVerifier
+```
+
+这条链路有四个强边界：
+
+| 边界 | 输入 | 输出 | 不能做什么 |
+| --- | --- | --- | --- |
+| ROS adapter | ROS message | `DetectionFrame`、`ObjectNodeSnapshot`、`RoomSnapshot` | 不能做目标语义判断，不能改写 SysNav 地图状态 |
+| Semantic policy | `SemanticMapSnapshot`、`InstructionPlan`、可选先验地图 context | `NavigationIntent` | 不能发布 ROS topic，不能直接声明物理到达 |
+| Motion bridge | `MotionGoal` | `/way_point`、`NavigationStatus` | 不能调用 VLM，不能判断自然语言任务是否成功 |
+| Evidence loop | `ViewpointGoal`、`NavigationStatus`、当前观测 | `ViewEvidence`、verifier decision | 未到达视点时不能伪造 final verifier 证据 |
+
+当前仓库已经具备 contract、SysNav ROS adapter、motion goal 和 evidence loop
+骨架。仍需补齐 live ROS node、真实 `NavigationStatus` provider、观测缓存、
+crop evidence provider，以及消费 `SemanticMapSnapshot` 的高层 instruction policy。
+详细待做项见 `docs/real_robot_todo_checklist.md`。
+
 ## 2. 硬件与传感器
 
 STRIVE 论文中的真实平台配置：
@@ -1385,15 +1422,17 @@ workspace 内构建；完整 SysNav C++ local planner 后续应作为单独迁�
 
 ### 12.6 单镜像实物部署
 
-实物部署不应依赖两个运行中的容器。当前仓库提供的实物镜像是单镜像方案：
+实物部署不应依赖两个运行中的容器。当前 Orin 实物部署已经收敛到单镜像、
+单入口方案：
 
 ```text
-strive-real-robot:humble
+huawei-nav-real:orin
   contains STRIVE high-level code
   contains real_robot adapters and runtime contracts
   contains vendored SysNav semantic_mapping overlay
   contains tare_planner ROS message definitions
   contains strive_sysnav_bringup launch package
+  contains Jetson/Orin-compatible runtime dependencies
 ```
 
 仿真 benchmark 镜像和实物镜像的职责不同：
@@ -1403,53 +1442,109 @@ strive-hm3d:local
   用于 Habitat / HM3D / OVON benchmark
   保留原始仿真依赖，避免被 ROS Humble / Ubuntu 22.04 依赖污染
 
-strive-real-robot:humble
-  用于真实机器人部署
-  基于 ROS2 Humble，运行 SysNav detector/mapping 和 STRIVE 上层语义策略
+huawei-nav-real:orin
+  用于 Orin / JetPack 实物机器人部署
+  基于 ROS2 Humble 运行 SysNav detector/mapping 和 STRIVE 上层语义策略
 ```
 
-也就是说，真机部署只启动 `strive-real-robot:humble` 一个容器；不需要同时启动
+也就是说，真机部署只启动 `huawei-nav-real:orin` 一个容器；不需要同时启动
 HM3D benchmark 容器。两个镜像只是开发阶段的不同运行目标，不是部署时的双容器架构。
 
-构建单实物镜像：
+Orin 上推荐使用宿主侧 Docker 入口：
 
 ```bash
-IMAGE_TAG=strive-real-robot:humble \
-INSTALL_LLM_DEPS=1 \
-INSTALL_ML_DEPS=0 \
-bash docker/build_real_robot.sh
+cd /home/orin26/code/HuaWeiNav
+SUDO_STDIN_PASSWORD=1 ./docker_en.sh start
+SUDO_STDIN_PASSWORD=1 ./docker_en.sh enter
+SUDO_STDIN_PASSWORD=1 ./docker_en.sh status
 ```
 
-`INSTALL_ML_DEPS=0` 是轻量验证模式，可用于确认 ROS overlay、topic adapter 和
-launch 包是否完整。真机运行 detector/mapping 时需要安装或挂载相应模型运行依赖：
+`docker_en.sh` 的默认部署值为：
+
+```text
+IMAGE_TAG=huawei-nav-real:orin
+CONTAINER_NAME=huawei-nav-real
+BLOCK_LOWER_CONTROLLER=1
+ENABLE_LOWER_CONTROLLER=0
+```
+
+因此默认只启动 LIO 检查、相机、detector 和 semantic mapping；底层控制器被阻塞，
+不会主动启动 `/cmd_vel` 发布链路。需要联调底盘时，必须显式设置：
 
 ```bash
-IMAGE_TAG=strive-real-robot:humble-runtime \
+BLOCK_LOWER_CONTROLLER=0 \
+ENABLE_LOWER_CONTROLLER=1 \
+LOWER_CONTROLLER_CMD='<controller launch command>' \
+SUDO_STDIN_PASSWORD=1 ./docker_en.sh start
+```
+
+Orin LIO 启动使用宿主侧 helper，确保 Point-LIO 发布 STRIVE 需要的点云：
+
+```bash
+cd /home/orin26/code/HuaWeiNav
+bash scripts/start_orin_lio_for_strive.sh
+```
+
+该脚本启动 `livox_ros_driver2` 和 `point_lio`，并覆盖：
+
+```text
+publish.scan_publish_en:=true
+```
+
+期望的 Orin 输入 topic：
+
+```text
+/livox/lidar
+/livox/imu
+/cloud_registered
+/aft_mapped_to_init
+/base_odom
+/path
+/camera/image
+```
+
+部署前 bounded smoke：
+
+```bash
+IMAGE_TAG=huawei-nav-real:orin REQUIRE_LIO=1 CHECK_CAMERA=1 \
+  bash scripts/smoke_real_robot_orin.sh
+```
+
+严格 smoke 可进一步要求 assets、ML import 和 detector 初始化。该 smoke 脚本只观察
+ROS graph 和短生命周期容器检查，不发布 `/way_point` 或 `/cmd_vel`。
+
+通用构建脚本仍可用于开发镜像或离线验证：
+
+```bash
+IMAGE_TAG=huawei-nav-real:orin \
 INSTALL_LLM_DEPS=1 \
 INSTALL_ML_DEPS=1 \
 bash docker/build_real_robot.sh
 ```
 
-权重不建议写入镜像层，而应通过 volume 和环境变量传入：
+轻量验证模式仍可使用 `INSTALL_ML_DEPS=0`，只确认 ROS overlay、topic adapter 和
+launch 包是否完整；真机 detector/mapping 需要完整 ML 依赖和外部模型资产。
+
+权重不建议写入镜像层，而应通过 volume 和环境变量传入。Orin smoke 中已验证过的
+环境变量包括：
 
 ```bash
 export SYSNAV_DETECTOR_MODEL_TYPE=yoloe
-export SYSNAV_DETECTOR_MODEL_PATH=/abs/path/to/models/yoloe-26x-seg.engine
-export SYSNAV_SAM2_CHECKPOINT=/abs/path/to/models/sam2.1_hiera_base_plus.pt
-
-IMAGE_TAG=strive-real-robot:humble-runtime \
-bash docker/run_real_robot_sysnav_stack.sh
+export SYSNAV_DETECTOR_MODEL_PATH=/home/orin26/code/HuaWeiNav/real_robot/ros2_ws/src/semantic_mapping/semantic_mapping/external/yoloe-11s-seg.pt
+export SYSNAV_SAM2_CHECKPOINT=/home/orin26/code/HuaWeiNav/real_robot/ros2_ws/src/semantic_mapping/semantic_mapping/external/sam2/checkpoints/sam2.1_hiera_base_plus.pt
+export SYSNAV_CLIP_VIT_B32_PATH=/home/orin26/code/HuaWeiNav/real_robot/ros2_ws/src/semantic_mapping/semantic_mapping/external/ViT-B-32.pt
+export SYSNAV_MOBILECLIP_BLT_TS_PATH=/home/orin26/code/HuaWeiNav/real_robot/ros2_ws/src/semantic_mapping/semantic_mapping/external/mobileclip_blt.ts
 ```
 
-`docker/run_real_robot_sysnav_stack.sh` 会把上述权重文件所在目录只读挂载进容器，
-并在容器内使用相同绝对路径读取模型。脚本也会透传 `LLM_PROVIDER`、
+`docker_en.sh` 和 `docker/run_real_robot_sysnav_stack.sh` 会把上述权重文件所在目录
+只读挂载进容器，并在容器内使用相同绝对路径读取模型。脚本也会透传 `LLM_PROVIDER`、
 `ARK_API_KEY`、`LLM_MODEL`、`LLM_API_BASE_URL`、`MAP_PROVIDER`、`AMAP_KEY`
 等运行时环境变量，因此真机部署不需要同时启动另一个 STRIVE 容器。
 
 这种边界的原因是：Habitat 仿真栈和 ROS2 Humble 真机栈的系统依赖不同。强行把
 Habitat、ROS、SysNav detector、SAM2、TensorRT 全部塞进同一个“万能镜像”，会让
-CUDA、OpenCV、PCL、PyTorch 和 Python ABI 的冲突不可控。单实物镜像已经满足部署
-需求；仿真镜像仅保留为 benchmark 开发和回归验证环境。
+CUDA、OpenCV、PCL、PyTorch 和 Python ABI 的冲突不可控。Orin 单实物镜像已经满足
+当前部署需求；仿真镜像仅保留为 benchmark 开发和回归验证环境。
 
 ## 13. 当前结论
 
@@ -1473,6 +1568,20 @@ read /object_nodes_list and /room_nodes_list
   -> instruction_adapter.decide()
   -> NavigationIntent.to_motion_goal()
   -> RosWaypointController.send_goal()
+```
+
+具体剩余工作按阶段维护在：
+
+```text
+docs/real_robot_todo_checklist.md
+```
+
+如果实物模式启用先验地图，先验地图仍只能作为搜索排序和 prompt context，
+不能直接生成 `/way_point`。相关设计见：
+
+```text
+docs/prior_map_mode.md
+docs/prior_map_todo_checklist.md
 ```
 
 在这条链路稳定前，不建议迁移 STRIVE detector 或重写 SysNav semantic mapping。

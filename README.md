@@ -4,7 +4,6 @@
 ### 1. Clone the repository
 
 ```bash
-git clone git@github.com:igzat1no/STRIVE.git
 cd STRIVE
 ```
 
