@@ -5,15 +5,15 @@ summary，不能直接发布导航目标或绕过 final verifier。
 
 ## 1. Contract Layer
 
-- [ ] 新增 `prior_map/contracts.py`。
-- [ ] 定义 `PriorMapData`，包含 scene id、rooms、objects、topology、source format、frame id 和 metadata。
-- [ ] 定义 `PriorRoom`，包含 uid、label、boundary、centroid、neighbors、confidence、source。
-- [ ] 定义 `PriorObject`，包含 uid、label、position、parent room、exactness、confidence、aliases。
-- [ ] 定义 `PriorTopologyEdge`，表达 room-room、room-object 或区域连接关系。
-- [ ] 定义 `PriorObservationRecord`，记录 runtime pose、observed objects、room hypothesis 和 source。
-- [ ] 定义 `SearchPriorResult`、`RoomPrior`、`ObjectPrior`、`FrontierPrior`。
-- [ ] 保证 contract 层不 import ROS、Habitat、OpenCV、detector 或 live LLM client。
-- [ ] 增加 JSON roundtrip 单元测试。
+- [x] 新增 `prior_map/contracts.py`。
+- [x] 定义 `PriorMapData`，包含 scene id、rooms、objects、topology、source format、frame id 和 metadata。
+- [x] 定义 `PriorRoom`，包含 uid、label、boundary、centroid、neighbors、confidence、source。
+- [x] 定义 `PriorObject`，包含 uid、label、position、parent room、exactness、confidence、aliases。
+- [x] 定义 `PriorTopologyEdge`，表达 room-room、room-object 或区域连接关系。
+- [x] 定义 `PriorObservationRecord`，记录 runtime pose、observed objects、room hypothesis 和 source。
+- [x] 定义 `SearchPriorResult`、`RoomPrior`、`ObjectPrior`、`FrontierPrior`。
+- [x] 保证 contract 层不 import ROS、Habitat、OpenCV、detector 或 live LLM client。
+- [x] 增加 JSON roundtrip 单元测试。
 
 ## 2. Loaders
 
