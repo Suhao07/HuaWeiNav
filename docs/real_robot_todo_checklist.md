@@ -20,11 +20,24 @@
 
 ## 2. Live ROS Runtime
 
-- [ ] 新增实物高层 ROS2 node，负责订阅 object/room/pose/image topic，调用 `SysNavInstructionRuntime.step()`。
-- [ ] 为高层 node 增加参数：instruction、topic names、world frame、policy mode、prior map path、run directory。
-- [ ] 让高层 node 输出 `RuntimeDecision` JSONL，包含 snapshot size、intent、motion goal、status 和 reason。
-- [ ] 增加 WAIT 行为：未收到 object snapshot、pose 或 image 时不发布 waypoint。
-- [ ] 增加 dry-run 模式：只打印 `NavigationIntent`，不发布 `/way_point`。
+- [x] 新增实物高层 ROS2 node，负责订阅 object/room/pose/image topic，调用 `SysNavInstructionRuntime.step()`。
+- [x] 为高层 node 增加参数：instruction、topic names、world frame、policy mode、prior map path、run directory。
+- [x] 让高层 node 输出 `RuntimeDecision` JSONL，包含 snapshot size、intent、motion goal、status 和 reason。
+- [x] 增加 WAIT 行为：未收到 object snapshot、pose 或 image 时不发布 waypoint。
+- [x] 增加 dry-run 模式：只打印 `NavigationIntent`，不发布 `/way_point`。
+
+当前入口：
+
+```bash
+bash scripts/run_real_robot_instruction_runtime.sh \
+  instruction:="find a book" \
+  dry_run:=true \
+  policy_mode:=wait \
+  run_directory:=/tmp/strive_real_robot_runtime
+```
+
+`policy_mode=wait` 是默认安全模式；`policy_mode=first_object_smoke` 只用于验证
+`SemanticMapSnapshot -> NavigationIntent` 链路，不做自然语言语义判断。
 
 ## 3. NavigationStatus Provider
 
@@ -73,7 +86,7 @@
 - [x] 提供 `scripts/start_orin_lio_for_strive.sh`，覆盖 Point-LIO `publish.scan_publish_en:=true`。
 - [x] 提供 `scripts/smoke_real_robot_orin.sh`，做 LIO、相机、容器 DDS、CUDA/ML、detector 初始化检查。
 - [ ] 更新 `scripts/run_sysnav_detection_mapping.sh`，明确高层 node 是否一起启动。
-- [ ] 新增 `scripts/run_real_robot_instruction_runtime.sh`，只启动 STRIVE 高层 runtime。
+- [x] 新增 `scripts/run_real_robot_instruction_runtime.sh`，只启动 STRIVE 高层 runtime。
 - [ ] 增加 bag replay 入口，读取录制的 object/room/odom/image topic。
 - [ ] 更新 Docker run 环境变量：instruction、topic remap、model paths、LLM provider、prior map path。
 - [ ] 确保权重、bag、缓存和 build/install/log 产物不进入代码导出。

@@ -15,10 +15,15 @@ from real_robot.contracts import (
     ViewpointGoal,
 )
 from real_robot.sysnav_runtime import (
+    DryRunMotionController,
+    FirstObjectSmokePolicy,
     LatestObservationEvidenceProvider,
+    RuntimeDecisionJsonlWriter,
+    RuntimeReadiness,
     SysNavInstructionRuntime,
     SysNavSemanticMapBridge,
     ViewpointEvidenceLoop,
+    runtime_decision_to_dict,
 )
 
 
@@ -126,6 +131,33 @@ def test_instruction_runtime_waits_until_sysnav_object_nodes_arrive() -> None:
     assert decision.reason == "waiting for SysNav semantic map"
 
 
+def test_instruction_runtime_readiness_gate_prevents_policy_and_motion() -> None:
+    bridge = SysNavSemanticMapBridge(robot_pose_provider=lambda: Pose3D(position=(0.0, 0.0, 0.0)))
+    bridge.update_object_nodes(_object_list_msg())
+    policy = FakePolicy()
+    controller = FakeMotionController()
+    runtime = SysNavInstructionRuntime(
+        semantic_map_bridge=bridge,
+        high_level_policy=policy,
+        motion_controller=controller,
+        readiness_provider=lambda: RuntimeReadiness(
+            ready=False,
+            reason="waiting for live inputs: image",
+            metadata={"missing": ["image"]},
+        ),
+        now_fn=lambda: 4.0,
+    )
+
+    decision = runtime.step("find a book")
+
+    assert decision.intent.mode == MotionGoalMode.WAIT
+    assert decision.reason == "waiting for live inputs: image"
+    assert decision.motion_goal is None
+    assert policy.calls == []
+    assert controller.goals == []
+    assert decision.lower_planner_state["readiness"]["metadata"]["missing"] == ["image"]
+
+
 def test_instruction_runtime_dispatches_navigation_intent_to_motion_controller() -> None:
     bridge = SysNavSemanticMapBridge(robot_pose_provider=lambda: Pose3D(position=(0.0, 0.0, 0.0)))
     bridge.update_object_nodes(_object_list_msg())
@@ -146,6 +178,52 @@ def test_instruction_runtime_dispatches_navigation_intent_to_motion_controller()
     assert decision.motion_goal.mode == MotionGoalMode.GO_TO_OBJECT
     assert decision.navigation_status.status == NavigationStatusCode.RUNNING
     assert decision.lower_planner_state["object_count"] == 1
+
+
+def test_dry_run_motion_controller_records_goal_without_running_waypoint() -> None:
+    controller = DryRunMotionController()
+    goal = MotionGoal(
+        mode=MotionGoalMode.GO_TO_OBJECT,
+        goal_pose=Pose3D(position=(1.0, 2.0, -0.8)),
+        target_object_uid="sysnav_object:11",
+    )
+
+    goal_id = controller.send_goal(goal)
+    status = controller.poll_status(goal_id)
+
+    assert controller.goals == [goal]
+    assert status.status == NavigationStatusCode.IDLE
+    assert status.metadata["dry_run"] is True
+    assert status.metadata["requires_motion"] is True
+
+
+def test_first_object_smoke_policy_selects_first_positioned_object() -> None:
+    bridge = SysNavSemanticMapBridge(robot_pose_provider=lambda: Pose3D(position=(0.0, 0.0, 0.0)))
+    bridge.update_object_nodes(_object_list_msg())
+    snapshot = bridge.build_snapshot(timestamp=10.0)
+
+    intent = FirstObjectSmokePolicy().decide(snapshot, "find a book")
+
+    assert intent.mode == MotionGoalMode.GO_TO_OBJECT
+    assert intent.target_object_uid == "sysnav_object:11"
+    assert intent.goal_pose.position == (1.0, 2.0, 0.0)
+    assert intent.metadata["policy"] == "first_object_smoke"
+
+
+def test_runtime_decision_jsonl_writer_serializes_decisions(tmp_path) -> None:
+    decision = SysNavInstructionRuntime(
+        semantic_map_bridge=SysNavSemanticMapBridge(robot_pose_provider=lambda: Pose3D(position=(0.0, 0.0, 0.0))),
+        high_level_policy=FakePolicy(),
+        motion_controller=DryRunMotionController(),
+        now_fn=lambda: 1.0,
+    ).step("find a book")
+    writer = RuntimeDecisionJsonlWriter(tmp_path / "runtime_decisions.jsonl")
+
+    payload = writer.write(decision)
+
+    assert payload == runtime_decision_to_dict(decision)
+    assert (tmp_path / "runtime_decisions.jsonl").read_text(encoding="utf-8").strip()
+    assert payload["intent"]["mode"] == "wait"
 
 
 class FakeEvidenceProvider:

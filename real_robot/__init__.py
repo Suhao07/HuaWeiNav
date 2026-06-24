@@ -46,10 +46,16 @@ from real_robot.sysnav_ros_adapters import (
     build_semantic_map_snapshot,
 )
 from real_robot.sysnav_runtime import (
+    DryRunMotionController,
+    FirstObjectSmokePolicy,
     LatestObservationEvidenceProvider,
+    RuntimeDecisionJsonlWriter,
+    RuntimeReadiness,
     SysNavInstructionRuntime,
     SysNavSemanticMapBridge,
     ViewpointEvidenceLoop,
+    WaitInstructionPolicy,
+    runtime_decision_to_dict,
 )
 
 __all__ = [
@@ -87,8 +93,14 @@ __all__ = [
     "RosWaypointController",
     "SysNavTopicConfig",
     "build_semantic_map_snapshot",
+    "DryRunMotionController",
+    "FirstObjectSmokePolicy",
     "LatestObservationEvidenceProvider",
+    "RuntimeDecisionJsonlWriter",
+    "RuntimeReadiness",
     "SysNavInstructionRuntime",
     "SysNavSemanticMapBridge",
     "ViewpointEvidenceLoop",
+    "WaitInstructionPolicy",
+    "runtime_decision_to_dict",
 ]

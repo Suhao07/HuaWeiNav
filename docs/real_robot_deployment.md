@@ -1371,16 +1371,42 @@ ViewpointGoal
   -> ViewpointResult
 ```
 
-这两条链路对应下一步 ROS live node 的最小实现：
+当前已经补上高层 ROS live node，负责把 SysNav topic 缓存为 STRIVE
+snapshot，再周期性调用 `SysNavInstructionRuntime.step()`：
 
 ```text
-subscribe /object_nodes_list
-subscribe /room_nodes_list
-read latest RealObservation
-call STRIVE policy / verifier
-publish /way_point
-write RuntimeDecision and ViewpointResult logs
+strive_instruction_runtime
+  subscribe /object_nodes_list
+  subscribe /room_nodes_list
+  subscribe /aft_mapped_to_init
+  subscribe /camera/image
+  -> SysNavSemanticMapBridge
+  -> SysNavInstructionRuntime.step(instruction)
+  -> RuntimeDecisionJsonlWriter
+  -> DryRunMotionController 或 RosWaypointController
 ```
+
+启动入口：
+
+```bash
+bash scripts/run_real_robot_instruction_runtime.sh \
+  instruction:="find a book" \
+  dry_run:=true \
+  policy_mode:=wait \
+  run_directory:=/tmp/strive_real_robot_runtime
+```
+
+该脚本会 source ROS/overlay，并把仓库根目录加入 `PYTHONPATH`，确保 ROS node
+能够 import `real_robot/contracts.py` 和 adapter/runtime 模块。
+
+默认 `dry_run=true` 且 `policy_mode=wait`，只输出 `NavigationIntent` 和
+`RuntimeDecision` JSONL，不发布 `/way_point`。当缺少 object snapshot、pose
+或 image 时，runtime 返回 WAIT，并在 `lower_planner_state.readiness` 中记录
+缺失 topic，避免在输入不完整时触发运动。
+
+`policy_mode=first_object_smoke` 只用于验证
+`SemanticMapSnapshot -> NavigationIntent -> MotionGoal` 的线缆级链路；它不会
+理解自然语言，也不能作为最终实物策略。
 
 ### 12.5 本仓库内 ROS overlay
 

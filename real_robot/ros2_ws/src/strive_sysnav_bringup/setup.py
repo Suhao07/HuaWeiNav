@@ -19,6 +19,11 @@ setup(
     zip_safe=True,
     maintainer="STRIVE Real Robot Integration",
     maintainer_email="devnull@example.com",
-    description="Launch files for STRIVE vendored SysNav detector and semantic mapping stack.",
+    description="Bringup launches and high-level runtime nodes for STRIVE SysNav integration.",
     license="BSD-3-Clause",
+    entry_points={
+        "console_scripts": [
+            "strive_instruction_runtime = strive_sysnav_bringup.instruction_runtime_node:main",
+        ],
+    },
 )

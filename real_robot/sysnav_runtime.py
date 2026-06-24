@@ -8,8 +8,12 @@ goals through the motion bridge.
 
 from __future__ import annotations
 
+import json
 import time
-from dataclasses import dataclass, field
+import uuid
+from dataclasses import asdict, dataclass, field, is_dataclass
+from enum import Enum
+from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Protocol
 
 from real_robot.contracts import (
@@ -63,6 +67,187 @@ class InstructionPolicyProtocol(Protocol):
 
     def decide(self, snapshot: SemanticMapSnapshot, instruction: Optional[str] = None) -> NavigationIntent:
         """Return the next semantic navigation intent."""
+
+
+@dataclass(frozen=True)
+class RuntimeReadiness:
+    """Readiness state for a live real-robot runtime tick.
+
+    Args:
+        ready: Whether the runtime has enough synchronized inputs to make a
+            high-level decision.
+        reason: Human-readable reason used when the runtime must wait.
+        metadata: JSON-friendly diagnostics such as topic availability.
+    """
+
+    ready: bool
+    reason: str = ""
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def as_dict(self) -> Dict[str, Any]:
+        """Return a JSON-friendly readiness record."""
+
+        return {
+            "ready": self.ready,
+            "reason": self.reason,
+            "metadata": dict(self.metadata),
+        }
+
+
+class DryRunMotionController:
+    """Motion controller that records goals without publishing robot commands.
+
+    This controller is used by live ROS dry-run and bag replay. It preserves the
+    `MotionGoal -> NavigationStatus` contract while guaranteeing that no
+    waypoint is sent to the lower planner.
+    """
+
+    def __init__(self, status_code: NavigationStatusCode = NavigationStatusCode.IDLE) -> None:
+        """Initialize the dry-run controller.
+
+        Args:
+            status_code: Status returned for motion-requiring goals. WAIT and
+                STOP keep their non-motion status semantics.
+        """
+
+        self.status_code = status_code
+        self.goals: list[MotionGoal] = []
+        self._statuses: Dict[str, NavigationStatus] = {}
+
+    def send_goal(self, goal: MotionGoal) -> str:
+        """Record one goal and return a dry-run goal id.
+
+        Args:
+            goal: Motion request produced by STRIVE high-level policy.
+
+        Returns:
+            Stable dry-run goal id for this recorded request.
+        """
+
+        goal_id = f"dry_run_goal:{uuid.uuid4().hex}"
+        self.goals.append(goal)
+        if goal.mode == MotionGoalMode.STOP:
+            status = NavigationStatusCode.REACHED
+        elif not goal.requires_motion():
+            status = NavigationStatusCode.IDLE
+        else:
+            status = self.status_code
+        self._statuses[goal_id] = NavigationStatus(
+            status=status,
+            goal_id=goal_id,
+            message=f"dry-run recorded {goal.mode.value}; no waypoint published",
+            metadata={
+                "dry_run": True,
+                "requires_motion": goal.requires_motion(),
+                "target_object_uid": goal.target_object_uid,
+                "anchor_object_uid": goal.anchor_object_uid,
+            },
+        )
+        return goal_id
+
+    def poll_status(self, goal_id: str) -> NavigationStatus:
+        """Return the dry-run status for a recorded goal id.
+
+        Args:
+            goal_id: Goal id returned by `send_goal`.
+
+        Returns:
+            Recorded `NavigationStatus`, or FAILED for unknown goal ids.
+        """
+
+        return self._statuses.get(
+            goal_id,
+            NavigationStatus(
+                NavigationStatusCode.FAILED,
+                goal_id=goal_id,
+                message="unknown dry-run goal id",
+                metadata={"dry_run": True},
+            ),
+        )
+
+
+class WaitInstructionPolicy:
+    """Conservative policy that always asks the runtime to wait."""
+
+    def __init__(self, reason: str = "no high-level policy configured") -> None:
+        """Initialize the policy.
+
+        Args:
+            reason: Reason attached to each WAIT intent.
+        """
+
+        self.reason = reason
+
+    def decide(self, snapshot: SemanticMapSnapshot, instruction: Optional[str] = None) -> NavigationIntent:
+        """Return a WAIT intent with snapshot diagnostics.
+
+        Args:
+            snapshot: Current semantic map snapshot.
+            instruction: Optional raw instruction.
+
+        Returns:
+            WAIT `NavigationIntent`.
+        """
+
+        return NavigationIntent(
+            mode=MotionGoalMode.WAIT,
+            reason=self.reason,
+            metadata={
+                "instruction": instruction or "",
+                "object_count": len(snapshot.objects),
+                "room_count": len(snapshot.rooms),
+                "policy": "wait",
+            },
+        )
+
+
+class FirstObjectSmokePolicy:
+    """Smoke-test policy that targets the first object with a 3-D position.
+
+    This policy is only for runtime wiring validation. It does not interpret
+    natural language and must not be used as the final semantic navigation
+    policy.
+    """
+
+    def decide(self, snapshot: SemanticMapSnapshot, instruction: Optional[str] = None) -> NavigationIntent:
+        """Return a GO_TO_OBJECT intent for the first positioned object.
+
+        Args:
+            snapshot: Current semantic map snapshot.
+            instruction: Optional raw instruction, recorded only for debug.
+
+        Returns:
+            `NavigationIntent` for a smoke-test object, or WAIT when no object
+            has a usable position.
+        """
+
+        for obj in snapshot.objects:
+            if obj.position is None:
+                continue
+            return NavigationIntent(
+                mode=MotionGoalMode.GO_TO_OBJECT,
+                goal_pose=Pose3D(
+                    position=obj.position,
+                    frame_id=snapshot.robot_pose.frame_id,
+                    stamp=snapshot.timestamp,
+                ),
+                target_object_uid=obj.uid,
+                reason=f"smoke policy selected first positioned object: {obj.label}",
+                metadata={
+                    "instruction": instruction or "",
+                    "policy": "first_object_smoke",
+                    "object_label": obj.label,
+                },
+            )
+        return NavigationIntent(
+            mode=MotionGoalMode.WAIT,
+            reason="no positioned object available for first_object_smoke policy",
+            metadata={
+                "instruction": instruction or "",
+                "policy": "first_object_smoke",
+                "object_count": len(snapshot.objects),
+            },
+        )
 
 
 @dataclass
@@ -141,9 +326,25 @@ class SysNavInstructionRuntime:
     high_level_policy: InstructionPolicyProtocol
     motion_controller: MotionControllerProtocol
     now_fn: Callable[[], float] = time.time
+    readiness_provider: Optional[Callable[[], RuntimeReadiness]] = None
 
     def step(self, instruction: Optional[str] = None) -> RuntimeDecision:
         """Run one real-robot high-level decision step."""
+
+        if self.readiness_provider is not None:
+            readiness = self.readiness_provider()
+            if not readiness.ready:
+                wait_intent = NavigationIntent(
+                    mode=MotionGoalMode.WAIT,
+                    reason=readiness.reason or "waiting for live runtime inputs",
+                    metadata={"readiness": readiness.as_dict()},
+                )
+                return RuntimeDecision(
+                    timestamp=self.now_fn(),
+                    intent=wait_intent,
+                    lower_planner_state={"readiness": readiness.as_dict()},
+                    reason=wait_intent.reason,
+                )
 
         snapshot = self.semantic_map_bridge.build_snapshot(timestamp=self.now_fn())
         if snapshot is None:
@@ -287,6 +488,64 @@ class LatestObservationEvidenceProvider:
                 **dict(crop_payload.get("metadata") or {}),
             },
         )
+
+
+class RuntimeDecisionJsonlWriter:
+    """Append real-robot runtime decisions to a JSONL log file."""
+
+    def __init__(self, path: str | Path) -> None:
+        """Initialize the writer and create parent directories.
+
+        Args:
+            path: Destination JSONL file path.
+        """
+
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+
+    def write(self, decision: RuntimeDecision) -> Dict[str, Any]:
+        """Append one decision to disk.
+
+        Args:
+            decision: Runtime decision emitted by `SysNavInstructionRuntime`.
+
+        Returns:
+            JSON-friendly dictionary that was written.
+        """
+
+        payload = runtime_decision_to_dict(decision)
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+        return payload
+
+
+def runtime_decision_to_dict(decision: RuntimeDecision) -> Dict[str, Any]:
+    """Return a JSON-friendly runtime decision dictionary.
+
+    Args:
+        decision: Runtime decision emitted by the real-robot loop.
+
+    Returns:
+        JSON-serializable dictionary.
+    """
+
+    return _json_ready(decision)
+
+
+def _json_ready(value: Any) -> Any:
+    """Convert dataclasses, enums, tuples, and paths into JSON-ready values."""
+
+    if is_dataclass(value):
+        return _json_ready(asdict(value))
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, dict):
+        return {str(key): _json_ready(val) for key, val in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_ready(item) for item in value]
+    if isinstance(value, Path):
+        return str(value)
+    return value
 
 
 def _viewpoint_goal_summary(goal: ViewpointGoal) -> Dict[str, Any]:

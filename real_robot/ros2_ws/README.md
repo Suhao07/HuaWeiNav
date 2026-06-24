@@ -18,7 +18,8 @@ src/semantic_mapping
   publishes /detection_result and /object_nodes_list.
 
 src/strive_sysnav_bringup
-  Launch-only package for starting detection_node and semantic_mapping_node
+  Launch and high-level runtime package. It starts detection_node,
+  semantic_mapping_node, and the optional STRIVE instruction runtime node
   inside the STRIVE overlay.
 ```
 
@@ -139,6 +140,23 @@ Output:
 STRIVE consumes `/object_nodes_list` and `/room_nodes_list` through
 `real_robot.sysnav_runtime.SysNavSemanticMapBridge`, then publishes waypoint
 goals with `real_robot.sysnav_ros_adapters.RosWaypointController`.
+
+The high-level runtime node is available through:
+
+```bash
+bash scripts/run_real_robot_instruction_runtime.sh \
+  instruction:="find a book" \
+  dry_run:=true \
+  policy_mode:=wait \
+  run_directory:=/tmp/strive_real_robot_runtime
+```
+
+It subscribes `/object_nodes_list`, `/room_nodes_list`, `/aft_mapped_to_init`,
+and `/camera/image`. By default it only writes
+`/tmp/strive_real_robot_runtime/runtime_decisions.jsonl`; it does not publish
+`/way_point` unless `dry_run:=false` is set. The script sources ROS and the
+overlay, then adds the repository root to `PYTHONPATH` for the shared STRIVE
+`real_robot` package.
 
 Observed hardware topics on the Orin robot:
 
