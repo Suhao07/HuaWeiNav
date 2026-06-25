@@ -8,6 +8,7 @@ result is a static scene prior rather than leaked task evidence.
 
 from __future__ import annotations
 
+import csv
 import json
 import math
 from collections import deque
@@ -19,6 +20,7 @@ from .alignment import PriorMapAlignment
 from .contracts import BoundaryXY, PriorMapData, PriorObject, PriorRoom, PriorTopologyEdge, Vector2, Vector3
 
 _GridCell = tuple[int, int, int]
+_TEXTURE_COLOR_TOLERANCE_SQUARED = 20 * 20 * 3
 
 
 @dataclass(frozen=True)
@@ -147,6 +149,8 @@ class HM3DGroundTruthPriorMapBuilder:
         sim: Any,
         scene_id: str,
         config: Optional[HM3DGroundTruthBuildConfig] = None,
+        *,
+        mesh_object_bounds: Optional[dict[str, dict[str, Any]]] = None,
     ) -> HM3DGroundTruthPriorMapBuildResult:
         """Build a geometric prior map from an existing Habitat simulator.
 
@@ -155,6 +159,9 @@ class HM3DGroundTruthPriorMapBuilder:
                 ``pathfinder`` attributes.
             scene_id: Stable scene id for generated prior ids.
             config: Optional build configuration.
+            mesh_object_bounds: Optional object bounds extracted from a
+                semantic mesh. Keys should be Habitat semantic object ids or
+                HM3D semantic txt instance ids.
 
         Returns:
             Build result containing a canonical ``PriorMapData`` and identity
@@ -175,7 +182,11 @@ class HM3DGroundTruthPriorMapBuilder:
             raise ValueError("sim must expose pathfinder")
 
         regions = _extract_regions(semantic_scene)
-        objects = _extract_objects(semantic_scene, include_structural=cfg.include_structural)
+        objects = _extract_objects(
+            semantic_scene,
+            include_structural=cfg.include_structural,
+            mesh_object_bounds=mesh_object_bounds or {},
+        )
         bounds_min, bounds_max = _pathfinder_bounds(pathfinder, regions, objects)
         traversable_cells = _sample_traversable_cells(
             pathfinder,
@@ -256,7 +267,9 @@ class HM3DGroundTruthPriorMapBuilder:
         path = Path(scene_dir)
         basis_glb = _single_scene_asset(path, "*.basis.glb")
         semantic_glb = _single_scene_asset(path, "*.semantic.glb")
+        semantic_txt = _single_scene_asset(path, "*.semantic.txt")
         navmesh = _single_scene_asset(path, "*.basis.navmesh")
+        scene_dataset_config = _find_scene_dataset_config(path)
         try:
             import habitat_sim  # type: ignore
         except Exception as exc:  # pragma: no cover - depends on local install.
@@ -264,6 +277,8 @@ class HM3DGroundTruthPriorMapBuilder:
 
         sim_cfg = habitat_sim.SimulatorConfiguration()
         sim_cfg.scene_id = str(basis_glb)
+        if scene_dataset_config is not None and hasattr(sim_cfg, "scene_dataset_config_file"):
+            sim_cfg.scene_dataset_config_file = str(scene_dataset_config)
         if hasattr(sim_cfg, "semantic_scene_id"):
             sim_cfg.semantic_scene_id = str(semantic_glb)
         if hasattr(sim_cfg, "enable_physics"):
@@ -275,7 +290,13 @@ class HM3DGroundTruthPriorMapBuilder:
             if navmesh.exists() and hasattr(simulator.pathfinder, "load_nav_mesh"):
                 simulator.pathfinder.load_nav_mesh(str(navmesh))
             inferred_scene_id = scene_id or _infer_scene_id_from_dir(path)
-            return self.build_from_sim(simulator, inferred_scene_id, config=config)
+            mesh_bounds = _extract_mesh_object_bounds(semantic_glb, semantic_txt)
+            return self.build_from_sim(
+                simulator,
+                inferred_scene_id,
+                config=config,
+                mesh_object_bounds=mesh_bounds,
+            )
         except Exception as exc:  # pragma: no cover - depends on Habitat assets.
             raise RuntimeError(f"Failed to build HM3D prior map from {path}") from exc
         finally:
@@ -287,6 +308,8 @@ def build_hm3d_groundtruth_prior_map_from_sim(
     sim: Any,
     scene_id: str,
     config: Optional[HM3DGroundTruthBuildConfig] = None,
+    *,
+    mesh_object_bounds: Optional[dict[str, dict[str, Any]]] = None,
 ) -> HM3DGroundTruthPriorMapBuildResult:
     """Build an HM3D ground-truth prior map from an existing simulator.
 
@@ -294,12 +317,19 @@ def build_hm3d_groundtruth_prior_map_from_sim(
         sim: Habitat-like simulator.
         scene_id: Scene id for generated stable identifiers.
         config: Optional build configuration.
+        mesh_object_bounds: Optional object bounds extracted from a semantic
+            mesh.
 
     Returns:
         Build result with canonical prior map and identity alignment.
     """
 
-    return HM3DGroundTruthPriorMapBuilder().build_from_sim(sim, scene_id, config=config)
+    return HM3DGroundTruthPriorMapBuilder().build_from_sim(
+        sim,
+        scene_id,
+        config=config,
+        mesh_object_bounds=mesh_object_bounds,
+    )
 
 
 def build_hm3d_groundtruth_prior_map_from_scene_dir(
@@ -354,14 +384,16 @@ def write_hm3d_groundtruth_prior_map_with_alignment(
 
 def _extract_regions(semantic_scene: Any) -> tuple[_SemanticRegionRecord, ...]:
     regions = []
+    seen_ids: dict[str, int] = {}
     for index, region in enumerate(getattr(semantic_scene, "regions", ()) or ()):
         aabb = _read_aabb(region)
         center = _vector3_or_default(aabb.get("center"), (0.0, 0.0, 0.0))
         sizes = _vector3_or_default(aabb.get("sizes"), (0.0, 0.0, 0.0))
         semantic_id = _read_id(region, fallback=index)
+        unique_region_id = _unique_semantic_id(semantic_id, seen_ids)
         regions.append(
             _SemanticRegionRecord(
-                uid=f"region_{_safe_uid(semantic_id)}",
+                uid=unique_region_id,
                 semantic_id=str(semantic_id),
                 label=_category_name(region, fallback=f"region_{semantic_id}"),
                 center_xyz=center,
@@ -378,8 +410,14 @@ def _extract_regions(semantic_scene: Any) -> tuple[_SemanticRegionRecord, ...]:
     return tuple(regions)
 
 
-def _extract_objects(semantic_scene: Any, *, include_structural: bool) -> tuple[_SemanticObjectRecord, ...]:
+def _extract_objects(
+    semantic_scene: Any,
+    *,
+    include_structural: bool,
+    mesh_object_bounds: dict[str, dict[str, Any]],
+) -> tuple[_SemanticObjectRecord, ...]:
     objects = []
+    seen_ids: dict[str, int] = {}
     for index, obj in enumerate(getattr(semantic_scene, "objects", ()) or ()):
         label = _category_name(obj, fallback=f"object_{index}")
         if not include_structural and _norm(label) in _STRUCTURAL_LABELS:
@@ -388,10 +426,17 @@ def _extract_objects(semantic_scene: Any, *, include_structural: bool) -> tuple[
         center = _vector3_or_default(aabb.get("center"), (0.0, 0.0, 0.0))
         sizes = _vector3_or_default(aabb.get("sizes"), (0.0, 0.0, 0.0))
         semantic_id = _read_id(obj, fallback=index)
+        unique_object_id = _unique_semantic_id(semantic_id, seen_ids)
+        mesh_bound = _mesh_bound_for_semantic_id(mesh_object_bounds, semantic_id)
+        geometry_source = "semantic_scene_aabb"
+        if mesh_bound is not None and _degenerate_box(center, sizes):
+            center = _vector3_or_default(mesh_bound.get("center"), center)
+            sizes = _vector3_or_default(mesh_bound.get("sizes"), sizes)
+            geometry_source = "semantic_glb_texture_bounds"
         region_id = _read_parent_region_id(obj)
         objects.append(
             _SemanticObjectRecord(
-                uid=f"object_{_safe_uid(semantic_id)}",
+                uid=unique_object_id,
                 semantic_id=str(semantic_id),
                 label=label,
                 center_xyz=center,
@@ -402,10 +447,267 @@ def _extract_objects(semantic_scene: Any, *, include_structural: bool) -> tuple[
                     "semantic_region_id": region_id,
                     "aabb_center": list(center),
                     "aabb_sizes": list(sizes),
+                    "geometry_source": geometry_source,
+                    "semantic_glb_vertex_count": mesh_bound.get("vertex_count") if mesh_bound else None,
                 },
             )
         )
     return tuple(objects)
+
+
+def _extract_mesh_object_bounds(semantic_glb: Path, semantic_txt: Path) -> dict[str, dict[str, Any]]:
+    """Extract object AABBs from HM3D semantic mesh texture ids.
+
+    HM3D Habitat semantic objects can expose degenerate semantic-scene AABBs for
+    small objects. The semantic mesh stores instance identity in a texture
+    color, and ``*.semantic.txt`` maps that color to an instance id. This helper
+    samples face-center UV colors, groups matched faces by instance id, and
+    computes per-instance mesh-space AABBs.
+
+    Args:
+        semantic_glb: Path to ``*.semantic.glb``.
+        semantic_txt: Path to ``*.semantic.txt`` color metadata.
+
+    Returns:
+        Mapping from semantic txt instance id to mesh bounds metadata.
+    """
+
+    color_to_instance = _read_semantic_txt_color_lookup(semantic_txt)
+    if not color_to_instance:
+        return {}
+    try:
+        import numpy as np  # type: ignore
+        import trimesh  # type: ignore
+    except Exception:
+        return {}
+
+    target_colors = np.array([item["rgb"] for item in color_to_instance.values()], dtype=np.int32)
+    target_keys = list(color_to_instance.keys())
+    bounds: dict[str, dict[str, Any]] = {}
+    try:
+        scene = trimesh.load(str(semantic_glb), force="scene", process=False)
+    except Exception:
+        return {}
+    for geom in getattr(scene, "geometry", {}).values():
+        vertices = np.asarray(getattr(geom, "vertices", ()), dtype=float)
+        if vertices.size == 0:
+            continue
+        visual = getattr(geom, "visual", None)
+        uv = np.asarray(getattr(visual, "uv", ()), dtype=float)
+        faces = np.asarray(getattr(geom, "faces", ()), dtype=int)
+        image = _texture_image_array(visual)
+        if uv.shape[0] != vertices.shape[0] or image is None:
+            continue
+        if faces.size:
+            face_uv = np.mean(uv[faces], axis=1)
+            recognized_faces = _recognized_texture_samples(face_uv, image, target_colors, target_keys, np)
+            for key, face_indices in recognized_faces.items():
+                selected = np.unique(faces[face_indices].reshape(-1))
+                selected_vertices = vertices[selected]
+                if selected_vertices.size == 0:
+                    continue
+                _update_mesh_bound(bounds, color_to_instance[key]["instance_id"], selected_vertices, np)
+            continue
+        recognized_vertices = _recognized_texture_samples(uv, image, target_colors, target_keys, np)
+        for key, vertex_indices in recognized_vertices.items():
+            selected_vertices = vertices[vertex_indices]
+            if selected_vertices.size == 0:
+                continue
+            _update_mesh_bound(bounds, color_to_instance[key]["instance_id"], selected_vertices, np)
+    return bounds
+
+
+def _read_semantic_txt_color_lookup(semantic_txt: Path) -> dict[str, dict[str, Any]]:
+    """Read HM3D semantic color-to-instance metadata.
+
+    Args:
+        semantic_txt: Path to the HM3D ``*.semantic.txt`` CSV-like file.
+
+    Returns:
+        Mapping from hex color string to instance id, label, region id, and RGB.
+    """
+
+    lookup: dict[str, dict[str, Any]] = {}
+    try:
+        with semantic_txt.open(newline="", encoding="utf-8") as f:
+            reader = csv.reader(f)
+            next(reader, None)
+            for row in reader:
+                if len(row) < 4:
+                    continue
+                instance_id = str(row[0]).strip()
+                color_hex = str(row[1]).strip().lstrip("#").upper()
+                if not instance_id or len(color_hex) != 6:
+                    continue
+                try:
+                    rgb = tuple(int(color_hex[index : index + 2], 16) for index in (0, 2, 4))
+                except ValueError:
+                    continue
+                lookup[color_hex] = {
+                    "instance_id": instance_id,
+                    "label": str(row[2]).strip().strip('"'),
+                    "region_id": str(row[3]).strip(),
+                    "rgb": rgb,
+                }
+    except OSError:
+        return {}
+    return lookup
+
+
+def _texture_image_array(visual: Any) -> Any:
+    """Return a visual material texture as an RGB array when available.
+
+    Args:
+        visual: Trimesh visual object.
+
+    Returns:
+        RGB numpy array, or ``None`` when the visual has no readable texture.
+    """
+
+    material = getattr(visual, "material", None)
+    image = getattr(material, "baseColorTexture", None) if material is not None else None
+    if image is None and material is not None:
+        image = getattr(material, "image", None)
+    if image is None:
+        return None
+    try:
+        import numpy as np  # type: ignore
+
+        return np.asarray(image.convert("RGB"))
+    except Exception:
+        return None
+
+
+def _recognized_texture_samples(
+    sample_uv: Any,
+    image: Any,
+    target_colors: Any,
+    target_keys: list[str],
+    np: Any,
+) -> dict[str, Any]:
+    """Map sampled UV colors to known HM3D semantic instance colors.
+
+    Args:
+        sample_uv: UV coordinates to sample.
+        image: RGB texture image array.
+        target_colors: Known semantic RGB colors.
+        target_keys: Hex color keys aligned with ``target_colors``.
+        np: Imported numpy module.
+
+    Returns:
+        Mapping from matched color key to sample indices. The function tests
+        both V-axis conventions and keeps the one with more recognized samples.
+    """
+
+    height, width = image.shape[:2]
+    best: dict[str, Any] = {}
+    best_count = -1
+    for flip_v in (True, False):
+        u = np.clip(np.rint(sample_uv[:, 0] * (width - 1)).astype(int), 0, width - 1)
+        v_values = 1.0 - sample_uv[:, 1] if flip_v else sample_uv[:, 1]
+        v = np.clip(np.rint(v_values * (height - 1)).astype(int), 0, height - 1)
+        colors = image[v, u, :3].astype(np.int32)
+        unique_colors, inverse = np.unique(colors, axis=0, return_inverse=True)
+        mapped: dict[str, list[Any]] = {}
+        for color_index, color in enumerate(unique_colors):
+            distances = np.sum((target_colors - color) * (target_colors - color), axis=1)
+            nearest = int(np.argmin(distances))
+            if int(distances[nearest]) > _TEXTURE_COLOR_TOLERANCE_SQUARED:
+                continue
+            key = target_keys[nearest]
+            mapped.setdefault(key, []).append(np.flatnonzero(inverse == color_index))
+        recognized = {
+            key: np.unique(np.concatenate(indices))
+            for key, indices in mapped.items()
+            if indices
+        }
+        count = sum(len(indices) for indices in recognized.values())
+        if count > best_count:
+            best = recognized
+            best_count = count
+    return best
+
+
+def _update_mesh_bound(bounds: dict[str, dict[str, Any]], instance_id: str, vertices: Any, np: Any) -> None:
+    """Merge selected mesh vertices into one per-instance AABB.
+
+    Args:
+        bounds: Mutable output bounds dictionary.
+        instance_id: HM3D semantic txt instance id.
+        vertices: Selected vertex positions.
+        np: Imported numpy module.
+    """
+
+    min_point = np.min(vertices, axis=0)
+    max_point = np.max(vertices, axis=0)
+    current = bounds.get(str(instance_id))
+    if current is not None:
+        min_point = np.minimum(np.asarray(current["min"], dtype=float), min_point)
+        max_point = np.maximum(np.asarray(current["max"], dtype=float), max_point)
+        vertex_count = int(current.get("vertex_count", 0)) + int(vertices.shape[0])
+    else:
+        vertex_count = int(vertices.shape[0])
+    center = (min_point + max_point) / 2.0
+    sizes = max_point - min_point
+    bounds[str(instance_id)] = {
+        "min": tuple(float(value) for value in min_point),
+        "max": tuple(float(value) for value in max_point),
+        "center": tuple(float(value) for value in center),
+        "sizes": tuple(float(value) for value in sizes),
+        "vertex_count": vertex_count,
+    }
+
+
+def _mesh_bound_for_semantic_id(
+    mesh_object_bounds: dict[str, dict[str, Any]],
+    semantic_id: str,
+) -> Optional[dict[str, Any]]:
+    """Find mesh bounds for either Habitat semantic id or semantic txt id.
+
+    Args:
+        mesh_object_bounds: Bounds extracted from semantic mesh textures.
+        semantic_id: Habitat semantic object id, such as ``tv_349``.
+
+    Returns:
+        Matching mesh bounds, or ``None``.
+    """
+
+    for key in (str(semantic_id), _semantic_txt_instance_id(semantic_id)):
+        if key and key in mesh_object_bounds:
+            return mesh_object_bounds[key]
+    return None
+
+
+def _semantic_txt_instance_id(semantic_id: str) -> str:
+    """Convert Habitat semantic object ids to HM3D semantic txt instance ids.
+
+    Args:
+        semantic_id: Habitat object id such as ``tv_349`` or ``349``.
+
+    Returns:
+        Numeric suffix when present; otherwise the original id string.
+    """
+
+    text = str(semantic_id)
+    if "_" in text:
+        suffix = text.rsplit("_", maxsplit=1)[-1]
+        if suffix.isdigit():
+            return suffix
+    return text
+
+
+def _degenerate_box(center: Vector3, sizes: Vector3) -> bool:
+    """Return whether an AABB lacks usable spatial extent.
+
+    Args:
+        center: AABB center. Present for interface symmetry.
+        sizes: AABB side lengths in meters.
+
+    Returns:
+        ``True`` when all side lengths are effectively zero.
+    """
+
+    return all(abs(value) <= 1e-9 for value in sizes)
 
 
 def _pathfinder_bounds(
@@ -477,6 +779,7 @@ def _build_room_components(
     config: HM3DGroundTruthBuildConfig,
 ) -> tuple[_RoomComponent, ...]:
     components: list[_RoomComponent] = []
+    emitted_uids: dict[str, int] = {}
     for region in regions:
         region_cells = frozenset(
             cell
@@ -497,7 +800,7 @@ def _build_room_components(
         ]
         for index, cells in enumerate(kept):
             component_count = len(kept)
-            uid = _room_uid(scene_id, region.semantic_id, index, component_count)
+            uid = _dedupe_uid(_room_uid(scene_id, region.uid, index, component_count), emitted_uids)
             boundary = _boundary_from_cells(cells, config.topdown_resolution)
             centroid = _centroid_from_cells(cells, config.topdown_resolution)
             components.append(
@@ -634,7 +937,7 @@ def _make_objects(
         parent_room_uid, containment_source = parent_lookup.get(obj.uid, (None, "unassigned"))
         prior_objects.append(
             PriorObject(
-                uid=f"prior_object:{_safe_uid(scene_id)}:{_safe_uid(obj.semantic_id)}",
+                uid=f"prior_object:{_safe_uid(scene_id)}:{_safe_uid(obj.uid)}",
                 label=obj.label,
                 position_xyz=obj.center_xyz,
                 parent_room_uid=parent_room_uid,
@@ -753,6 +1056,27 @@ def _infer_scene_id_from_dir(scene_dir: Path) -> str:
     return name
 
 
+def _find_scene_dataset_config(scene_dir: Path) -> Optional[Path]:
+    """Find the HM3D scene-dataset config near a scene directory.
+
+    Args:
+        scene_dir: HM3D scene directory.
+
+    Returns:
+        Path to a scene-dataset config if present; otherwise ``None``.
+    """
+
+    candidates = (
+        scene_dir.parent / f"hm3d_annotated_{scene_dir.parent.name}_basis.scene_dataset_config.json",
+        scene_dir.parent / "hm3d_annotated_basis.scene_dataset_config.json",
+        scene_dir.parent.parent / "hm3d_annotated_basis.scene_dataset_config.json",
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return None
+
+
 def _read_aabb(value: Any) -> dict[str, Any]:
     aabb = getattr(value, "aabb", None) or getattr(value, "bbox", None) or getattr(value, "obb", None)
     if aabb is None:
@@ -829,6 +1153,43 @@ def _read_parent_region_id(value: Any) -> Optional[str]:
     if region is not None:
         return _read_id(region, fallback=0)
     return None
+
+
+def _unique_semantic_id(raw_id: str, seen_ids: dict[str, int]) -> str:
+    """Return a stable unique id when Habitat exposes duplicate raw ids.
+
+    Args:
+        raw_id: Raw semantic id from Habitat-Sim.
+        seen_ids: Mutable count table.
+
+    Returns:
+        Original id for first occurrence, suffixed id for duplicates.
+    """
+
+    key = str(raw_id)
+    count = seen_ids.get(key, 0)
+    seen_ids[key] = count + 1
+    if count == 0:
+        return key
+    return f"{key}_{count}"
+
+
+def _dedupe_uid(uid: str, seen_ids: dict[str, int]) -> str:
+    """Return a unique uid while preserving the first emitted uid.
+
+    Args:
+        uid: Candidate uid.
+        seen_ids: Mutable count table.
+
+    Returns:
+        Original uid for first occurrence, suffixed uid for duplicates.
+    """
+
+    count = seen_ids.get(uid, 0)
+    seen_ids[uid] = count + 1
+    if count == 0:
+        return uid
+    return f"{uid}:duplicate_{count}"
 
 
 def _read_level(value: Any) -> int:

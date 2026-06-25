@@ -170,6 +170,50 @@ def test_splits_disconnected_components_inside_one_semantic_region() -> None:
     assert all("component_" in room.uid for room in result.prior_map.rooms)
 
 
+def test_build_from_sim_uses_mesh_bounds_when_semantic_aabb_is_degenerate() -> None:
+    living = _FakeRegion(
+        id="1",
+        category=_FakeCategory("living room"),
+        aabb=_FakeAABB(center=(1.0, 0.0, 1.0), sizes=(2.0, 2.0, 2.0)),
+    )
+    sim = _FakeSim(
+        semantic_scene=_FakeSemanticScene(
+            regions=(living,),
+            objects=(
+                _FakeObject(
+                    id="tv_349",
+                    category=_FakeCategory("tv"),
+                    aabb=_FakeAABB(center=(0.0, 0.0, 0.0), sizes=(0.0, 0.0, 0.0)),
+                    region=living,
+                ),
+            ),
+        ),
+        pathfinder=_FakePathfinder(
+            bounds=((0.0, 0.0, 0.0), (2.0, 0.0, 2.0)),
+            navigable_rectangles=((0.0, 2.0, 0.0, 2.0),),
+        ),
+    )
+
+    result = build_hm3d_groundtruth_prior_map_from_sim(
+        sim,
+        scene_id="scene",
+        config=HM3DGroundTruthBuildConfig(topdown_resolution=1.0),
+        mesh_object_bounds={
+            "349": {
+                "center": (1.2, 0.4, 1.1),
+                "sizes": (0.5, 0.6, 0.2),
+                "vertex_count": 12,
+            }
+        },
+    )
+
+    tv = result.prior_map.object_by_uid("prior_object:scene:tv_349")
+    assert tv is not None
+    assert tv.position_xyz == pytest.approx((1.2, 0.4, 1.1))
+    assert tv.metadata["geometry_source"] == "semantic_glb_texture_bounds"
+    assert tv.metadata["semantic_glb_vertex_count"] == 12
+
+
 def test_write_groundtruth_prior_roundtrips_with_loader_and_alignment(tmp_path: Path) -> None:
     result = build_hm3d_groundtruth_prior_map_from_sim(
         _base_fake_sim(),

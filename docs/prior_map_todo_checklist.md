@@ -156,7 +156,9 @@ summary，不能直接发布导航目标或绕过 final verifier。
 - [x] 写出 `alignment.json`：仿真默认 `identity`、`base_confidence=1.0`、`enabled_for_ranking=true`。
 - [x] 明确 builder 不读取 ObjectNav goal positions，不从 episode target 泄漏答案。
 - [x] 增加 fake semantic scene + fake navmesh 单元测试：object position、room boundary、centroid、neighbors、topology 全部生成。
-- [ ] 增加真实 scene smoke：`wcojb4TFT35` 导出的 TV `position_xyz != None`，至少一个 room 有非空 `boundary_xy`，至少一个 `room-room` edge。
+- [x] 增加真实 scene smoke：`wcojb4TFT35` 导出的 TV `position_xyz != None`，至少一个 room 有非空 `boundary_xy`，至少一个 `room-room` edge。
+  - 容器内 smoke 已导出 `logs/prior_maps/wcojb4TFT35_groundtruth_prior_map.json`：`object_count=779`、`room_count=90`、`topology_edge_count=1039`。
+  - TV `prior_object:wcojb4TFT35:tv_349` 使用 `semantic_glb_texture_bounds` 几何来源，`position_xyz=[-0.18259349465370178, -0.9289894700050354, 1.8373835682868958]`。
 
 ## 13. Geometry-Aware Query And Ranking
 
@@ -183,9 +185,9 @@ summary，不能直接发布导航目标或绕过 final verifier。
 
 ## 15. Ground-Truth Prior Acceptance
 
-- [ ] 构建真实 `wcojb4TFT35` HM3D ground-truth prior map。
-- [ ] 检查 `base_map.json`：TV `position_xyz` 非空、parent room 非空、room boundary/centroid 非空、room-room topology 非空。
-- [ ] 检查 `alignment.json`：`identity`、`confidence=1.0`、`enabled_for_ranking=true`。
+- [x] 构建真实 `wcojb4TFT35` HM3D ground-truth prior map。
+- [x] 检查 `base_map.json`：TV `position_xyz` 非空、parent room 非空、room boundary/centroid 非空、room-room topology 非空。
+- [x] 检查 `alignment.json`：`identity`、`confidence=1.0`、`enabled_for_ranking=true`。
 - [ ] 运行同一 episode prior-on/off A/B，确认 prior-on 产生 `frontier_biases`。
 - [ ] 运行同一 episode prior-on/off A/B，确认 chosen frontier 或 waypoint 至少在一次 planning cycle 中不同。
 - [ ] 记录 first target seen step、final accept step、travel distance、SPL、LLM call counts。
