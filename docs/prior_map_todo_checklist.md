@@ -75,14 +75,14 @@ summary，不能直接发布导航目标或绕过 final verifier。
 
 ## 7. Prompt Context And SoM
 
-- [ ] 新增 `prior_map/prompt_context.py`。
-- [ ] 实现 prior map natural-language summary。
-- [ ] 实现 OSM-like compact XML summary。
-- [ ] 实现 `SearchPriorResult` 的 prompt-friendly summary。
-- [ ] 新增或迁移 SoM visualizer 到 `prior_map/visualizer.py`。
-- [ ] 输出 global view、room view、markers 和 legend。
-- [ ] 限制 prompt context 长度，避免把完整地图无节制塞给 LLM。
-- [ ] 增加测试：marker id 稳定、room/object labels 可追踪。
+- [x] 新增 `prior_map/prompt_context.py`。
+- [x] 实现 prior map natural-language summary。
+- [x] 实现 OSM-like compact XML summary。
+- [x] 实现 `SearchPriorResult` 的 prompt-friendly summary。
+- [x] 新增或迁移 SoM visualizer 到 `prior_map/visualizer.py`。
+- [x] 输出 global view、room view、markers 和 legend。
+- [x] 限制 prompt context 长度，避免把完整地图无节制塞给 LLM。
+- [x] 增加测试：marker id 稳定、room/object labels 可追踪。
 
 ## 8. Simulation Integration
 
