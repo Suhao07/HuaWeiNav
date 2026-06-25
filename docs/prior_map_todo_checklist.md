@@ -53,15 +53,15 @@ summary，不能直接发布导航目标或绕过 final verifier。
 
 ## 5. Query Service
 
-- [ ] 新增 `prior_map/query.py`。
-- [ ] 实现 `PriorMapQueryService.query(plan, runtime_context, memory)`。
-- [ ] 根据 `InstructionPlan.target_detector_prompts` 和 concept aliases 计算 object relevance。
-- [ ] 根据 `InstructionPlan.search_priors.room_hints` 计算 room relevance。
-- [ ] 根据 support objects 和 affordances 生成 support region ranking。
-- [ ] 根据 visited/exhausted/rejected state 调整 soft score。
-- [ ] 根据 live observed objects 提高 matching prior 的 confidence。
-- [ ] 输出 `SearchPriorResult`，包含 score components 和 reason。
-- [ ] 增加测试：prior 只能改变排序，不能生成 motion goal。
+- [x] 新增 `prior_map/query.py`。
+- [x] 实现 `PriorMapQueryService.query(plan, runtime_context, memory)`。
+- [x] 根据 `InstructionPlan.target_detector_prompts` 和 concept aliases 计算 object relevance。
+- [x] 根据 `InstructionPlan.search_priors.room_hints` 计算 room relevance。
+- [x] 根据 support objects 和 affordances 生成 support region ranking。
+- [x] 根据 visited/exhausted/rejected state 调整 soft score。
+- [x] 根据 live observed objects 提高 matching prior 的 confidence。
+- [x] 输出 `SearchPriorResult`，包含 score components 和 reason。
+- [x] 增加测试：prior 只能改变排序，不能生成 motion goal。
 
 ## 6. Policy Adapter
 

@@ -15,6 +15,7 @@ from .contracts import (
 )
 from .loaders import PriorMapLoader, PriorMapLoaderError
 from .memory import PriorMapMemory, PriorObjectRuntimeState, PriorRoomRuntimeState
+from .query import PriorMapQueryContext, PriorMapQueryService, PriorMapQueryWeights
 
 __all__ = [
     "FrontierPrior",
@@ -24,6 +25,9 @@ __all__ = [
     "PriorMapLoader",
     "PriorMapLoaderError",
     "PriorMapMemory",
+    "PriorMapQueryContext",
+    "PriorMapQueryService",
+    "PriorMapQueryWeights",
     "PriorMapData",
     "PriorObject",
     "PriorObjectRuntimeState",
