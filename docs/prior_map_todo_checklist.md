@@ -162,15 +162,15 @@ summary，不能直接发布导航目标或绕过 final verifier。
 
 ## 13. Geometry-Aware Query And Ranking
 
-- [ ] 扩展 `PriorMapQueryService`，在 prior object 有 `position_xyz` 且 alignment 可用时，按目标对象位置和 parent room 生成几何 search prior。
-- [ ] 将 target object prior 的 parent room 排名提前到 room ranking，而不是只给所有 unvisited room 相同 `0.2` 分。
-- [ ] 为 runtime frontier 建立稳定 uid 和 world position，供 `PriorMapQueryService._rank_frontiers()` 消费。
-- [ ] 实现 runtime frontier/node 坐标到 `habitat_world` 的转换，避免 mapper local frame 和 prior frame 混用。
-- [ ] 基于 geodesic distance 或 euclidean fallback，计算 frontier 到 top prior room/object 的 score delta。
-- [ ] `frontier_biases` 必须包含 score components：target object relevance、target room relevance、distance score、alignment confidence、visited/exhausted penalty。
-- [ ] 当 alignment 不可用或 prior object 无坐标时，显式降级为 prompt context，并在 diagnostics 写明 `geometry_disabled_reason`。
-- [ ] 增加测试：有几何 prior 时 `frontier_biases` 非空；无几何 prior 时保持现有行为。
-- [ ] 增加测试：prior 只能改变 frontier/room 排序，不能生成 motion goal、不能绕过 final verifier。
+- [x] 扩展 `PriorMapQueryService`，在 prior object 有 `position_xyz` 且 alignment 可用时，按目标对象位置和 parent room 生成几何 search prior。
+- [x] 将 target object prior 的 parent room 排名提前到 room ranking，而不是只给所有 unvisited room 相同 `0.2` 分。
+- [x] 为 runtime frontier 建立稳定 uid 和 world position，供 `PriorMapQueryService._rank_frontiers()` 消费。
+- [x] 实现 runtime frontier/node 坐标到 `habitat_world` 的转换，避免 mapper local frame 和 prior frame 混用。
+- [x] 基于 geodesic distance 或 euclidean fallback，计算 frontier 到 top prior room/object 的 score delta。
+- [x] `frontier_biases` 必须包含 score components：target object relevance、target room relevance、distance score、alignment confidence、visited/exhausted penalty。
+- [x] 当 alignment 不可用或 prior object 无坐标时，显式降级为 prompt context，并在 diagnostics 写明 `geometry_disabled_reason`。
+- [x] 增加测试：有几何 prior 时 `frontier_biases` 非空；无几何 prior 时保持现有行为。
+- [x] 增加测试：prior 只能改变 frontier/room 排序，不能生成 motion goal、不能绕过 final verifier。
 
 ## 14. Active Planner Integration
 
