@@ -174,14 +174,14 @@ summary，不能直接发布导航目标或绕过 final verifier。
 
 ## 14. Active Planner Integration
 
-- [ ] 在 active frontier/room selection 前刷新 geometry-aware prior query。
-- [ ] 将 `frontier_biases` 接入实际使用的 frontier/waypoint selection 路径，而不是只写 artifact。
-- [ ] 在 `planning/room_policy.py` 中保留 deterministic nearest-frontier baseline，并记录 prior-adjusted distance。
-- [ ] 在 active non-relocate planning 路径中记录 prior-on 选中的 frontier uid、raw distance、prior score、adjusted score。
-- [ ] 增加 debug artifact：`prior_map/chosen_frontier_*.json`，包含候选排序前后对比。
-- [ ] 增加 A/B guard：关闭 prior map 时排序结果和当前主线一致。
-- [ ] 确认 prior map 不直接设置 `found_goal`，目标发现仍来自 live perception + existing target selection。
-- [ ] 确认 final stop authority 仍由 physical stop contract + final verifier 决定。
+- [x] 在 active frontier/room selection 前刷新 geometry-aware prior query。
+- [x] 将 `frontier_biases` 接入实际使用的 frontier/waypoint selection 路径，而不是只写 artifact。
+- [x] 在 `planning/room_policy.py` 中保留 deterministic nearest-frontier baseline，并记录 prior-adjusted distance。
+- [x] 在 active non-relocate planning 路径中记录 prior-on 选中的 frontier uid、raw distance、prior score、adjusted score。
+- [x] 增加 debug artifact：`prior_map/chosen_frontier_*.json`，包含候选排序前后对比。
+- [x] 增加 A/B guard：关闭 prior map 时排序结果和当前主线一致。
+- [x] 确认 prior map 不直接设置 `found_goal`，目标发现仍来自 live perception + existing target selection。
+- [x] 确认 final stop authority 仍由 physical stop contract + final verifier 决定。
 
 ## 15. Ground-Truth Prior Acceptance
 

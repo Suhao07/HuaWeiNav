@@ -100,6 +100,7 @@ class PriorMapSimulationRuntime:
         self.last_observation: Any = None
         self.last_query_result: Optional[SearchPriorResult] = None
         self.last_prompt_context: Optional[PromptContextBundle] = None
+        self.last_chosen_frontier: Optional[dict[str, Any]] = None
         self.last_query_step: Optional[int] = None
 
     @classmethod
@@ -138,6 +139,7 @@ class PriorMapSimulationRuntime:
         self.last_observation = None
         self.last_query_result = None
         self.last_prompt_context = None
+        self.last_chosen_frontier = None
         self.last_query_step = None
         write_prior_map_static_artifacts(output_dir=self.episode_dir, memory=self.memory)
         _write_json(
@@ -197,6 +199,33 @@ class PriorMapSimulationRuntime:
             memory=self.memory,
             prior_result=self.last_query_result,
         )
+
+    def record_chosen_frontier(self, payload: dict[str, Any], step: Optional[int] = None) -> Optional[Path]:
+        """Write the active planner's chosen-frontier debug artifact.
+
+        Args:
+            payload: JSON-friendly selection payload produced by the active
+                frontier policy.
+            step: Optional planning step. If omitted, the last query step is
+                used.
+
+        Returns:
+            Written path when an episode directory is available, otherwise
+            ``None``.
+        """
+
+        self.last_chosen_frontier = dict(payload)
+        if self.episode_dir is None:
+            return None
+        step_value = int(step if step is not None and int(step) >= 0 else self.last_query_step or 0)
+        output = self.episode_dir / f"chosen_frontier_{step_value:06d}.json"
+        enriched = {
+            "step": step_value,
+            "authority": "ranking_only",
+            **dict(payload),
+        }
+        _write_json(output, enriched)
+        return output
 
     def _ensure_episode_dir(self, mapper: Any, episode_idx: Optional[int]) -> None:
         if self.episode_dir is not None:
@@ -273,6 +302,8 @@ def configure_mapper_prior_map(mapper: Any, runtime: Optional[PriorMapSimulation
     setattr(mapper, "search_prior_result", None)
     setattr(mapper, "prior_map_prompt_context", None)
     setattr(mapper, "prior_map_last_observation", None)
+    setattr(mapper, "prior_map_last_chosen_frontier", None)
+    setattr(mapper, "prior_map_current_step", None)
 
 
 def refresh_mapper_prior_map_query(
@@ -302,6 +333,7 @@ def refresh_mapper_prior_map_query(
     setattr(mapper, "prior_map_policy_adapter", runtime.policy_adapter)
     setattr(mapper, "prior_map_prompt_context", runtime.last_prompt_context)
     setattr(mapper, "prior_map_last_observation", runtime.last_observation)
+    setattr(mapper, "prior_map_current_step", int(step))
     return result
 
 

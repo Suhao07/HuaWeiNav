@@ -2083,7 +2083,11 @@ class Instruct_Mapper:
             f.write(f'Policy: nearest_frontier_room\n')
             f.write(f'Answer: {selection.reason}\n')
             f.write(f'Closest node: {selection.closest_node_idx}\n')
+            f.write(f'Baseline closest node: {selection.baseline_closest_node_idx}\n')
             f.write(f'Distances: {selection.distances or []}\n')
+            f.write(f'Prior scores: {selection.prior_scores or []}\n')
+            f.write(f'Adjusted distances: {selection.adjusted_distances or []}\n')
+            f.write(f'Prior changed selection: {selection.prior_changed_selection}\n')
             if getattr(self, "search_prior_result", None) is not None:
                 f.write(f'Prior map: {json.dumps(self.search_prior_result.to_dict(), ensure_ascii=False)}\n')
             f.write(f'\n')

@@ -13,6 +13,12 @@ class RoomSelection:
     reason: str
     closest_node_idx: int | None = None
     distances: list[float] | None = None
+    baseline_closest_node_idx: int | None = None
+    prior_scores: list[float] | None = None
+    adjusted_distances: list[float] | None = None
+    selected_prior_score: float = 0.0
+    selected_adjusted_distance: float | None = None
+    prior_changed_selection: bool = False
 
 
 def select_nearest_frontier_room(mapper: Any) -> RoomSelection:
@@ -47,6 +53,7 @@ def select_nearest_frontier_room(mapper: Any) -> RoomSelection:
         distance - bias_m * prior_score
         for distance, prior_score in zip(distances, prior_scores)
     ]
+    baseline_idx = int(np.argmin(distances))
     best_idx = int(np.argmin(adjusted_distances))
     closest_node = frontier_nodes[best_idx]
     room = mapper.room_nodes[closest_node.room_idx]
@@ -56,10 +63,21 @@ def select_nearest_frontier_room(mapper: Any) -> RoomSelection:
             f" Prior map room score={prior_scores[best_idx]:.3f}, "
             f"distance_bias_m={bias_m:.3f}, adjusted_distance={adjusted_distances[best_idx]:.3f}."
         )
+    if best_idx != baseline_idx:
+        prior_suffix += (
+            f" Baseline nearest node={frontier_nodes[baseline_idx].idx}, "
+            f"prior-adjusted node={closest_node.idx}."
+        )
     return RoomSelection(
         room=room,
         closest_node_idx=closest_node.idx,
+        baseline_closest_node_idx=frontier_nodes[baseline_idx].idx,
         distances=distances,
+        prior_scores=prior_scores,
+        adjusted_distances=adjusted_distances,
+        selected_prior_score=prior_scores[best_idx],
+        selected_adjusted_distance=adjusted_distances[best_idx],
+        prior_changed_selection=best_idx != baseline_idx,
         reason=(
             f"Node {closest_node.idx} in Room {closest_node.room_idx} is the closest frontier "
             f"from current position.{prior_suffix}"
