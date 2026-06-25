@@ -56,6 +56,72 @@ Robot sensor topics
 | Motion bridge | `MotionGoal` | `/way_point`、`NavigationStatus` | 不能调用 VLM，不能判断自然语言任务是否成功 |
 | Evidence loop | `ViewpointGoal`、`NavigationStatus`、当前观测 | `ViewEvidence`、verifier decision | 未到达视点时不能伪造 final verifier 证据 |
 
+核心模块输入输出可以用下面的 Mermaid 图概括：
+
+```mermaid
+flowchart TD
+  subgraph Sensors["实物传感器输入"]
+    Livox["Livox Mid-360<br/>/livox/lidar, /livox/imu"]
+    Camera["RGB Camera<br/>/camera/image"]
+  end
+
+  subgraph Localization["定位与点云注册"]
+    LivoxDriver["livox_ros_driver2"]
+    PointLIO["Point-LIO<br/>输出: /cloud_registered<br/>/aft_mapped_to_init, /base_odom"]
+  end
+
+  subgraph SysNav["SysNav 感知建图"]
+    Detector["detection_node<br/>/camera/image -> /detection_result"]
+    Mapper["semantic_mapping_node<br/>检测 + 点云 + 位姿<br/>-> /object_nodes_list, /room_nodes_list"]
+  end
+
+  subgraph STRIVE["STRIVE 高层语义导航"]
+    Bridge["ROS adapters / SysNavSemanticMapBridge<br/>object/room topics -> SemanticMapSnapshot"]
+    Runtime["SysNavInstructionRuntime<br/>InstructionPlan + snapshot<br/>-> NavigationIntent / MotionGoal"]
+    Verifier["Evidence + Final Verifier<br/>REACHED 后决定 STOP / improve view"]
+  end
+
+  subgraph Motion["运动交接与安全边界"]
+    WaypointCtrl["RosWaypointController<br/>MotionGoal -> /way_point"]
+    Waypoint["/way_point<br/>geometry_msgs/PointStamped"]
+    LowerPlanner["lower planner / chassis bridge<br/>path tracking + safety + /cmd_vel"]
+    NavStatus["NavigationStatusProvider<br/>odom/path -> RUNNING/REACHED/BLOCKED"]
+  end
+
+  Livox --> LivoxDriver --> PointLIO
+  PointLIO -->|"/cloud_registered"| Mapper
+  PointLIO -->|"/aft_mapped_to_init, /base_odom"| Mapper
+
+  Camera --> Detector --> Mapper
+
+  Mapper -->|"/object_nodes_list, /room_nodes_list"| Bridge
+  PointLIO -->|pose| Bridge
+  Bridge --> Runtime
+
+  Runtime --> WaypointCtrl
+  WaypointCtrl -->|dry_run=false 且 lower_controller_enabled=true| Waypoint
+  Waypoint --> LowerPlanner
+  PointLIO -->|odom| NavStatus
+  LowerPlanner -->|path / execution feedback| NavStatus
+  NavStatus --> Runtime
+
+  Runtime -->|REACHED 后采样当前图像和目标 bbox| Verifier
+  Camera -->|current image| Verifier
+  Verifier -->|accept / reject_candidate / need_better_view| Runtime
+```
+
+图中要点：
+
+```text
+STRIVE 不直接发布 /cmd_vel。
+STRIVE 对底层控制器的正常输出只有 MotionGoal 经 RosWaypointController 转成 /way_point。
+dry_run=true 或 lower_controller_enabled=false 时，不向真实 /way_point 交接。
+FinalInstructionVerifier 只能在 NavigationStatus.REACHED 后消费 ViewEvidence。
+Point-LIO 是实物链路中的定位和 registered cloud 来源，不承担语义目标判断。
+RosObservationCache、ObjectCropEvidenceProvider、InstructionPlan provider 等作为 STRIVE
+内部实现细节保留，不在核心数据流图中展开。
+```
+
 当前仓库已经具备 contract、SysNav ROS adapter、motion goal、live ROS node、
 `NavigationStatus` provider、观测缓存、crop evidence provider，以及消费
 `SemanticMapSnapshot` 的高层策略适配上下文。后续重点是安全边界、真实

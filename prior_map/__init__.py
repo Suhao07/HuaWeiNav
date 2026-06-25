@@ -1,5 +1,6 @@
 """Prior-map contracts and adapters for STRIVE."""
 
+from .alignment import PriorMapAlignment, PriorMapAlignmentError
 from .contracts import (
     FrontierPrior,
     ObjectPrior,
@@ -17,6 +18,8 @@ from .loaders import PriorMapLoader, PriorMapLoaderError
 __all__ = [
     "FrontierPrior",
     "ObjectPrior",
+    "PriorMapAlignment",
+    "PriorMapAlignmentError",
     "PriorMapLoader",
     "PriorMapLoaderError",
     "PriorMapData",

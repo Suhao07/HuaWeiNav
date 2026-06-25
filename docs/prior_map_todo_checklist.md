@@ -29,14 +29,14 @@ summary，不能直接发布导航目标或绕过 final verifier。
 
 ## 3. Alignment
 
-- [ ] 新增 `prior_map/alignment.py`。
-- [ ] 定义 `PriorMapAlignment`，包含 `prior_to_runtime()`、`runtime_to_prior()` 和 `confidence()`。
-- [ ] 实现 identity alignment。
-- [ ] 实现 affine 2D alignment：scale、rotation、translation。
-- [ ] 支持保存和加载 `alignment.json`。
-- [ ] 增加 inverse consistency 测试。
-- [ ] 在 diagnostics 中记录 frame id、source points、target points、误差统计。
-- [ ] 明确坐标对齐失败时 prior map 降级为 prompt context，不参与 frontier/object 排序。
+- [x] 新增 `prior_map/alignment.py`。
+- [x] 定义 `PriorMapAlignment`，包含 `prior_to_runtime()`、`runtime_to_prior()` 和 `confidence()`。
+- [x] 实现 identity alignment。
+- [x] 实现 affine 2D alignment：scale、rotation、translation。
+- [x] 支持保存和加载 `alignment.json`。
+- [x] 增加 inverse consistency 测试。
+- [x] 在 diagnostics 中记录 frame id、source points、target points、误差统计。
+- [x] 明确坐标对齐失败时 prior map 降级为 prompt context，不参与 frontier/object 排序。
 
 ## 4. Memory
 

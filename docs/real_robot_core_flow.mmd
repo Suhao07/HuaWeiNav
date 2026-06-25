@@ -1,0 +1,49 @@
+flowchart TD
+  subgraph Sensors["实物传感器输入"]
+    Livox["Livox Mid-360<br/>/livox/lidar, /livox/imu"]
+    Camera["RGB Camera<br/>/camera/image"]
+  end
+
+  subgraph Localization["定位与点云注册"]
+    LivoxDriver["livox_ros_driver2"]
+    PointLIO["Point-LIO<br/>输出: /cloud_registered<br/>/aft_mapped_to_init, /base_odom"]
+  end
+
+  subgraph SysNav["SysNav 感知建图"]
+    Detector["detection_node<br/>/camera/image -> /detection_result"]
+    Mapper["semantic_mapping_node<br/>检测 + 点云 + 位姿<br/>-> /object_nodes_list, /room_nodes_list"]
+  end
+
+  subgraph STRIVE["STRIVE 高层语义导航"]
+    Bridge["ROS adapters / SysNavSemanticMapBridge<br/>object/room topics -> SemanticMapSnapshot"]
+    Runtime["SysNavInstructionRuntime<br/>InstructionPlan + snapshot<br/>-> NavigationIntent / MotionGoal"]
+    Verifier["Evidence + Final Verifier<br/>REACHED 后决定 STOP / improve view"]
+  end
+
+  subgraph Motion["运动交接与安全边界"]
+    WaypointCtrl["RosWaypointController<br/>MotionGoal -> /way_point"]
+    Waypoint["/way_point<br/>geometry_msgs/PointStamped"]
+    LowerPlanner["lower planner / chassis bridge<br/>path tracking + safety + /cmd_vel"]
+    NavStatus["NavigationStatusProvider<br/>odom/path -> RUNNING/REACHED/BLOCKED"]
+  end
+
+  Livox --> LivoxDriver --> PointLIO
+  PointLIO -->|"/cloud_registered"| Mapper
+  PointLIO -->|"/aft_mapped_to_init, /base_odom"| Mapper
+
+  Camera --> Detector --> Mapper
+
+  Mapper -->|"/object_nodes_list, /room_nodes_list"| Bridge
+  PointLIO -->|pose| Bridge
+  Bridge --> Runtime
+
+  Runtime --> WaypointCtrl
+  WaypointCtrl -->|dry_run=false 且 lower_controller_enabled=true| Waypoint
+  Waypoint --> LowerPlanner
+  PointLIO -->|odom| NavStatus
+  LowerPlanner -->|path / execution feedback| NavStatus
+  NavStatus --> Runtime
+
+  Runtime -->|REACHED 后采样当前图像和目标 bbox| Verifier
+  Camera -->|current image| Verifier
+  Verifier -->|accept / reject_candidate / need_better_view| Runtime
