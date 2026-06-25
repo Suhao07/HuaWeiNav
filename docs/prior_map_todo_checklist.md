@@ -65,13 +65,13 @@ summary，不能直接发布导航目标或绕过 final verifier。
 
 ## 6. Policy Adapter
 
-- [ ] 新增 `prior_map/policy_adapter.py` 或并入 `prior_map/query.py` 的 adapter 层。
-- [ ] 实现 `rank_rooms(rooms, prior_result)`。
-- [ ] 实现 `rank_frontiers(frontiers, prior_result)`。
-- [ ] 实现 `annotate_target_candidates(candidates, prior_result)`。
-- [ ] 接入 `planning/room_policy.py` 或 `planning/exploration_policy.py` 的排序路径。
-- [ ] 接入 `planning/target_selection_policy.py` 的 debug annotation，不改变 final verifier 逻辑。
-- [ ] 增加 A/B 测试：关闭 prior map 时保持现有行为。
+- [x] 新增 `prior_map/policy_adapter.py` 或并入 `prior_map/query.py` 的 adapter 层。
+- [x] 实现 `rank_rooms(rooms, prior_result)`。
+- [x] 实现 `rank_frontiers(frontiers, prior_result)`。
+- [x] 实现 `annotate_target_candidates(candidates, prior_result)`。
+- [x] 提供可接入 `planning/room_policy.py` 或 `planning/exploration_policy.py` 排序路径的稳定 API。
+- [x] 提供可接入 `planning/target_selection_policy.py` 的 debug annotation，不改变 final verifier 逻辑。
+- [x] 增加 A/B 测试：关闭 prior map 时保持现有行为。
 
 ## 7. Prompt Context And SoM
 

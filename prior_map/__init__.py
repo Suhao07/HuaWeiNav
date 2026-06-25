@@ -15,6 +15,13 @@ from .contracts import (
 )
 from .loaders import PriorMapLoader, PriorMapLoaderError
 from .memory import PriorMapMemory, PriorObjectRuntimeState, PriorRoomRuntimeState
+from .policy_adapter import (
+    PriorAnnotatedCandidate,
+    PriorMapPolicyAdapter,
+    annotate_target_candidates,
+    rank_frontiers,
+    rank_rooms,
+)
 from .query import PriorMapQueryContext, PriorMapQueryService, PriorMapQueryWeights
 
 __all__ = [
@@ -25,6 +32,8 @@ __all__ = [
     "PriorMapLoader",
     "PriorMapLoaderError",
     "PriorMapMemory",
+    "PriorAnnotatedCandidate",
+    "PriorMapPolicyAdapter",
     "PriorMapQueryContext",
     "PriorMapQueryService",
     "PriorMapQueryWeights",
@@ -38,4 +47,7 @@ __all__ = [
     "RoomPrior",
     "SearchPriorResult",
     "SupportRegionPrior",
+    "annotate_target_candidates",
+    "rank_frontiers",
+    "rank_rooms",
 ]
