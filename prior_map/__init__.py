@@ -14,6 +14,7 @@ from .contracts import (
     SupportRegionPrior,
 )
 from .loaders import PriorMapLoader, PriorMapLoaderError
+from .memory import PriorMapMemory, PriorObjectRuntimeState, PriorRoomRuntimeState
 
 __all__ = [
     "FrontierPrior",
@@ -22,10 +23,13 @@ __all__ = [
     "PriorMapAlignmentError",
     "PriorMapLoader",
     "PriorMapLoaderError",
+    "PriorMapMemory",
     "PriorMapData",
     "PriorObject",
+    "PriorObjectRuntimeState",
     "PriorObservationRecord",
     "PriorRoom",
+    "PriorRoomRuntimeState",
     "PriorTopologyEdge",
     "RoomPrior",
     "SearchPriorResult",

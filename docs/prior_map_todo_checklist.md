@@ -40,16 +40,16 @@ summary，不能直接发布导航目标或绕过 final verifier。
 
 ## 4. Memory
 
-- [ ] 新增 `prior_map/memory.py`。
-- [ ] 实现 `PriorMapMemory(base_map, alignment)`。
-- [ ] 实现 `update_from_mapper(mapper, step)`，用于仿真模式。
-- [ ] 实现 `update_from_snapshot(snapshot)`，用于实物模式。
-- [ ] 实现 `mark_room_visited(room_uid, step)`。
-- [ ] 实现 `mark_object_verified(prior_uid, runtime_uid, step)`。
-- [ ] 实现 `mark_prior_rejected(prior_uid, reason, step)`。
-- [ ] 实现 `current_map()`，返回合并 runtime state 后的只读地图视图。
-- [ ] 增加 visit count、verified/rejected、confidence moving average 测试。
-- [ ] 确保 memory 不修改原始 `PriorMapData`。
+- [x] 新增 `prior_map/memory.py`。
+- [x] 实现 `PriorMapMemory(base_map, alignment)`。
+- [x] 实现 `update_from_mapper(mapper, step)`，用于仿真模式。
+- [x] 实现 `update_from_snapshot(snapshot)`，用于实物模式。
+- [x] 实现 `mark_room_visited(room_uid, step)`。
+- [x] 实现 `mark_object_verified(prior_uid, runtime_uid, step)`。
+- [x] 实现 `mark_prior_rejected(prior_uid, reason, step)`。
+- [x] 实现 `current_map()`，返回合并 runtime state 后的只读地图视图。
+- [x] 增加 visit count、verified/rejected、confidence moving average 测试。
+- [x] 确保 memory 不修改原始 `PriorMapData`。
 
 ## 5. Query Service
 
