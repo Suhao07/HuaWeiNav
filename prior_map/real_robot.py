@@ -15,6 +15,11 @@ from typing import Any, Optional
 
 from .alignment import PriorMapAlignment
 from .contracts import PriorMapData, SearchPriorResult
+from .evaluation import (
+    prior_map_metrics_summary,
+    write_prior_map_static_artifacts,
+    write_prior_map_step_artifacts,
+)
 from .loaders import PriorMapLoader
 from .memory import PriorMapMemory
 from .policy_adapter import PriorMapPolicyAdapter
@@ -130,6 +135,7 @@ class PriorMapRealRobotRuntime:
         return self._context_payload()
 
     def _context_payload(self) -> dict[str, Any]:
+        summary = self.metrics_summary()
         return {
             "prior_result": self.last_query_result,
             "prior_map_policy_adapter": self.policy_adapter,
@@ -138,6 +144,7 @@ class PriorMapRealRobotRuntime:
                 "enabled": True,
                 "scene_id": self.base_map.scene_id,
                 "alignment": self.alignment.diagnostics_payload(),
+                "metrics_summary": summary,
                 "live_conflicts": list(
                     (self.last_query_result.diagnostics or {}).get("live_conflicts", [])
                     if self.last_query_result is not None
@@ -148,10 +155,23 @@ class PriorMapRealRobotRuntime:
             },
         }
 
+    def metrics_summary(self) -> dict[str, Any]:
+        """Return compact prior-map metrics/debug summary.
+
+        Returns:
+            JSON-friendly prior-map metrics/debug payload.
+        """
+
+        return prior_map_metrics_summary(
+            enabled=True,
+            alignment=self.alignment,
+            memory=self.memory,
+            prior_result=self.last_query_result,
+        )
+
     def _write_static_artifacts(self) -> None:
         self.artifact_dir.mkdir(parents=True, exist_ok=True)
-        _write_json(self.artifact_dir / "base_map.json", self.base_map.to_dict())
-        _write_json(self.artifact_dir / "alignment.json", self.alignment.to_dict())
+        write_prior_map_static_artifacts(output_dir=self.artifact_dir, memory=self.memory)
         _write_json(
             self.artifact_dir / "manifest.json",
             {
@@ -171,20 +191,30 @@ class PriorMapRealRobotRuntime:
         prompt_context: PromptContextBundle,
     ) -> None:
         suffix = f"{int(step):06d}"
+        query_payload = {
+            "step": int(step),
+            "raw_instruction": str(getattr(plan, "raw_instruction", "")),
+            "dataset_target": str(getattr(plan, "dataset_target", "")),
+            "observation": self.last_observation.to_dict() if hasattr(self.last_observation, "to_dict") else {},
+            "authority": "ranking_only",
+            "live_evidence_priority": True,
+        }
+        paths = write_prior_map_step_artifacts(
+            output_dir=self.artifact_dir,
+            step=int(step),
+            memory=self.memory,
+            prior_result=result,
+            query_payload=query_payload,
+            prompt_context_payload=prompt_context.to_dict(),
+        )
         _write_json(
-            self.artifact_dir / f"query_{suffix}.json",
+            self.artifact_dir / f"artifact_manifest_{suffix}.json",
             {
                 "step": int(step),
-                "raw_instruction": str(getattr(plan, "raw_instruction", "")),
-                "dataset_target": str(getattr(plan, "dataset_target", "")),
-                "observation": self.last_observation.to_dict() if hasattr(self.last_observation, "to_dict") else {},
+                "artifacts": paths,
                 "authority": "ranking_only",
-                "live_evidence_priority": True,
             },
         )
-        _write_json(self.artifact_dir / f"search_prior_result_{suffix}.json", result.to_dict())
-        _write_json(self.artifact_dir / f"prompt_context_{suffix}.json", prompt_context.to_dict())
-        _write_json(self.artifact_dir / f"runtime_state_{suffix}.json", self.memory.state_dict())
 
 
 def detect_live_prior_conflicts(*, snapshot: Any, base_map: PriorMapData) -> list[dict[str, Any]]:

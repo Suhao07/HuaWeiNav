@@ -1,15 +1,19 @@
-"""Set-of-Marks SVG visualizer for prior maps.
+"""Set-of-Marks visualizer for prior maps.
 
-The visualizer renders deterministic SVG text and marker metadata. It does not
+The visualizer renders deterministic SVG/PNG text and marker metadata. It does not
 depend on OpenCV, ROS, Habitat, or browser runtimes, so it can run in offline
 tests and deployment smoke checks.
 """
 
 from __future__ import annotations
 
+import json
 import re
+import struct
+import zlib
 from dataclasses import dataclass, field
 from html import escape
+from pathlib import Path
 from typing import Any, Iterable, List, Optional, Sequence, Tuple
 
 from .contracts import PriorMapData, PriorObject, PriorRoom
@@ -197,6 +201,97 @@ class PriorMapSomVisualizer:
             },
         )
 
+    def write_global_artifacts(
+        self,
+        map_data: PriorMapData,
+        output_dir: str | Path,
+        *,
+        stem: str = "som_global",
+    ) -> dict[str, str]:
+        """Write global SVG, PNG, and marker metadata artifacts.
+
+        Args:
+            map_data: Prior map to render.
+            output_dir: Destination directory.
+            stem: File stem for the artifact set.
+
+        Returns:
+            Dictionary with ``svg``, ``png``, and ``markers`` paths.
+        """
+
+        return self._write_view_artifacts(self.render_global_view(map_data), output_dir, stem=stem)
+
+    def write_room_artifacts(
+        self,
+        map_data: PriorMapData,
+        room_uid: str,
+        output_dir: str | Path,
+        *,
+        stem: Optional[str] = None,
+    ) -> dict[str, str]:
+        """Write room-level SVG, PNG, and marker metadata artifacts.
+
+        Args:
+            map_data: Prior map to render.
+            room_uid: Room uid to focus.
+            output_dir: Destination directory.
+            stem: Optional file stem. Defaults to ``som_room_<room_uid>``.
+
+        Returns:
+            Dictionary with ``svg``, ``png``, and ``markers`` paths.
+        """
+
+        safe_room = re.sub(r"[^A-Za-z0-9]+", "_", str(room_uid)).strip("_") or "unknown"
+        return self._write_view_artifacts(
+            self.render_room_view(map_data, room_uid),
+            output_dir,
+            stem=stem or f"som_room_{safe_room}",
+        )
+
+    def _write_view_artifacts(self, view: SomView, output_dir: str | Path, *, stem: str) -> dict[str, str]:
+        output = Path(output_dir)
+        output.mkdir(parents=True, exist_ok=True)
+        svg_path = output / f"{stem}.svg"
+        png_path = output / f"{stem}.png"
+        marker_path = output / f"{stem}_markers.json"
+        svg_path.write_text(view.svg, encoding="utf-8")
+        png_path.write_bytes(self._render_marker_png(view))
+        marker_path.write_text(
+            json.dumps(
+                {
+                    "view_type": view.view_type,
+                    "view_box": list(view.view_box),
+                    "legend": view.legend,
+                    "markers": [marker.to_dict() for marker in view.markers],
+                    "metadata": view.metadata,
+                },
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+        return {"svg": str(svg_path), "png": str(png_path), "markers": str(marker_path)}
+
+    def _render_marker_png(self, view: SomView) -> bytes:
+        transform = _CanvasTransform(
+            bounds=view.view_box,
+            width=self.width,
+            height=self.height,
+            margin=self.margin,
+        )
+        canvas = _RasterCanvas(width=self.width, height=self.height, background=(248, 250, 252))
+        for marker in view.markers:
+            x_float, y_float = transform.to_canvas(marker.xy)
+            x, y = int(round(x_float)), int(round(y_float))
+            if marker.marker_type == "room":
+                canvas.fill_rect(x - 10, y - 8, 20, 16, color=(29, 78, 216))
+                canvas.stroke_rect(x - 10, y - 8, 20, 16, color=(30, 64, 175))
+            else:
+                canvas.fill_circle(x, y, 8, color=(194, 65, 12))
+                canvas.stroke_circle(x, y, 8, color=(124, 45, 18))
+        return canvas.to_png()
+
     def _build_markers(
         self,
         *,
@@ -350,6 +445,37 @@ def render_room_view(map_data: PriorMapData, room_uid: str, *, width: int = 900,
     return PriorMapSomVisualizer(width=width, height=height).render_room_view(map_data, room_uid)
 
 
+def write_som_artifacts(
+    map_data: PriorMapData,
+    output_dir: str | Path,
+    *,
+    max_room_views: int = 4,
+    width: int = 900,
+    height: int = 600,
+) -> dict[str, Any]:
+    """Write global and selected room SoM artifacts.
+
+    Args:
+        map_data: Prior map to render.
+        output_dir: Destination directory.
+        max_room_views: Maximum room-level views to write.
+        width: SVG/PNG width.
+        height: SVG/PNG height.
+
+    Returns:
+        Dictionary containing artifact path groups.
+    """
+
+    visualizer = PriorMapSomVisualizer(width=width, height=height)
+    artifacts = {
+        "global": visualizer.write_global_artifacts(map_data, output_dir),
+        "rooms": {},
+    }
+    for room in sorted(map_data.rooms, key=lambda item: item.uid)[: max(0, int(max_room_views))]:
+        artifacts["rooms"][room.uid] = visualizer.write_room_artifacts(map_data, room.uid, output_dir)
+    return artifacts
+
+
 def _map_bounds(
     map_data: PriorMapData,
     rooms: Sequence[PriorRoom],
@@ -422,10 +548,73 @@ def _legend_svg(width: int, height: int) -> List[str]:
     ]
 
 
+class _RasterCanvas:
+    def __init__(self, *, width: int, height: int, background: tuple[int, int, int]) -> None:
+        self.width = max(1, int(width))
+        self.height = max(1, int(height))
+        self.pixels = bytearray(background * (self.width * self.height))
+
+    def fill_rect(self, x: int, y: int, width: int, height: int, *, color: tuple[int, int, int]) -> None:
+        for yy in range(max(0, y), min(self.height, y + height)):
+            for xx in range(max(0, x), min(self.width, x + width)):
+                self._set(xx, yy, color)
+
+    def stroke_rect(self, x: int, y: int, width: int, height: int, *, color: tuple[int, int, int]) -> None:
+        for xx in range(x, x + width):
+            self._set(xx, y, color)
+            self._set(xx, y + height - 1, color)
+        for yy in range(y, y + height):
+            self._set(x, yy, color)
+            self._set(x + width - 1, yy, color)
+
+    def fill_circle(self, x: int, y: int, radius: int, *, color: tuple[int, int, int]) -> None:
+        rr = radius * radius
+        for yy in range(y - radius, y + radius + 1):
+            for xx in range(x - radius, x + radius + 1):
+                if (xx - x) * (xx - x) + (yy - y) * (yy - y) <= rr:
+                    self._set(xx, yy, color)
+
+    def stroke_circle(self, x: int, y: int, radius: int, *, color: tuple[int, int, int]) -> None:
+        outer = radius * radius
+        inner = max(0, radius - 1) * max(0, radius - 1)
+        for yy in range(y - radius, y + radius + 1):
+            for xx in range(x - radius, x + radius + 1):
+                dist = (xx - x) * (xx - x) + (yy - y) * (yy - y)
+                if inner <= dist <= outer:
+                    self._set(xx, yy, color)
+
+    def to_png(self) -> bytes:
+        raw_rows = []
+        for y in range(self.height):
+            start = y * self.width * 3
+            end = start + self.width * 3
+            raw_rows.append(b"\x00" + bytes(self.pixels[start:end]))
+        compressed = zlib.compress(b"".join(raw_rows), level=6)
+        return (
+            b"\x89PNG\r\n\x1a\n"
+            + _png_chunk(b"IHDR", struct.pack(">IIBBBBB", self.width, self.height, 8, 2, 0, 0, 0))
+            + _png_chunk(b"IDAT", compressed)
+            + _png_chunk(b"IEND", b"")
+        )
+
+    def _set(self, x: int, y: int, color: tuple[int, int, int]) -> None:
+        if not 0 <= x < self.width or not 0 <= y < self.height:
+            return
+        offset = (y * self.width + x) * 3
+        self.pixels[offset : offset + 3] = bytes(color)
+
+
+def _png_chunk(chunk_type: bytes, data: bytes) -> bytes:
+    checksum = zlib.crc32(chunk_type)
+    checksum = zlib.crc32(data, checksum)
+    return struct.pack(">I", len(data)) + chunk_type + data + struct.pack(">I", checksum & 0xFFFFFFFF)
+
+
 __all__ = [
     "PriorMapSomVisualizer",
     "SomMarker",
     "SomView",
     "render_global_view",
     "render_room_view",
+    "write_som_artifacts",
 ]

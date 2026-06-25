@@ -21,6 +21,7 @@ from llm_utils.lvlm_call_tracker import counts_compact, reset_counts, set_trace_
 from mapper_with_process_obs import Instruct_Mapper
 from mapping_utils.transform import habitat_camera_intrinsic
 from objnav_agent_with_process_obs import HM3D_Objnav_Agent
+from prior_map.evaluation import prior_map_metrics_fields, prior_map_metrics_summary
 from prior_map.simulation import build_prior_map_simulation_runtime, configure_mapper_prior_map
 
 os.environ['CUDA_VISIBLE_DEVICES'] = '0'
@@ -343,6 +344,11 @@ if __name__ == "__main__":
             flag = habitat_agent.step_mod(idx=i)
 
         habitat_agent.save_trajectory(f"./{args.save_dir}/episode-{i}/")
+        prior_map_summary = (
+            prior_map_runtime.metrics_summary()
+            if prior_map_runtime is not None
+            else prior_map_metrics_summary(enabled=False)
+        )
         evaluation_metrics.append({
             # success/spl 是 Habitat 原始目标类别指标；instruction_success
             # 是自然语言指令 verifier 的终止结果，两者不能混读。
@@ -372,6 +378,7 @@ if __name__ == "__main__":
             'accepted_relation_edge': json.dumps(habitat_agent.accepted_relation_edge, ensure_ascii=False, sort_keys=True),
             'accepted_distance_to_target': habitat_agent.accepted_distance_to_target,
             'accepted_distance_source': habitat_agent.accepted_distance_source,
+            **prior_map_metrics_fields(prior_map_summary),
             'lvlm_call_count_by_type': counts_compact(),
             # 兼容前期文档/脚本中的拼写；规范字段是 lvlm_call_count_by_type。
             'lvml_call_count_by_type': counts_compact(),

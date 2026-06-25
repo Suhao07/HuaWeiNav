@@ -14,6 +14,11 @@ from typing import Any, Optional
 
 from .alignment import PriorMapAlignment
 from .contracts import PriorMapData, SearchPriorResult
+from .evaluation import (
+    prior_map_metrics_summary,
+    write_prior_map_static_artifacts,
+    write_prior_map_step_artifacts,
+)
 from .loaders import PriorMapLoader
 from .memory import PriorMapMemory
 from .policy_adapter import PriorMapPolicyAdapter
@@ -134,8 +139,7 @@ class PriorMapSimulationRuntime:
         self.last_query_result = None
         self.last_prompt_context = None
         self.last_query_step = None
-        _write_json(self.episode_dir / "base_map.json", self.base_map.to_dict())
-        _write_json(self.episode_dir / "alignment.json", self.alignment.to_dict())
+        write_prior_map_static_artifacts(output_dir=self.episode_dir, memory=self.memory)
         _write_json(
             self.episode_dir / "manifest.json",
             {
@@ -180,6 +184,20 @@ class PriorMapSimulationRuntime:
         self._write_step_artifacts(step=step, plan=plan, mapper=mapper, result=result, prompt_context=prompt_context)
         return result
 
+    def metrics_summary(self) -> dict[str, Any]:
+        """Return compact prior-map metrics for benchmark rows.
+
+        Returns:
+            JSON-friendly prior-map metrics/debug summary.
+        """
+
+        return prior_map_metrics_summary(
+            enabled=True,
+            alignment=self.alignment,
+            memory=self.memory,
+            prior_result=self.last_query_result,
+        )
+
     def _ensure_episode_dir(self, mapper: Any, episode_idx: Optional[int]) -> None:
         if self.episode_dir is not None:
             return
@@ -198,24 +216,34 @@ class PriorMapSimulationRuntime:
     ) -> None:
         assert self.episode_dir is not None
         suffix = f"{int(step):06d}"
+        query_payload = {
+            "step": int(step),
+            "raw_instruction": str(getattr(plan, "raw_instruction", "") or getattr(mapper, "target", "")),
+            "dataset_target": str(getattr(plan, "dataset_target", "") or getattr(mapper, "target", "")),
+            "runtime_counts": {
+                "objects": len(list(getattr(mapper, "objects", []) or [])),
+                "rooms": len(list(getattr(mapper, "room_nodes", []) or [])),
+                "frontiers": len(list(getattr(mapper, "nodes", []) or [])),
+            },
+            "observation": self.last_observation.to_dict() if hasattr(self.last_observation, "to_dict") else {},
+            "authority": "ranking_only",
+        }
+        paths = write_prior_map_step_artifacts(
+            output_dir=self.episode_dir,
+            step=int(step),
+            memory=self.memory,
+            prior_result=result,
+            query_payload=query_payload,
+            prompt_context_payload=prompt_context.to_dict(),
+        )
         _write_json(
-            self.episode_dir / f"query_{suffix}.json",
+            self.episode_dir / f"artifact_manifest_{suffix}.json",
             {
                 "step": int(step),
-                "raw_instruction": str(getattr(plan, "raw_instruction", "") or getattr(mapper, "target", "")),
-                "dataset_target": str(getattr(plan, "dataset_target", "") or getattr(mapper, "target", "")),
-                "runtime_counts": {
-                    "objects": len(list(getattr(mapper, "objects", []) or [])),
-                    "rooms": len(list(getattr(mapper, "room_nodes", []) or [])),
-                    "frontiers": len(list(getattr(mapper, "nodes", []) or [])),
-                },
-                "observation": self.last_observation.to_dict() if hasattr(self.last_observation, "to_dict") else {},
+                "artifacts": paths,
                 "authority": "ranking_only",
             },
         )
-        _write_json(self.episode_dir / f"search_prior_result_{suffix}.json", result.to_dict())
-        _write_json(self.episode_dir / f"prompt_context_{suffix}.json", prompt_context.to_dict())
-        _write_json(self.episode_dir / f"runtime_state_{suffix}.json", self.memory.state_dict())
 
 
 def build_prior_map_simulation_runtime(args: Any, save_dir: str) -> Optional[PriorMapSimulationRuntime]:

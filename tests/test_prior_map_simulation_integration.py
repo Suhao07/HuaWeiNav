@@ -88,11 +88,19 @@ def test_simulation_runtime_updates_queries_and_writes_artifacts(tmp_path: Path)
     prior_dir = tmp_path / "episode-0" / "prior_map"
     assert (prior_dir / "base_map.json").exists()
     assert (prior_dir / "alignment.json").exists()
+    assert (prior_dir / "som_global.png").read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+    assert (prior_dir / "som_global_markers.json").exists()
     assert (prior_dir / "query_000007.json").exists()
     assert (prior_dir / "search_prior_result_000007.json").exists()
+    assert (prior_dir / "runtime_state_000007.json").exists()
+    assert (prior_dir / "debug_000007.json").exists()
+    assert (prior_dir / "failure_modes_000007.json").exists()
     query_payload = json.loads((prior_dir / "query_000007.json").read_text(encoding="utf-8"))
     assert query_payload["authority"] == "ranking_only"
     assert query_payload["runtime_counts"]["objects"] == 1
+    debug_payload = json.loads((prior_dir / "debug_000007.json").read_text(encoding="utf-8"))
+    assert debug_payload["enabled"] is True
+    assert debug_payload["top_object"]["uid"] == "prior_mug"
 
 
 def test_simulation_runtime_reuses_same_step_query_without_duplicate_observation(tmp_path: Path) -> None:

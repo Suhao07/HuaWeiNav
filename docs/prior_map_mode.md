@@ -83,6 +83,151 @@ Instruction / benchmark target
   -> FinalInstructionVerifier decides STOP
 ```
 
+仿真中可以直接消费的先验地图是 canonical `PriorMapData` JSON，而不是 Habitat
+dataset 原始 episode 文件。正式 smoke 优先使用 HM3D scene semantic annotation
+生成场景级语义库存先验，因为它来自 scene asset，不依赖当前 ObjectNav episode 的
+goal object 坐标，不会把评测目标位置泄漏给 policy。
+
+HM3D `*.semantic.txt` 路径只提供 instance label 和 region id，不提供可校准的
+object position 或 room boundary。因此第一版生成的 alignment 默认为
+`unavailable`，先验地图会降级为 prompt/context/ranking evidence，不参与几何
+frontier 生成，也不能直接给出 motion goal：
+
+```text
+HM3D scene semantic txt
+  -> scripts/build_hm3d_semantic_prior_map.py
+  -> prior_map.json            # source_format=hm3d_semantic_txt
+  -> alignment.json            # unavailable, prompt_context_only
+  -> objnav_benchmark_with_process_obs.py --enable_prior_map
+```
+
+示例：
+
+```bash
+mkdir -p logs/prior_maps
+
+python3 scripts/build_hm3d_semantic_prior_map.py \
+  /home/ubuntu/WorkSpace/research/code/Navigation/CogNav_ObjNav/data/scene_datasets/hm3d_v0.2/val/00802-wcojb4TFT35/wcojb4TFT35.semantic.txt \
+  --scene_id wcojb4TFT35 \
+  --output logs/prior_maps/wcojb4TFT35_hm3d_semantic_prior_map.json \
+  --alignment_output logs/prior_maps/wcojb4TFT35_hm3d_semantic_alignment.json \
+  --alignment_mode unavailable
+```
+
+加载验证：
+
+```bash
+LLM_OFFLINE=1 STRIVE_LLM_FALLBACK=1 bash docker/run_hm3d_baseline.sh \
+  --benchmark hm3d_ovon \
+  --benchmark_split val_seen_complex_balanced_2k \
+  --scene_id wcojb4TFT35 \
+  --object_category tv \
+  --episode_rank 0 \
+  --save_dir hm3d_semantic_prior_on \
+  --vlm cognav \
+  --max_steps 1 \
+  --enable_prior_map \
+  --prior_map_path /workspace/STRIVE/logs/prior_maps/wcojb4TFT35_hm3d_semantic_prior_map.json \
+  --prior_map_source canonical_json \
+  --prior_map_alignment /workspace/STRIVE/logs/prior_maps/wcojb4TFT35_hm3d_semantic_alignment.json
+```
+
+A/B 对照关闭 prior map：
+
+```bash
+LLM_OFFLINE=1 STRIVE_LLM_FALLBACK=1 bash docker/run_hm3d_baseline.sh \
+  --benchmark hm3d_ovon \
+  --benchmark_split val_seen_complex_balanced_2k \
+  --scene_id wcojb4TFT35 \
+  --object_category tv \
+  --episode_rank 0 \
+  --save_dir hm3d_semantic_prior_off \
+  --vlm cognav \
+  --max_steps 1
+```
+
+Habitat/ObjectNav dataset 也可以生成 canonical prior map，但它读取 episode
+`goals_by_category`。这条路径适合调试 loader、artifact 和 A/B 回归，不适合作为
+正式“真实先验地图”评测，因为 goal object 坐标可能泄漏当前任务答案：
+
+```text
+Habitat ObjectNav val.json.gz
+  -> scripts/build_habitat_prior_map.py
+  -> prior_map.json            # source_format=habitat_objectnav_json
+  -> alignment.json optional   # default unavailable, unless coordinates are calibrated
+  -> objnav_benchmark_with_process_obs.py --enable_prior_map
+```
+
+示例，宿主侧生成 ObjectNav 调试 prior，Docker 内按 `/workspace/STRIVE/...` 路径消费：
+脚本可以直接读取 `content/<scene>.json.gz`，也可以读取 split 根文件并自动扫描
+同目录 `content/` 下的 scene episode 文件。
+
+```bash
+mkdir -p logs/prior_maps
+
+python scripts/build_habitat_prior_map.py \
+  /home/ubuntu/WorkSpace/research/code/Navigation/CogNav_ObjNav/data/datasets/objectnav/hm3d_ovon/v1/val_seen_complex_balanced_2k/val_seen_complex_balanced_2k.json.gz \
+  --scene_id wcojb4TFT35 \
+  --object_category tv \
+  --episode_rank 0 \
+  --output logs/prior_maps/wcojb4TFT35_tv_prior_map.json \
+  --alignment_output logs/prior_maps/wcojb4TFT35_tv_alignment.json \
+  --alignment_mode unavailable
+```
+
+加载验证：
+
+```bash
+LLM_OFFLINE=1 STRIVE_LLM_FALLBACK=1 bash docker/run_hm3d_baseline.sh \
+  --benchmark hm3d_ovon \
+  --benchmark_split val_seen_complex_balanced_2k \
+  --eval_episodes 1 \
+  --start_episode 0 \
+  --save_dir hm3d_prior_smoke \
+  --vlm cognav \
+  --max_steps 1 \
+  --scene_id wcojb4TFT35 \
+  --object_category tv \
+  --episode_rank 0 \
+  --enable_prior_map \
+  --prior_map_path /workspace/STRIVE/logs/prior_maps/wcojb4TFT35_tv_prior_map.json \
+  --prior_map_source canonical_json \
+  --prior_map_alignment /workspace/STRIVE/logs/prior_maps/wcojb4TFT35_tv_alignment.json
+```
+
+A/B 对照关闭 prior map：
+
+```bash
+LLM_OFFLINE=1 STRIVE_LLM_FALLBACK=1 bash docker/run_hm3d_baseline.sh \
+  --benchmark hm3d_ovon \
+  --benchmark_split val_seen_complex_balanced_2k \
+  --eval_episodes 1 \
+  --start_episode 0 \
+  --save_dir hm3d_prior_ab_off \
+  --vlm cognav \
+  --max_steps 1 \
+  --scene_id wcojb4TFT35 \
+  --object_category tv \
+  --episode_rank 0
+```
+
+验证重点：
+
+```text
+prior map on:
+  logs/<save_dir>/episode-*/prior_map/base_map.json exists
+  query_*.json / search_prior_result_*.json / runtime_state_*.json exists
+  metrics/debug records prior_map_enabled=true
+
+prior map off:
+  no prior_map runtime artifacts are required
+  planner still uses current mainline behavior
+
+both:
+  STOP authority remains final verifier / existing success logic
+  SearchPriorResult never contains motion_goal or navigation_intent
+```
+
 ### 3.2 实物模式
 
 ```text
@@ -400,8 +545,10 @@ prior_map/alignment.json
 prior_map/runtime_state_*.json
 prior_map/query_*.json
 prior_map/search_prior_result_*.json
-prior_map/som_global_*.png
-prior_map/som_room_<room_uid>_*.png
+prior_map/som_global.png
+prior_map/som_global_markers.json
+prior_map/som_room_<room_uid>.png
+prior_map/som_room_<room_uid>_markers.json
 ```
 
 `query_*.json` 至少包含：
@@ -437,6 +584,14 @@ tests/test_prior_map_query.py
 
 tests/test_prior_map_policy_adapter.py
   ranking-only behavior; no direct goal publication
+
+tests/test_habitat_objectnav_prior_map.py
+  Habitat ObjectNav dataset -> canonical prior map generator,
+  loader roundtrip, alignment file, CLI smoke
+
+tests/test_hm3d_semantic_prior_map.py
+  HM3D scene semantic txt -> canonical prior map generator,
+  structural label filtering, loader roundtrip, unavailable alignment, CLI smoke
 ```
 
 集成测试再覆盖：

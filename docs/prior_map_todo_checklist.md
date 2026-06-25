@@ -23,6 +23,7 @@ summary，不能直接发布导航目标或绕过 final verifier。
 - [x] 支持 FloorPlan-VLN JSON。
 - [x] 支持 OSM/XML 简化格式。
 - [x] 支持 HM3D top-down / generated prior map JSON。
+- [x] 支持 HM3D scene `*.semantic.txt` 到 canonical `PriorMapData` 的真实语义先验构建。
 - [x] 为 VLM reconstruction 输出预留 loader。
 - [x] 增加最小 fixture 测试，覆盖 room、object、topology 和 metadata。
 - [x] 明确 loader 只解析文件，不进行 runtime 坐标对齐和导航决策。
@@ -92,6 +93,8 @@ summary，不能直接发布导航目标或绕过 final verifier。
 - [x] 在 room/frontier/object selection 前调用 `PriorMapQueryService.query()`。
 - [x] 将 `SearchPriorResult` 作为排序 context 传给 planning policy。
 - [x] 保存 `prior_map/query_*.json` 和 `search_prior_result_*.json`。
+- [x] 新增 Habitat/ObjectNav dataset 到 canonical `PriorMapData` 的生成脚本。
+- [x] 新增 HM3D semantic txt 到 canonical `PriorMapData` 的生成脚本，避免 ObjectNav goal prior 泄漏目标位置。
 - [x] 做 1 episode offline smoke，确认无 live API 依赖。
 
 ## 9. Real-Robot Integration
@@ -105,18 +108,19 @@ summary，不能直接发布导航目标或绕过 final verifier。
 
 ## 10. Artifacts And Evaluation
 
-- [ ] 保存 `prior_map/base_map.json`。
-- [ ] 保存 `prior_map/alignment.json`。
-- [ ] 保存 `prior_map/runtime_state_*.json`。
-- [ ] 保存 `prior_map/query_*.json`。
-- [ ] 保存 SoM PNG 和 marker metadata。
-- [ ] 在 metrics/debug 中记录 prior map enabled、top room/object prior、alignment confidence。
-- [ ] 增加 failure mode 统计：wrong prior、alignment mismatch、live conflict、prior exhausted。
+- [x] 保存 `prior_map/base_map.json`。
+- [x] 保存 `prior_map/alignment.json`。
+- [x] 保存 `prior_map/runtime_state_*.json`。
+- [x] 保存 `prior_map/query_*.json`。
+- [x] 保存 SoM PNG 和 marker metadata。
+- [x] 在 metrics/debug 中记录 prior map enabled、top room/object prior、alignment confidence。
+- [x] 增加 failure mode 统计：wrong prior、alignment mismatch、live conflict、prior exhausted。
 
 ## 11. Acceptance
 
-- [ ] Contract/loaders/alignment/memory/query 单元测试通过。
-- [ ] 仿真 smoke：启用 prior map 后可以完成至少一个 episode，不改变 stop authority。
-- [ ] 仿真 A/B：关闭 prior map 后行为与当前主线一致。
-- [ ] 实物 replay smoke：fake `SemanticMapSnapshot` 能生成 prior-aware `NavigationIntent`。
-- [ ] 文档同步：`docs/prior_map_mode.md` 与本 checklist 保持一致。
+- [x] Contract/loaders/alignment/memory/query 单元测试通过。
+- [x] 仿真 smoke：启用 prior map 后可以完成至少一个 episode，不改变 stop authority。
+- [x] 仿真 A/B：关闭 prior map 后行为与当前主线一致。
+- [x] 真实 HM3D semantic prior A/B：同一 episode 下 prior-on 生成 `SearchPriorResult`，prior-off 不生成 prior runtime artifact。
+- [x] 实物 replay smoke：fake `SemanticMapSnapshot` 能生成 prior-aware `NavigationIntent`。
+- [x] 文档同步：`docs/prior_map_mode.md` 与本 checklist 保持一致。

@@ -100,11 +100,18 @@ def test_real_robot_prior_runtime_updates_from_snapshot_and_writes_artifacts(tmp
     prior_dir = tmp_path / "prior_map"
     assert (prior_dir / "base_map.json").exists()
     assert (prior_dir / "alignment.json").exists()
+    assert (prior_dir / "som_global.png").read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+    assert (prior_dir / "som_global_markers.json").exists()
     assert (prior_dir / "query_000005.json").exists()
     assert (prior_dir / "search_prior_result_000005.json").exists()
+    assert (prior_dir / "runtime_state_000005.json").exists()
+    assert (prior_dir / "debug_000005.json").exists()
+    assert (prior_dir / "failure_modes_000005.json").exists()
     query_payload = json.loads((prior_dir / "query_000005.json").read_text(encoding="utf-8"))
     assert query_payload["authority"] == "ranking_only"
     assert query_payload["live_evidence_priority"] is True
+    debug_payload = json.loads((prior_dir / "debug_000005.json").read_text(encoding="utf-8"))
+    assert debug_payload["failure_modes"]["live_conflict"] == 1
 
 
 def test_semantic_snapshot_adapter_consumes_prior_ranking_context_without_stop_authority() -> None:
