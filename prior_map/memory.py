@@ -687,7 +687,7 @@ def _runtime_label(value: Any) -> str:
         Semantic label string.
     """
 
-    return _text_or_none(_first_attr(value, ("label", "type", "category", "name"))) or ""
+    return _text_or_none(_first_attr(value, ("label", "tag", "type", "category", "name", "class_name"))) or ""
 
 
 def _runtime_confidence(value: Any) -> float:

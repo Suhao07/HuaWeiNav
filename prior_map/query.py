@@ -632,7 +632,7 @@ def _runtime_label(value: Any) -> str:
         Runtime label.
     """
 
-    return _text_or_none(_first_attr(value, ("label", "type", "category", "name"))) or ""
+    return _text_or_none(_first_attr(value, ("label", "tag", "type", "category", "name", "class_name"))) or ""
 
 
 def _string_list(value: Any) -> List[str]:

@@ -86,13 +86,13 @@ summary，不能直接发布导航目标或绕过 final verifier。
 
 ## 8. Simulation Integration
 
-- [ ] 增加 CLI 参数：`--enable_prior_map`、`--prior_map_path`、`--prior_map_source`、`--prior_map_alignment`。
-- [ ] 在 episode/run 初始化时加载 prior map。
-- [ ] 在每个 planning cycle 后调用 `PriorMapMemory.update_from_mapper()`。
-- [ ] 在 room/frontier/object selection 前调用 `PriorMapQueryService.query()`。
-- [ ] 将 `SearchPriorResult` 作为排序 context 传给 planning policy。
-- [ ] 保存 `prior_map/query_*.json` 和 `search_prior_result_*.json`。
-- [ ] 做 1 episode offline smoke，确认无 live API 依赖。
+- [x] 增加 CLI 参数：`--enable_prior_map`、`--prior_map_path`、`--prior_map_source`、`--prior_map_alignment`。
+- [x] 在 episode/run 初始化时加载 prior map。
+- [x] 在每个 planning cycle 后调用 `PriorMapMemory.update_from_mapper()`。
+- [x] 在 room/frontier/object selection 前调用 `PriorMapQueryService.query()`。
+- [x] 将 `SearchPriorResult` 作为排序 context 传给 planning policy。
+- [x] 保存 `prior_map/query_*.json` 和 `search_prior_result_*.json`。
+- [x] 做 1 episode offline smoke，确认无 live API 依赖。
 
 ## 9. Real-Robot Integration
 

@@ -21,6 +21,7 @@ from llm_utils.lvlm_call_tracker import counts_compact, reset_counts, set_trace_
 from mapper_with_process_obs import Instruct_Mapper
 from mapping_utils.transform import habitat_camera_intrinsic
 from objnav_agent_with_process_obs import HM3D_Objnav_Agent
+from prior_map.simulation import build_prior_map_simulation_runtime, configure_mapper_prior_map
 
 os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 os.environ["MAGNUM_LOG"] = "quiet"
@@ -133,6 +134,10 @@ def get_args():
     parser.add_argument("--enable_instruction_adapter", default=False, action="store_true")
     parser.add_argument("--instruction_adapter_backend", type=str, default="llm")
     parser.add_argument("--instruction_adapter_strict_classes", default=False, action="store_true")
+    parser.add_argument("--enable_prior_map", default=False, action="store_true")
+    parser.add_argument("--prior_map_path", type=str, default="")
+    parser.add_argument("--prior_map_source", type=str, default="auto")
+    parser.add_argument("--prior_map_alignment", type=str, default="identity")
     return parser.parse_known_args()[0]
 
 
@@ -207,6 +212,13 @@ if __name__ == "__main__":
                 "run_id": run_id,
                 "save_dir": args.save_dir,
                 "started_at_local": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "prior_map": {
+                    "enabled": bool(args.enable_prior_map),
+                    "path": args.prior_map_path,
+                    "source": args.prior_map_source,
+                    "alignment": args.prior_map_alignment,
+                    "authority": "ranking_only",
+                },
             },
             f,
             ensure_ascii=False,
@@ -253,6 +265,15 @@ if __name__ == "__main__":
         strict_available_classes=args.instruction_adapter_strict_classes,
         vlm=args.vlm,
     )
+    prior_map_runtime = build_prior_map_simulation_runtime(args, args.save_dir)
+    configure_mapper_prior_map(habitat_mapper, prior_map_runtime)
+    if prior_map_runtime is not None:
+        logger.info(
+            "Prior map enabled: scene={}, source={}, alignment={}",
+            prior_map_runtime.base_map.scene_id,
+            prior_map_runtime.base_map.source_format,
+            prior_map_runtime.alignment.diagnostics_payload(),
+        )
 
     start_idx = args.start_episode
     if hasattr(habitat_agent.env.episode_iterator, "set_next_episode_by_index"):
@@ -268,6 +289,8 @@ if __name__ == "__main__":
         _set_next_episode_by_index(habitat_agent.env, i)
         habitat_agent.reset(i)
         episode_dir = os.path.join(args.save_dir, f"episode-{i}")
+        if prior_map_runtime is not None:
+            prior_map_runtime.begin_episode(episode_dir, i)
         reset_counts()
         set_trace_dir(os.path.join(episode_dir, "lvlm_calls"))
 

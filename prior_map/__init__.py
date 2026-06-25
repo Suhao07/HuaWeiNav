@@ -30,6 +30,13 @@ from .prompt_context import (
     to_compact_xml,
 )
 from .query import PriorMapQueryContext, PriorMapQueryService, PriorMapQueryWeights
+from .simulation import (
+    PriorMapSimulationConfig,
+    PriorMapSimulationRuntime,
+    build_prior_map_simulation_runtime,
+    configure_mapper_prior_map,
+    refresh_mapper_prior_map_query,
+)
 from .visualizer import PriorMapSomVisualizer, SomMarker, SomView, render_global_view, render_room_view
 
 __all__ = [
@@ -46,6 +53,8 @@ __all__ = [
     "PriorMapQueryContext",
     "PriorMapQueryService",
     "PriorMapQueryWeights",
+    "PriorMapSimulationConfig",
+    "PriorMapSimulationRuntime",
     "PriorMapSomVisualizer",
     "PriorMapData",
     "PriorObject",
@@ -61,8 +70,11 @@ __all__ = [
     "SomView",
     "SupportRegionPrior",
     "annotate_target_candidates",
+    "build_prior_map_simulation_runtime",
+    "configure_mapper_prior_map",
     "rank_frontiers",
     "rank_rooms",
+    "refresh_mapper_prior_map_query",
     "render_global_view",
     "render_room_view",
     "summarize_prior_map",
