@@ -33,6 +33,14 @@ from .hm3d_semantic import (
     build_hm3d_semantic_prior_map,
     write_hm3d_semantic_prior_map_with_alignment,
 )
+from .hm3d_groundtruth import (
+    HM3DGroundTruthBuildConfig,
+    HM3DGroundTruthPriorMapBuildResult,
+    HM3DGroundTruthPriorMapBuilder,
+    build_hm3d_groundtruth_prior_map_from_scene_dir,
+    build_hm3d_groundtruth_prior_map_from_sim,
+    write_hm3d_groundtruth_prior_map_with_alignment,
+)
 from .loaders import PriorMapLoader, PriorMapLoaderError
 from .memory import PriorMapMemory, PriorObjectRuntimeState, PriorRoomRuntimeState
 from .policy_adapter import (
@@ -79,6 +87,9 @@ __all__ = [
     "HM3DSemanticInstance",
     "HM3DSemanticPriorMapBuildResult",
     "HM3DSemanticTxtPriorMapBuilder",
+    "HM3DGroundTruthBuildConfig",
+    "HM3DGroundTruthPriorMapBuildResult",
+    "HM3DGroundTruthPriorMapBuilder",
     "ObjectPrior",
     "PriorMapAlignment",
     "PriorMapAlignmentError",
@@ -114,6 +125,8 @@ __all__ = [
     "build_prior_map_simulation_runtime",
     "build_habitat_objectnav_prior_map",
     "build_hm3d_semantic_prior_map",
+    "build_hm3d_groundtruth_prior_map_from_scene_dir",
+    "build_hm3d_groundtruth_prior_map_from_sim",
     "configure_mapper_prior_map",
     "detect_live_prior_conflicts",
     "prior_map_failure_modes",
@@ -131,5 +144,6 @@ __all__ = [
     "write_prior_map_step_artifacts",
     "write_prior_map_with_alignment",
     "write_hm3d_semantic_prior_map_with_alignment",
+    "write_hm3d_groundtruth_prior_map_with_alignment",
     "write_som_artifacts",
 ]
