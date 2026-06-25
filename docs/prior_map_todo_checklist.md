@@ -96,12 +96,12 @@ summary，不能直接发布导航目标或绕过 final verifier。
 
 ## 9. Real-Robot Integration
 
-- [ ] 在实物高层 node 中增加 prior map 参数。
-- [ ] 用 `SemanticMapSnapshot` 调用 `PriorMapMemory.update_from_snapshot()`。
-- [ ] 将 `SearchPriorResult` 作为 ranking/context evidence 传给 `SemanticMapSnapshotPolicyContext` / 现有 planning policy adapter。
-- [ ] prior map 和 live map 冲突时，live evidence 优先，并写入 diagnostics。
-- [ ] 确认 prior map 不直接生成 `/way_point`。
-- [ ] 增加 fake snapshot replay 测试。
+- [x] 在实物高层 node 中增加 prior map 参数。
+- [x] 用 `SemanticMapSnapshot` 调用 `PriorMapMemory.update_from_snapshot()`。
+- [x] 将 `SearchPriorResult` 作为 ranking/context evidence 传给 `SemanticMapSnapshotPolicyContext` / 现有 planning policy adapter。
+- [x] prior map 和 live map 冲突时，live evidence 优先，并写入 diagnostics。
+- [x] 确认 prior map 不直接生成 `/way_point`。
+- [x] 增加 fake snapshot replay 测试。
 
 ## 10. Artifacts And Evaluation
 

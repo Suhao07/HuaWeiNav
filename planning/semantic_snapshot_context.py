@@ -127,6 +127,10 @@ class SemanticMapSnapshotPolicyContext:
         relation_pair_ledger: Optional relation pair ledger.
         constraint_evaluator: Optional existing constraint evaluator.
         instruction_object_search_policy: Optional existing object search policy.
+        prior_result: Optional `SearchPriorResult` used as ranking evidence.
+        prior_map_policy_adapter: Optional adapter for target annotations.
+        prior_map_prompt_context: Optional bounded prompt context bundle.
+        prior_map_diagnostics: Optional conflict/alignment diagnostics.
         vlm: VLM provider name used when constructing default matchers.
     """
 
@@ -138,6 +142,10 @@ class SemanticMapSnapshotPolicyContext:
     relation_pair_ledger: Optional[RelationPairLedger] = None
     constraint_evaluator: Optional[ConstraintEvaluator] = None
     instruction_object_search_policy: Optional[InstructionObjectSearchPolicy] = None
+    prior_result: Optional[Any] = None
+    prior_map_policy_adapter: Optional[Any] = None
+    prior_map_prompt_context: Optional[Any] = None
+    prior_map_diagnostics: Optional[dict[str, Any]] = None
     vlm: str = "cognav"
 
     def __post_init__(self) -> None:
@@ -151,6 +159,9 @@ class SemanticMapSnapshotPolicyContext:
         self.target = _active_target_name(self.plan)
         self.target_list = list(getattr(self.plan, "target_detector_prompts", []) or [self.target])
         self.target_aliases = list(getattr(self.plan, "target_match_terms", []) or [self.target])
+        self.search_prior_result = self.prior_result
+        self.prior_map_last_result = self.prior_result
+        self.prior_map_diagnostics = dict(self.prior_map_diagnostics or {})
         self.concept_matcher = self.concept_matcher or RuntimeConceptMatcher(vlm=self.vlm)
         self.verification_ledger = self.verification_ledger or VerificationLedger()
         self.anchor_search_ledger = self.anchor_search_ledger or AnchorSearchLedger()
@@ -454,6 +465,7 @@ class SemanticMapSnapshotIntentAdapter:
         plan_provider: Callable[[Optional[str]], InstructionPlan],
         *,
         context: Optional[SemanticMapSnapshotPolicyContext] = None,
+        prior_context_provider: Optional[Callable[[SemanticMapSnapshot, InstructionPlan, int], dict[str, Any]]] = None,
         vlm: str = "cognav",
     ) -> None:
         """Initialize the adapter.
@@ -461,11 +473,14 @@ class SemanticMapSnapshotIntentAdapter:
         Args:
             plan_provider: Callable returning the active `InstructionPlan`.
             context: Optional persistent snapshot policy context.
+            prior_context_provider: Optional callable returning prior-map
+                context kwargs for the current snapshot.
             vlm: VLM provider name used for default matchers in the context.
         """
 
         self.plan_provider = plan_provider
         self.context = context
+        self.prior_context_provider = prior_context_provider
         self.vlm = vlm
         self.step = 0
         self.last_selection: Optional[SnapshotTargetSelection] = None
@@ -510,12 +525,17 @@ class SemanticMapSnapshotIntentAdapter:
                     },
                 )
 
+        prior_context = {}
+        if self.prior_context_provider is not None:
+            prior_context = dict(self.prior_context_provider(snapshot, plan, self.step) or {})
+
         selection = select_target_candidate_from_snapshot(
             snapshot,
             plan=plan,
             context=self.context,
             step=self.step,
             vlm=self.vlm,
+            **prior_context,
         )
         self.context = selection.context
         self.last_selection = selection
@@ -596,6 +616,8 @@ def select_target_candidate_from_snapshot(
     else:
         context.snapshot = snapshot
         context.plan = plan
+        for key, value in context_kwargs.items():
+            setattr(context, key, value)
         context.__post_init__()
     result = select_target_candidate(context, plan=plan, step=step)
     return SnapshotTargetSelection(context=context, result=result)
@@ -626,7 +648,32 @@ def _selection_metadata(selection: SnapshotTargetSelection, candidate: Any | Non
         "anchor_record": dict(selection.result.anchor_record or {}),
         "skipped_objs": list(selection.result.skipped_objs or []),
         "concept_debug": list(selection.result.concept_debug or []),
+        "prior_map": _prior_map_metadata(selection.context),
     }
+
+
+def _prior_map_metadata(context: SemanticMapSnapshotPolicyContext) -> dict[str, Any]:
+    prior_result = getattr(context, "prior_result", None)
+    prompt_context = getattr(context, "prior_map_prompt_context", None)
+    diagnostics = dict(getattr(context, "prior_map_diagnostics", {}) or {})
+    payload = {
+        "enabled": prior_result is not None,
+        "diagnostics": diagnostics,
+    }
+    if prior_result is not None:
+        payload["top_rooms"] = [
+            {"room_uid": item.room_uid, "label": item.label, "score": item.score}
+            for item in list(getattr(prior_result, "room_rankings", ()) or ())[:3]
+        ]
+        payload["top_objects"] = [
+            {"object_uid": item.object_uid, "label": item.label, "score": item.score}
+            for item in list(getattr(prior_result, "object_rankings", ()) or ())[:5]
+        ]
+        payload["live_conflicts"] = list((getattr(prior_result, "diagnostics", {}) or {}).get("live_conflicts", []))
+        payload["authority"] = "ranking_only"
+    if prompt_context is not None:
+        payload["prompt_context"] = prompt_context.to_dict() if hasattr(prompt_context, "to_dict") else {}
+    return payload
 
 
 def _verification_result_from_dict(payload: dict[str, Any]) -> VerificationResult:

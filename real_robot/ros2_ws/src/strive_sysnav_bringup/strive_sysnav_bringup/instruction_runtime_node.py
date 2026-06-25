@@ -17,6 +17,7 @@ from planning.semantic_snapshot_context import (
     SemanticMapSnapshotIntentAdapter,
     StaticInstructionPlanProvider,
 )
+from prior_map.real_robot import PriorMapRealRobotConfig, build_prior_map_real_robot_runtime
 from real_robot.observation_cache import ObjectCropEvidenceProvider, RosObservationCache
 from real_robot.contracts import NavigationStatusCode, Pose3D
 from real_robot.sysnav_ros_adapters import (
@@ -62,6 +63,8 @@ class StriveInstructionRuntimeNode(Node):
         self.enable_final_verifier = _param_bool(self.get_parameter("enable_final_verifier").value)
         self.evidence_mode = str(self.get_parameter("evidence_mode").value or "auto")
         self.prior_map_path = str(self.get_parameter("prior_map_path").value or "")
+        self.prior_map_source = str(self.get_parameter("prior_map_source").value or "auto")
+        self.prior_map_alignment = str(self.get_parameter("prior_map_alignment").value or "identity")
         self.image_topic = str(self.get_parameter("image_topic").value)
         self.detection_topic = str(self.get_parameter("detection_topic").value)
         self.waypoint_topic = str(self.get_parameter("waypoint_topic").value or "/way_point")
@@ -77,6 +80,21 @@ class StriveInstructionRuntimeNode(Node):
 
         run_directory = Path(str(self.get_parameter("run_directory").value or "/tmp/strive_real_robot_runtime"))
         self._decision_writer = RuntimeDecisionJsonlWriter(run_directory / "runtime_decisions.jsonl")
+        self.prior_map_runtime = build_prior_map_real_robot_runtime(
+            PriorMapRealRobotConfig(
+                prior_map_path=self.prior_map_path,
+                prior_map_source=self.prior_map_source,
+                prior_map_alignment=self.prior_map_alignment,
+                run_directory=str(run_directory),
+            )
+        )
+        if self.prior_map_runtime is not None:
+            self.get_logger().info(
+                "prior map enabled for real-robot runtime: "
+                f"scene={self.prior_map_runtime.base_map.scene_id}, "
+                f"source={self.prior_map_runtime.base_map.source_format}, "
+                f"alignment={self.prior_map_runtime.alignment.diagnostics_payload()}"
+            )
         image_directory_param = str(self.get_parameter("observation_image_directory").value or "")
         image_directory = Path(image_directory_param) if image_directory_param else run_directory / "observations"
         self.observation_cache = RosObservationCache(
@@ -181,7 +199,8 @@ class StriveInstructionRuntimeNode(Node):
             "STRIVE instruction runtime started: "
             f"dry_run={self.dry_run}, policy_mode={self.policy_mode}, "
             f"lower_controller_enabled={self.lower_controller_enabled}, waypoint_topic={self.waypoint_topic}, "
-            f"run_directory={run_directory}, prior_map_path={self.prior_map_path or '<disabled>'}"
+            f"run_directory={run_directory}, prior_map_path={self.prior_map_path or '<disabled>'}, "
+            f"prior_map_source={self.prior_map_source}, prior_map_alignment={self.prior_map_alignment}"
         )
 
     def _declare_parameters(self) -> None:
@@ -212,6 +231,8 @@ class StriveInstructionRuntimeNode(Node):
         self.declare_parameter("enable_final_verifier", False)
         self.declare_parameter("evidence_mode", "auto")
         self.declare_parameter("prior_map_path", "")
+        self.declare_parameter("prior_map_source", "auto")
+        self.declare_parameter("prior_map_alignment", "identity")
         self.declare_parameter("run_directory", "/tmp/strive_real_robot_runtime")
         self.declare_parameter("decision_period_s", 1.0)
         self.declare_parameter("queue_size", 10)
@@ -252,6 +273,7 @@ class StriveInstructionRuntimeNode(Node):
             )
             return SemanticMapSnapshotIntentAdapter(
                 StaticInstructionPlanProvider(plan),
+                prior_context_provider=self._prior_map_context_provider,
                 vlm=self.vlm,
             )
         if normalized in {"wait", "disabled", ""}:
@@ -307,6 +329,13 @@ class StriveInstructionRuntimeNode(Node):
             final_verifier=final_verifier,
             now_fn=self._now_seconds,
         )
+
+    def _prior_map_context_provider(self, snapshot, plan, step: int) -> dict:
+        """Return prior-map context kwargs for semantic snapshot planning."""
+
+        if self.prior_map_runtime is None:
+            return {}
+        return self.prior_map_runtime.update_and_query(snapshot=snapshot, plan=plan, step=step)
 
     def _update_odom(self, msg: Odometry) -> None:
         """Cache the latest robot pose from odometry."""

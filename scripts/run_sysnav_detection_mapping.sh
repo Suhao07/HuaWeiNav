@@ -98,6 +98,8 @@ runtime_args() {
   append_runtime_arg RUNTIME_ARGS "enable_final_verifier" "${STRIVE_ENABLE_FINAL_VERIFIER:-false}"
   append_runtime_arg RUNTIME_ARGS "evidence_mode" "${STRIVE_EVIDENCE_MODE:-auto}"
   append_runtime_arg RUNTIME_ARGS "prior_map_path" "${STRIVE_PRIOR_MAP_PATH:-}"
+  append_runtime_arg RUNTIME_ARGS "prior_map_source" "${STRIVE_PRIOR_MAP_SOURCE:-auto}"
+  append_runtime_arg RUNTIME_ARGS "prior_map_alignment" "${STRIVE_PRIOR_MAP_ALIGNMENT:-identity}"
   append_runtime_arg RUNTIME_ARGS "run_directory" "${STRIVE_RUN_DIRECTORY:-/tmp/strive_real_robot_runtime}"
   append_runtime_arg RUNTIME_ARGS "dry_run" "${STRIVE_DRY_RUN:-true}"
   append_runtime_arg RUNTIME_ARGS "dry_run_status" "${STRIVE_DRY_RUN_STATUS:-idle}"

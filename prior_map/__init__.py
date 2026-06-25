@@ -30,6 +30,12 @@ from .prompt_context import (
     to_compact_xml,
 )
 from .query import PriorMapQueryContext, PriorMapQueryService, PriorMapQueryWeights
+from .real_robot import (
+    PriorMapRealRobotConfig,
+    PriorMapRealRobotRuntime,
+    build_prior_map_real_robot_runtime,
+    detect_live_prior_conflicts,
+)
 from .simulation import (
     PriorMapSimulationConfig,
     PriorMapSimulationRuntime,
@@ -53,6 +59,8 @@ __all__ = [
     "PriorMapQueryContext",
     "PriorMapQueryService",
     "PriorMapQueryWeights",
+    "PriorMapRealRobotConfig",
+    "PriorMapRealRobotRuntime",
     "PriorMapSimulationConfig",
     "PriorMapSimulationRuntime",
     "PriorMapSomVisualizer",
@@ -70,8 +78,10 @@ __all__ = [
     "SomView",
     "SupportRegionPrior",
     "annotate_target_candidates",
+    "build_prior_map_real_robot_runtime",
     "build_prior_map_simulation_runtime",
     "configure_mapper_prior_map",
+    "detect_live_prior_conflicts",
     "rank_frontiers",
     "rank_rooms",
     "refresh_mapper_prior_map_query",

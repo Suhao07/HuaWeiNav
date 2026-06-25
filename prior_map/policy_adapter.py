@@ -250,6 +250,8 @@ def _match_object_prior(candidate: Any, object_priors: Sequence[ObjectPrior]) ->
         if _any_match(candidate_ids, (prior.object_uid, prior.matched_runtime_uid)):
             return prior
     for prior in object_priors:
+        if prior.matched_runtime_uid:
+            continue
         if _any_match(candidate_labels, (prior.label,)):
             return prior
     return None
