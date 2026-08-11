@@ -129,8 +129,11 @@
 - [x] 2026-08-11 只读核对 AgileX 桥接：输入 `/cmd_vel`，rosbridge 默认 `ws://192.168.1.102:9090`，输出 `/navflow_cmd_vel`（`geometry_msgs/Twist`），mux 相关为 `/mux_vel/add`、`/mux_vel/select`、`/mux_vel/selected`（`std_msgs/String`）和 `/base_cmd_vel`；历史命令曾使用 `--max-linear 1.5 --max-angular 0.45`，未执行。
 - [x] 2026-08-11 只读核对控制运行态：无 PD/bridge/mux 进程、无 `/tmp/navflow_cmd_vel_bridge_enabled`、无本机 9090 监听；唯一 tmux 会话为外部 `livox_odom`，未修改。
 - [x] 2026-08-11 只读发现状态辅助接口：`/odom`（`nav_msgs/Odometry`）、`/interface_management/BMS_status`（`tools_msgs/RobotBmsStatus`）、`/sensor_status`（`tools_msgs/SensorStatus`）；源码中未找到可批准的急停 topic/service。
+- [x] 2026-08-11 已同步观测版 `real_robot/control/orin26_controller_contract.yaml`；该文件明确 `approval_status: unapproved`，仅记录外部接口事实，不满足真实运动门控，也不进入 Git。
+- [x] 2026-08-11 隔离 `--network none` 容器中的 `RosWaypointController` 测试通过（8 passed）；验证 `geometry_msgs/PointStamped`、frame/坐标写入、STOP 不发布和禁止 `/cmd_vel` 直连。
+- [ ] 外部 `/waypoint`（`Float32MultiArray`、无 header）与 STRIVE `/way_point`（`PointStamped`）存在接口不匹配；需要所有者确认或提供显式 adapter 后，才能进行真实下层 handoff。
 - [ ] 确认底盘/局部规划器的启动所有权、订阅 topic、消息类型、frame、状态回执与急停接口。
-- [ ] 先在 `/huawei_vln/test_way_point` 做无人订阅的消息与坐标系验证。
+- [ ] 先在 `/strive/test_way_point`（`geometry_msgs/PointStamped`）做无人订阅的消息与坐标系验证；该 topic 不得连接底盘控制器。
 - [ ] 在人工监控、急停可达、限速和受控场地中验证真实 `/way_point` handoff。
 - [ ] 验证 REACHED/BLOCKED/TIMEOUT/PREEMPTED、HOLD 与故障降级行为。
 
