@@ -20,6 +20,8 @@
 - [x] 已识别 Generic USB RGB 相机（稳定路径见 profile）及 Intel RealSense D435i。
 - [x] 已确认当前没有活跃 `/way_point`、`/cmd_vel` 或经验证的下层控制器。
 - [x] 2026-08-11 Point-LIO 的只读 tmux 日志确认正在处理首帧 LiDAR/IMU 并持续输出 mapping 时延；未修改该 session。
+- [x] 2026-08-11 只读核对 `/dev/video0`：udev 身份为 Generic USB Camera（VID `0bda`、PID `3035`、序列号 `200901010001`），`/dev/v4l/by-id/usb-Generic_USB_Camera_200901010001-video-index0` 指向该设备。
+- [x] 2026-08-11 只读核对当前 ROS graph：`/depth_camera_adapter`、`/laserMapping`、`/livox_lidar_publisher`、`/tf_aft_mapped_to_base` 存在；没有控制节点。`/depth_camera_adapter` 仅订阅 `/camera/camera/depth/image_rect_raw`，发布 `/depth_camera`，frame=`depth_camera`，输出 32×24、范围 0.05–2.5 m。
 - [ ] 单独 ROS CLI 订阅 `/livox/lidar`、`/livox/imu`、`/cloud_registered`、`/aft_mapped_to_init` 在匹配的 Reliable/Best-Effort QoS 下仍会超时，需在启用融合前解决外部 DDS data-plane 接收并记录频率、header frame、timestamp。
 - [x] 已提供 `lio-diagnostics` profile 子命令：只读采集 ROS/DDS 环境、LIO endpoint QoS 与实际 header 样本，并将报告仅写入本工作区 `logs/diagnostics/`。
 - [x] 2026-08-11 已生成 `logs/diagnostics/lio_dds_20260811T060757Z.md`：host Fast DDS 默认 transport、domain 0 下 Point-LIO 参数服务可读，但四个实际 header 样本均在 8 秒内超时；保持 `START_SEMANTIC_MAPPING=false`，不重启外部 `livox_odom`。
@@ -58,6 +60,7 @@
 - [x] 2026-08-11 容器内 `/camera/image` 已收到 header（`frame_id=default_cam`）；preflight 与 launch 的相机参数一致。
 - [x] 2026-08-11 容器内 `/camera/image` 实测编码为 `yuv422_yuy2`，20 帧窗口稳定到 `9.946 Hz`（profile 输入为 1280×720 YUYV 10 FPS）。
 - [x] 2026-08-11 相机→YOLOE detector 闭环已验证：`/huawei_vln/detection_result` 收到 `frame_id=map` 的真实时间戳和 track ID；空检测帧不会再使 `detection_node` 退出。
+- [x] 2026-08-11 只读检查其他项目历史配置：旧 `tools/usb_camera_node.py` 使用 `/image_raw`、640×480 MJPEG 30 FPS；它与当前已实测的 `usb_cam` profile 不同，不作为本部署的启动配置。
 - [x] `USB_CAMERA_INFO_URL` 已成为可插拔 profile 参数；`real_robot/calibration/` 由容器只读挂载。标定后只需放入该目录并填写 `file:///workspace/STRIVE/real_robot/calibration/<camera>.yaml`，profile check 会验证文件存在。
 - [ ] 为 usb_cam 提供你标定后的 `camera_info` 文件；在该文件就绪前启动日志会提示缺少 `/root/.ros/camera_info/default_cam.yaml`，但不影响当前 detector-only 验收。
 - [ ] RealSense D435i driver、RGB-D topic 和 device 权限按独立 profile 验证。
@@ -118,6 +121,10 @@
 - [x] 真实运动要求同时设置 `ALLOW_REAL_MOTION=true`、`STRIVE_DRY_RUN=false`、`STRIVE_LOWER_CONTROLLER_ENABLED=true`、`ENABLE_LOWER_CONTROLLER=1`、`BLOCK_LOWER_CONTROLLER=0`。
 - [x] 已新增只读挂载的 `real_robot/control/` 契约模板；即便有人打开上述开关，profile 与 runtime 仍要求经过批准的 controller contract，且明确禁止直接 `/cmd_vel` 发布并确认急停。
 - [x] 2026-08-11 在 `--network none` 临时容器中强制打开 lower-controller 开关；因 `CONTROL_CONTRACT_FILE` 为空被拒绝（exit 4），控制命令没有运行。
+- [x] 2026-08-11 只读核对 `/home/orin26/code/Urban-Nav-SR/Policy_part`：`/waypoint` 为 `std_msgs/Float32MultiArray`，`/topoplan/reached_goal` 为 `std_msgs/Bool`，PD controller 发布 `geometry_msgs/Twist` 到 `/cmd_vel`；配置上限为 `max_v=1.5 m/s`、`max_w=0.5 rad/s`，waypoint 数据按 ego-frame 二维点处理但消息本身没有 frame 字段。
+- [x] 2026-08-11 只读核对 AgileX 桥接：输入 `/cmd_vel`，rosbridge 默认 `ws://192.168.1.102:9090`，输出 `/navflow_cmd_vel`（`geometry_msgs/Twist`），mux 相关为 `/mux_vel/add`、`/mux_vel/select`、`/mux_vel/selected`（`std_msgs/String`）和 `/base_cmd_vel`；历史命令曾使用 `--max-linear 1.5 --max-angular 0.45`，未执行。
+- [x] 2026-08-11 只读核对控制运行态：无 PD/bridge/mux 进程、无 `/tmp/navflow_cmd_vel_bridge_enabled`、无本机 9090 监听；唯一 tmux 会话为外部 `livox_odom`，未修改。
+- [x] 2026-08-11 只读发现状态辅助接口：`/odom`（`nav_msgs/Odometry`）、`/interface_management/BMS_status`（`tools_msgs/RobotBmsStatus`）、`/sensor_status`（`tools_msgs/SensorStatus`）；源码中未找到可批准的急停 topic/service。
 - [ ] 确认底盘/局部规划器的启动所有权、订阅 topic、消息类型、frame、状态回执与急停接口。
 - [ ] 先在 `/huawei_vln/test_way_point` 做无人订阅的消息与坐标系验证。
 - [ ] 在人工监控、急停可达、限速和受控场地中验证真实 `/way_point` handoff。
