@@ -67,6 +67,8 @@
 - [x] 2026-08-11 只读检查其他项目历史配置：旧 `tools/usb_camera_node.py` 使用 `/image_raw`、640×480 MJPEG 30 FPS；它与当前已实测的 `usb_cam` profile 不同，不作为本部署的启动配置。
 - [x] `USB_CAMERA_INFO_URL` 已成为可插拔 profile 参数；`real_robot/calibration/` 由容器只读挂载。标定后只需放入该目录并填写 `file:///workspace/STRIVE/real_robot/calibration/<camera>.yaml`，profile check 会验证文件存在。
 - [ ] 为 usb_cam 提供你标定后的 `camera_info` 文件；在该文件就绪前启动日志会提示缺少 `/root/.ros/camera_info/default_cam.yaml`，但不影响当前 detector-only 验收。
+- [x] 已从机器人上 VEOcc-Rywang 项目只读导入 D435i↔MID-360 外参参数：`real_robot/calibration/orin26_d435i_mid360_targetless_v009_r009_extrinsics.json`。源文件路径和 SHA-256 已记录，未修改源项目。
+- [ ] 该资产当前仅为 `extrinsics_only`；仍需补齐 RGB `camera_info`、畸变、RGB-LiDAR 时间偏移、标定日期/方法/重投影误差后，才能生成并批准 semantic-fusion projection profile。
 - [ ] RealSense D435i driver、RGB-D topic 和 device 权限按独立 profile 验证。
 
 ## 5. 标定与传感器融合
@@ -76,7 +78,7 @@
 - [x] 未经批准的 `calibration_status` 会拒绝 semantic mapping。
 - [x] Orin profile 默认 `START_SEMANTIC_MAPPING=false`，允许安全 detector-only bringup。
 - [x] detector-only profile 不依赖 LIO 数据；启用 semantic mapping 时 helper 强制要求 LIO topic 与实际 header 样本双门槛。
-- [ ] 采集 RGB 内参（分辨率、`fx/fy/cx/cy`、畸变）。
+- [ ] 从相机节点的 `sensor_msgs/CameraInfo` 读取并记录 RGB 内参（分辨率、`fx/fy/cx/cy`、畸变）；当前机器人未运行相机节点，尚无实时 `CameraInfo` 话题。
 - [ ] 标定 MID-360 到 RGB optical frame 的外参和平移单位。
 - [ ] 记录时间偏移与投影重投影误差。
 - [ ] 将校准后的 profile 标记为 `calibrated` 并启用 semantic mapping。

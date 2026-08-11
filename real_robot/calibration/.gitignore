@@ -2,3 +2,7 @@
 # them in this workspace and mount them read-only; do not commit them by default.
 *.yaml
 *.yml
+# JSON calibration exports are also robot-specific deployment assets. Keep
+# them local/remote under the calibration mount unless a reviewed release
+# explicitly vendors one.
+*.json
