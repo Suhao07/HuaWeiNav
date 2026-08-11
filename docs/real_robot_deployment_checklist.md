@@ -25,6 +25,7 @@
 - [ ] 单独 ROS CLI 订阅 `/livox/lidar`、`/livox/imu`、`/cloud_registered`、`/aft_mapped_to_init` 在匹配的 Reliable/Best-Effort QoS 下仍会超时，需在启用融合前解决外部 DDS data-plane 接收并记录频率、header frame、timestamp。
 - [x] 已提供 `lio-diagnostics` profile 子命令：只读采集 ROS/DDS 环境、LIO endpoint QoS 与实际 header 样本，并将报告仅写入本工作区 `logs/diagnostics/`。
 - [x] 2026-08-11 已生成 `logs/diagnostics/lio_dds_20260811T060757Z.md`：host Fast DDS 默认 transport、domain 0 下 Point-LIO 参数服务可读，但四个实际 header 样本均在 8 秒内超时；保持 `START_SEMANTIC_MAPPING=false`，不重启外部 `livox_odom`。
+- [x] 2026-08-11 最新只读诊断 `logs/diagnostics/lio_dds_20260811T095246Z.md`：Point-LIO/Livox 进程仍在，四个 topic 的 publisher/subscriber 端点可发现，但 `/livox/lidar`、`/livox/imu`、`/cloud_registered`、`/aft_mapped_to_init` 的实际 header 样本再次全部在 8 秒内超时；`publish.scan_publish_en=false`、`scan_bodyframe_pub_en=false`，继续保持 `START_SEMANTIC_MAPPING=false`。
 - [ ] 已确认运行中的外部 Point-LIO 参数 `publish.scan_publish_en=false`，这会使 `/cloud_registered` 保持可发现却不输出实际点云；需由其所有者确认并在其工作流中启用，再重新运行本工作区的只读诊断。Livox 原始 IMU 与 LIO 里程计仍须同时通过实际 header 门槛；仅开启 scan output 不能替代该验收。
 - [x] 容器专用 `FASTDDS_BUILTIN_TRANSPORTS=UDPv4` 已与 host-side LIO 诊断分离：diagnostic 默认恢复外部 Point-LIO 的 host Fast DDS transport，避免把容器 workaround 错用于参数/传感器验收。
 - [ ] 为本次 deployment 保存机器/代码/镜像/资产 SHA256 清单。
