@@ -38,6 +38,7 @@
 - [x] 不使用 `--privileged`，模型通过只读 volume 注入。
 - [x] smoke 不再 stop/start 宿主共享 ROS daemon。
 - [x] 2026-08-11 只读资源检查：根分区 233G/206G（94%），可用约 15G；Docker 镜像 20 个、约 25.36G；部署容器当前不存在，未执行 prune。
+- [x] 2026-08-11 存储审计已落盘至 `docs/real_robot_storage_audit_20260811.md`，记录项目、bag、模型、缓存和 Docker 占用；未删除或移动数据。
 - [ ] 构建前确认至少有足够的 Docker 构建余量；当前余量偏紧，先不构建，不得对其他镜像执行 prune。
 - [ ] 新容器启动后确认不会重启、停止或改变 `livox_odom` tmux session。
 
