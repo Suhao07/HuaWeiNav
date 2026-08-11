@@ -14,14 +14,15 @@ fi
 append_jetson_nvidia_library_args() {
   local -n args_ref=$1
   local cuda_home="${CUDA_HOME_HOST:-}"
+  local cuda_container_mount="${CUDA_CONTAINER_MOUNT:-/opt/strive/host-cuda}"
   local ld_paths=()
 
   if [[ -z "${cuda_home}" && -e /usr/local/cuda ]]; then
     cuda_home="$(readlink -f /usr/local/cuda 2>/dev/null || true)"
   fi
   if [[ -n "${cuda_home}" && -d "${cuda_home}" ]]; then
-    args_ref+=(-v "${cuda_home}:${cuda_home}:ro")
-    ld_paths+=("${cuda_home}/lib64" "${cuda_home}/targets/aarch64-linux/lib")
+    args_ref+=(-v "${cuda_home}:${cuda_container_mount}:ro")
+    ld_paths+=("${cuda_container_mount}/lib64" "${cuda_container_mount}/targets/aarch64-linux/lib")
   fi
 
   for lib in /usr/lib/aarch64-linux-gnu/libcudnn*.so*; do

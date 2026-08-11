@@ -24,11 +24,17 @@ def launch_setup(context, *args, **kwargs):
     cloud_topic = LaunchConfiguration("cloud_topic").perform(context)
     odom_topic = LaunchConfiguration("odom_topic").perform(context)
     viewpoint_topic = LaunchConfiguration("viewpoint_topic").perform(context)
+    detection_topic = LaunchConfiguration("detection_topic").perform(context)
+    object_nodes_topic = LaunchConfiguration("object_nodes_topic").perform(context)
+    projection_config = LaunchConfiguration("projection_config").perform(context)
+    start_semantic_mapping = LaunchConfiguration("start_semantic_mapping").perform(context).lower() in ("1", "true", "yes", "on")
     start_usb_cam = LaunchConfiguration("start_usb_cam").perform(context).lower() in ("1", "true", "yes", "on")
     usb_video_device = LaunchConfiguration("usb_video_device").perform(context)
     usb_image_width = int(LaunchConfiguration("usb_image_width").perform(context))
     usb_image_height = int(LaunchConfiguration("usb_image_height").perform(context))
     usb_pixel_format = LaunchConfiguration("usb_pixel_format").perform(context)
+    usb_framerate = float(LaunchConfiguration("usb_framerate").perform(context))
+    usb_camera_info_url = LaunchConfiguration("usb_camera_info_url").perform(context)
 
     if not _non_empty(mapping_config):
         mapping_config = os.path.join(semantic_share, "mapping_mecanum_real.yaml")
@@ -55,6 +61,8 @@ def launch_setup(context, *args, **kwargs):
             "object_file": object_file,
         },
     ]
+    if _non_empty(projection_config):
+        mapping_parameters[1]["projection_config"] = projection_config
 
     actions = []
     if _non_empty(sam2_checkpoint):
@@ -76,6 +84,12 @@ def launch_setup(context, *args, **kwargs):
                                 "image_width": usb_image_width,
                                 "image_height": usb_image_height,
                                 "pixel_format": usb_pixel_format,
+                                "framerate": usb_framerate,
+                                **(
+                                    {"camera_info_url": usb_camera_info_url}
+                                    if _non_empty(usb_camera_info_url)
+                                    else {}
+                                ),
                             }
                         ],
                         remappings=[
@@ -95,19 +109,28 @@ def launch_setup(context, *args, **kwargs):
                 parameters=detection_parameters,
                 remappings=[
                     ("/camera/image", camera_topic),
+                    ("/detection_result", detection_topic),
                 ],
             ),
-            Node(
-                package="semantic_mapping",
-                executable="semantic_mapping_node",
-                name="semantic_mapping_node",
-                output="screen",
-                parameters=mapping_parameters,
-                remappings=[
-                    ("/registered_scan", cloud_topic),
-                    ("/state_estimation", odom_topic),
-                    ("/viewpoint_rep_header", viewpoint_topic),
-                ],
+            *(
+                [
+                    Node(
+                        package="semantic_mapping",
+                        executable="semantic_mapping_node",
+                        name="semantic_mapping_node",
+                        output="screen",
+                        parameters=mapping_parameters,
+                        remappings=[
+                            ("/registered_scan", cloud_topic),
+                            ("/state_estimation", odom_topic),
+                            ("/viewpoint_rep_header", viewpoint_topic),
+                            ("/detection_result", detection_topic),
+                            ("/object_nodes_list", object_nodes_topic),
+                        ],
+                    )
+                ]
+                if start_semantic_mapping
+                else []
             ),
         ]
     )
@@ -128,11 +151,17 @@ def generate_launch_description():
             DeclareLaunchArgument("cloud_topic", default_value="/registered_scan"),
             DeclareLaunchArgument("odom_topic", default_value="/state_estimation"),
             DeclareLaunchArgument("viewpoint_topic", default_value="/viewpoint_rep_header"),
+            DeclareLaunchArgument("detection_topic", default_value="/detection_result"),
+            DeclareLaunchArgument("object_nodes_topic", default_value="/object_nodes_list"),
+            DeclareLaunchArgument("projection_config", default_value=""),
+            DeclareLaunchArgument("start_semantic_mapping", default_value="true"),
             DeclareLaunchArgument("start_usb_cam", default_value="false"),
             DeclareLaunchArgument("usb_video_device", default_value="/dev/video0"),
             DeclareLaunchArgument("usb_image_width", default_value="1280"),
             DeclareLaunchArgument("usb_image_height", default_value="720"),
             DeclareLaunchArgument("usb_pixel_format", default_value="yuyv"),
+            DeclareLaunchArgument("usb_framerate", default_value="30.0"),
+            DeclareLaunchArgument("usb_camera_info_url", default_value=""),
             OpaqueFunction(function=launch_setup),
         ]
     )

@@ -12,6 +12,9 @@ data
 datasets
 weights
 checkpoints
+# Deployment assets are mounted read-only at runtime.  Never bake robot-model
+# weights into an image layer or send them as Docker build context.
+assets/
 
 real_robot/ros2_ws/build
 real_robot/ros2_ws/install

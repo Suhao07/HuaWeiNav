@@ -1,0 +1,6 @@
+# Robot-specific controller contracts are deployment assets.  Keep the
+# template versioned, but do not commit a real robot's approved contract by
+# default.
+*.yaml
+*.yml
+!controller_contract_template.yaml

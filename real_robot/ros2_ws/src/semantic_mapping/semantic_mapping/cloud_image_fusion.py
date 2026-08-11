@@ -10,6 +10,8 @@ from scipy.ndimage import minimum_filter
 
 import time
 
+from .projection_config import load_projection_config
+
 def scan2pixels(laserCloud, L2C_PARA, CAMERA_PARA, LIDAR_PARA):
     lidarX = L2C_PARA["x"] #   lidarXStack[imageIDPointer]
     lidarY = L2C_PARA["y"] # idarYStack[imageIDPointer]
@@ -301,8 +303,34 @@ def grow_cluster_from_min(points, threshold=0.3):
     return cluster_idx
 
 class CloudImageFusion:
-    def __init__(self, platform):
+    """Associate segmented RGB masks with a LiDAR cloud.
+
+    A deployed robot should provide ``projection_config_path``.  Legacy
+    platform projections remain available for replay compatibility only; a
+    caller can set ``require_calibration`` to reject them.
+
+    Args:
+        platform: Legacy platform selector used by simulation and old bags.
+        projection_config_path: Optional YAML calibration profile.
+        require_calibration: Reject missing or unapproved calibration assets.
+    """
+
+    def __init__(self, platform, projection_config_path=None, require_calibration=False):
         self.platform_list = ['wheelchair', 'mecanum', 'mecanum_bagfile', 'mecanum_sim', 'scannet', 'diablo']
+
+        if projection_config_path:
+            projection_config = load_projection_config(
+                projection_config_path,
+                require_calibrated=require_calibration,
+            )
+            self.platform = platform
+            self.scan2pixels = projection_config.project
+            return
+        if require_calibration:
+            raise ValueError(
+                "Real-robot cloud/image fusion requires projection_config_path when "
+                "require_calibration=true"
+            )
 
         if platform not in self.platform_list:
             raise ValueError(f"Invalid platform: {platform}. Available platforms: {self.platform_list}")

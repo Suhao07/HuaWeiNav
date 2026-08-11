@@ -130,6 +130,8 @@ class MappingNode(Node):
         self.declare_parameter("grounding_score_thresh", 0.3)
         self.declare_parameter("object_file", "config/objects_rfdetr.yaml")
         self.declare_parameter("save_png", False)
+        self.declare_parameter("projection_config", "")
+        self.declare_parameter("require_calibration", False)
 
         # class global containers
         self.cloud_stack = []
@@ -166,6 +168,11 @@ class MappingNode(Node):
         self.grounding_score_thresh = self.get_parameter('grounding_score_thresh').get_parameter_value().double_value
         self.object_file_path = str(resolve_package_path(self.get_parameter('object_file').get_parameter_value().string_value))
         self.save_png = self.get_parameter('save_png').get_parameter_value().bool_value
+        projection_config_value = self.get_parameter('projection_config').get_parameter_value().string_value
+        self.projection_config_path = (
+            str(resolve_package_path(projection_config_value)) if projection_config_value else None
+        )
+        self.require_calibration = self.get_parameter('require_calibration').get_parameter_value().bool_value
 
         print(
             f'Platform: {self.platform}\n,\
@@ -197,7 +204,11 @@ class MappingNode(Node):
         self.viewpoint_id = -1
         self.timestamp = -1.0
 
-        self.cloud_img_fusion = CloudImageFusion(platform=self.platform)
+        self.cloud_img_fusion = CloudImageFusion(
+            platform=self.platform,
+            projection_config_path=self.projection_config_path,
+            require_calibration=self.require_calibration,
+        )
 
         if self.ANNOTATE:
             self.box_annotator = sv.BoxAnnotator(color=ColorPalette.DEFAULT)
