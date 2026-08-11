@@ -90,3 +90,18 @@
 3. 当前只剩约 15G 可用空间，不建议立即重新构建 7G 级别镜像。
 4. 可在得到确认后分别制定 bag 归档、旧 TensorRT cache、ROS log 和旧 Docker 镜像
    的回收计划；本次审计没有改变任何文件。
+
+## 复查：2026-08-11 17:47 CST
+
+本次仍为只读检查。与初次审计相比：
+
+- 根分区从 206G 已用/15G 可用（94%）变为 108G 已用/113G 可用（49%），约释放 98G。
+- `Urban-Nav-SR` 从约 110G 变为 12G；其中 `Policy_part/bags` 从 98G 变为约 20K，
+  `staging` 和 `auto_import` 目前只剩目录结构。
+- `VEOcc-Rywang` 仍约 37G，`HuaweiVLN` 仍约 1.9G；主要 TensorRT cache 和 ROS
+  日志占用也未明显变化。
+- Docker 仍报告 20 个可计费镜像、约 25.36G，当前没有
+  `huawei-vln-realworld` 容器；本次没有清理 Docker 镜像。
+
+因此本次空间释放主要来自 Urban-Nav-SR 的历史 ROS bag，未影响当前 HuaweiVLN
+部署工作区或 Docker 镜像。
