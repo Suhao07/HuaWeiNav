@@ -35,6 +35,7 @@ debug*
 run.sh
 *.png
 .vscode/
+.docker_build/
 
 # Local/private deployment env files. Keep real API keys out of git.
 .env*

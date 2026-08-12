@@ -24,6 +24,7 @@ from .memory import PriorMapMemory
 from .policy_adapter import PriorMapPolicyAdapter
 from .prompt_context import PriorMapPromptContextBuilder, PromptContextBundle
 from .query import PriorMapQueryService
+from .visualizer import PriorMapFloorPlanVisualizer, build_floorplan_overlay
 
 
 @dataclass(frozen=True)
@@ -225,6 +226,28 @@ class PriorMapSimulationRuntime:
             **dict(payload),
         }
         _write_json(output, enriched)
+        overlay = build_floorplan_overlay(
+            self.memory.base_map,
+            prior_result=self.last_query_result,
+            chosen_frontier=enriched,
+            observations=self.memory.observations,
+            object_states=self.memory.object_states,
+        )
+        floorplan_paths = PriorMapFloorPlanVisualizer().write_global_artifacts(
+            self.memory.base_map,
+            self.episode_dir,
+            stem=f"floorplan_chosen_frontier_{step_value:06d}",
+            overlay=overlay,
+        )
+        _write_json(
+            self.episode_dir / f"floorplan_chosen_frontier_{step_value:06d}_manifest.json",
+            {
+                "step": step_value,
+                "authority": "diagnostic_only",
+                "chosen_frontier": str(output),
+                "floorplan": floorplan_paths,
+            },
+        )
         return output
 
     def _ensure_episode_dir(self, mapper: Any, episode_idx: Optional[int]) -> None:

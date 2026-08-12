@@ -146,6 +146,9 @@ def _fallback_payload(response_format) -> dict[str, Any]:
 
 class _CogNavParsedChat:
     def __init__(self) -> None:
+        self._client = None
+        if os.getenv("LLM_OFFLINE", "0") in ("1", "true", "True"):
+            return
         _add_cognav_to_path()
         from utils.llm_client import LLMClient
 
@@ -174,6 +177,9 @@ class _CogNavParsedChat:
             }
         else:
             normalized.insert(0, {"role": "system", "content": schema_prompt})
+
+        if self._client is None:
+            raise RuntimeError("CogNav LLM client is unavailable; use LLM_OFFLINE=1 or --vlm ark/openai/gemini")
 
         completion = self._client.chat_completion(
             messages=normalized,
@@ -256,9 +262,11 @@ class TracingOpenAICompatibleClient:
 
 
 def get_client_and_model(vlm: str):
-    # 统一 LLM 入口：STRIVE 上层仍使用 OpenAI-compatible parse 形式，
-    # 实际请求由 CogNav_ObjNav/utils/llm_client.py 负责处理 Ark/OpenAI/离线模式。
+    # 统一 LLM 入口：STRIVE 上层使用 OpenAI-compatible parse 形式。
+    # 离线 smoke 使用本文件内的保守 fallback，不依赖外部 LLM client。
     backend = (vlm or DEFAULT_VLM or "cognav").lower()
+    if os.getenv("LLM_OFFLINE", "0") in ("1", "true", "True"):
+        return CogNavOpenAICompatibleClient(), COGNAV_MODEL_NAME
     if backend == "cognav":
         return CogNavOpenAICompatibleClient(), COGNAV_MODEL_NAME
 
@@ -271,7 +279,18 @@ def get_client_and_model(vlm: str):
             )),
             GEMINI_MODEL_NAME,
         )
+    if backend in ("ark", "openai_compatible", "openai-compatible"):
+        OpenAI = _openai_client_class()
+        api_key = os.getenv("ARK_API_KEY") or os.getenv("OPENAI_API_KEY")
+        base_url = os.getenv("LLM_API_BASE_URL") or os.getenv("OPENAI_BASE_URL")
+        return (
+            TracingOpenAICompatibleClient(OpenAI(api_key=api_key, base_url=base_url)),
+            COGNAV_MODEL_NAME,
+        )
     if backend == "openai":
         OpenAI = _openai_client_class()
-        return TracingOpenAICompatibleClient(OpenAI()), "gpt-4o"
+        kwargs = {}
+        if os.getenv("OPENAI_BASE_URL") or os.getenv("LLM_API_BASE_URL"):
+            kwargs["base_url"] = os.getenv("OPENAI_BASE_URL") or os.getenv("LLM_API_BASE_URL")
+        return TracingOpenAICompatibleClient(OpenAI(**kwargs)), os.getenv("OPENAI_MODEL", "gpt-4o")
     raise ValueError(f"Invalid VLM: {vlm}")

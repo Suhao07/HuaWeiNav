@@ -74,6 +74,10 @@ def test_active_frontier_bias_changes_selection_and_writes_artifact(tmp_path) ->
     artifact = tmp_path / "episode-0" / "prior_map" / "chosen_frontier_000005.json"
     assert artifact.exists()
     assert json.loads(artifact.read_text(encoding="utf-8"))["selected_uid"] == "2"
+    floorplan = tmp_path / "episode-0" / "prior_map" / "floorplan_chosen_frontier_000005.png"
+    floorplan_markers = tmp_path / "episode-0" / "prior_map" / "floorplan_chosen_frontier_000005_markers.json"
+    assert floorplan.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+    assert json.loads(floorplan_markers.read_text(encoding="utf-8"))["overlay"]["selected_frontier_uid"] == "2"
 
 
 def test_room_policy_records_baseline_and_prior_adjusted_distance(tmp_path) -> None:

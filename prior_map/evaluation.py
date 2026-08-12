@@ -14,7 +14,12 @@ from typing import Any, Optional
 from .alignment import PriorMapAlignment
 from .contracts import SearchPriorResult
 from .memory import PriorMapMemory
-from .visualizer import write_som_artifacts
+from .visualizer import (
+    PriorMapFloorPlanVisualizer,
+    build_floorplan_overlay,
+    write_floorplan_artifacts,
+    write_som_artifacts,
+)
 
 
 def prior_map_metrics_summary(
@@ -162,9 +167,12 @@ def write_prior_map_static_artifacts(
         encoding="utf-8",
     )
     som = write_som_artifacts(memory.base_map, output, max_room_views=max_room_views)
+    floorplan = write_floorplan_artifacts(memory.base_map, output, max_room_views=max_room_views)
     marker_manifest = {
         "global": som["global"].get("markers"),
         "rooms": {room_uid: paths.get("markers") for room_uid, paths in som.get("rooms", {}).items()},
+        "floorplan_global": floorplan["global"].get("markers"),
+        "floorplan_rooms": {room_uid: paths.get("markers") for room_uid, paths in floorplan.get("rooms", {}).items()},
     }
     (output / "som_markers_manifest.json").write_text(
         json.dumps(marker_manifest, ensure_ascii=False, indent=2, sort_keys=True),
@@ -174,6 +182,7 @@ def write_prior_map_static_artifacts(
         "base_map": str(base_map_path),
         "alignment": str(alignment_path),
         "som": som,
+        "floorplan": floorplan,
         "marker_manifest": str(output / "som_markers_manifest.json"),
     }
 
@@ -229,7 +238,20 @@ def write_prior_map_step_artifacts(
     }
     for path, payload in payloads.items():
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
-    return {name: str(path) for name, path in paths.items()}
+    overlay = build_floorplan_overlay(
+        memory.base_map,
+        prior_result=prior_result,
+        observations=memory.observations,
+        object_states=memory.object_states,
+    )
+    floorplan_paths = PriorMapFloorPlanVisualizer().write_global_artifacts(
+        memory.base_map,
+        output,
+        stem=f"floorplan_step_{suffix}",
+        overlay=overlay,
+    )
+    renamed = {f"floorplan_step_{key}": Path(value) for key, value in floorplan_paths.items()}
+    return {name: str(path) for name, path in {**paths, **renamed}.items()}
 
 
 def _top_room(prior_result: Optional[SearchPriorResult]) -> dict[str, Any]:

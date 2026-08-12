@@ -1,0 +1,62 @@
+FROM nvidia/cuda:11.8.0-cudnn8-devel-ubuntu22.04
+
+ARG CONDA_ENV_NAME=strive
+ARG PYTHON_VERSION=3.9
+ARG HABITAT_LAB_REPO=https://github.com/facebookresearch/habitat-lab.git
+ARG HABITAT_LAB_REF=v0.3.2
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV CONDA_DIR=/opt/conda
+ENV CONDA_ENV_NAME=${CONDA_ENV_NAME}
+ENV PATH=${CONDA_DIR}/envs/${CONDA_ENV_NAME}/bin:${CONDA_DIR}/bin:${PATH}
+ENV HABITAT_LAB_PATH=/opt/habitat-lab
+ENV PYTHONNOUSERSITE=1
+
+SHELL ["/bin/bash", "-lc"]
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      bash \
+      ca-certificates \
+      curl \
+      git \
+      git-lfs \
+      libegl1 \
+      libgl1 \
+      libglib2.0-0 \
+      libsm6 \
+      libxext6 \
+      libxrender1 \
+      wget \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN curl -L -o /tmp/miniforge.sh \
+      https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh \
+ && bash /tmp/miniforge.sh -b -p ${CONDA_DIR} \
+ && rm /tmp/miniforge.sh \
+ && conda config --system --set channel_priority flexible \
+ && conda clean -afy
+
+RUN mamba create -y -n ${CONDA_ENV_NAME} python=${PYTHON_VERSION} pip cmake ninja pkg-config \
+ && mamba install -y -n ${CONDA_ENV_NAME} \
+      -c pytorch -c nvidia -c conda-forge \
+      pytorch==2.0.1 torchvision==0.15.2 pytorch-cuda=11.8 \
+ && mamba install -y -n ${CONDA_ENV_NAME} \
+      -c aihabitat -c conda-forge \
+      habitat-sim=0.3.2 withbullet \
+ && conda clean -afy
+
+RUN git clone --depth 1 --branch ${HABITAT_LAB_REF} ${HABITAT_LAB_REPO} ${HABITAT_LAB_PATH} \
+ && cd ${HABITAT_LAB_PATH} \
+ && pip install --no-cache-dir -e habitat-lab \
+ && pip install --no-cache-dir -e habitat-baselines \
+ && python - <<'PY'
+import habitat
+import habitat_sim
+import torch
+print("habitat:", getattr(habitat, "__version__", "unknown"))
+print("habitat_sim:", getattr(habitat_sim, "__version__", "unknown"))
+print("torch:", torch.__version__, "cuda:", torch.cuda.is_available())
+PY
+
+WORKDIR /workspace/STRIVE

@@ -213,7 +213,9 @@ class PriorMapMemory:
         room_hypothesis_uid = _text_or_none(
             _first_attr(mapper, ("current_room_uid", "room_hypothesis_uid", "current_room_id", "room_id"))
         )
-        pose_xyz = _pose_xyz(_first_attr(mapper, ("robot_pose", "pose", "current_pose", "agent_pose")))
+        pose_xyz = _pose_xyz(
+            _first_attr(mapper, ("robot_pose", "pose", "current_pose", "agent_pose", "current_position"))
+        )
 
         observed_object_uids: List[str] = []
         observed_object_labels: List[str] = []
@@ -719,6 +721,8 @@ def _pose_xyz(value: Any) -> Optional[Vector3]:
 
     if value is None:
         return None
+    if hasattr(value, "tolist"):
+        value = value.tolist()
     if isinstance(value, (list, tuple)) and len(value) >= 2:
         z = value[2] if len(value) >= 3 else 0.0
         return (_safe_float(value[0]), _safe_float(value[1]), _safe_float(z))

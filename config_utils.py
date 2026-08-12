@@ -32,23 +32,44 @@ def _first_existing(paths):
     return paths[0]
 
 
-HABITAT_LAB_PATH = _get_env("HABITAT_LAB_PATH")
-_HABITAT_ROOT = Path(HABITAT_LAB_PATH)
-HM3D_CONFIG_PATH = _first_existing([
-    str(_HABITAT_ROOT / "habitat-lab/habitat/config/benchmark/nav/objectnav/objectnav_hm3d.yaml"),
-    str(_HABITAT_ROOT / "habitat-lab/configs/tasks/objectnav_hm3d.yaml"),
-    str(_HABITAT_ROOT / "configs/tasks/objectnav_hm3d.yaml"),
-])
-MP3D_CONFIG_PATH = _first_existing([
-    str(_HABITAT_ROOT / "habitat-lab/habitat/config/benchmark/nav/objectnav/objectnav_mp3d.yaml"),
-    str(_HABITAT_ROOT / "habitat-lab/configs/tasks/objectnav_mp3d.yaml"),
-    str(_HABITAT_ROOT / "configs/tasks/objectnav_mp3d.yaml"),
-])
-GIBSON_CONFIG_PATH = _first_existing([
-    str(_HABITAT_ROOT / "habitat-lab/habitat/config/benchmark/nav/objectnav/objectnav_gibson.yaml"),
-    str(_HABITAT_ROOT / "habitat-lab/configs/tasks/objectnav_gibson.yaml"),
-    str(_HABITAT_ROOT / "configs/tasks/objectnav_gibson.yaml"),
-])
+HABITAT_LAB_PATH = os.getenv("HABITAT_LAB_PATH", "")
+
+
+def _habitat_roots():
+    roots = []
+    if HABITAT_LAB_PATH:
+        roots.append(Path(HABITAT_LAB_PATH))
+    try:
+        package_root = Path(habitat.__file__).resolve().parent
+        roots.extend([package_root, package_root.parent, package_root.parent.parent])
+    except Exception:
+        pass
+    deduped = []
+    seen = set()
+    for root in roots:
+        text = str(root)
+        if text in seen:
+            continue
+        seen.add(text)
+        deduped.append(root)
+    return deduped or [Path(".")]
+
+
+def _habitat_config_path(name: str) -> str:
+    candidates = []
+    for root in _habitat_roots():
+        candidates.extend([
+            str(root / f"habitat-lab/habitat/config/benchmark/nav/objectnav/{name}"),
+            str(root / f"habitat/config/benchmark/nav/objectnav/{name}"),
+            str(root / f"configs/tasks/{name}"),
+            str(root / f"habitat-lab/configs/tasks/{name}"),
+        ])
+    return _first_existing(candidates)
+
+
+HM3D_CONFIG_PATH = _habitat_config_path("objectnav_hm3d.yaml")
+MP3D_CONFIG_PATH = _habitat_config_path("objectnav_mp3d.yaml")
+GIBSON_CONFIG_PATH = _habitat_config_path("objectnav_gibson.yaml")
 
 SAM_CHECKPOINT = _get_env("SAM_CHECKPOINT")
 GROUNDING_DINO_PATH = _get_env("GROUNDING_DINO_PATH")

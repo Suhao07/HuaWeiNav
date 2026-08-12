@@ -12,7 +12,16 @@ from prior_map.contracts import (
     SupportRegionPrior,
 )
 from prior_map.prompt_context import PriorMapPromptContextBuilder, summarize_prior_map, to_compact_xml
-from prior_map.visualizer import PriorMapSomVisualizer, render_global_view, render_room_view
+from prior_map.visualizer import (
+    FloorPlanOverlay,
+    FloorPlanOverlayPoint,
+    PriorMapFloorPlanVisualizer,
+    PriorMapSomVisualizer,
+    render_floorplan_global_view,
+    render_global_view,
+    render_room_view,
+    write_floorplan_artifacts,
+)
 
 
 def _map() -> PriorMapData:
@@ -129,6 +138,60 @@ def test_som_visualizer_room_view_contains_only_room_objects() -> None:
     assert "O_obj_fridge" in marker_ids
     assert "O_obj_book_hint" not in marker_ids
     assert view.metadata["room_uid"] == "room_kitchen"
+
+
+def test_floorplan_visualizer_renders_topology_and_runtime_overlay(tmp_path: Path) -> None:
+    overlay = FloorPlanOverlay(
+        target_prior_object_uids=("obj_fridge",),
+        frontiers=(
+            FloorPlanOverlayPoint(
+                uid="frontier_1",
+                label="frontier 1",
+                xy=(3.0, 1.5),
+                point_type="frontier",
+                selected=True,
+            ),
+        ),
+        live_detections=(
+            FloorPlanOverlayPoint(
+                uid="obj_fridge",
+                label="fridge",
+                xy=(1.0, 1.0),
+                point_type="live_detection",
+            ),
+        ),
+        trajectory_xy=((0.5, 0.5), (2.0, 1.0), (3.0, 1.5)),
+        selected_frontier_uid="frontier_1",
+    )
+
+    view = render_floorplan_global_view(_map(), overlay=overlay, width=640, height=420)
+
+    assert view.view_type == "floorplan_global"
+    assert "room-room topology edge" in view.svg
+    assert "selected frontier" in view.svg
+    assert any(marker["marker_type"] == "room_edge" for marker in view.markers)
+    assert any(marker["marker_type"] == "frontier" and marker["selected"] for marker in view.markers)
+
+    paths = PriorMapFloorPlanVisualizer(width=640, height=420).write_global_artifacts(
+        _map(),
+        tmp_path,
+        overlay=overlay,
+    )
+    assert Path(paths["png"]).read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+    markers = Path(paths["markers"]).read_text(encoding="utf-8")
+    assert "frontier_1" in markers
+    assert "obj_fridge" in markers
+
+
+def test_write_floorplan_artifacts_uses_fixed_names(tmp_path: Path) -> None:
+    artifacts = write_floorplan_artifacts(_map(), tmp_path, max_room_views=1, width=640, height=420)
+
+    assert Path(artifacts["global"]["png"]).name == "floorplan_global.png"
+    assert Path(artifacts["global"]["svg"]).name == "floorplan_global.svg"
+    assert Path(artifacts["global"]["markers"]).name == "floorplan_global_markers.json"
+    assert (tmp_path / "floorplan_global.png").read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+    room_paths = next(iter(artifacts["rooms"].values()))
+    assert Path(room_paths["png"]).name.startswith("floorplan_room_")
 
 
 def test_prompt_and_visualizer_stay_platform_neutral() -> None:

@@ -130,7 +130,7 @@ def get_args():
     parser.add_argument("--no_gpt_seg", default=True, action="store_false")
     parser.add_argument("--relocate", default=False, action="store_true")
     parser.add_argument("--no_gpt_relocate", default=False, action="store_true")
-    parser.add_argument("--vlm", type=str, default="cognav")
+    parser.add_argument("--vlm", type=str, default=DEFAULT_VLM)
     parser.add_argument("--custom_instruction", type=str, default="")
     parser.add_argument("--enable_instruction_adapter", default=False, action="store_true")
     parser.add_argument("--instruction_adapter_backend", type=str, default="llm")
