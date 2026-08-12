@@ -7,8 +7,8 @@ read-only at `/workspace/STRIVE/real_robot/calibration`.
 `camera_x001_intrinsics.yaml` is a read-only import of the Orin-26 Generic
 USB-camera calibration (`1920x1080`, radial-3, offline reprojection error
 `0.69 px`). It is not a D435i calibration and must not use the D435i extrinsic.
-The current USB device advertises MJPEG only up to 1280x960; at 1920x1080 it
-uses YUYV (5 Hz). Select a matching mode before using these intrinsics.
+The device supports 1920x1080 MJPEG at 30 Hz; with `usb_cam`, select
+`pixel_format=mjpeg2rgb` (the literal `mjpeg` is not a valid ROS encoding).
 
 The Orin-26 deployment also has an imported, read-only extrinsics asset:
 `orin26_d435i_mid360_targetless_v009_r009_extrinsics.json`. It preserves the

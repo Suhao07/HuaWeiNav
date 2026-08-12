@@ -59,10 +59,10 @@
 - [x] profile 能在 Bash 中直接 source 时定位自身工作区根目录；profile 启动器默认不会再级联加载通用 `.env.realworld`，避免其它机器人遗留的 topic、相机或容器名覆盖当前 profile；只有显式设置 `SYSNAV_ENV_FILE` 才会加载补充文件。
 - [x] 内部输出隔离到 `/huawei_vln/detection_result`、`/huawei_vln/object_nodes_list`。
 - [x] 外部 LIO 输入保持为只读 `/cloud_registered`、`/aft_mapped_to_init`、`/path`。
-- [x] Generic UVC 能力已读取：MJPEG 支持到 1280×960；1920×1080 仅提供 YUYV（设备声明 5 Hz）。profile 使用 1920×1080/YUYV/5 Hz，与 `camera_x001_intrinsics.yaml` 分辨率一致。
-- [x] 2026-08-12 隔离 `usb_cam` smoke 已打开 `/dev/video0` 的 1920×1080 模式；`pixel_format=mjpeg` 会使驱动在打开设备后因非法 ROS 枚举退出，已改为合法 `yuyv`。`raw_mjpeg`/`mjpeg2rgb` 在设备可用的 MJPEG 分辨率下可发布图像。
+- [x] Generic UVC 能力已读取：`/dev/video0` 支持 1920×1080 MJPEG 30 Hz 和 1920×1080 YUYV 5 Hz；profile 使用与标定分辨率一致的 1920×1080 MJPEG。
+- [x] 2026-08-12 真实隔离 camera smoke 以 `pixel_format=mjpeg2rgb` 打开 `/dev/video0` 的 1920×1080 MJPEG，实测 `/camera/image` 约 24.9 Hz、编码 `rgb8`、`width=1920`、`height=1080`，并收到匹配 `/camera_info`。字面 `pixel_format=mjpeg` 会因 ROS 枚举非法退出，已禁止使用。
 - [x] 2026-08-11 容器内 `/camera/image` 已收到 header（`frame_id=default_cam`）；preflight 与 launch 的相机参数一致。
-- [x] 2026-08-12 正式 profile 参数隔离测试确认 `/camera/image` 的 `frame_id=default_cam`、`1920×1080`、编码 `yuv422_yuy2`，并收到 `/camera_info`：`radial_3`、`K=[749.2058,0,1003.1,0,749.2058,526.5258,0,0,1]`；与用户文件一致。
+- [x] 2026-08-12 正式 profile 参数隔离测试确认 `/camera/image` 的 `frame_id=default_cam`、`1920×1080`、编码 `rgb8`，并收到 `/camera_info`：`radial_3`、`K=[749.2058,0,1003.1,0,749.2058,526.5258,0,0,1]`；与用户文件一致。
 - [x] 2026-08-11 相机→YOLOE detector 闭环已验证：`/huawei_vln/detection_result` 收到 `frame_id=map` 的真实时间戳和 track ID；空检测帧不会再使 `detection_node` 退出。
 - [x] 2026-08-11 只读检查其他项目历史配置：旧 `tools/usb_camera_node.py` 使用 `/image_raw`、640×480 MJPEG 30 FPS；它与当前已实测的 `usb_cam` profile 不同，不作为本部署的启动配置。
 - [x] `USB_CAMERA_INFO_URL` 已成为可插拔 profile 参数；`real_robot/calibration/` 由容器只读挂载。标定后只需放入该目录并填写 `file:///workspace/STRIVE/real_robot/calibration/<camera>.yaml`，profile check 会验证文件存在。
@@ -77,6 +77,7 @@
 - [x] 已确认旧 `mecanum` 投影固定为 1920×640 全景相机，不能用于当前 Generic RGB/D435i。
 - [x] 新增可验证的 `pinhole` / `equirectangular` 投影配置模块。
 - [x] 已生成 `docs/real_robot_tf_graph.md`，区分实时 TF、Point-LIO 消息 frame 和 D435i/USB-camera 标定文件变换，并记录未发现的 TF 关系。
+- [x] 2026-08-12 实时 TF 采样确认：`/tf` 有 `camera_init→aft_mapped`；`/tf_static` 有 `aft_mapped→base`（`x=-0.2 m`、`yaw=-1.5708 rad`）；`default_cam` 和 D435i optical frame 无实时 TF。
 - [x] 未经批准的 `calibration_status` 会拒绝 semantic mapping。
 - [x] Orin profile 默认 `START_SEMANTIC_MAPPING=false`，允许安全 detector-only bringup。
 - [x] detector-only profile 不依赖 LIO 数据；启用 semantic mapping 时 helper 强制要求 LIO topic 与实际 header 样本双门槛。
