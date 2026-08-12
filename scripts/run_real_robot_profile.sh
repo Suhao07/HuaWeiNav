@@ -64,9 +64,18 @@ container_to_host_path() {
 check_profile() {
   local missing=0
   local path projection_host_path camera_info_host_path control_contract_host_path
+  case "${LIO_INPUT_MODE:-cloud_and_pose}" in
+    pose_only|cloud_and_pose|disabled) ;;
+    *)
+      echo "unsupported LIO_INPUT_MODE=${LIO_INPUT_MODE:-<unset>}" >&2
+      missing=1
+      ;;
+  esac
   printf 'profile=%s\nversion=%s\n' "${ROBOT_PROFILE_NAME:-unknown}" "${ROBOT_PROFILE_VERSION:-unknown}"
   printf 'image=%s\ncontainer=%s\n' "${IMAGE_TAG}" "${CONTAINER_NAME}"
-  printf 'lio=%s\ncloud=%s\nodom=%s\n' "${START_LIO}" "${CLOUD_TOPIC}" "${ODOM_TOPIC}"
+  printf 'lio=%s\nlio_input_mode=%s\ncloud=%s\npose=%s\nworld_frame=%s\n' \
+    "${START_LIO}" "${LIO_INPUT_MODE:-cloud_and_pose}" "${CLOUD_TOPIC}" \
+    "${POSE_TOPIC:-${ODOM_TOPIC}}" "${WORLD_FRAME:-${STRIVE_WORLD_FRAME:-map}}"
   printf 'camera=%s\ndevice=%s\nformat=%sx%s %s @ %s FPS\n' \
     "${START_USB_CAM}" "${USB_VIDEO_DEVICE}" "${USB_IMAGE_WIDTH}" "${USB_IMAGE_HEIGHT}" \
     "${USB_PIXEL_FORMAT}" "${USB_FRAMERATE:-30.0}"
@@ -115,7 +124,10 @@ check_profile() {
       echo "semantic mapping requires an approved calibration profile: ${projection_host_path}" >&2
       missing=1
     fi
-    if ! is_true "${WAIT_FOR_LIO:-0}" || ! is_true "${REQUIRE_LIO_SAMPLE:-0}"; then
+    if [[ "${LIO_INPUT_MODE:-cloud_and_pose}" != "cloud_and_pose" ]]; then
+      echo "semantic mapping requires LIO_INPUT_MODE=cloud_and_pose." >&2
+      missing=1
+    elif ! is_true "${WAIT_FOR_LIO:-0}" || ! is_true "${REQUIRE_LIO_SAMPLE:-0}"; then
       echo "semantic mapping requires WAIT_FOR_LIO=true and REQUIRE_LIO_SAMPLE=true." >&2
       missing=1
     fi

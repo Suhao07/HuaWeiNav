@@ -1781,35 +1781,36 @@ bash scripts/run_real_robot_instruction_runtime.sh \
   allow_emergency_stop_publish:=false
 ```
 
-Orin LIO 启动使用宿主侧 helper，确保 Point-LIO 发布 STRIVE 需要的点云：
+Point-LIO 的安装配置中 `publish.scan_publish_en: false`，因此
+`/cloud_registered` 可以存在于 ROS graph，却没有实际点云样本。当前 Orin
+profile 采用 `LIO_INPUT_MODE=pose_only`：继续使用机器人所有者现有的
+`/home/orin26/code/start_livox_odom.sh` 工作流，STRIVE 只订阅现有
+`nav_msgs/msg/Odometry` 位姿。Orin-26 当前 profile 使用机器人已有的
+`/odom`（`odom→base_link`，约 15 Hz，由 `/odom_publisher` 提供）；profile
+将高层 `world_frame` 显式设为 `odom`，不修改外部 TF，也不启动、停止或覆盖 Point-LIO。
 
-```bash
-cd /home/orin26/code/HuaWeiNav
-bash scripts/start_orin_lio_for_strive.sh
-```
-
-该脚本启动 `livox_ros_driver2` 和 `point_lio`，并覆盖：
-
-```text
-publish.scan_publish_en:=true
-```
-
-期望的 Orin 输入 topic：
+pose-only 模式的输入 topic：
 
 ```text
-/livox/lidar
-/livox/imu
-/cloud_registered
-/aft_mapped_to_init
-/base_odom
-/path
-/camera/image
+/odom                     nav_msgs/msg/Odometry (odom→base_link, ~15 Hz)
+/camera/image             sensor_msgs/msg/Image
 ```
+
+只有已完成标定并准备做点云-图像融合的独立 profile 才设置
+`LIO_INPUT_MODE=cloud_and_pose`，并额外验收：
+
+```text
+/cloud_registered         sensor_msgs/msg/PointCloud2
+```
+
+迁移到其他机器人时，只需在 `real_robot/profiles/<robot>.env` 替换
+`LIO_INPUT_MODE`、`POSE_TOPIC` 和可选 `CLOUD_TOPIC`；不需要复制或修改其原有
+Point-LIO 启动脚本。
 
 部署前 bounded smoke：
 
 ```bash
-IMAGE_TAG=huawei-nav-real:orin REQUIRE_LIO=1 CHECK_CAMERA=1 \
+LIO_INPUT_MODE=pose_only POSE_TOPIC=/odom REQUIRE_LIO=1 CHECK_CAMERA=1 \
   bash scripts/smoke_real_robot_orin.sh
 ```
 

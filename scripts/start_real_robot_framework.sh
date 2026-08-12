@@ -10,6 +10,12 @@ OVERLAY_SETUP="${STRIVE_REAL_ROBOT_WS:-${REPO_ROOT}/real_robot/ros2_ws}/install/
 PLATFORM="${PLATFORM:-mecanum}"
 CLOUD_TOPIC="${CLOUD_TOPIC:-/cloud_registered}"
 ODOM_TOPIC="${ODOM_TOPIC:-/aft_mapped_to_init}"
+POSE_TOPIC="${POSE_TOPIC:-${ODOM_TOPIC}}"
+WORLD_FRAME="${WORLD_FRAME:-${STRIVE_WORLD_FRAME:-map}}"
+# `cloud_and_pose` is the fusion mode used by semantic mapping.  `pose_only`
+# consumes an externally-owned robot localization result and deliberately does
+# not require Point-LIO's optional registered-cloud output.
+LIO_INPUT_MODE="${LIO_INPUT_MODE:-cloud_and_pose}"
 CAMERA_TOPIC="${CAMERA_TOPIC:-/camera/image}"
 VIEWPOINT_TOPIC="${VIEWPOINT_TOPIC:-/viewpoint_rep_header}"
 START_USB_CAM="${START_USB_CAM:-false}"
@@ -63,6 +69,16 @@ is_true() {
   case "${1,,}" in
     1|true|yes|on) return 0 ;;
     *) return 1 ;;
+  esac
+}
+
+validate_lio_input_mode() {
+  case "${LIO_INPUT_MODE}" in
+    pose_only|cloud_and_pose|disabled) ;;
+    *)
+      echo "Unsupported LIO_INPUT_MODE=${LIO_INPUT_MODE}; expected pose_only, cloud_and_pose, or disabled." >&2
+      exit 2
+      ;;
   esac
 }
 
@@ -128,7 +144,9 @@ cmd_vel_publishers() {
 preflight() {
   section "Real-Robot Framework Preflight"
   echo "platform=${PLATFORM}"
+  echo "lio_input_mode=${LIO_INPUT_MODE}"
   echo "cloud_topic=${CLOUD_TOPIC}"
+  echo "pose_topic=${POSE_TOPIC}"
   echo "odom_topic=${ODOM_TOPIC}"
   echo "camera_topic=${CAMERA_TOPIC}"
   echo "start_usb_cam=${START_USB_CAM}"
@@ -137,15 +155,28 @@ preflight() {
   echo "start_strive_runtime=${START_STRIVE_RUNTIME:-0}"
   echo "start_waypoint_adapter=${START_WAYPOINT_ADAPTER}"
 
-  if is_true "${WAIT_FOR_LIO}"; then
-    wait_for_topic "${CLOUD_TOPIC}" "sensor_msgs/msg/PointCloud2" "${PREFLIGHT_TIMEOUT_S}"
-    wait_for_topic "${ODOM_TOPIC}" "nav_msgs/msg/Odometry" "${PREFLIGHT_TIMEOUT_S}"
+  if is_true "${WAIT_FOR_LIO}" && [[ "${LIO_INPUT_MODE}" != "disabled" ]]; then
+    wait_for_topic "${POSE_TOPIC}" "nav_msgs/msg/Odometry" "${PREFLIGHT_TIMEOUT_S}"
+    if [[ "${LIO_INPUT_MODE}" == "cloud_and_pose" ]]; then
+      wait_for_topic "${CLOUD_TOPIC}" "sensor_msgs/msg/PointCloud2" "${PREFLIGHT_TIMEOUT_S}"
+    else
+      echo "[lio] pose_only: skipping registered point-cloud gate (${CLOUD_TOPIC:-<unset>})"
+    fi
   fi
 
-  if is_true "${REQUIRE_LIO_SAMPLE}"; then
+  if is_true "${START_SEMANTIC_MAPPING}" && [[ "${LIO_INPUT_MODE}" != "cloud_and_pose" ]]; then
+    echo "semantic mapping requires LIO_INPUT_MODE=cloud_and_pose; pose_only is localization input only." >&2
+    exit 2
+  fi
+
+  if is_true "${REQUIRE_LIO_SAMPLE}" && [[ "${LIO_INPUT_MODE}" != "disabled" ]]; then
     section "LIO Data Sample Gate"
-    wait_for_topic_sample "${CLOUD_TOPIC}" "${LIO_SAMPLE_TIMEOUT_S}"
-    wait_for_topic_sample "${ODOM_TOPIC}" "${LIO_SAMPLE_TIMEOUT_S}"
+    wait_for_topic_sample "${POSE_TOPIC}" "${LIO_SAMPLE_TIMEOUT_S}"
+    if [[ "${LIO_INPUT_MODE}" == "cloud_and_pose" ]]; then
+      wait_for_topic_sample "${CLOUD_TOPIC}" "${LIO_SAMPLE_TIMEOUT_S}"
+    else
+      echo "[lio] pose_only: skipping registered point-cloud sample gate"
+    fi
   fi
 
   if ! is_true "${START_USB_CAM}" && is_true "${WAIT_FOR_CAMERA}"; then
@@ -224,6 +255,7 @@ main() {
   esac
 
   source_ros
+  validate_lio_input_mode
   preflight
   maybe_start_lower_controller
 
@@ -233,7 +265,8 @@ main() {
   local launch_args=(
     "platform:=${PLATFORM}"
     "cloud_topic:=${CLOUD_TOPIC}"
-    "odom_topic:=${ODOM_TOPIC}"
+    "odom_topic:=${POSE_TOPIC}"
+    "world_frame:=${WORLD_FRAME}"
     "camera_topic:=${CAMERA_TOPIC}"
     "start_semantic_mapping:=${START_SEMANTIC_MAPPING}"
     "detection_topic:=${DETECTION_TOPIC}"

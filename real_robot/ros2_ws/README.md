@@ -463,29 +463,22 @@ nodes before running the full stack.
 
 Point-LIO's installed `mapping_mid360_orin.launch.py` loads
 `publish.scan_publish_en: false` from its config, so `/cloud_registered` can
-exist in the ROS graph without emitting live `PointCloud2` samples. For STRIVE,
-start the Livox/LIO tmux session through the HuaWeiNav host helper, which keeps
-the external repositories unchanged and applies runtime parameter overrides:
+exist in the ROS graph without emitting live `PointCloud2` samples. The default
+STRIVE deployment uses `LIO_INPUT_MODE=pose_only`: it leaves the robot-owned
+`/home/orin26/code/start_livox_odom.sh` workflow untouched and subscribes only
+to the existing `nav_msgs/msg/Odometry` result. On Orin-26 the selected profile
+uses `/odom` (`odom→base_link`, approximately 15 Hz, from `/odom_publisher`).
+The profile passes `world_frame:=odom` to the high-level runtime. STRIVE does
+not start, stop, or override Point-LIO in this mode.
 
-```bash
-cd /home/orin26/code/HuaWeiNav
-bash scripts/start_orin_lio_for_strive.sh
-```
+For a separately calibrated semantic-fusion profile, set
+`LIO_INPUT_MODE=cloud_and_pose`; that profile must independently confirm live
+`/cloud_registered` samples before enabling semantic mapping. It may use the
+robot owner's normal Point-LIO workflow; the historical helper in this
+repository is optional and requires explicit ownership approval.
 
-The helper starts `livox_ros_driver2` and runs `point_lio` with:
-
-```text
-publish.scan_publish_en:=true
-```
-
-`/cloud_registered_body` is optional for STRIVE and is disabled by default to
-reduce Point-LIO load. Enable it only when debugging body-frame clouds:
-
-```bash
-ENABLE_BODY_CLOUD_PUBLISH=1 bash scripts/start_orin_lio_for_strive.sh
-```
-
-After this, the observed smoke rates were roughly:
+When the external owner has enabled cloud publication, observed smoke rates
+were roughly:
 
 ```text
 /livox/lidar          ~100 Hz

@@ -207,8 +207,8 @@ runtime_safety.allow_emergency_stop_publish
 ## 7. Deployment And Scripts
 
 - [x] 提供 `docker_en.sh` 作为 Orin 宿主侧一键入口，默认镜像 `huawei-nav-real:orin`。
-- [x] 提供 `scripts/start_real_robot_framework.sh`，启动前检查 `/cloud_registered` 和 `/aft_mapped_to_init`。
-- [x] 提供 `scripts/start_orin_lio_for_strive.sh`，覆盖 Point-LIO `publish.scan_publish_en:=true`。
+- [x] 提供 `scripts/start_real_robot_framework.sh`，按 `LIO_INPUT_MODE` 检查外部位姿；只有融合模式才要求 `/cloud_registered`。
+- [x] 保留 `scripts/start_orin_lio_for_strive.sh` 作为显式授权的融合调试工具；默认 profile 不调用它，直接读取机器人所有者现有定位结果。
 - [x] 提供 `scripts/smoke_real_robot_orin.sh`，做 LIO、相机、容器 DDS、CUDA/ML、detector 初始化检查。
 - [x] 更新 `scripts/run_sysnav_detection_mapping.sh`，明确高层 node 是否一起启动。
 - [x] 新增 `scripts/run_real_robot_instruction_runtime.sh`，只启动 STRIVE 高层 runtime。

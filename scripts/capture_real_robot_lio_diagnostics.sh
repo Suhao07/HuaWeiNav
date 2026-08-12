@@ -10,6 +10,8 @@ LIVOX_SETUP="${LIVOX_SETUP:-/home/orin26/code/ws_livox/install/setup.bash}"
 POINT_LIO_SETUP="${POINT_LIO_SETUP:-/home/orin26/code/point_lio_ws/install/setup.bash}"
 CLOUD_TOPIC="${CLOUD_TOPIC:-/cloud_registered}"
 ODOM_TOPIC="${ODOM_TOPIC:-/aft_mapped_to_init}"
+POSE_TOPIC="${POSE_TOPIC:-${ODOM_TOPIC}}"
+LIO_INPUT_MODE="${LIO_INPUT_MODE:-cloud_and_pose}"
 LIO_LIDAR_TOPIC="${LIO_LIDAR_TOPIC:-/livox/lidar}"
 LIO_IMU_TOPIC="${LIO_IMU_TOPIC:-/livox/imu}"
 POINT_LIO_NODE_NAME="${POINT_LIO_NODE_NAME:-/laserMapping}"
@@ -87,6 +89,10 @@ if [[ "${report_path}" != "${REPO_ROOT}"/* ]]; then
 fi
 
 source_ros
+case "${LIO_INPUT_MODE}" in
+  pose_only|cloud_and_pose|disabled) ;;
+  *) echo "Unsupported LIO_INPUT_MODE=${LIO_INPUT_MODE}" >&2; exit 2 ;;
+esac
 # FASTDDS_BUILTIN_TRANSPORTS=UDPv4 is deliberately set for the deployment
 # container.  Do not leak that container workaround into a host-side LIO
 # diagnostic: the externally owned LIO processes on this robot use Fast DDS'
@@ -112,12 +118,20 @@ lio_pids="${lio_pids:-0}"
   printf -- '- ros_localhost_only: `%s`\n' "${ROS_LOCALHOST_ONLY:-<unset>}"
   printf -- '- sample_timeout_s: `%s`\n' "${SAMPLE_TIMEOUT_S}"
   printf -- '- point_lio_node: `%s`\n' "${POINT_LIO_NODE_NAME}"
+  printf -- '- lio_input_mode: `%s`\n' "${LIO_INPUT_MODE}"
+  printf -- '- pose_topic: `%s`\n' "${POSE_TOPIC}"
 
   capture "LIO process snapshot" ps -o pid,etime,pcpu,pmem,stat,command -p "${lio_pids}"
 
-  for topic in "${LIO_LIDAR_TOPIC}" "${LIO_IMU_TOPIC}" "${CLOUD_TOPIC}" "${ODOM_TOPIC}"; do
+  for topic in "${LIO_LIDAR_TOPIC}" "${LIO_IMU_TOPIC}" "${POSE_TOPIC}"; do
     capture "topic info: ${topic}" ros2 topic info -v "${topic}"
   done
+  if [[ "${LIO_INPUT_MODE}" == "cloud_and_pose" ]]; then
+    capture "topic info: ${CLOUD_TOPIC}" ros2 topic info -v "${CLOUD_TOPIC}"
+  else
+    printf '\n## topic info: %s (optional in pose_only mode)\n' "${CLOUD_TOPIC}"
+    capture "topic info: ${CLOUD_TOPIC}" ros2 topic info -v "${CLOUD_TOPIC}"
+  fi
 
   # A ROS publisher endpoint alone does not mean Point-LIO emits a cloud.  In
   # particular, scan_publish_en=false leaves /cloud_registered discoverable
@@ -134,10 +148,15 @@ lio_pids="${lio_pids:-0}"
 
   # Point-LIO and Livox endpoint QoS on this robot are inspected above.  The
   # chosen profiles deliberately cover the actual endpoint reliability modes.
-  capture_sample "${LIO_LIDAR_TOPIC}" "best_effort"
-  capture_sample "${LIO_IMU_TOPIC}" "reliable"
-  capture_sample "${CLOUD_TOPIC}" "reliable"
-  capture_sample "${ODOM_TOPIC}" "reliable"
+  if [[ "${LIO_INPUT_MODE}" != "disabled" ]]; then
+    capture_sample "${POSE_TOPIC}" "reliable"
+  fi
+  if [[ "${LIO_INPUT_MODE}" == "cloud_and_pose" ]]; then
+    capture_sample "${CLOUD_TOPIC}" "reliable"
+  else
+    printf '\n### header sample: %s (optional in pose_only mode)\n' "${CLOUD_TOPIC}"
+    printf 'RESULT: SKIP (registered cloud is not consumed by this profile)\n'
+  fi
 } >"${report_path}"
 
 printf 'LIO diagnostics report: %s\n' "${report_path}"
