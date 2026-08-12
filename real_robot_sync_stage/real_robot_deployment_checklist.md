@@ -69,7 +69,6 @@
 - [ ] 为 usb_cam 提供你标定后的 `camera_info` 文件；在该文件就绪前启动日志会提示缺少 `/root/.ros/camera_info/default_cam.yaml`，但不影响当前 detector-only 验收。
 - [x] 已从机器人上 VEOcc-Rywang 项目只读导入 D435i↔MID-360 外参参数：`real_robot/calibration/orin26_d435i_mid360_targetless_v009_r009_extrinsics.json`。源文件路径和 SHA-256 已记录，未修改源项目。
 - [ ] 该资产当前仅为 `extrinsics_only`；仍需补齐 RGB `camera_info`、畸变、RGB-LiDAR 时间偏移、标定日期/方法/重投影误差后，才能生成并批准 semantic-fusion projection profile。
-- [x] 已从机器人只读导入 `camera_x001_intrinsics.yaml`：1920×1080、`fx=fy=749.2058`、`cx=1003.1`、`cy=526.5258`、radial-3 畸变、离线 RMSE 0.69 px；因当前 Generic USB profile 为 1280×720，未自动绑定。
 - [ ] RealSense D435i driver、RGB-D topic 和 device 权限按独立 profile 验证。
 
 ## 5. 标定与传感器融合
@@ -79,7 +78,7 @@
 - [x] 未经批准的 `calibration_status` 会拒绝 semantic mapping。
 - [x] Orin profile 默认 `START_SEMANTIC_MAPPING=false`，允许安全 detector-only bringup。
 - [x] detector-only profile 不依赖 LIO 数据；启用 semantic mapping 时 helper 强制要求 LIO topic 与实际 header 样本双门槛。
-- [ ] 从相机节点的 `sensor_msgs/CameraInfo` 读取并核对 RGB 内参（当前已具备离线 `camera_x001` 资产，但机器人尚无实时 `CameraInfo` 话题）。
+- [ ] 从相机节点的 `sensor_msgs/CameraInfo` 读取并记录 RGB 内参（分辨率、`fx/fy/cx/cy`、畸变）；当前机器人未运行相机节点，尚无实时 `CameraInfo` 话题。
 - [ ] 标定 MID-360 到 RGB optical frame 的外参和平移单位。
 - [ ] 记录时间偏移与投影重投影误差。
 - [ ] 将校准后的 profile 标记为 `calibrated` 并启用 semantic mapping。
@@ -134,11 +133,7 @@
 - [x] 2026-08-11 只读发现状态辅助接口：`/odom`（`nav_msgs/Odometry`）、`/interface_management/BMS_status`（`tools_msgs/RobotBmsStatus`）、`/sensor_status`（`tools_msgs/SensorStatus`）；源码中未找到可批准的急停 topic/service。
 - [x] 2026-08-11 已同步观测版 `real_robot/control/orin26_controller_contract.yaml`；该文件明确 `approval_status: unapproved`，仅记录外部接口事实，不满足真实运动门控，也不进入 Git。
 - [x] 2026-08-11 隔离 `--network none` 容器中的 `RosWaypointController` 测试通过（8 passed）；验证 `geometry_msgs/PointStamped`、frame/坐标写入、STOP 不发布和禁止 `/cmd_vel` 直连。
-- [x] 已实现可配置 waypoint format adapter：`geometry_msgs/PointStamped` → `std_msgs/Float32MultiArray`，支持 `identity`、`static_se2`、只读 odom 的 `ego_from_odom`；默认 `output_enabled=false`，禁止 `/cmd_vel`。
-- [x] 已提供 `real_robot/control/waypoint_adapter_template.yaml`、独立 ROS2 launch/node 和 `scripts/run_real_robot_waypoint_adapter.sh`；其他机器人只需替换 adapter YAML 参数。
-- [x] Orin-26 profile 已配置 `real_robot/control/orin26_waypoint_adapter.yaml`（机器人专用、Git-ignored、远端只读挂载），当前 `output_enabled=false`；adapter 不会自动发布 `/waypoint`。
-- [x] 2026-08-12 重建 ARM64 镜像后，以 `--network none` 只读挂载运行 adapter/waypoint 测试：`13 passed`；镜像 ID `sha256:ed210b885d04…`，未启动 ROS graph。
-- [ ] 外部 `/waypoint`（`Float32MultiArray`、无 header）与 STRIVE `/way_point`（`PointStamped`）的坐标语义仍需所有者确认；adapter 已实现格式和可配置坐标转换，但真实下层 handoff 仍未批准。
+- [ ] 外部 `/waypoint`（`Float32MultiArray`、无 header）与 STRIVE `/way_point`（`PointStamped`）存在接口不匹配；需要所有者确认或提供显式 adapter 后，才能进行真实下层 handoff。
 - [ ] 确认底盘/局部规划器的启动所有权、订阅 topic、消息类型、frame、状态回执与急停接口。
 - [ ] 先在 `/strive/test_way_point`（`geometry_msgs/PointStamped`）做无人订阅的消息与坐标系验证；该 topic 不得连接底盘控制器。
 - [ ] 在人工监控、急停可达、限速和受控场地中验证真实 `/way_point` handoff。

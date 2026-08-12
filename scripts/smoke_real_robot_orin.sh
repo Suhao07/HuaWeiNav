@@ -5,8 +5,6 @@ IMAGE_TAG="${IMAGE_TAG:-huawei-vln-realworld:orin}"
 ROS_SETUP="${ROS_SETUP:-/opt/ros/humble/setup.bash}"
 LIVOX_SETUP="${LIVOX_SETUP:-/home/orin26/code/ws_livox/install/setup.bash}"
 POINT_LIO_SETUP="${POINT_LIO_SETUP:-/home/orin26/code/point_lio_ws/install/setup.bash}"
-ODOM_TOPIC="${ODOM_TOPIC:-/aft_mapped_to_init}"
-CLOUD_TOPIC="${CLOUD_TOPIC:-/cloud_registered}"
 CHECK_CAMERA="${CHECK_CAMERA:-1}"
 USB_IMAGE_WIDTH="${USB_IMAGE_WIDTH:-1280}"
 USB_IMAGE_HEIGHT="${USB_IMAGE_HEIGHT:-720}"
@@ -17,9 +15,6 @@ DETECTOR_INIT_TIMEOUT="${DETECTOR_INIT_TIMEOUT:-180}"
 REQUIRE_ML="${REQUIRE_ML:-0}"
 REQUIRE_ASSETS="${REQUIRE_ASSETS:-0}"
 REQUIRE_LIO="${REQUIRE_LIO:-0}"
-POSE_TOPIC="${POSE_TOPIC:-${ODOM_TOPIC:-/aft_mapped_to_init}}"
-LIO_INPUT_MODE="${LIO_INPUT_MODE:-cloud_and_pose}"
-WORLD_FRAME="${WORLD_FRAME:-${STRIVE_WORLD_FRAME:-map}}"
 # Keep graph inspection available by default, but allow an explicit GPU/ML-only
 # smoke run to avoid creating diagnostic subscribers on a shared ROS graph.
 # A required LIO gate always enables the read-only sampling checks.
@@ -30,14 +25,6 @@ ECHO_TIMEOUT="${ECHO_TIMEOUT:-5}"
 if [[ "${REQUIRE_LIO}" == "1" ]]; then
   CHECK_LIO_SAMPLES=1
 fi
-
-case "${LIO_INPUT_MODE}" in
-  pose_only|cloud_and_pose|disabled) ;;
-  *)
-    echo "Unsupported LIO_INPUT_MODE=${LIO_INPUT_MODE}; expected pose_only, cloud_and_pose, or disabled." >&2
-    exit 2
-    ;;
-esac
 
 # This smoke must not stop, start, or otherwise mutate the host's shared ROS
 # daemon.  Every ROS CLI command discovers the live graph directly.
@@ -258,22 +245,14 @@ done
 
 if [[ "${CHECK_LIO_SAMPLES}" == "1" ]]; then
   section "Hardware Topic Samples"
-  sample_topics=("${POSE_TOPIC}")
-  if [[ "${LIO_INPUT_MODE}" == "cloud_and_pose" ]]; then
-    sample_topics+=("${CLOUD_TOPIC:-/cloud_registered}")
-  fi
-  for topic in "${sample_topics[@]}"; do
+  for topic in /livox/imu /cloud_registered /aft_mapped_to_init /path; do
     echo "--- hz ${topic}"
     ROS_DISABLE_DAEMON=1 bounded_timeout "${HZ_TIMEOUT}" ros2 topic hz "${topic}" --window 5 2>&1 | sed -n '1,30p' || true
   done
-  echo "--- ${POSE_TOPIC} once"
-  ROS_DISABLE_DAEMON=1 bounded_timeout "${ECHO_TIMEOUT}" ros2 topic echo --once "${POSE_TOPIC}" 2>&1 | sed -n '1,80p' || true
-  if [[ "${LIO_INPUT_MODE}" == "cloud_and_pose" ]]; then
-    echo "--- ${CLOUD_TOPIC:-/cloud_registered} header once"
-    ROS_DISABLE_DAEMON=1 bounded_timeout "${ECHO_TIMEOUT}" ros2 topic echo --once "${CLOUD_TOPIC:-/cloud_registered}" --field header 2>&1 | sed -n '1,60p' || true
-  else
-    echo "--- registered cloud optional in pose_only mode: ${CLOUD_TOPIC:-/cloud_registered}"
-  fi
+  echo "--- /aft_mapped_to_init once"
+  ROS_DISABLE_DAEMON=1 bounded_timeout "${ECHO_TIMEOUT}" ros2 topic echo --once /aft_mapped_to_init 2>&1 | sed -n '1,80p' || true
+  echo "--- /cloud_registered header once"
+  ROS_DISABLE_DAEMON=1 bounded_timeout "${ECHO_TIMEOUT}" ros2 topic echo --once /cloud_registered --field header 2>&1 | sed -n '1,60p' || true
 else
   section "Hardware Topic Samples"
   echo "Skipped (CHECK_LIO_SAMPLES=0; GPU/ML-only smoke mode)."
@@ -282,12 +261,13 @@ fi
 if [[ "${REQUIRE_LIO}" == "1" ]]; then
   section "Required LIO Sample Gate"
   lio_missing=0
-  required_topics=("${POSE_TOPIC}")
-  if [[ "${LIO_INPUT_MODE}" == "cloud_and_pose" ]]; then
-    required_topics+=("${CLOUD_TOPIC:-/cloud_registered}")
-  fi
-  for topic in "${required_topics[@]}"; do
-    field="header"
+  for spec in \
+    "/livox/lidar header" \
+    "/livox/imu header" \
+    "/cloud_registered header" \
+    "/aft_mapped_to_init header"; do
+    topic="${spec% *}"
+    field="${spec##* }"
     echo "--- required ${topic} ${field}"
     sample_output="$(
       ROS_DISABLE_DAEMON=1 bounded_timeout "${ECHO_TIMEOUT}" \
@@ -302,7 +282,7 @@ if [[ "${REQUIRE_LIO}" == "1" ]]; then
     fi
   done
   if [[ "${lio_missing}" != "0" ]]; then
-    echo "Required localization samples are missing. Verify the robot-owned Point-LIO/localization workflow and DDS data plane; do not restart it from this deployment unless ownership is explicitly approved." >&2
+    echo "Required LIO samples are missing. Start/restart LIO with scripts/start_orin_lio_for_strive.sh." >&2
     exit 5
   fi
 fi
@@ -319,13 +299,7 @@ if run_maybe_sudo docker info --format '{{json .Runtimes}}' 2>/dev/null | grep -
 elif have_cmd nvidia-smi; then
   DOCKER_GPU_ARGS=(--gpus all)
 fi
-DOCKER_DDS_ARGS=(
-  -e "FASTDDS_BUILTIN_TRANSPORTS=${FASTDDS_BUILTIN_TRANSPORTS:-UDPv4}"
-  -e "LIO_INPUT_MODE=${LIO_INPUT_MODE}"
-  -e "POSE_TOPIC=${POSE_TOPIC}"
-  -e "CLOUD_TOPIC=${CLOUD_TOPIC:-/cloud_registered}"
-  -e "WORLD_FRAME=${WORLD_FRAME}"
-)
+DOCKER_DDS_ARGS=(-e "FASTDDS_BUILTIN_TRANSPORTS=${FASTDDS_BUILTIN_TRANSPORTS:-UDPv4}")
 
 run_maybe_sudo docker run --rm --network host --ipc=host "${DOCKER_GPU_ARGS[@]}" "${DOCKER_DDS_ARGS[@]}" "${IMAGE_TAG}" bash -lc '
 set -eo pipefail
@@ -351,17 +325,15 @@ set -eo pipefail
 set +u
 source /opt/ros/humble/setup.bash
 set -u
-echo "--- container ${POSE_TOPIC} header"
-timeout --kill-after=2s 8 ros2 topic echo --once "${POSE_TOPIC}" --field header
-if [[ "${LIO_INPUT_MODE}" == "cloud_and_pose" ]]; then
-  echo "--- container ${CLOUD_TOPIC:-/cloud_registered} header"
-  timeout --kill-after=2s 8 ros2 topic echo --once "${CLOUD_TOPIC:-/cloud_registered}" --field header
-fi
+echo "--- container /aft_mapped_to_init header"
+timeout --kill-after=2s 8 ros2 topic echo --once /aft_mapped_to_init --field header
+echo "--- container /cloud_registered header"
+timeout --kill-after=2s 8 ros2 topic echo --once /cloud_registered --field header
 '
   )"
   printf '%s\n' "${container_lio_output}" | sed -n '1,80p'
   if ! grep -q '^stamp:' <<< "${container_lio_output}"; then
-    echo "Container could not receive the required localization topic. Check Docker DDS settings." >&2
+    echo "Container could not receive required LIO topics. Check Docker DDS settings." >&2
     exit 6
   fi
 fi
