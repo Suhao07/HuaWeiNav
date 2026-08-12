@@ -4,3 +4,4 @@
 *.yaml
 *.yml
 !controller_contract_template.yaml
+!waypoint_adapter_template.yaml

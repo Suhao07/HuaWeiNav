@@ -33,6 +33,7 @@ LIO_SAMPLE_TIMEOUT_S="${LIO_SAMPLE_TIMEOUT_S:-5}"
 WAIT_FOR_CAMERA="${WAIT_FOR_CAMERA:-0}"
 REQUIRE_NO_CMD_VEL_PUBLISHERS="${REQUIRE_NO_CMD_VEL_PUBLISHERS:-1}"
 START_SEMANTIC_MAPPING="${START_SEMANTIC_MAPPING:-false}"
+START_WAYPOINT_ADAPTER="${START_WAYPOINT_ADAPTER:-false}"
 MAPPING_CONFIG="${MAPPING_CONFIG:-}"
 PROJECTION_CONFIG="${PROJECTION_CONFIG:-}"
 DETECTION_TOPIC="${DETECTION_TOPIC:-/detection_result}"
@@ -134,6 +135,7 @@ preflight() {
   echo "start_semantic_mapping=${START_SEMANTIC_MAPPING}"
   echo "block_lower_controller=${BLOCK_LOWER_CONTROLLER}"
   echo "start_strive_runtime=${START_STRIVE_RUNTIME:-0}"
+  echo "start_waypoint_adapter=${START_WAYPOINT_ADAPTER}"
 
   if is_true "${WAIT_FOR_LIO}"; then
     wait_for_topic "${CLOUD_TOPIC}" "sensor_msgs/msg/PointCloud2" "${PREFLIGHT_TIMEOUT_S}"

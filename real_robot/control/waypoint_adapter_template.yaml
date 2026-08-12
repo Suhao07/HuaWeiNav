@@ -1,0 +1,19 @@
+# Per-robot STRIVE -> externally owned waypoint adapter.
+# This bridge only converts a waypoint message. It never publishes /cmd_vel.
+# Keep output_enabled=false until the external controller contract is reviewed.
+waypoint_adapter:
+  input_topic: /way_point
+  output_topic: /waypoint
+  odom_topic: /aft_mapped_to_init
+  input_frame: map
+  output_frame: base_link
+  coordinate_mode: ego_from_odom
+  output_message_type: std_msgs/msg/Float32MultiArray
+  include_z: false
+  max_input_age_s: 1.0
+  output_enabled: false
+  static_translation_xy_m: [0.0, 0.0]
+  static_yaw_rad: 0.0
+  metadata:
+    external_controller: "replace per robot"
+    external_waypoint_semantics: "ego-frame [x, y]"

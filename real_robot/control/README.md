@@ -26,3 +26,20 @@ exists and has all of the following exact approved gate values:
 This directory is mounted read-only into the deployment container.  Do not use
 this mechanism to start, change, or take ownership of another project's lower
 controller.
+
+## Waypoint format adapter
+
+`waypoint_adapter_template.yaml` defines the independent, configurable bridge
+from STRIVE `/way_point` (`geometry_msgs/PointStamped`) to an externally owned
+`/waypoint` (`std_msgs/Float32MultiArray`). It supports `identity`,
+`static_se2`, and read-only odometry-based `ego_from_odom` conversion. Other
+robots should copy the template to their ignored robot-specific config and
+change only topic names, frames, coordinate mode, timeout, and output switch.
+The adapter never publishes `/cmd_vel`.
+
+Safe validation keeps output disabled:
+
+```bash
+WAYPOINT_ADAPTER_CONFIG=/workspace/STRIVE/real_robot/control/<robot>_waypoint_adapter.yaml \
+  scripts/run_real_robot_waypoint_adapter.sh
+```

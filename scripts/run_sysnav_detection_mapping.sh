@@ -8,6 +8,7 @@ ROS_DISTRO_NAME="${ROS_DISTRO:-humble}"
 ROS_SETUP="/opt/ros/${ROS_DISTRO_NAME}/setup.bash"
 OVERLAY_SETUP="${WS_DIR}/install/setup.bash"
 START_STRIVE_RUNTIME="${START_STRIVE_RUNTIME:-0}"
+START_WAYPOINT_ADAPTER="${START_WAYPOINT_ADAPTER:-0}"
 START_SEMANTIC_MAPPING="${START_SEMANTIC_MAPPING:-true}"
 MAPPING_CONFIG="${MAPPING_CONFIG:-}"
 PROJECTION_CONFIG="${PROJECTION_CONFIG:-}"
@@ -128,6 +129,15 @@ runtime_args() {
   append_runtime_arg RUNTIME_ARGS "use_sim_time" "${STRIVE_USE_SIM_TIME:-false}"
 }
 
+adapter_args() {
+  WAYPOINT_ADAPTER_ARGS=()
+  append_runtime_arg WAYPOINT_ADAPTER_ARGS "config_path" "${WAYPOINT_ADAPTER_CONFIG:-}"
+  append_runtime_arg WAYPOINT_ADAPTER_ARGS "input_topic" "${WAYPOINT_ADAPTER_INPUT_TOPIC:-/way_point}"
+  append_runtime_arg WAYPOINT_ADAPTER_ARGS "output_topic" "${WAYPOINT_ADAPTER_OUTPUT_TOPIC:-/waypoint}"
+  append_runtime_arg WAYPOINT_ADAPTER_ARGS "odom_topic" "${WAYPOINT_ADAPTER_ODOM_TOPIC:-/aft_mapped_to_init}"
+  append_runtime_arg WAYPOINT_ADAPTER_ARGS "output_enabled" "${WAYPOINT_ADAPTER_OUTPUT_ENABLED:-false}"
+}
+
 mapping_args() {
   MAPPING_ARGS=(
     "start_semantic_mapping:=${START_SEMANTIC_MAPPING}"
@@ -150,10 +160,27 @@ mapping_args
 
 # 核心：默认启动 vendored SysNav detector/mapping；profile 可显式停用未标定的 semantic mapping。
 if ! is_true "${START_STRIVE_RUNTIME}"; then
-  exec ros2 launch strive_sysnav_bringup sysnav_detection_mapping.launch.py "${MODEL_ARGS[@]}" "${MAPPING_ARGS[@]}" "$@"
+  if ! is_true "${START_WAYPOINT_ADAPTER}"; then
+    exec ros2 launch strive_sysnav_bringup sysnav_detection_mapping.launch.py "${MODEL_ARGS[@]}" "${MAPPING_ARGS[@]}" "$@"
+  fi
+  adapter_args
+  PIDS=()
+  trap 'cleanup; exit 130' INT
+  trap 'cleanup; exit 143' TERM
+  ros2 launch strive_sysnav_bringup sysnav_detection_mapping.launch.py "${MODEL_ARGS[@]}" "${MAPPING_ARGS[@]}" "$@" &
+  PIDS+=("$!")
+  ros2 launch strive_sysnav_bringup waypoint_adapter.launch.py "${WAYPOINT_ADAPTER_ARGS[@]}" &
+  PIDS+=("$!")
+  set +e
+  wait -n "${PIDS[@]}"
+  status=$?
+  set -e
+  cleanup
+  exit "${status}"
 fi
 
 runtime_args
+adapter_args
 PIDS=()
 trap 'cleanup; exit 130' INT
 trap 'cleanup; exit 143' TERM
@@ -162,6 +189,10 @@ ros2 launch strive_sysnav_bringup sysnav_detection_mapping.launch.py "${MODEL_AR
 PIDS+=("$!")
 ros2 launch strive_sysnav_bringup strive_instruction_runtime.launch.py "${RUNTIME_ARGS[@]}" &
 PIDS+=("$!")
+if is_true "${START_WAYPOINT_ADAPTER}"; then
+  ros2 launch strive_sysnav_bringup waypoint_adapter.launch.py "${WAYPOINT_ADAPTER_ARGS[@]}" &
+  PIDS+=("$!")
+fi
 
 set +e
 wait -n "${PIDS[@]}"

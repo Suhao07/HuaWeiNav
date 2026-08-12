@@ -87,6 +87,7 @@ RUN chmod +x ${STRIVE_WS}/scripts/build_real_robot_ros_ws.sh \
              ${STRIVE_WS}/scripts/run_sysnav_detection_mapping.sh \
              ${STRIVE_WS}/scripts/run_real_robot_bag_replay.sh \
              ${STRIVE_WS}/scripts/run_real_robot_instruction_runtime.sh \
+             ${STRIVE_WS}/scripts/run_real_robot_waypoint_adapter.sh \
              ${STRIVE_WS}/scripts/start_real_robot_framework.sh \
              ${STRIVE_WS}/scripts/start_orin_lio_for_strive.sh \
              ${STRIVE_WS}/scripts/smoke_real_robot_orin.sh \
