@@ -69,6 +69,12 @@ mask 边界时会出现 `mask_hits>0` 但融合点数为 0；现在按机器人 
 - 点云和对象输出频率受当前 Orin GPU/CPU 负载影响，需在正式部署时做性能优化和
   稳定性测试。
 - Point-LIO 位姿/语义对象坐标出现异常大值，需完成坐标系、单位和初始化检查。
+- 后续复测发现异常大值来自隔离建图容器与 Point-LIO 争用 CPU：停止旧 mapping
+  容器并重启原有 LIO helper 后，位姿恢复到米级、LIO 处理约 1–6 ms。测试容器
+  已设置 CPU 上限并固定到独立 CPU 集合；不得以无限制的 mapping smoke 结果验收。
+- 检测器新增 `image_processing_interval=0.5` 和 `max_input_age_s=1.0` 参数，避免
+  D435i 30 Hz 输入在 Orin 上积压成 5–10 秒旧检测。该修复已在本地提交，机器人
+  网络恢复后需替换隔离容器检测进程并重新测量同步延迟。
 - 控制流尚未接入：`/cmd_vel`、`/waypoint`、`/way_point` 当前均无 publisher。
   waypoint 格式转换 adapter 已实现，但真实 handoff 仍须底盘所有权、坐标语义、
   到达/阻塞/超时反馈、限速和急停流程书面批准后，才可进行无运动接口验证。

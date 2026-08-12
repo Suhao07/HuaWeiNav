@@ -74,6 +74,8 @@
 - [ ] RealSense D435i driver、RGB-D topic 和 device 权限按独立 profile 验证。
 - [x] 2026-08-13 D435i driver、实时 CameraInfo、Point-LIO body cloud、检测和语义对象输出已在隔离容器完成数据层闭环验证；详见 [`docs/real_robot_d435i_dataflow_evidence_20260813.md`](real_robot_d435i_dataflow_evidence_20260813.md)。
 - [ ] Point-LIO 位姿和对象坐标通过合理量级/初始化/单位检查；2026-08-13 采样发现位置约为 `5e5–8e5`，暂不得用于导航闭环。
+- [x] 已定位该异常的直接诱因是无限制隔离 mapping 与 LIO 的 CPU 争用；停止旧容器并重启 LIO 后恢复米级位姿，mapping smoke 必须使用 CPU 限额。
+- [ ] 将检测器节流/过期帧丢弃修复部署到机器人后，重新验证检测与 Point-LIO 时间差小于 profile 门限。
 
 ## 5. 标定与传感器融合
 

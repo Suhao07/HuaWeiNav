@@ -7,7 +7,6 @@ semantic_mapping_node:
     platform: mecanum
     detection_linear_state_time_bias: 0.0
     detection_angular_state_time_bias: 0.0
-    image_processing_interval: 0.5
     visualize: false
     vis_interval: 0.5
     annotate_image: false
@@ -32,6 +31,9 @@ semantic_mapping_node:
 detection_node:
   ros__parameters:
     platform: mecanum
+    # Run detector at a bounded rate and reject stale camera frames so the
+    # detection timestamp remains close enough to Point-LIO for fusion.
+    max_input_age_s: 1.0
     image_processing_interval: 0.5
     visualize: false
     vis_interval: 0.5

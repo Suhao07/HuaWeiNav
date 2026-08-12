@@ -71,6 +71,8 @@ class DetectNode(Node):
         self.declare_parameter('grounding_score_thresh', 0.3)
         self.declare_parameter('device', device)
         self.declare_parameter('annotate_image', True)
+        self.declare_parameter('image_processing_interval', 0.5)
+        self.declare_parameter('max_input_age_s', 1.0)
         self.declare_parameter('object_file', str(self.CONFIG_DIR / 'config' / 'objects.yaml'))
         self.declare_parameter('detector_model_type', 'yoloe')
         self.declare_parameter('detector_model_path', str(self.CONFIG_DIR / 'external' / 'yoloe-26x-seg.engine'))
@@ -78,6 +80,12 @@ class DetectNode(Node):
         self.platform = self.get_parameter('platform').get_parameter_value().string_value
         self.ANNOTATE = self.get_parameter('annotate_image').get_parameter_value().bool_value
         self.grounding_score_thresh = self.get_parameter('grounding_score_thresh').get_parameter_value().double_value
+        self.image_processing_interval = self.get_parameter('image_processing_interval').get_parameter_value().double_value
+        self.max_input_age_s = self.get_parameter('max_input_age_s').get_parameter_value().double_value
+        if self.image_processing_interval < 0.0:
+            raise ValueError('image_processing_interval must be non-negative')
+        if self.max_input_age_s < 0.0:
+            raise ValueError('max_input_age_s must be non-negative')
         object_file_path = resolve_package_path(self.get_parameter('object_file').get_parameter_value().string_value, self.CONFIG_DIR)
         detector_model_path = resolve_package_path(self.get_parameter('detector_model_path').get_parameter_value().string_value, self.CONFIG_DIR)
         detector_model_type = self.get_parameter('detector_model_type').get_parameter_value().string_value.lower()
@@ -142,6 +150,7 @@ class DetectNode(Node):
         self.detection_result_pub = self.create_publisher(DetectionResult, '/detection_result', 50)
 
         self.call_back_time_stamp = time.time()
+        self.last_processed_wall_time = 0.0
 
         self.log_info('Detection node has been started.')
 
@@ -196,8 +205,26 @@ class DetectNode(Node):
 
         start_time = time.time()
 
-        cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+        # D435i can publish faster than the detector can infer on Orin.  Do
+        # not build an old-message queue: throttle at the callback boundary
+        # and discard frames that are already too old for fusion.
+        if (
+            self.image_processing_interval > 0.0
+            and start_time - self.last_processed_wall_time < self.image_processing_interval
+        ):
+            return
+
         det_stamp = msg.header.stamp.sec + msg.header.stamp.nanosec / 1e9
+        if (
+            self.max_input_age_s > 0.0
+            and det_stamp > 0.0
+            and start_time - det_stamp > self.max_input_age_s
+        ):
+            return
+
+        self.last_processed_wall_time = start_time
+
+        cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
         self.detection_processing(cv_image, det_stamp)
 
     def detection_processing(self, image, detection_stamp):
