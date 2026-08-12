@@ -138,6 +138,8 @@
 - [x] 已提供 `real_robot/control/waypoint_adapter_template.yaml`、独立 ROS2 launch/node 和 `scripts/run_real_robot_waypoint_adapter.sh`；其他机器人只需替换 adapter YAML 参数。
 - [x] Orin-26 profile 已配置 `real_robot/control/orin26_waypoint_adapter.yaml`（机器人专用、Git-ignored、远端只读挂载），当前 `output_enabled=false`；adapter 不会自动发布 `/waypoint`。
 - [x] 2026-08-12 重建 ARM64 镜像后，以 `--network none` 只读挂载运行 adapter/waypoint 测试：`13 passed`；镜像 ID `sha256:ed210b885d04…`，未启动 ROS graph。
+- [x] 2026-08-12 按机器人原有 `/home/orin26/code/HuaWeiNav/scripts/start_orin_lio_for_strive.sh` 重启 `livox_odom`，仅通过启动参数覆盖 `publish.scan_publish_en=true`、`publish.scan_bodyframe_pub_en=false`；未修改 Point-LIO 配置文件、未启动控制器。
+- [x] 2026-08-12 只读 LIO 诊断 `logs/diagnostics/lio_dds_20260812T104441Z.md`：`/livox/lidar`、`/livox/imu`、`/cloud_registered`、`/aft_mapped_to_init` 四项均收到实际 header 样本。
 - [ ] 外部 `/waypoint`（`Float32MultiArray`、无 header）与 STRIVE `/way_point`（`PointStamped`）的坐标语义仍需所有者确认；adapter 已实现格式和可配置坐标转换，但真实下层 handoff 仍未批准。
 - [ ] 确认底盘/局部规划器的启动所有权、订阅 topic、消息类型、frame、状态回执与急停接口。
 - [ ] 先在 `/strive/test_way_point`（`geometry_msgs/PointStamped`）做无人订阅的消息与坐标系验证；该 topic 不得连接底盘控制器。

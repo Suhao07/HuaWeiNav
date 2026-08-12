@@ -18,20 +18,21 @@ camera_projection:
   rgb_minus_lidar_time_offset_s: 0.0
   model: pinhole
   image:
-    width: 1280
-    height: 720
+    width: 1920
+    height: 1080
   intrinsics:
-    # Replace all four placeholders with the calibrated Generic USB RGB camera values.
-    fx: 0.0
-    fy: 0.0
-    cx: 0.0
-    cy: 0.0
+    # Temporary user-provided camera_x001 intrinsics.  The profile remains
+    # uncalibrated until the LiDAR-to-camera/time-offset validation is complete.
+    fx: 749.2058
+    fy: 749.2058
+    cx: 1003.1
+    cy: 526.5258
   # Keep the distortion record together with the pinhole values.  The current
   # projection path expects rectified RGB; rectify upstream if coefficients are
   # non-zero, rather than silently applying an unsupported distortion model.
   distortion:
     model: plumb_bob
-    coefficients: []
+    coefficients: [1.5847e-5, -1.3585e-7, 0.0, 0.0, 4.7386e-11]
   lidar_to_camera:
     # Replace with the measured MID-360 -> RGB optical-frame transform.
     translation_m: [0.0, 0.0, 0.0]
@@ -39,7 +40,7 @@ camera_projection:
   min_depth_m: 0.05
   validation:
     # Fill these from the calibration report before changing status above.
-    method: ""
+    method: "user-provided camera_x001 intrinsics; LiDAR extrinsics pending validation"
     calibration_date_utc: ""
-    reprojection_rmse_px: null
+    reprojection_rmse_px: 0.69
     sample_count: 0
