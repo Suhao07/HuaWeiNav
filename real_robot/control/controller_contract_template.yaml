@@ -1,52 +1,52 @@
-# Copy to real_robot/control/<robot>_controller_contract.yaml, fill it from
-# the externally owned chassis/local-planner specification, and obtain review
-# before marking approval_status: approved.  This file is a safety gate, not a
-# replacement for the lower controller itself.
+# 真机底盘控制契约模板（机器可读字段保持英文，说明使用中文）。
+# 复制为 real_robot/control/<robot>_controller_contract.yaml 后，必须依据
+# 底盘/局部规划器所有者的书面规格填写，并完成现场复核，才允许把
+# approval_status 改为 approved。本文件只是安全门禁，不替代底盘控制器。
 controller_contract:
-  schema_version: 2
-  approval_status: unapproved
-  approval_reference: ""
-  owner: ""
-  owner_confirmation: false
-  allow_strive_waypoint_handoff: false
-  cmd_vel_direct_publish: false
+  schema_version: 2 # 契约格式版本
+  approval_status: unapproved # 未验收必须保持 unapproved
+  approval_reference: "" # 审批单/测试记录编号
+  owner: "" # 底盘控制器实际所有者
+  owner_confirmation: false # 所有者是否书面确认
+  allow_strive_waypoint_handoff: false # 未验收不得接收 STRIVE waypoint
+  cmd_vel_direct_publish: false # STRIVE 永远不得直接发布速度
 
   waypoint:
-    topic: ""
-    message_type: ""
-    frame_id: "map"
-    coordinate_semantics: ""
-    xy_goal_tolerance_m: 0.0
-    yaw_goal_tolerance_rad: 0.0
-    timeout_s: 0.0
-    max_distance_m: 0.0
-    stale_after_s: 0.0
+    topic: "" # 外部控制器 waypoint 输入话题
+    message_type: "" # ROS 消息类型
+    frame_id: "map" # 坐标系；无 Header 的消息必须写清约定
+    coordinate_semantics: "" # 坐标含义、单位、轴向和是否 ego-frame
+    xy_goal_tolerance_m: 0.0 # 到达判定平移容差
+    yaw_goal_tolerance_rad: 0.0 # 到达判定角度容差
+    timeout_s: 0.0 # 单个目标超时
+    max_distance_m: 0.0 # 单次允许的最大目标距离
+    stale_after_s: 0.0 # waypoint 过期时间
 
   feedback:
-    status_topic: ""
-    message_type: ""
-    reached_value: ""
-    blocked_value: ""
-    timeout_value: ""
-    preempted_value: ""
-    heartbeat_topic: ""
-    heartbeat_timeout_s: 0.0
+    status_topic: "" # 到达/阻塞/超时反馈话题
+    message_type: "" # 反馈消息类型
+    reached_value: "" # 到达取值
+    blocked_value: "" # 阻塞取值
+    timeout_value: "" # 超时取值
+    preempted_value: "" # 被抢占/取消取值
+    heartbeat_topic: "" # 控制器心跳话题（没有则明确写 none）
+    heartbeat_timeout_s: 0.0 # 心跳失联判定时间
 
   safety:
-    max_linear_speed_mps: 0.0
-    max_angular_speed_rps: 0.0
-    max_linear_accel_mps2: 0.0
-    max_angular_accel_rps2: 0.0
-    emergency_stop_topic: ""
-    emergency_stop_message_type: ""
-    emergency_stop_asserted_value: ""
-    emergency_stop_clear_procedure: ""
-    emergency_stop_verified: false
-    manual_takeover_procedure: ""
+    max_linear_speed_mps: 0.0 # 最大线速度
+    max_angular_speed_rps: 0.0 # 最大角速度
+    max_linear_accel_mps2: 0.0 # 最大线加速度
+    max_angular_accel_rps2: 0.0 # 最大角加速度
+    emergency_stop_topic: "" # 急停话题或服务
+    emergency_stop_message_type: "" # 急停消息类型
+    emergency_stop_asserted_value: "" # 触发急停的明确取值
+    emergency_stop_clear_procedure: "" # 清除急停的人工步骤
+    emergency_stop_verified: false # 未实测不得改为 true
+    manual_takeover_procedure: "" # 人工接管和优先级规则
 
   staged_acceptance:
-    no_motion_shadow_topic: ""
-    dry_run_log_directory: ""
-    bench_mode_procedure: ""
-    tethered_low_speed_procedure: ""
-    rollback_command: ""
+    no_motion_shadow_topic: "" # 无运动影子话题
+    dry_run_log_directory: "" # dry-run 决策日志路径
+    bench_mode_procedure: "" # 抬轮/刹车锁定的台架测试步骤
+    tethered_low_speed_procedure: "" # 有人持急停的低速测试步骤
+    rollback_command: "" # 关闭交接并恢复安全状态的命令

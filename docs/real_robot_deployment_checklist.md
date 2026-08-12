@@ -1,9 +1,9 @@
 # Orin-26 实物部署实时 Checklist
 
-> 最后更新：2026-08-11
+> 最后更新：2026-08-12
 > 工作区：`/home/orin26/HuaweiVLN`
 > 代码分支：`realworld`
-> 原则：不修改其他工作区、不重启现有 LIO、STRIVE 不直接发布 `/cmd_vel`。
+> 原则：不修改其他工作区；只有在明确批准的诊断动作中调用原有 LIO helper；STRIVE 不直接发布 `/cmd_vel`。
 
 本文档是实物部署的执行记录，而不是设计愿景。只有有明确命令输出、测试结果或
 落盘工件的项才可勾选。任何失败都保持在 dry-run 或 detector-only 阶段。
@@ -22,11 +22,11 @@
 - [x] 2026-08-11 Point-LIO 的只读 tmux 日志确认正在处理首帧 LiDAR/IMU 并持续输出 mapping 时延；未修改该 session。
 - [x] 2026-08-11 只读核对 `/dev/video0`：udev 身份为 Generic USB Camera（VID `0bda`、PID `3035`、序列号 `200901010001`），`/dev/v4l/by-id/usb-Generic_USB_Camera_200901010001-video-index0` 指向该设备。
 - [x] 2026-08-11 只读核对当前 ROS graph：`/depth_camera_adapter`、`/laserMapping`、`/livox_lidar_publisher`、`/tf_aft_mapped_to_base` 存在；没有控制节点。`/depth_camera_adapter` 仅订阅 `/camera/camera/depth/image_rect_raw`，发布 `/depth_camera`，frame=`depth_camera`，输出 32×24、范围 0.05–2.5 m。
-- [ ] 单独 ROS CLI 订阅 `/livox/lidar`、`/livox/imu`、`/cloud_registered`、`/aft_mapped_to_init` 在匹配的 Reliable/Best-Effort QoS 下仍会超时，需在启用融合前解决外部 DDS data-plane 接收并记录频率、header frame、timestamp。
+- [x] 2026-08-12 按原有 `/home/orin26/code/HuaWeiNav/scripts/start_orin_lio_for_strive.sh` 重启 `livox_odom`，只覆盖 `publish.scan_publish_en=true`、`scan_bodyframe_pub_en=false`；未修改 Point-LIO 配置文件、未启动控制器。
 - [x] 已提供 `lio-diagnostics` profile 子命令：只读采集 ROS/DDS 环境、LIO endpoint QoS 与实际 header 样本，并将报告仅写入本工作区 `logs/diagnostics/`。
 - [x] 2026-08-11 已生成 `logs/diagnostics/lio_dds_20260811T060757Z.md`：host Fast DDS 默认 transport、domain 0 下 Point-LIO 参数服务可读，但四个实际 header 样本均在 8 秒内超时；保持 `START_SEMANTIC_MAPPING=false`，不重启外部 `livox_odom`。
-- [x] 2026-08-11 最新只读诊断 `logs/diagnostics/lio_dds_20260811T095246Z.md`：Point-LIO/Livox 进程仍在，四个 topic 的 publisher/subscriber 端点可发现，但 `/livox/lidar`、`/livox/imu`、`/cloud_registered`、`/aft_mapped_to_init` 的实际 header 样本再次全部在 8 秒内超时；`publish.scan_publish_en=false`、`scan_bodyframe_pub_en=false`，继续保持 `START_SEMANTIC_MAPPING=false`。
-- [ ] 已确认运行中的外部 Point-LIO 参数 `publish.scan_publish_en=false`，这会使 `/cloud_registered` 保持可发现却不输出实际点云；需由其所有者确认并在其工作流中启用，再重新运行本工作区的只读诊断。Livox 原始 IMU 与 LIO 里程计仍须同时通过实际 header 门槛；仅开启 scan output 不能替代该验收。
+- [x] 2026-08-12 重新诊断确认 `/livox/lidar`、`/livox/imu`、`/cloud_registered`、`/aft_mapped_to_init` 均收到实际 header；`/cloud_registered` 样本存在丢包/高负载警告，需在融合启动前继续记录稳定频率。
+- [x] 已确认当前运行中的外部 Point-LIO 参数 `publish.scan_publish_en=true`；该设置通过原有 helper 的命令行覆盖完成，源配置文件未修改。
 - [x] 容器专用 `FASTDDS_BUILTIN_TRANSPORTS=UDPv4` 已与 host-side LIO 诊断分离：diagnostic 默认恢复外部 Point-LIO 的 host Fast DDS transport，避免把容器 workaround 错用于参数/传感器验收。
 - [ ] 为本次 deployment 保存机器/代码/镜像/资产 SHA256 清单。
 
@@ -59,23 +59,24 @@
 - [x] profile 能在 Bash 中直接 source 时定位自身工作区根目录；profile 启动器默认不会再级联加载通用 `.env.realworld`，避免其它机器人遗留的 topic、相机或容器名覆盖当前 profile；只有显式设置 `SYSNAV_ENV_FILE` 才会加载补充文件。
 - [x] 内部输出隔离到 `/huawei_vln/detection_result`、`/huawei_vln/object_nodes_list`。
 - [x] 外部 LIO 输入保持为只读 `/cloud_registered`、`/aft_mapped_to_init`、`/path`。
-- [x] Generic UVC 能力已读取：1920×1080 MJPEG 30 FPS；1280×720 YUYV 10 FPS。profile 显式使用后者（`USB_FRAMERATE=10.0`）。
-- [x] 2026-08-11 独立 `usb_cam` smoke 已打开 `/dev/video0`，使用 1280×720 YUYV 10 FPS；验证结束后无残留容器或节点。
+- [x] Generic UVC 能力已读取：MJPEG 支持到 1280×960；1920×1080 仅提供 YUYV（设备声明 5 Hz）。profile 使用 1920×1080/YUYV/5 Hz，与 `camera_x001_intrinsics.yaml` 分辨率一致。
+- [x] 2026-08-12 隔离 `usb_cam` smoke 已打开 `/dev/video0` 的 1920×1080 模式；`pixel_format=mjpeg` 会使驱动在打开设备后因非法 ROS 枚举退出，已改为合法 `yuyv`。`raw_mjpeg`/`mjpeg2rgb` 在设备可用的 MJPEG 分辨率下可发布图像。
 - [x] 2026-08-11 容器内 `/camera/image` 已收到 header（`frame_id=default_cam`）；preflight 与 launch 的相机参数一致。
-- [x] 2026-08-11 容器内 `/camera/image` 实测编码为 `yuv422_yuy2`，20 帧窗口稳定到 `9.946 Hz`（profile 输入为 1280×720 YUYV 10 FPS）。
+- [x] 2026-08-12 正式 profile 参数隔离测试确认 `/camera/image` 的 `frame_id=default_cam`、`1920×1080`、编码 `yuv422_yuy2`，并收到 `/camera_info`：`radial_3`、`K=[749.2058,0,1003.1,0,749.2058,526.5258,0,0,1]`；与用户文件一致。
 - [x] 2026-08-11 相机→YOLOE detector 闭环已验证：`/huawei_vln/detection_result` 收到 `frame_id=map` 的真实时间戳和 track ID；空检测帧不会再使 `detection_node` 退出。
 - [x] 2026-08-11 只读检查其他项目历史配置：旧 `tools/usb_camera_node.py` 使用 `/image_raw`、640×480 MJPEG 30 FPS；它与当前已实测的 `usb_cam` profile 不同，不作为本部署的启动配置。
 - [x] `USB_CAMERA_INFO_URL` 已成为可插拔 profile 参数；`real_robot/calibration/` 由容器只读挂载。标定后只需放入该目录并填写 `file:///workspace/STRIVE/real_robot/calibration/<camera>.yaml`，profile check 会验证文件存在。
-- [ ] 为 usb_cam 提供你标定后的 `camera_info` 文件；在该文件就绪前启动日志会提示缺少 `/root/.ros/camera_info/default_cam.yaml`，但不影响当前 detector-only 验收。
+- [x] 已从机器人导入 `camera_x001_intrinsics.yaml` 并配置 `USB_CAMERA_INFO_URL`；隔离正式参数测试已确认 `/camera_info` 实际发布，不能只看默认校准警告。
 - [x] 已从机器人上 VEOcc-Rywang 项目只读导入 D435i↔MID-360 外参参数：`real_robot/calibration/orin26_d435i_mid360_targetless_v009_r009_extrinsics.json`。源文件路径和 SHA-256 已记录，未修改源项目。
-- [ ] 该资产当前仅为 `extrinsics_only`；仍需补齐 RGB `camera_info`、畸变、RGB-LiDAR 时间偏移、标定日期/方法/重投影误差后，才能生成并批准 semantic-fusion projection profile。
-- [x] 已从机器人只读导入 `camera_x001_intrinsics.yaml`：1920×1080、`fx=fy=749.2058`、`cx=1003.1`、`cy=526.5258`、radial-3 畸变、离线 RMSE 0.69 px；因当前 Generic USB profile 为 1280×720，未自动绑定。
+- [x] 已生成独立 D435i 投影配置 `real_robot/ros2_ws/src/semantic_mapping/config/projection_orin26_d435i_mid360.yaml`，导入 `T_camera_from_lidar`；配置明确 `rgb_minus_lidar_time_offset_s=0` 只是未验证初始假设，仍不得启用融合。
+- [x] 已从机器人只读导入 `camera_x001_intrinsics.yaml`：1920×1080、`fx=fy=749.2058`、`cx=1003.1`、`cy=526.5258`、radial-3 畸变、离线 RMSE 0.69 px；当前 Generic USB profile 绑定同一分辨率，D435i 使用独立配置。
 - [ ] RealSense D435i driver、RGB-D topic 和 device 权限按独立 profile 验证。
 
 ## 5. 标定与传感器融合
 
 - [x] 已确认旧 `mecanum` 投影固定为 1920×640 全景相机，不能用于当前 Generic RGB/D435i。
 - [x] 新增可验证的 `pinhole` / `equirectangular` 投影配置模块。
+- [x] 已生成 `docs/real_robot_tf_graph.md`，区分实时 TF、Point-LIO 消息 frame 和 D435i/USB-camera 标定文件变换，并记录未发现的 TF 关系。
 - [x] 未经批准的 `calibration_status` 会拒绝 semantic mapping。
 - [x] Orin profile 默认 `START_SEMANTIC_MAPPING=false`，允许安全 detector-only bringup。
 - [x] detector-only profile 不依赖 LIO 数据；启用 semantic mapping 时 helper 强制要求 LIO topic 与实际 header 样本双门槛。
