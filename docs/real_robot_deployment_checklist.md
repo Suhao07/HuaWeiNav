@@ -63,6 +63,7 @@
 - [x] 2026-08-12 真实隔离 camera smoke 以 `pixel_format=mjpeg2rgb` 打开 `/dev/video0` 的 1920×1080 MJPEG，实测 `/camera/image` 约 24.9 Hz、编码 `rgb8`、`width=1920`、`height=1080`，并收到匹配 `/camera_info`。字面 `pixel_format=mjpeg` 会因 ROS 枚举非法退出，已禁止使用。
 - [x] 2026-08-11 容器内 `/camera/image` 已收到 header（`frame_id=default_cam`）；preflight 与 launch 的相机参数一致。
 - [x] 2026-08-12 正式 profile 参数隔离测试确认 `/camera/image` 的 `frame_id=default_cam`、`1920×1080`、编码 `rgb8`，并收到 `/camera_info`：`radial_3`、`K=[749.2058,0,1003.1,0,749.2058,526.5258,0,0,1]`；与用户文件一致。
+- [x] 2026-08-12 现场相机、Point-LIO、TF、外参和控制门禁证据已集中记录到 [`docs/real_robot_runtime_evidence_20260812.md`](real_robot_runtime_evidence_20260812.md)。
 - [x] 2026-08-11 相机→YOLOE detector 闭环已验证：`/huawei_vln/detection_result` 收到 `frame_id=map` 的真实时间戳和 track ID；空检测帧不会再使 `detection_node` 退出。
 - [x] 2026-08-11 只读检查其他项目历史配置：旧 `tools/usb_camera_node.py` 使用 `/image_raw`、640×480 MJPEG 30 FPS；它与当前已实测的 `usb_cam` profile 不同，不作为本部署的启动配置。
 - [x] `USB_CAMERA_INFO_URL` 已成为可插拔 profile 参数；`real_robot/calibration/` 由容器只读挂载。标定后只需放入该目录并填写 `file:///workspace/STRIVE/real_robot/calibration/<camera>.yaml`，profile check 会验证文件存在。
