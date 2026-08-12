@@ -132,6 +132,14 @@ class MappingNode(Node):
         self.declare_parameter("save_png", False)
         self.declare_parameter("projection_config", "")
         self.declare_parameter("require_calibration", False)
+        self.declare_parameter("cloud_input_frame", "lidar")
+        self.declare_parameter("cloud_sync_before_s", 0.5)
+        self.declare_parameter("cloud_sync_after_s", 0.1)
+        self.declare_parameter("cloud_sync_max_gap_s", 1.25)
+        self.declare_parameter("allow_latest_odom", False)
+        self.declare_parameter("odom_max_age_s", 0.5)
+        self.declare_parameter("filter_depth_jumps", True)
+        self.declare_parameter("mask_erosion_iterations", 2)
 
         # class global containers
         self.cloud_stack = []
@@ -173,6 +181,21 @@ class MappingNode(Node):
             str(resolve_package_path(projection_config_value)) if projection_config_value else None
         )
         self.require_calibration = self.get_parameter('require_calibration').get_parameter_value().bool_value
+        self.cloud_input_frame = self.get_parameter('cloud_input_frame').get_parameter_value().string_value.strip().lower()
+        self.cloud_is_body_frame = self.cloud_input_frame in {"body", "imu", "imu_body"}
+        self.cloud_sync_before_s = self.get_parameter('cloud_sync_before_s').get_parameter_value().double_value
+        self.cloud_sync_after_s = self.get_parameter('cloud_sync_after_s').get_parameter_value().double_value
+        self.cloud_sync_max_gap_s = self.get_parameter('cloud_sync_max_gap_s').get_parameter_value().double_value
+        self.allow_latest_odom = self.get_parameter('allow_latest_odom').get_parameter_value().bool_value
+        self.odom_max_age_s = self.get_parameter('odom_max_age_s').get_parameter_value().double_value
+        self.filter_depth_jumps = self.get_parameter('filter_depth_jumps').get_parameter_value().bool_value
+        self.mask_erosion_iterations = self.get_parameter('mask_erosion_iterations').get_parameter_value().integer_value
+        if self.cloud_sync_before_s < 0.0 or self.cloud_sync_after_s < 0.0 or self.cloud_sync_max_gap_s < 0.0:
+            raise ValueError("cloud synchronization windows must be non-negative")
+        if self.odom_max_age_s < 0.0:
+            raise ValueError("odom_max_age_s must be non-negative")
+        if self.mask_erosion_iterations < 0:
+            raise ValueError("mask_erosion_iterations must be non-negative")
 
         print(
             f'Platform: {self.platform}\n,\
@@ -180,6 +203,12 @@ class MappingNode(Node):
                 Detection angular state time bias: {self.detection_angular_state_time_bias}\n,\
                 Annotate image: {self.ANNOTATE}\n,\
                 Grounding score threshold: {self.grounding_score_thresh}'
+        )
+        self.log_info(
+            f"Cloud input frame: {self.cloud_input_frame}; "
+            f"sync window=[-{self.cloud_sync_before_s:.3f}, +{self.cloud_sync_after_s:.3f}]s; "
+            f"latest odom fallback={self.allow_latest_odom}; "
+            f"mask erosion iterations={self.mask_erosion_iterations}"
         )
 
         self.mask_predictor = mask_predictor
@@ -208,6 +237,7 @@ class MappingNode(Node):
             platform=self.platform,
             projection_config_path=self.projection_config_path,
             require_calibration=self.require_calibration,
+            filter_depth_jumps=self.filter_depth_jumps,
         )
 
         if self.ANNOTATE:
@@ -328,6 +358,8 @@ class MappingNode(Node):
                                     log_info=self.log_info,
                                     object_node_pub = self.object_node_pub,
                                     target_object = self.target_object,
+                                    cloud_already_in_body=self.cloud_is_body_frame,
+                                    mask_erosion_iterations=self.mask_erosion_iterations,
                                     )
         
         threading.Thread(target=self.save_worker, daemon=True).start()
@@ -486,6 +518,29 @@ class MappingNode(Node):
                         masks = masks.squeeze(1)
                     
                     detections_tracked['masks'] = masks
+                    try:
+                        projected = self.cloud_img_fusion.scan2pixels(neighboring_cloud)
+                        valid_projection = (
+                            np.isfinite(projected).all(axis=1)
+                            & (projected[:, 0] >= 0)
+                            & (projected[:, 0] < masks.shape[2])
+                            & (projected[:, 1] >= 0)
+                            & (projected[:, 1] < masks.shape[1])
+                        )
+                        projected_int = projected[valid_projection].astype(int)
+                        mask_hits = [
+                            int(mask[projected_int[:, 1], projected_int[:, 0]].astype(bool).sum())
+                            if len(projected_int) else 0
+                            for mask in masks
+                        ]
+                        mask_pixels = [int(np.asarray(mask).astype(bool).sum()) for mask in masks]
+                        self.log_info(
+                            f"Fusion precheck: cloud_points={len(neighboring_cloud)} "
+                            f"projected_in_image={len(projected_int)} "
+                            f"mask_pixels={mask_pixels} mask_hits={mask_hits}"
+                        )
+                    except Exception as exc:
+                        self.log_info(f"Fusion precheck unavailable: {exc}")
                 else: # no information need to add to map
                     detections_tracked['masks'] = []
                     # return
@@ -549,7 +604,11 @@ class MappingNode(Node):
                 t_b2w = np.array(camera_odom['position'])
                 R_w2b = R_b2w.T
                 t_w2b = -R_w2b @ t_b2w
-                cloud_body = neighboring_cloud @ R_w2b.T + t_w2b
+                cloud_body = (
+                    neighboring_cloud
+                    if self.cloud_is_body_frame
+                    else neighboring_cloud @ R_w2b.T + t_w2b
+                )
 
                 # cv2.imwrite(os.path.join(self.IMAGE_DIR, f"{detection_stamp}.png"), image)
                 # Here we save the image for the viewpoint timestamp if it is set
@@ -695,8 +754,15 @@ class MappingNode(Node):
                 self.log_info("⚠️⚠️⚠️⚠️⚠️⚠️Detection older than oldest odom. Waiting for next detection...")
                 return
             if target_right_odom_stamp < det_linear_state_stamp: # wait for odometry
-                self.log_info(f"⚠️⚠️⚠️⚠️⚠️⚠️Odom older than detection. Right odom: {target_right_odom_stamp}, det linear: {det_linear_state_stamp}. Waiting for odometry...")
-                return
+                odom_age = det_linear_state_stamp - target_right_odom_stamp
+                if not self.allow_latest_odom or odom_age > self.odom_max_age_s:
+                    self.log_info(f"⚠️⚠️⚠️⚠️⚠️⚠️Odom older than detection. Right odom: {target_right_odom_stamp}, det linear: {det_linear_state_stamp}. Waiting for odometry...")
+                    return
+                self.log_info(
+                    f"Using latest odometry {odom_age:.3f}s older than detection "
+                    f"(limit {self.odom_max_age_s:.3f}s)."
+                )
+                target_left_odom_stamp = target_right_odom_stamp
 
             # target_angular_odom_stamp = find_closest_stamp(angular_state_stamps, det_angular_state_stamp)
             # if abs(target_angular_odom_stamp - det_angular_state_stamp) > 0.1:
@@ -749,13 +815,20 @@ class MappingNode(Node):
 
             neighboring_cloud = []
             for i in range(len(self.cloud_stamps)):
-                if self.cloud_stamps[i] >= (detection_stamp - 0.5) and self.cloud_stamps[i] <= (detection_stamp + 0.1):
+                if self.cloud_stamps[i] >= (detection_stamp - self.cloud_sync_before_s) and self.cloud_stamps[i] <= (detection_stamp + self.cloud_sync_after_s):
                     neighboring_cloud.append(self.cloud_stack[i])
             if len(neighboring_cloud) == 0:
-                self.log_info("⚠️⚠️⚠️⚠️⚠️⚠️No neighboring cloud found. Waiting for cloud...")
-                return
-            else:
-                neighboring_cloud = np.concatenate(neighboring_cloud, axis=0)
+                nearest_index = int(np.argmin(np.abs(np.asarray(self.cloud_stamps) - detection_stamp)))
+                nearest_gap = abs(self.cloud_stamps[nearest_index] - detection_stamp)
+                if nearest_gap > self.cloud_sync_max_gap_s:
+                    self.log_info("⚠️⚠️⚠️⚠️⚠️⚠️No neighboring cloud found. Waiting for cloud...")
+                    return
+                self.log_info(
+                    f"Using nearest cloud {nearest_gap:.3f}s from detection "
+                    f"(limit {self.cloud_sync_max_gap_s:.3f}s)."
+                )
+                neighboring_cloud.append(self.cloud_stack[nearest_index])
+            neighboring_cloud = np.concatenate(neighboring_cloud, axis=0)
 
         # if self.last_camera_odom is not None:
         #     if np.linalg.norm(self.last_camera_odom['position'] - camera_odom['position']) < 0.05:

@@ -315,7 +315,8 @@ class CloudImageFusion:
         require_calibration: Reject missing or unapproved calibration assets.
     """
 
-    def __init__(self, platform, projection_config_path=None, require_calibration=False):
+    def __init__(self, platform, projection_config_path=None, require_calibration=False, filter_depth_jumps=True):
+        self.filter_depth_jumps = bool(filter_depth_jumps)
         self.platform_list = ['wheelchair', 'mecanum', 'mecanum_bagfile', 'mecanum_sim', 'scannet', 'diablo']
 
         if projection_config_path:
@@ -386,6 +387,13 @@ class CloudImageFusion:
                 obj_cloud_world = obj_cloud[:, :3] @ R_b2w.T + t_b2w
                 obj_cloud_world_list.append(obj_cloud_world)
                 continue
+            # PointCloud2 order is not a depth order.  Sort before the jump
+            # test; otherwise an arbitrary packet-order jump can occur at
+            # index 0 and discard every point from a sparse detection.
+            depth_order = np.argsort(obj_depth[:, 0])
+            obj_depth = obj_depth[depth_order]
+            obj_cloud = obj_cloud[depth_order]
+
             # 错位相减obj_depth
             obj_depth_diff = (obj_depth[1:] - obj_depth[:-1]).squeeze()
             obj_depth_max = np.max(obj_depth_diff)
@@ -395,7 +403,7 @@ class CloudImageFusion:
             # max_depth = np.max(obj_depth)
             # count = len(obj_depth > (min_depth + max_depth) / 2)
             # if obj_depth_max > 0.5 and len(obj_depth) > 5:
-            if obj_depth_max > 0.3:
+            if self.filter_depth_jumps and obj_depth_max > 0.3:
                 # print(f"Object {i} has large depth variation: {obj_depth_max}, len: {len(obj_depth)}")
                 # from sklearn.cluster import DBSCAN
                 # db = DBSCAN(eps=0.2, min_samples=5).fit(obj_depth)
@@ -426,8 +434,16 @@ class CloudImageFusion:
                 # only keep the idx before the largest jump
                 idx_tmp = np.ones(len(obj_depth), dtype=bool)
                 jump_idx = np.argmax(obj_depth_diff)
-                idx_tmp[jump_idx+1:] = False
-                obj_cloud = obj_cloud[idx_tmp]
+                # Keep a sparse observation intact if the largest gap would
+                # leave fewer than two points for object-map insertion.
+                if jump_idx + 1 >= 2:
+                    idx_tmp[jump_idx+1:] = False
+                    obj_cloud = obj_cloud[idx_tmp]
+                else:
+                    # The first sorted point may be an isolated outlier.  A
+                    # depth discontinuity must not make a valid sparse mask
+                    # produce an empty cloud; keep all points for this frame.
+                    obj_cloud = obj_cloud
 
                 # 用 idx_tmp 过滤 cloud_mask
                 filtered_mask = cloud_mask.copy()

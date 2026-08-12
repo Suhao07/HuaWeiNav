@@ -145,6 +145,8 @@ class ObjMapper():
         log_info=print,
         object_node_pub = None,
         target_object = None,
+        cloud_already_in_body: bool = False,
+        mask_erosion_iterations: int = 2,
     ):
         self.single_obj_list: list[SingleObject] = []
         self.background_obj_list = []
@@ -155,6 +157,8 @@ class ObjMapper():
 
         self.label_template = label_template
         self.object_node_pub = object_node_pub
+        self.cloud_already_in_body = cloud_already_in_body
+        self.mask_erosion_iterations = int(mask_erosion_iterations)
 
         self.delete_bbox_list = []
         self.delete_text_list = []
@@ -234,7 +238,7 @@ class ObjMapper():
         t_b2w = np.array(detection_odom['position'])
         R_w2b = R_b2w.T
         t_w2b = -R_w2b @ t_b2w
-        cloud_body = cloud @ R_w2b.T + t_w2b
+        cloud_body = cloud if self.cloud_already_in_body else cloud @ R_w2b.T + t_w2b
 
         confidences = np.array(detections['confidences'])
         confidences_mask = (confidences >= self.confidence_thres)
@@ -248,10 +252,16 @@ class ObjMapper():
         # if viewpoint_stamp_to_process is not None:
         #     self.log_info(f"🎯 [Publish1] {len(masks)}")
         
-        # FIXME: super weird bug here, if ths erode is put into semantic_mapping_node.py, the memory usage of this node will keep increasing
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-        for i in range(len(masks)):
-            masks[i] = cv2.erode(masks[i].astype(np.uint8), kernel, iterations=2).astype(bool)
+        # Sparse real-world LiDAR projections may land near detector mask
+        # boundaries, so erosion is a per-robot configurable operation.
+        if self.mask_erosion_iterations > 0:
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+            for i in range(len(masks)):
+                masks[i] = cv2.erode(
+                    masks[i].astype(np.uint8),
+                    kernel,
+                    iterations=self.mask_erosion_iterations,
+                ).astype(bool)
 
         # maintain adjacency graph
         if len(obj_ids) == 0:
@@ -263,6 +273,13 @@ class ObjMapper():
         # else:
         #     obj_clouds_world = self.cloud_image_fusion.generate_seg_cloud(cloud_body, masks, labels, confidences, R_b2w, t_b2w)
         obj_clouds_world = self.cloud_image_fusion.generate_seg_cloud(cloud_body, masks, labels, confidences, R_b2w, t_b2w)
+        self.log_info(
+            "Fusion cloud counts: "
+            + ", ".join(
+                f"{label}={len(obj_cloud) if obj_cloud is not None else 0}"
+                for label, obj_cloud in zip(labels, obj_clouds_world or [])
+            )
+        )
         
         self.frame_count += 1
         t1 = time.time()
@@ -282,6 +299,7 @@ class ObjMapper():
             dist_mask = (cloud_to_odom_dist < self.cloud_to_odom_dist_thres)
             # dist_mask = dist_mask & (cloud[:, 2] > self.ground_height)
             cloud = cloud[dist_mask]
+            self.log_info(f"Fusion retained {labels[cloud_cnt]} points={len(cloud)}")
             
             # if cloud.shape[0] < 5 and viewpoint_stamp_to_process is None:
             if cloud.shape[0] < 2 and viewpoint_stamp_to_process is None:

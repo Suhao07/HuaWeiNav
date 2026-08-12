@@ -72,6 +72,8 @@
 - [x] 已生成独立 D435i 投影配置 `real_robot/ros2_ws/src/semantic_mapping/config/projection_orin26_d435i_mid360.yaml`，导入 `T_camera_from_lidar`；配置明确 `rgb_minus_lidar_time_offset_s=0` 只是未验证初始假设，仍不得启用融合。
 - [x] 已从机器人只读导入 `camera_x001_intrinsics.yaml`：1920×1080、`fx=fy=749.2058`、`cx=1003.1`、`cy=526.5258`、radial-3 畸变、离线 RMSE 0.69 px；当前 Generic USB profile 绑定同一分辨率，D435i 使用独立配置。
 - [ ] RealSense D435i driver、RGB-D topic 和 device 权限按独立 profile 验证。
+- [x] 2026-08-13 D435i driver、实时 CameraInfo、Point-LIO body cloud、检测和语义对象输出已在隔离容器完成数据层闭环验证；详见 [`docs/real_robot_d435i_dataflow_evidence_20260813.md`](real_robot_d435i_dataflow_evidence_20260813.md)。
+- [ ] Point-LIO 位姿和对象坐标通过合理量级/初始化/单位检查；2026-08-13 采样发现位置约为 `5e5–8e5`，暂不得用于导航闭环。
 
 ## 5. 标定与传感器融合
 
@@ -82,11 +84,11 @@
 - [x] 未经批准的 `calibration_status` 会拒绝 semantic mapping。
 - [x] Orin profile 默认 `START_SEMANTIC_MAPPING=false`，允许安全 detector-only bringup。
 - [x] detector-only profile 不依赖 LIO 数据；启用 semantic mapping 时 helper 强制要求 LIO topic 与实际 header 样本双门槛。
-- [ ] 从相机节点的 `sensor_msgs/CameraInfo` 读取并核对 RGB 内参（当前已具备离线 `camera_x001` 资产，但机器人尚无实时 `CameraInfo` 话题）。
+- [x] 从 D435i 相机节点读取并核对实时 `sensor_msgs/CameraInfo`；Generic USB 与 D435i 使用独立 profile。
 - [ ] 标定 MID-360 到 RGB optical frame 的外参和平移单位。
 - [ ] 记录时间偏移与投影重投影误差。
 - [ ] 将校准后的 profile 标记为 `calibrated` 并启用 semantic mapping。
-- [ ] 使用离线 bag 验证点云-掩码融合结果，再接入实时传感器。
+- [x] 2026-08-13 在隔离容器用实时 D435i、Point-LIO 和检测 topic 完成点云-掩码融合数据层验证；仍需完成标定/性能验收。
 
 ### 外参/内参填写入口（暂不启用融合）
 

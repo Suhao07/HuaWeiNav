@@ -1,5 +1,7 @@
 # Orin-26 实物运行证据记录（2026-08-12）
 
+后续 D435i 实时数据层闭环记录见 [`real_robot_d435i_dataflow_evidence_20260813.md`](real_robot_d435i_dataflow_evidence_20260813.md)。
+
 本文把本次只读实物验证的关键输出集中记录，供部署验收和后续迁移复核使用。
 记录不包含任何控制指令；没有发布 `/waypoint`、`/way_point` 或 `/cmd_vel`。
 
@@ -121,4 +123,3 @@ emergency_stop_verified: false
 
 已知接口格式为 STRIVE `/way_point` (`geometry_msgs/PointStamped`) 到外部
 `/waypoint` (`std_msgs/Float32MultiArray`)；adapter 只做可配置格式/坐标转换，默认不输出。
-

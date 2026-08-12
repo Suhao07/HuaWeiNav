@@ -50,6 +50,9 @@ class CameraProjectionConfig:
         intrinsics: ``fx``, ``fy``, ``cx`` and ``cy`` for the pinhole model.
         horizontal_fov_deg: Horizontal field of view for equirectangular images.
         vertical_fov_deg: Vertical field of view for equirectangular images.
+        input_frame: Frame represented by the input cloud, normally ``lidar`` or ``body``.
+        input_to_lidar_translation_m: Translation used to convert input-frame points to LiDAR points.
+        input_to_lidar_rotation_rpy_rad: Rotation used to convert input-frame points to LiDAR points.
     """
 
     model: str
@@ -62,6 +65,9 @@ class CameraProjectionConfig:
     intrinsics: Mapping[str, float]
     horizontal_fov_deg: float | None = None
     vertical_fov_deg: float | None = None
+    input_frame: str = "lidar"
+    input_to_lidar_translation_m: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    input_to_lidar_rotation_rpy_rad: tuple[float, float, float] = (0.0, 0.0, 0.0)
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any]) -> "CameraProjectionConfig":
@@ -80,12 +86,18 @@ class CameraProjectionConfig:
         model = str(data.get("model", "")).strip().lower()
         image = data.get("image", {})
         extrinsics = data.get("lidar_to_camera", {})
+        input_to_lidar = data.get("input_to_lidar", {})
+        input_frame = str(data.get("input_frame", "lidar")).strip().lower() or "lidar"
         translation = tuple(float(value) for value in extrinsics.get("translation_m", ()))
         rotation = tuple(float(value) for value in extrinsics.get("rotation_rpy_rad", ()))
+        input_translation = tuple(float(value) for value in input_to_lidar.get("translation_m", (0.0, 0.0, 0.0)))
+        input_rotation = tuple(float(value) for value in input_to_lidar.get("rotation_rpy_rad", (0.0, 0.0, 0.0)))
         if model not in {"pinhole", "equirectangular"}:
             raise CalibrationError("camera_projection.model must be pinhole or equirectangular")
         if len(translation) != 3 or len(rotation) != 3:
             raise CalibrationError("lidar_to_camera translation_m and rotation_rpy_rad must each contain three values")
+        if len(input_translation) != 3 or len(input_rotation) != 3:
+            raise CalibrationError("input_to_lidar translation_m and rotation_rpy_rad must each contain three values")
         try:
             image_width = int(image["width"])
             image_height = int(image["height"])
@@ -113,6 +125,9 @@ class CameraProjectionConfig:
             intrinsics=intrinsics,
             horizontal_fov_deg=(float(data["horizontal_fov_deg"]) if "horizontal_fov_deg" in data else None),
             vertical_fov_deg=(float(data["vertical_fov_deg"]) if "vertical_fov_deg" in data else None),
+            input_frame=input_frame,
+            input_to_lidar_translation_m=input_translation,
+            input_to_lidar_rotation_rpy_rad=input_rotation,
         )
 
     def require_calibrated(self) -> None:
@@ -145,7 +160,12 @@ class CameraProjectionConfig:
         if points.ndim != 2 or points.shape[1] < 3:
             raise CalibrationError("cloud must be an N x 3 (or wider) array")
         rotation = _rotation_matrix_from_rpy(*self.rotation_rpy_rad)
-        camera_points = points[:, :3].astype(np.float64, copy=False) @ rotation.T
+        lidar_points = points[:, :3].astype(np.float64, copy=False)
+        if self.input_frame != "lidar":
+            input_rotation = _rotation_matrix_from_rpy(*self.input_to_lidar_rotation_rpy_rad)
+            lidar_points = lidar_points @ input_rotation.T
+            lidar_points += np.asarray(self.input_to_lidar_translation_m, dtype=np.float64)
+        camera_points = lidar_points @ rotation.T
         camera_points += np.asarray(self.translation_m, dtype=np.float64)
         output = np.full((camera_points.shape[0], 3), -1.0, dtype=np.float64)
 
