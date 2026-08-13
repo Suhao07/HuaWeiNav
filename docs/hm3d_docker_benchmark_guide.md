@@ -2,6 +2,11 @@
 
 本文档记录从零创建本地 Docker 镜像、复用 CogNav_ObjNav 数据和 LLM client、配置权重、运行 HM3D ObjectNav baseline benchmark 的完整流程。
 
+本文件中的 `run_hm3d_baseline.sh` 只用于 ObjectNav benchmark。如果目标是从 HM3D
+生成 room-only `floorplan.json` 和语义 BEV bundle，请使用
+`docker/run_hm3d_floorplan_layout.sh`；它不需要 SAM、GroundingDINO 或 episode
+权重/标注，具体命令见 `docs/prior_map_mode.md`。
+
 ## 1. 前置条件
 
 默认项目路径：
@@ -61,17 +66,35 @@ docker images strive-hm3d:local
 
 ## 3. 权重配置
 
-启动脚本会优先搜索本机权重，搜索不到时可按需下载。
+启动脚本会读取仓库内 `configs/strive_weights.yaml` 中的本机数据集和权重路径。
+环境变量优先级更高：`STRIVE_DATA_ROOT`/`HM3D_DATA_ROOT` 可覆盖 `data_root`，
+`SAM_CHECKPOINT` 和 `GROUNDING_DINO_CHECKPOINT` 可覆盖对应权重路径。搜索不到权重时
+才可按需下载。YAML 只记录路径，不会把模型文件复制进 Git。
+
+当前工作区的 HM3D 数据复用 CogNav_ObjNav：
+
+```text
+configs/strive_weights.yaml:data_root ->
+/home/ubuntu/WorkSpace/research/code/Navigation/CogNav_ObjNav/data
+```
+
+该目录必须同时包含 `scene_datasets/` 和 ObjectNav 回合数据。迁移到其他机器时，
+只需修改 `data_root`，或显式设置：
+
+```bash
+STRIVE_DATA_ROOT=/path/to/CogNav_ObjNav/data bash docker/run_hm3d_baseline.sh
+```
 
 ### 3.1 SAM
 
-默认搜索：
+当前本机配置：
 
 ```text
-$COGNAV_ROOT/model/pretrained_model/sam_vit_h_4b8939.pth
-/home/ubuntu/WorkSpace/research/code/CoRL2025/SG-Nav/segment_anything/sam_vit_h_4b8939.pth
-/home/ubuntu/WorkSpace/research/code/CoRL2025/AKGVP/data/models/sam_vit_h_4b8939.pth
+configs/strive_weights.yaml ->
+/home/ubuntu/3rdparty/Grounded-Segment-Anything/sam_vit_h_4b8939.pth
 ```
+
+如果迁移到其他机器，只修改 YAML，或设置 `SAM_CHECKPOINT` 覆盖它。
 
 手动指定：
 
@@ -87,12 +110,14 @@ STRIVE 当前 mmdet 配置使用 Swin-L 权重：
 grounding_dino_swin-l_pretrain_obj365_goldg-34dcdc53.pth
 ```
 
-默认搜索：
+当前本机配置：
 
 ```text
-$COGNAV_ROOT/model/pretrained_model/grounding_dino_swin-l_pretrain_obj365_goldg-34dcdc53.pth
-./grounding_dino_swin-l_pretrain_obj365_goldg-34dcdc53.pth
+configs/strive_weights.yaml ->
+/home/ubuntu/WorkSpace/research/code/Navigation/CogNav_ObjNav/model/pretrained_model/grounding_dino_swin-l_pretrain_obj365_goldg-34dcdc53.pth
 ```
+
+如果迁移到其他机器，只修改 YAML，或设置 `GROUNDING_DINO_CHECKPOINT` 覆盖它。
 
 如果本机没有，可以允许脚本下载到 CogNav 权重目录：
 

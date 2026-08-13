@@ -4,9 +4,9 @@ set -euo pipefail
 IMAGE_TAG="${IMAGE_TAG:-strive-hm3d:local}"
 CONTAINER_NAME="${CONTAINER_NAME:-strive-hm3d-baseline}"
 STRIVE_ROOT="${STRIVE_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
-DATA_ROOT="${STRIVE_DATA_ROOT:-${HM3D_DATA_ROOT:-$STRIVE_ROOT/data}}"
 MODELS_DIR="${STRIVE_MODELS_DIR:-$STRIVE_ROOT/models}"
 HF_HOME_HOST="${HF_HOME_HOST:-$HOME/.cache/huggingface}"
+WEIGHTS_CONFIG="${STRIVE_WEIGHTS_CONFIG:-$STRIVE_ROOT/configs/strive_weights.yaml}"
 
 mkdir -p "$MODELS_DIR" "$STRIVE_ROOT/logs"
 
@@ -36,7 +36,23 @@ download_if_enabled() {
   fi
 }
 
-SAM_HOST="${SAM_CHECKPOINT:-}"
+yaml_value() {
+  local key="$1"
+  [ -f "$WEIGHTS_CONFIG" ] || return 1
+  grep -E "^[[:space:]]*${key}[[:space:]]*:" "$WEIGHTS_CONFIG" \
+    | head -n 1 \
+    | cut -d: -f2- \
+    | sed 's/[[:space:]]*#.*$//' \
+    | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
+    | tr -d '"'
+}
+
+# 环境变量用于跨机器覆盖；未设置时从本机路径配置读取数据根目录。
+DATA_ROOT="${STRIVE_DATA_ROOT:-${HM3D_DATA_ROOT:-$(yaml_value data_root || true)}}"
+DATA_ROOT="${DATA_ROOT:-$STRIVE_ROOT/data}"
+echo "[data] using data root: $DATA_ROOT"
+
+SAM_HOST="${SAM_CHECKPOINT:-$(yaml_value sam_checkpoint || true)}"
 if [ -z "$SAM_HOST" ]; then
   SAM_CANDIDATES=("$MODELS_DIR/sam_vit_h_4b8939.pth" "$STRIVE_ROOT/models/sam_vit_h_4b8939.pth")
   SAM_HOST="$(find_first "${SAM_CANDIDATES[@]}" 2>/dev/null || true)"
@@ -49,7 +65,7 @@ if [ -z "$SAM_HOST" ]; then
   }
 fi
 
-DINO_HOST="${GROUNDING_DINO_CHECKPOINT:-}"
+DINO_HOST="${GROUNDING_DINO_CHECKPOINT:-$(yaml_value grounding_dino_checkpoint || true)}"
 if [ -z "$DINO_HOST" ]; then
   DINO_CANDIDATES=(
     "$MODELS_DIR/grounding_dino_swin-l_pretrain_obj365_goldg-34dcdc53.pth"
@@ -72,7 +88,7 @@ fi
 
 if [ ! -d "$DATA_ROOT/scene_datasets/hm3d_v0.2" ]; then
   echo "[data] HM3D scene data not found under $DATA_ROOT/scene_datasets/hm3d_v0.2" >&2
-  echo "[data] Set STRIVE_DATA_ROOT to the directory that contains scene_datasets/ and objectnav_hm3d_v2/." >&2
+  echo "[data] Set STRIVE_DATA_ROOT or data_root in $WEIGHTS_CONFIG." >&2
   exit 2
 fi
 if [ ! -f "$DATA_ROOT/objectgoal_hm3d/val/val.json.gz" ] \
@@ -117,8 +133,8 @@ RUN_ARGS=(
   -e "HM3D_DATASET_PATH=${HM3D_DATASET_PATH:-}"
   -e "MP3D_DATA_PATH=/workspace/data"
   -e "SAM_CHECKPOINT=/weights/sam_vit_h_4b8939.pth"
-  -e "GROUNDING_DINO_PATH=/opt/mmdetection"
-  -e "GROUNDING_DINO_CONFIG=/opt/mmdetection/configs/mm_grounding_dino/grounding_dino_swin-l_pretrain_all.py"
+  -e "GROUNDING_DINO_PATH=$(yaml_value grounding_dino_path_container || printf '/opt/mmdetection')"
+  -e "GROUNDING_DINO_CONFIG=$(yaml_value grounding_dino_config_container || printf '/opt/mmdetection/configs/mm_grounding_dino/grounding_dino_swin-l_pretrain_all.py')"
   -e "GROUNDING_DINO_CHECKPOINT=/weights/grounding_dino_swin-l_pretrain_obj365_goldg-34dcdc53.pth"
   # STRIVE 可写挂载；数据和权重独立挂载。
   -v "$STRIVE_ROOT":/workspace/STRIVE
