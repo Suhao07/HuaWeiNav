@@ -35,3 +35,8 @@ real_robot/ros2_ws/log
 *.bag
 *.db3
 *.mcap
+
+# SysNav localPlanner loads these sampled trajectories at runtime. They are
+# source-controlled deployment assets, unlike generated point-cloud outputs.
+!real_robot/ros2_ws/src/local_planner/paths/
+!real_robot/ros2_ws/src/local_planner/paths/*.ply

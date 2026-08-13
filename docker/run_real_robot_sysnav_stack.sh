@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 IMAGE_TAG="${IMAGE_TAG:-huawei-nav-real:orin}"
 CONTAINER_NAME="${CONTAINER_NAME:-huawei-nav-real-sysnav}"
 GPU_ARGS=()
@@ -87,8 +88,10 @@ for name in \
   MAP_PROVIDER AMAP_KEY \
   LLM_PROVIDER LLM_MODEL LLM_API_BASE_URL ARK_API_KEY GEMINI_API_KEY \
   STRIVE_LLM_CLIENT COGNAV_OBJNAV_PATH SYSNAV_MAPPING_EXECUTOR_THREADS \
-  START_STRIVE_RUNTIME STRIVE_INSTRUCTION STRIVE_DATASET_TARGET \
+  START_STRIVE_RUNTIME START_LOWER_STACK STRIVE_INSTRUCTION STRIVE_DATASET_TARGET \
   STRIVE_POLICY_MODE STRIVE_INSTRUCTION_PLAN_BACKEND STRIVE_VLM \
+  STRIVE_MOTION_BACKEND STRIVE_MOTION_ACTION_NAME \
+  CONTROL_CONTRACT_FILE \
   STRIVE_ENABLE_FINAL_VERIFIER STRIVE_EVIDENCE_MODE STRIVE_PRIOR_MAP_PATH \
   STRIVE_DRY_RUN STRIVE_DRY_RUN_STATUS \
   STRIVE_LOWER_CONTROLLER_ENABLED STRIVE_WAYPOINT_TOPIC STRIVE_TEST_WAYPOINT_TOPIC \
@@ -134,6 +137,16 @@ if [[ -n "${SYSNAV_MOBILECLIP_BLT_TS_PATH:-}" && -f "${SYSNAV_MOBILECLIP_BLT_TS_
 fi
 if [[ -n "${SYSNAV_CLIP_VIT_B32_PATH:-}" && -f "${SYSNAV_CLIP_VIT_B32_PATH}" ]]; then
   VOLUME_ARGS+=(-v "${SYSNAV_CLIP_VIT_B32_PATH}:/root/.cache/clip/ViT-B-32.pt:ro")
+fi
+if [[ -n "${CONTROL_CONTRACT_FILE:-}" ]]; then
+  control_contract_dir="${CONTROL_CONTRACT_HOST_DIR:-${REPO_ROOT}/real_robot/control}"
+  if [[ ! -d "${control_contract_dir}" ]]; then
+    echo "CONTROL_CONTRACT_HOST_DIR does not exist: ${control_contract_dir}" >&2
+    exit 2
+  fi
+  # 只读挂载 robot-specific contract；容器内路径与 profile 保持一致，
+  # 防止审批文件被镜像中的模板或旧配置遮蔽。
+  VOLUME_ARGS+=(-v "${control_contract_dir}:/workspace/STRIVE/real_robot/control:ro")
 fi
 
 docker run --rm "${TTY_ARGS[@]}" \

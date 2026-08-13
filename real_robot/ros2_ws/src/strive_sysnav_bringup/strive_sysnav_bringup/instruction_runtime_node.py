@@ -19,7 +19,13 @@ from planning.semantic_snapshot_context import (
 )
 from prior_map.real_robot import PriorMapRealRobotConfig, build_prior_map_real_robot_runtime
 from real_robot.observation_cache import ObjectCropEvidenceProvider, RosObservationCache
+from real_robot.control.controller_contract import (
+    ControllerContractError,
+    load_controller_contract,
+    validate_controller_contract,
+)
 from real_robot.contracts import NavigationStatusCode, Pose3D
+from real_robot.action_motion_controller import RosActionMotionController
 from real_robot.sysnav_ros_adapters import (
     RosNavigationStatusProvider,
     RosWaypointController,
@@ -71,6 +77,8 @@ class StriveInstructionRuntimeNode(Node):
         self.detection_topic = str(self.get_parameter("detection_topic").value)
         self.waypoint_topic = str(self.get_parameter("waypoint_topic").value or "/way_point")
         self.test_waypoint_topic = str(self.get_parameter("test_waypoint_topic").value or "/strive/test_way_point")
+        self.motion_backend = str(self.get_parameter("motion_backend").value or "waypoint")
+        self.controller_contract_file = str(self.get_parameter("controller_contract_file").value or "")
         self.hold_topic = str(self.get_parameter("hold_topic").value or "")
         self.cancel_topic = str(self.get_parameter("cancel_topic").value or "")
         self.emergency_stop_topic = str(self.get_parameter("emergency_stop_topic").value or "")
@@ -112,6 +120,7 @@ class StriveInstructionRuntimeNode(Node):
             pointcloud_topic=str(self.get_parameter("pointcloud_topic").value or ""),
             now_fn=self._now_seconds,
         )
+        self.semantic_bridge = SysNavSemanticMapBridge(robot_pose_provider=self._current_pose)
         # 中文注释：SysNav RoomNode 只有 mask 消息，RGB 由独立相机 topic 提供；
         # 在 bridge 层注入两个证据 provider，才能复现“RGB + room mask”分类输入。
         self.semantic_bridge.room_adapter.rgb_path_provider = self.observation_cache.latest_rgb_visual_path
@@ -124,11 +133,12 @@ class StriveInstructionRuntimeNode(Node):
             no_progress_timeout_s=float(self.get_parameter("no_progress_timeout_s").value),
             min_progress_delta_m=float(self.get_parameter("min_progress_delta_m").value),
             path_stale_timeout_s=float(self.get_parameter("path_stale_timeout_s").value),
+            velocity_tolerance_mps=float(self.get_parameter("velocity_tolerance_mps").value),
+            stable_reach_time_s=float(self.get_parameter("stable_reach_time_s").value),
             world_frame=self.world_frame,
             now_fn=self._now_seconds,
         )
 
-        self.semantic_bridge = SysNavSemanticMapBridge(robot_pose_provider=self._current_pose)
         self.high_level_policy = self._build_policy(self.policy_mode)
         self.motion_controller = self._build_motion_controller()
         # evidence loop 只在 semantic_snapshot 模式下启用；wait/smoke 不需要 verifier 链路。
@@ -222,13 +232,16 @@ class StriveInstructionRuntimeNode(Node):
         self.declare_parameter("room_topic", "/room_nodes_list")
         self.declare_parameter("odom_topic", "/aft_mapped_to_init")
         self.declare_parameter("path_topic", "/path")
-        self.declare_parameter("planner_status_topic", "")
+        self.declare_parameter("planner_status_topic", "/local_planner/status")
         self.declare_parameter("image_topic", "/camera/image")
         self.declare_parameter("detection_topic", "/detection_result")
         self.declare_parameter("depth_topic", "")
         self.declare_parameter("pointcloud_topic", "")
         self.declare_parameter("waypoint_topic", "/way_point")
         self.declare_parameter("test_waypoint_topic", "/strive/test_way_point")
+        self.declare_parameter("motion_backend", "waypoint")
+        self.declare_parameter("motion_action_name", "/strive/execute_waypoint")
+        self.declare_parameter("controller_contract_file", "")
         self.declare_parameter("hold_topic", "")
         self.declare_parameter("cancel_topic", "")
         self.declare_parameter("emergency_stop_topic", "")
@@ -264,6 +277,8 @@ class StriveInstructionRuntimeNode(Node):
         self.declare_parameter("no_progress_timeout_s", 12.0)
         self.declare_parameter("min_progress_delta_m", 0.05)
         self.declare_parameter("path_stale_timeout_s", 5.0)
+        self.declare_parameter("velocity_tolerance_mps", 0.08)
+        self.declare_parameter("stable_reach_time_s", 0.2)
         self.declare_parameter("persist_observation_images", False)
         self.declare_parameter("observation_image_directory", "")
 
@@ -304,6 +319,9 @@ class StriveInstructionRuntimeNode(Node):
         if self.dry_run:
             # dry_run_status 可模拟 reached/blocked 等状态，用于不接底盘时测试 verifier 分支。
             return DryRunMotionController(status_code=_navigation_status_code(self.dry_run_status))
+        if self.motion_backend.strip().lower() == "action":
+            # Action backend 不直接发布 /way_point；SysNavMotionServer 才是唯一 topic owner。
+            return RosActionMotionController(node=self, action_name=str(self.get_parameter("motion_action_name").value))
         return RosWaypointController(
             node=self,
             waypoint_topic=self.waypoint_topic,
@@ -465,6 +483,20 @@ class StriveInstructionRuntimeNode(Node):
         if self.dry_run:
             return
         if self.lower_controller_enabled:
+            if not self.controller_contract_file:
+                raise RuntimeError(
+                    "Refusing live waypoint publication: controller_contract_file is required"
+                )
+            try:
+                contract = load_controller_contract(self.controller_contract_file)
+                validate_controller_contract(
+                    contract,
+                    waypoint_topic=self.waypoint_topic,
+                    world_frame=self.world_frame,
+                    action_name=str(self.get_parameter("motion_action_name").value or "/strive/execute_waypoint"),
+                )
+            except ControllerContractError as exc:
+                raise RuntimeError(f"Refusing live waypoint publication: {exc}") from exc
             return
         if _same_topic(self.waypoint_topic, self.test_waypoint_topic):
             self.get_logger().warning(
@@ -493,6 +525,7 @@ class StriveInstructionRuntimeNode(Node):
             "cancel_topic": self.cancel_topic,
             "emergency_stop_topic": self.emergency_stop_topic,
             "allow_emergency_stop_publish": self.allow_emergency_stop_publish,
+            "controller_contract_file": self.controller_contract_file or None,
         }
 
 

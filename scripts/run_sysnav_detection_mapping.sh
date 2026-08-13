@@ -8,6 +8,7 @@ ROS_DISTRO_NAME="${ROS_DISTRO:-humble}"
 ROS_SETUP="/opt/ros/${ROS_DISTRO_NAME}/setup.bash"
 OVERLAY_SETUP="${WS_DIR}/install/setup.bash"
 START_STRIVE_RUNTIME="${START_STRIVE_RUNTIME:-0}"
+START_LOWER_STACK="${START_LOWER_STACK:-0}"
 START_SEMANTIC_MAPPING="${START_SEMANTIC_MAPPING:-true}"
 MAPPING_CONFIG="${MAPPING_CONFIG:-}"
 PROJECTION_CONFIG="${PROJECTION_CONFIG:-}"
@@ -29,6 +30,7 @@ variables such as:
   STRIVE_DATASET_TARGET
   STRIVE_POLICY_MODE
   STRIVE_INSTRUCTION_PLAN_BACKEND
+  STRIVE_MOTION_BACKEND / STRIVE_MOTION_ACTION_NAME
   STRIVE_DRY_RUN
   STRIVE_RUN_DIRECTORY
   STRIVE_PRIOR_MAP_PATH
@@ -36,6 +38,13 @@ variables such as:
 
 The runtime remains dry-run by default and does not publish /way_point unless
 STRIVE_DRY_RUN=false and the safety parameters allow it.
+
+Complete guarded stack:
+  START_LOWER_STACK=1 scripts/run_sysnav_detection_mapping.sh
+  This starts the aggregate launch with localPlanner, pathFollower,
+  SysNavMotionServer, and SafetyVelocityMux.  Live motion still requires
+  STRIVE_DRY_RUN=false, STRIVE_LOWER_CONTROLLER_ENABLED=true, and an approved
+  CONTROL_CONTRACT_FILE.
 EOF
 }
 
@@ -65,6 +74,10 @@ set +u
 source "${ROS_SETUP}"
 source "${OVERLAY_SETUP}"
 set -u
+
+# ROS nodes import the platform-neutral STRIVE contracts from the repository
+# root. Keep this overlay importable when the motion server is launched alone.
+export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 
 MODEL_ARGS=()
 if [[ -n "${SYSNAV_DETECTOR_MODEL_PATH:-}" ]]; then
@@ -99,6 +112,9 @@ runtime_args() {
   append_runtime_arg RUNTIME_ARGS "dataset_target" "${STRIVE_DATASET_TARGET:-}"
   append_runtime_arg RUNTIME_ARGS "policy_mode" "${STRIVE_POLICY_MODE:-wait}"
   append_runtime_arg RUNTIME_ARGS "instruction_plan_backend" "${STRIVE_INSTRUCTION_PLAN_BACKEND:-rules}"
+  append_runtime_arg RUNTIME_ARGS "motion_backend" "${STRIVE_MOTION_BACKEND:-waypoint}"
+  append_runtime_arg RUNTIME_ARGS "motion_action_name" "${STRIVE_MOTION_ACTION_NAME:-/strive/execute_waypoint}"
+  append_runtime_arg RUNTIME_ARGS "controller_contract_file" "${CONTROL_CONTRACT_FILE:-}"
   append_runtime_arg RUNTIME_ARGS "vlm" "${STRIVE_VLM:-cognav}"
   append_runtime_arg RUNTIME_ARGS "enable_final_verifier" "${STRIVE_ENABLE_FINAL_VERIFIER:-false}"
   append_runtime_arg RUNTIME_ARGS "evidence_mode" "${STRIVE_EVIDENCE_MODE:-auto}"
@@ -119,7 +135,7 @@ runtime_args() {
   append_runtime_arg RUNTIME_ARGS "room_topic" "${STRIVE_ROOM_TOPIC:-/room_nodes_list}"
   append_runtime_arg RUNTIME_ARGS "odom_topic" "${STRIVE_ODOM_TOPIC:-${ODOM_TOPIC:-/aft_mapped_to_init}}"
   append_runtime_arg RUNTIME_ARGS "path_topic" "${STRIVE_PATH_TOPIC:-/path}"
-  append_runtime_arg RUNTIME_ARGS "planner_status_topic" "${STRIVE_PLANNER_STATUS_TOPIC:-}"
+  append_runtime_arg RUNTIME_ARGS "planner_status_topic" "${STRIVE_PLANNER_STATUS_TOPIC:-/local_planner/status}"
   append_runtime_arg RUNTIME_ARGS "image_topic" "${STRIVE_IMAGE_TOPIC:-${CAMERA_TOPIC:-/camera/image}}"
   append_runtime_arg RUNTIME_ARGS "detection_topic" "${STRIVE_DETECTION_TOPIC:-/detection_result}"
   append_runtime_arg RUNTIME_ARGS "depth_topic" "${STRIVE_DEPTH_TOPIC:-}"
@@ -149,6 +165,42 @@ cleanup() {
 }
 
 mapping_args
+
+if is_true "${START_LOWER_STACK}"; then
+  if is_true "${STRIVE_DRY_RUN:-true}" || ! is_true "${STRIVE_LOWER_CONTROLLER_ENABLED:-false}"; then
+    echo "START_LOWER_STACK=1 requires STRIVE_DRY_RUN=false and STRIVE_LOWER_CONTROLLER_ENABLED=true." >&2
+    exit 4
+  fi
+  if [[ -z "${CONTROL_CONTRACT_FILE:-}" || ! -f "${CONTROL_CONTRACT_FILE}" ]]; then
+    echo "START_LOWER_STACK=1 requires an existing CONTROL_CONTRACT_FILE." >&2
+    exit 4
+  fi
+  # 聚合生产入口始终走 Action；若调用者显式提供其它 backend，拒绝静默
+  # 回退到直接发布 /way_point，保持 MotionServer 是唯一 task-level owner。
+  if [[ -n "${STRIVE_MOTION_BACKEND:-}" && "${STRIVE_MOTION_BACKEND}" != "action" ]]; then
+    echo "START_LOWER_STACK=1 requires STRIVE_MOTION_BACKEND=action." >&2
+    exit 4
+  fi
+  STRIVE_MOTION_BACKEND="action"
+  runtime_args
+  STACK_ARGS=(
+    "enable_lower_stack:=true"
+    "platform:=mecanum"
+    "camera_topic:=${CAMERA_TOPIC:-/camera/image}"
+    "cloud_topic:=${CLOUD_TOPIC:-/cloud_registered}"
+    "odom_topic:=${ODOM_TOPIC:-/aft_mapped_to_init}"
+    "viewpoint_topic:=${VIEWPOINT_TOPIC:-/viewpoint_rep_header}"
+    "start_semantic_mapping:=${START_SEMANTIC_MAPPING}"
+    "start_usb_cam:=${START_USB_CAM:-false}"
+    "${MODEL_ARGS[@]}"
+    "${MAPPING_ARGS[@]}"
+    "${RUNTIME_ARGS[@]}"
+  )
+  # 中文说明：聚合 launch 只在显式 START_LOWER_STACK=1 时启用；生产链路统一
+  # 由 Action backend 进入 MotionServer，避免高层 runtime 与 MotionServer
+  # 同时占有 /way_point。
+  exec ros2 launch strive_sysnav_bringup strive_real_robot_stack.launch.py "${STACK_ARGS[@]}" "$@"
+fi
 
 # 核心：默认启动 vendored SysNav detector/mapping；profile 可显式停用未标定的 semantic mapping。
 if ! is_true "${START_STRIVE_RUNTIME}"; then

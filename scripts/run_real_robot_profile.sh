@@ -139,6 +139,8 @@ check_profile() {
           '^[[:space:]]+approval_status:[[:space:]]+approved[[:space:]]*$' \
           '^[[:space:]]+allow_strive_waypoint_handoff:[[:space:]]+true[[:space:]]*$' \
           '^[[:space:]]+cmd_vel_direct_publish:[[:space:]]+false[[:space:]]*$' \
+          '^[[:space:]]+final_cmd_vel_owner:[[:space:]]+safety_velocity_mux[[:space:]]*$' \
+          '^[[:space:]]+sensor_watchdog_required:[[:space:]]+true[[:space:]]*$' \
           '^[[:space:]]+emergency_stop_verified:[[:space:]]+true[[:space:]]*$'; do
           if ! grep -Eq "${required_gate}" "${control_contract_host_path}"; then
             echo "Control contract is missing an approved safety gate: ${required_gate}" >&2

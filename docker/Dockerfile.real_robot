@@ -79,13 +79,18 @@ COPY . ${STRIVE_WS}
 # 权重仍通过 volume/env 挂载，避免把大模型文件固化进镜像。
 RUN source /opt/ros/humble/setup.bash \
  && cd ${STRIVE_REAL_ROBOT_WS} \
- && colcon build --symlink-install --packages-up-to tare_planner semantic_mapping strive_sysnav_bringup
+ && colcon build --symlink-install --packages-up-to \
+      tare_planner terrain_analysis local_planner semantic_mapping \
+      strive_motion_msgs strive_sysnav_motion strive_sysnav_bringup
 
 RUN chmod +x ${STRIVE_WS}/scripts/build_real_robot_ros_ws.sh \
              ${STRIVE_WS}/scripts/check_real_robot_acceptance.sh \
              ${STRIVE_WS}/scripts/export_code_only.sh \
              ${STRIVE_WS}/scripts/run_sysnav_detection_mapping.sh \
              ${STRIVE_WS}/scripts/run_real_robot_bag_replay.sh \
+             ${STRIVE_WS}/scripts/run_lower_planner_bag_replay.sh \
+             ${STRIVE_WS}/scripts/generate_synthetic_lower_planner_bag.py \
+             ${STRIVE_WS}/scripts/run_lower_planner_bag_smoke.sh \
              ${STRIVE_WS}/scripts/run_real_robot_instruction_runtime.sh \
              ${STRIVE_WS}/scripts/start_real_robot_framework.sh \
              ${STRIVE_WS}/scripts/start_orin_lio_for_strive.sh \
