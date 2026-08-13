@@ -65,6 +65,8 @@ class StriveInstructionRuntimeNode(Node):
         self.prior_map_path = str(self.get_parameter("prior_map_path").value or "")
         self.prior_map_source = str(self.get_parameter("prior_map_source").value or "auto")
         self.prior_map_alignment = str(self.get_parameter("prior_map_alignment").value or "identity")
+        self.enable_prior_map_vlm = _param_bool(self.get_parameter("enable_prior_map_vlm").value)
+        self.enable_room_semantics = _param_bool(self.get_parameter("enable_room_semantics").value)
         self.image_topic = str(self.get_parameter("image_topic").value)
         self.detection_topic = str(self.get_parameter("detection_topic").value)
         self.waypoint_topic = str(self.get_parameter("waypoint_topic").value or "/way_point")
@@ -85,6 +87,11 @@ class StriveInstructionRuntimeNode(Node):
                 prior_map_path=self.prior_map_path,
                 prior_map_source=self.prior_map_source,
                 prior_map_alignment=self.prior_map_alignment,
+                enable_high_level_vlm=self.enable_prior_map_vlm,
+                vlm=self.vlm,
+                high_level_interval=max(1, int(self.get_parameter("prior_map_vlm_interval").value)),
+                room_semantic_interval=max(1, int(self.get_parameter("room_semantic_interval").value)),
+                enable_room_semantics=self.enable_room_semantics,
                 run_directory=str(run_directory),
             )
         )
@@ -105,6 +112,10 @@ class StriveInstructionRuntimeNode(Node):
             pointcloud_topic=str(self.get_parameter("pointcloud_topic").value or ""),
             now_fn=self._now_seconds,
         )
+        # 中文注释：SysNav RoomNode 只有 mask 消息，RGB 由独立相机 topic 提供；
+        # 在 bridge 层注入两个证据 provider，才能复现“RGB + room mask”分类输入。
+        self.semantic_bridge.room_adapter.rgb_path_provider = self.observation_cache.latest_rgb_visual_path
+        self.semantic_bridge.room_adapter.room_mask_path_provider = self.observation_cache.persist_room_mask
         self.navigation_status_provider = RosNavigationStatusProvider(
             xy_tolerance_m=float(self.get_parameter("xy_goal_tolerance_m").value),
             z_tolerance_m=float(self.get_parameter("z_goal_tolerance_m").value),
@@ -233,6 +244,10 @@ class StriveInstructionRuntimeNode(Node):
         self.declare_parameter("prior_map_path", "")
         self.declare_parameter("prior_map_source", "auto")
         self.declare_parameter("prior_map_alignment", "identity")
+        self.declare_parameter("enable_prior_map_vlm", False)
+        self.declare_parameter("prior_map_vlm_interval", 10)
+        self.declare_parameter("room_semantic_interval", 10)
+        self.declare_parameter("enable_room_semantics", False)
         self.declare_parameter("run_directory", "/tmp/strive_real_robot_runtime")
         self.declare_parameter("decision_period_s", 1.0)
         self.declare_parameter("queue_size", 10)

@@ -76,6 +76,7 @@ def test_ros_observation_cache_can_persist_raw_image_bytes(tmp_path) -> None:
 
     assert observation.primary_camera().image_ref == record.raw_path
     assert (tmp_path / "rgb_1_250000000.bin").read_bytes() == b"abcdef"
+    assert (tmp_path / "rgb_1_250000000.png").read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
     assert (tmp_path / "rgb_1_250000000.json").exists()
     assert observation.primary_camera().metadata["storage"] == "file"
 

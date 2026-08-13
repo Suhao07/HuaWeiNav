@@ -111,6 +111,8 @@ def test_real_robot_prior_runtime_updates_from_snapshot_and_writes_artifacts(tmp
     assert (prior_dir / "failure_modes_000005.json").exists()
     assert (prior_dir / "floorplan_step_000005.png").read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
     assert (prior_dir / "floorplan_step_000005_markers.json").exists()
+    assert (prior_dir / "dynamic_prior_map_bev_000005.png").exists()
+    assert (prior_dir / "dynamic_prior_map_bev_000005_markers.json").exists()
     query_payload = json.loads((prior_dir / "query_000005.json").read_text(encoding="utf-8"))
     assert query_payload["authority"] == "ranking_only"
     assert query_payload["live_evidence_priority"] is True

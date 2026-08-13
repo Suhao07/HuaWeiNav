@@ -1587,6 +1587,22 @@ bash scripts/run_real_robot_instruction_runtime.sh \
   observation_image_directory:=/tmp/strive_real_robot_runtime/observations
 ```
 
+启用 `enable_room_semantics:=true` 时，建议同时启用图像持久化。运行时会把当前
+RGB 和 SysNav `RoomNode.room_mask` 编码为本地 PNG，通过 `RoomEvidence` 送入
+room semantic prompt；未启用持久化时只保留 ROS URI，分类器不会把 URI 当作图像，
+因此返回 `unknown` 而不发起无效 LVLM 请求。房间标注调用频率由
+`room_semantic_interval` 控制。
+
+```bash
+ros2 launch strive_sysnav_bringup strive_instruction_runtime.launch.py \
+  policy_mode:=semantic_snapshot \
+  instruction:="find a book on a shelf" \
+  enable_room_semantics:=true \
+  room_semantic_interval:=10 \
+  persist_observation_images:=true \
+  observation_image_directory:=/tmp/strive_real_robot_runtime/observations
+```
+
 `ObjectCropEvidenceProvider` 可以基于 object uid、object track id、object
 `bbox2d_xyxy`、`DetectionFrame.track_ids` 或 SysNav object `image_ref` 构造
 `ViewEvidence`。它支持 `full_image` 与 `bbox_crop` 两种证据模式，并写入：
