@@ -1,7 +1,8 @@
 """File loaders for STRIVE prior-map contracts.
 
 This module converts supported static map file formats into ``PriorMapData``.
-It deliberately stops at parsing and normalization: coordinate alignment,
+It performs only schema-level normalization, including the explicit reflection
+marker used by STRIVE-generated FloorPlan layouts. Coordinate alignment,
 runtime observation fusion, ranking, and navigation decisions belong to later
 prior-map modules.
 """
@@ -10,6 +11,7 @@ from __future__ import annotations
 
 import json
 import xml.etree.ElementTree as ET
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -236,16 +238,25 @@ class PriorMapLoader:
         explicit_edges = _parse_topology_edges(data, source_format)
         topology.extend(_dedupe_edges(explicit_edges, existing=topology))
 
+        metadata = _metadata(data, exclude=_MAP_KEYS)
+        frame_id = _text(data.get("frame_id") or self.default_frame_id)
+        rooms, frame_id, metadata = _normalize_floorplan_coordinates(
+            data,
+            rooms,
+            frame_id,
+            metadata,
+        )
+
         return PriorMapData(
             scene_id=scene_id,
             rooms=tuple(rooms),
             objects=tuple(objects),
             topology_edges=tuple(topology),
             source_format=_format_label(source_format, data),
-            frame_id=_text(data.get("frame_id") or self.default_frame_id),
+            frame_id=frame_id,
             world_min=_vector2(data.get("world_min")),
             world_max=_vector2(data.get("world_max")),
-            metadata=_metadata(data, exclude=_MAP_KEYS),
+            metadata=metadata,
         )
 
     def _load_generic_json(self, path: Path, data: Dict[str, Any], source_format: str) -> PriorMapData:
@@ -936,6 +947,61 @@ def _boundary_xy(value: Any) -> BoundaryXY:
         if vec is not None:
             points.append(vec)
     return tuple(points)
+
+
+def _normalize_floorplan_coordinates(
+    data: Dict[str, Any],
+    rooms: Sequence[PriorRoom],
+    frame_id: str,
+    metadata: Dict[str, Any],
+) -> tuple[Sequence[PriorRoom], str, Dict[str, Any]]:
+    """Normalize STRIVE-generated ``(x,-z)`` room geometry for runtime use.
+
+    FloorPlan-VLN stores its 2-D layout in an ``(x, -z)`` convention. STRIVE's
+    canonical prior-map query layer uses Habitat ``(x,z)`` projection, so the
+    generated interchange format carries an explicit marker and is reflected
+    exactly once at load time:
+
+    .. math::
+
+       (x, y_{floorplan}) \mapsto (x, -y_{floorplan})
+
+    Untagged third-party FloorPlan files are left untouched for backward
+    compatibility; their coordinate frame must be supplied by the caller's
+    alignment configuration.
+
+    Args:
+        data: Decoded top-level floorplan payload.
+        rooms: Parsed room contracts.
+        frame_id: Declared source frame id.
+        metadata: Parsed top-level metadata.
+
+    Returns:
+        Normalized rooms, runtime frame id, and augmented metadata.
+    """
+
+    convention = data.get("coordinate_convention")
+    axes = convention.get("floorplan_axes") if isinstance(convention, dict) else None
+    if frame_id != "floorplan_metric" or axes != ["x", "-z"]:
+        return rooms, frame_id, metadata
+
+    normalized = tuple(
+        replace(
+            room,
+            boundary_xy=tuple((float(x), -float(y)) for x, y in room.boundary_xy),
+            centroid_xy=(float(room.centroid_xy[0]), -float(room.centroid_xy[1]))
+            if room.centroid_xy is not None
+            else None,
+        )
+        for room in rooms
+    )
+    normalized_metadata = dict(metadata)
+    normalized_metadata["coordinate_normalization"] = {
+        "source_frame_id": "floorplan_metric",
+        "runtime_frame_id": "habitat_world",
+        "operation": "reflect_second_plane_axis",
+    }
+    return normalized, "habitat_world", normalized_metadata
 
 
 def _vector2(value: Any) -> Optional[Vector2]:

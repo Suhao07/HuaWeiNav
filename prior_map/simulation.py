@@ -21,9 +21,16 @@ from .evaluation import (
 )
 from .loaders import PriorMapLoader
 from .memory import PriorMapMemory
+from .multimodal import PriorMapMultimodalContext
+from .room_semantics import RoomSemanticCache, RoomSemanticClassifier, room_evidence_from_record
 from .policy_adapter import PriorMapPolicyAdapter
 from .prompt_context import PriorMapPromptContextBuilder, PromptContextBundle
 from .query import PriorMapQueryService
+from .high_level_selector import (
+    PriorMapHighLevelSelector,
+    build_runtime_candidates,
+    runtime_candidate_payloads,
+)
 from .visualizer import PriorMapFloorPlanVisualizer, build_floorplan_overlay
 
 
@@ -37,6 +44,11 @@ class PriorMapSimulationConfig:
         prior_map_source: Loader source format, or ``auto``.
         prior_map_alignment: Alignment mode or JSON path.
         artifact_root: Root directory for prior-map runtime artifacts.
+        enable_high_level_vlm: Whether to invoke the optional BEV selector.
+        vlm: LVLM backend name.
+        high_level_interval: Minimum planning-step interval between selector calls.
+        room_semantic_interval: Minimum planning-step interval between room LVLM calls.
+        enable_room_semantics: Whether to invoke online room annotation.
     """
 
     enabled: bool = False
@@ -44,6 +56,11 @@ class PriorMapSimulationConfig:
     prior_map_source: str = "auto"
     prior_map_alignment: str = "identity"
     artifact_root: str = ""
+    enable_high_level_vlm: bool = False
+    vlm: str = "cognav"
+    high_level_interval: int = 10
+    room_semantic_interval: int = 10
+    enable_room_semantics: bool = False
 
     @classmethod
     def from_args(cls, args: Any, save_dir: str) -> "PriorMapSimulationConfig":
@@ -63,6 +80,11 @@ class PriorMapSimulationConfig:
             prior_map_source=str(getattr(args, "prior_map_source", "auto") or "auto"),
             prior_map_alignment=str(getattr(args, "prior_map_alignment", "identity") or "identity"),
             artifact_root=str(Path(save_dir) / "prior_map"),
+            enable_high_level_vlm=bool(getattr(args, "enable_prior_map_vlm", False)),
+            vlm=str(getattr(args, "vlm", "cognav") or "cognav"),
+            high_level_interval=max(1, int(getattr(args, "prior_map_vlm_interval", 10) or 10)),
+            room_semantic_interval=max(1, int(getattr(args, "room_semantic_interval", 10) or 10)),
+            enable_room_semantics=bool(getattr(args, "enable_room_semantics", False)),
         )
 
 
@@ -87,6 +109,10 @@ class PriorMapSimulationRuntime:
         query_service: Optional[PriorMapQueryService] = None,
         prompt_builder: Optional[PriorMapPromptContextBuilder] = None,
         policy_adapter: Optional[PriorMapPolicyAdapter] = None,
+        high_level_selector: Optional[PriorMapHighLevelSelector] = None,
+        high_level_interval: int = 10,
+        room_semantic_interval: int = 10,
+        room_semantic_classifier: Optional[RoomSemanticClassifier] = None,
     ) -> None:
         """Create simulation runtime state."""
 
@@ -97,12 +123,21 @@ class PriorMapSimulationRuntime:
         self.query_service = query_service or PriorMapQueryService()
         self.prompt_builder = prompt_builder or PriorMapPromptContextBuilder(max_chars=4000)
         self.policy_adapter = policy_adapter or PriorMapPolicyAdapter(enabled=True)
+        self.high_level_selector = high_level_selector
+        self.high_level_interval = max(1, int(high_level_interval))
+        self.room_semantic_interval = max(1, int(room_semantic_interval))
+        self.room_semantic_classifier = room_semantic_classifier
         self.episode_dir: Optional[Path] = None
         self.last_observation: Any = None
         self.last_query_result: Optional[SearchPriorResult] = None
         self.last_prompt_context: Optional[PromptContextBundle] = None
         self.last_chosen_frontier: Optional[dict[str, Any]] = None
         self.last_query_step: Optional[int] = None
+        self.last_multimodal_context: Optional[PriorMapMultimodalContext] = None
+        self.last_high_level_selection: Any = None
+        self.last_high_level_step: Optional[int] = None
+        self.last_room_semantic_step: Optional[int] = None
+        self.last_room_semantics: dict[str, Any] = {}
 
     @classmethod
     def from_config(cls, config: PriorMapSimulationConfig) -> Optional["PriorMapSimulationRuntime"]:
@@ -124,7 +159,25 @@ class PriorMapSimulationRuntime:
             raise ValueError("--enable_prior_map requires --prior_map_path")
         base_map = PriorMapLoader().load(config.prior_map_path, source_format=config.prior_map_source)
         alignment = _load_alignment(config.prior_map_alignment, base_map)
-        return cls(base_map=base_map, alignment=alignment, artifact_root=config.artifact_root)
+        selector = (
+            PriorMapHighLevelSelector(vlm=config.vlm, scene_id=base_map.scene_id)
+            if config.enable_high_level_vlm
+            else None
+        )
+        room_classifier = (
+            RoomSemanticClassifier(vlm=config.vlm, scene_id=base_map.scene_id)
+            if config.enable_room_semantics
+            else None
+        )
+        return cls(
+            base_map=base_map,
+            alignment=alignment,
+            artifact_root=config.artifact_root,
+            high_level_selector=selector,
+            high_level_interval=config.high_level_interval,
+            room_semantic_interval=config.room_semantic_interval,
+            room_semantic_classifier=room_classifier,
+        )
 
     def begin_episode(self, episode_dir: str | Path, episode_idx: int) -> None:
         """Initialize per-episode artifact paths and reset memory.
@@ -142,6 +195,11 @@ class PriorMapSimulationRuntime:
         self.last_prompt_context = None
         self.last_chosen_frontier = None
         self.last_query_step = None
+        self.last_multimodal_context = None
+        self.last_high_level_selection = None
+        self.last_high_level_step = None
+        self.last_room_semantic_step = None
+        self.last_room_semantics = {}
         write_prior_map_static_artifacts(output_dir=self.episode_dir, memory=self.memory)
         _write_json(
             self.episode_dir / "manifest.json",
@@ -179,13 +237,126 @@ class PriorMapSimulationRuntime:
         if self.last_query_step == int(step) and self.last_query_result is not None:
             return self.last_query_result
         self.last_observation = self.memory.update_from_mapper(mapper, step=step)
+        self.last_room_semantics = self._classify_runtime_rooms(mapper, step=int(step))
         result = self.query_service.query(plan, mapper, self.memory)
-        prompt_context = self.prompt_builder.build_bundle(self.memory.current_map(), result)
+        result.diagnostics["room_semantics"] = dict(self.last_room_semantics)
+        runtime_rooms = tuple(getattr(mapper, "room_nodes", ()) or getattr(mapper, "rooms", ()) or ())
+        runtime_frontiers = tuple(getattr(mapper, "frontiers", ()) or ())
+        if not runtime_frontiers:
+            runtime_frontiers = tuple(
+                node for node in (getattr(mapper, "nodes", ()) or ())
+                if bool(getattr(node, "has_frontier", False) or getattr(node, "is_frontier", False))
+            )
+        multimodal_context = self._write_dynamic_bev(
+            step=step,
+            plan=plan,
+            result=result,
+            room_candidates=runtime_rooms,
+            frontier_candidates=runtime_frontiers,
+        )
         self.last_query_result = result
-        self.last_prompt_context = prompt_context
         self.last_query_step = int(step)
+        if (
+            self.high_level_selector is not None
+            and (
+                self.last_high_level_step is None
+                or int(step) - int(self.last_high_level_step) >= self.high_level_interval
+            )
+        ):
+            self.select_high_level(
+                plan=plan,
+                result=result,
+                room_candidates=runtime_rooms,
+                frontier_candidates=runtime_frontiers,
+            )
+            # 高层选择结果只作为后续 room/frontier policy 的候选上下文，不拥有 STOP 权限。
+            multimodal_context = self._write_dynamic_bev(
+                step=step,
+                plan=plan,
+                result=result,
+                room_candidates=runtime_rooms,
+                frontier_candidates=runtime_frontiers,
+            )
+        prompt_context = self.prompt_builder.build_bundle(
+            self.memory.current_map(), result, multimodal_context=multimodal_context
+        )
+        self.last_prompt_context = prompt_context
         self._write_step_artifacts(step=step, plan=plan, mapper=mapper, result=result, prompt_context=prompt_context)
         return result
+
+    def _classify_runtime_rooms(self, mapper: Any, *, step: int) -> dict[str, Any]:
+        """Annotate rooms when a new local RGB evidence version is available."""
+
+        if self.room_semantic_classifier is None:
+            return {}
+        if (
+            self.last_room_semantic_step is not None
+            and int(step) - int(self.last_room_semantic_step) < self.room_semantic_interval
+        ):
+            return dict(self.last_room_semantics)
+        output: dict[str, Any] = {}
+        rooms = list(getattr(mapper, "room_nodes", ()) or getattr(mapper, "rooms", ()) or ())
+        for room in rooms:
+            evidence = room_evidence_from_record(
+                room,
+                fallback_rgb_path=str(getattr(mapper, "current_rgb_path", "") or ""),
+                pose=tuple(float(item) for item in getattr(mapper, "current_position", ()) or ()),
+                source="simulation_room_observation",
+            )
+            output[evidence.room_uid] = self.room_semantic_classifier.classify(evidence).to_dict()
+        self.last_room_semantic_step = int(step)
+        return output
+
+    def select_high_level(
+        self,
+        *,
+        plan: Any,
+        result: Optional[SearchPriorResult] = None,
+        room_candidates: tuple[Any, ...] = (),
+        frontier_candidates: tuple[Any, ...] = (),
+    ) -> Any:
+        """Select an existing room candidate with the optional dynamic-BEV LVLM service.
+
+        Args:
+            plan: Current instruction plan.
+            result: Search result; defaults to the last query result.
+
+        Returns:
+            High-level selection result, or ``None`` when the service is disabled.
+        """
+
+        if self.high_level_selector is None or self.last_multimodal_context is None:
+            return None
+        result = result or self.last_query_result
+        if result is None:
+            return None
+        candidates = build_runtime_candidates(
+            rooms=room_candidates,
+            frontiers=frontier_candidates,
+            room_rankings=result.room_rankings,
+            frontier_biases=result.frontier_biases,
+        )
+        if not candidates:
+            candidates = build_runtime_candidates(
+                room_rankings=result.room_rankings,
+                frontier_biases=result.frontier_biases,
+            )
+        selection = self.high_level_selector.select(
+            instruction=str(getattr(plan, "raw_instruction", "") or ""),
+            instruction_plan=plan,
+            context=self.last_multimodal_context,
+            candidates=candidates,
+            runtime_state={
+                "step": self.last_query_step,
+                "authority": "ranking_only",
+                "candidate_types": sorted({candidate.candidate_type for candidate in candidates}),
+            },
+        )
+        self.last_high_level_selection = selection
+        self.last_high_level_step = self.last_query_step
+        if self.last_query_result is not None:
+            self.last_query_result.diagnostics["high_level_selection"] = selection.to_dict()
+        return selection
 
     def metrics_summary(self) -> dict[str, Any]:
         """Return compact prior-map metrics for benchmark rows.
@@ -223,6 +394,7 @@ class PriorMapSimulationRuntime:
         enriched = {
             "step": step_value,
             "authority": "ranking_only",
+            "room_semantics": self.last_room_semantics,
             **dict(payload),
         }
         _write_json(output, enriched)
@@ -232,6 +404,13 @@ class PriorMapSimulationRuntime:
             chosen_frontier=enriched,
             observations=self.memory.observations,
             object_states=self.memory.object_states,
+            robot_position_xyz=getattr(self.last_observation, "pose_xyz", None),
+            current_room_uid=getattr(self.last_observation, "room_hypothesis_uid", None),
+            candidate_room_uids=tuple(
+                item.room_uid for item in getattr(self.last_query_result, "room_rankings", ()) or ()
+            ),
+            selected_room_uid=getattr(self.last_high_level_selection, "selected_uid", None),
+            alignment=self.alignment,
         )
         floorplan_paths = PriorMapFloorPlanVisualizer().write_global_artifacts(
             self.memory.base_map,
@@ -279,6 +458,11 @@ class PriorMapSimulationRuntime:
             },
             "observation": self.last_observation.to_dict() if hasattr(self.last_observation, "to_dict") else {},
             "authority": "ranking_only",
+            "room_semantic_artifact": f"room_semantics_{suffix}.json",
+            "high_level_selection_artifact": (
+                f"high_level_selection_{suffix}.json"
+                if self.last_high_level_selection is not None else None
+            ),
         }
         paths = write_prior_map_step_artifacts(
             output_dir=self.episode_dir,
@@ -296,6 +480,104 @@ class PriorMapSimulationRuntime:
                 "authority": "ranking_only",
             },
         )
+        _write_json(
+            self.episode_dir / f"room_semantics_{suffix}.json",
+            {
+                "step": int(step),
+                "rooms": dict(self.last_room_semantics),
+                "authority": "semantic_annotation_only",
+            },
+        )
+        if self.last_high_level_selection is not None:
+            _write_json(
+                self.episode_dir / f"high_level_selection_{suffix}.json",
+                self.last_high_level_selection.to_dict(),
+            )
+
+    def _write_dynamic_bev(
+        self,
+        *,
+        step: int,
+        plan: Any,
+        result: SearchPriorResult,
+        room_candidates: tuple[Any, ...] = (),
+        frontier_candidates: tuple[Any, ...] = (),
+    ) -> PriorMapMultimodalContext:
+        """Render the current map state and return its LVLM context."""
+
+        assert self.episode_dir is not None
+        chosen_frontier = dict(self.last_chosen_frontier or {})
+        if (
+            self.last_high_level_selection is not None
+            and getattr(self.last_high_level_selection, "selected_type", "") == "frontier"
+        ):
+            chosen_frontier["selected_uid"] = self.last_high_level_selection.selected_uid
+        runtime_candidates = build_runtime_candidates(
+            rooms=room_candidates,
+            frontiers=frontier_candidates,
+            room_rankings=result.room_rankings,
+            frontier_biases=result.frontier_biases,
+        )
+        if not chosen_frontier.get("candidates"):
+            chosen_frontier["candidates"] = [
+                {
+                    "uid": candidate.uid,
+                    "frontier_uid": candidate.uid,
+                    "room_uid": candidate.room_uid,
+                    "position": candidate.metadata.get("position"),
+                }
+                for candidate in runtime_candidates
+                if candidate.candidate_type == "frontier"
+            ]
+        overlay = build_floorplan_overlay(
+            self.memory.base_map,
+            prior_result=result,
+            chosen_frontier=chosen_frontier or None,
+            observations=self.memory.observations,
+            object_states=self.memory.object_states,
+            robot_position_xyz=getattr(self.last_observation, "pose_xyz", None),
+            current_room_uid=getattr(self.last_observation, "room_hypothesis_uid", None),
+            candidate_room_uids=tuple(
+                str(getattr(room, "uid", "") or getattr(room, "room_uid", ""))
+                for room in room_candidates
+                if str(getattr(room, "uid", "") or getattr(room, "room_uid", ""))
+            ) or tuple(item.room_uid for item in result.room_rankings),
+            selected_room_uid=getattr(self.last_high_level_selection, "selected_uid", None),
+            alignment=self.alignment,
+        )
+        paths = PriorMapFloorPlanVisualizer().write_global_artifacts(
+            self.memory.base_map,
+            self.episode_dir,
+            stem=f"dynamic_prior_map_bev_{int(step):06d}",
+            overlay=overlay,
+        )
+        context = PriorMapMultimodalContext(
+            image_path=paths["png"],
+            image_role="dynamic_bev",
+            map_frame_id=self.base_map.frame_id,
+            alignment_status=str(self.alignment.diagnostics_payload().get("fallback", "aligned")),
+            text_context=json.dumps(
+                {
+                    "instruction": str(getattr(plan, "raw_instruction", "") or ""),
+                    "room_rankings": [
+                        {"uid": item.room_uid, "label": item.label, "score": item.score}
+                        for item in result.room_rankings[:8]
+                    ],
+                    "room_semantics": self.last_room_semantics,
+                    "candidate_types": sorted({
+                        candidate.candidate_type
+                        for candidate in runtime_candidates
+                    }),
+                    "candidates": list(runtime_candidate_payloads(runtime_candidates)),
+                    "authority": "high_level_room_selection_only",
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            metadata={"step": int(step), "artifact_paths": paths, "authority": "ranking_only"},
+        )
+        self.last_multimodal_context = context
+        return context
 
 
 def build_prior_map_simulation_runtime(args: Any, save_dir: str) -> Optional[PriorMapSimulationRuntime]:
@@ -325,6 +607,7 @@ def configure_mapper_prior_map(mapper: Any, runtime: Optional[PriorMapSimulation
     setattr(mapper, "search_prior_result", None)
     setattr(mapper, "prior_map_prompt_context", None)
     setattr(mapper, "prior_map_last_observation", None)
+    setattr(mapper, "prior_map_high_level_selection", None)
     setattr(mapper, "prior_map_last_chosen_frontier", None)
     setattr(mapper, "prior_map_current_step", None)
 
@@ -356,6 +639,13 @@ def refresh_mapper_prior_map_query(
     setattr(mapper, "prior_map_policy_adapter", runtime.policy_adapter)
     setattr(mapper, "prior_map_prompt_context", runtime.last_prompt_context)
     setattr(mapper, "prior_map_last_observation", runtime.last_observation)
+    setattr(
+        mapper,
+        "prior_map_high_level_selection",
+        runtime.last_high_level_selection.to_dict()
+        if hasattr(runtime.last_high_level_selection, "to_dict")
+        else runtime.last_high_level_selection,
+    )
     setattr(mapper, "prior_map_current_step", int(step))
     return result
 

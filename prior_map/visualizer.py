@@ -145,6 +145,10 @@ class FloorPlanOverlay:
         trajectory_xy: Runtime trajectory points in prior-map coordinates.
         selected_frontier_uid: Active selected frontier uid.
         baseline_frontier_uid: Baseline frontier uid before prior ranking.
+        robot_position_xy: Current robot position in prior-map coordinates.
+        current_room_uid: Runtime room containing the robot, when known.
+        candidate_room_uids: Room UIDs currently offered to high-level policy.
+        selected_room_uid: Room UID selected by the high-level policy.
         metadata: JSON-friendly overlay diagnostics.
     """
 
@@ -154,6 +158,10 @@ class FloorPlanOverlay:
     trajectory_xy: Tuple[Tuple[float, float], ...] = ()
     selected_frontier_uid: Optional[str] = None
     baseline_frontier_uid: Optional[str] = None
+    robot_position_xy: Optional[Tuple[float, float]] = None
+    current_room_uid: Optional[str] = None
+    candidate_room_uids: Tuple[str, ...] = ()
+    selected_room_uid: Optional[str] = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -171,6 +179,10 @@ class FloorPlanOverlay:
             "trajectory_xy": [list(point) for point in self.trajectory_xy],
             "selected_frontier_uid": self.selected_frontier_uid,
             "baseline_frontier_uid": self.baseline_frontier_uid,
+            "robot_position_xy": list(self.robot_position_xy) if self.robot_position_xy else None,
+            "current_room_uid": self.current_room_uid,
+            "candidate_room_uids": list(self.candidate_room_uids),
+            "selected_room_uid": self.selected_room_uid,
             "metadata": dict(self.metadata),
         }
 
@@ -812,6 +824,16 @@ class PriorMapFloorPlanVisualizer:
                     f'  <text x="{x + 12:.1f}" y="{y + 4:.1f}" font-family="sans-serif" '
                     f'font-size="12" font-weight="700" fill="#581c87">selected {escape(point.uid)}</text>'
                 )
+        if overlay.robot_position_xy is not None:
+            x, y = transform.to_canvas(overlay.robot_position_xy)
+            lines.append(
+                f'  <circle cx="{x:.1f}" cy="{y:.1f}" r="11" fill="#0f766e" '
+                f'stroke="#042f2e" stroke-width="3" opacity="0.98"/>'
+            )
+            lines.append(
+                f'  <text x="{x + 14:.1f}" y="{y - 12:.1f}" font-family="sans-serif" '
+                f'font-size="12" font-weight="700" fill="#115e59">robot</text>'
+            )
         for index, room in enumerate(rooms):
             anchor = _room_anchor(room)
             if anchor is None:
@@ -904,6 +926,10 @@ class PriorMapFloorPlanVisualizer:
             ]
             canvas.fill_polygon(triangle, color=(124, 58, 237) if point.selected else (245, 158, 11))
             canvas.stroke_polyline(triangle + [triangle[0]], color=(17, 24, 39), width=2 if point.selected else 1)
+        if view.overlay.robot_position_xy is not None:
+            x, y = _int_point(transform.to_canvas(view.overlay.robot_position_xy))
+            canvas.fill_circle(x, y, 11, color=(15, 118, 110))
+            canvas.stroke_circle(x, y, 11, color=(4, 47, 46))
         return canvas.to_png()
 
 
@@ -1085,6 +1111,11 @@ def build_floorplan_overlay(
     chosen_frontier: Optional[Mapping[str, Any]] = None,
     observations: Sequence[Any] = (),
     object_states: Optional[Mapping[str, Any]] = None,
+    robot_position_xyz: Optional[Sequence[float]] = None,
+    current_room_uid: Optional[str] = None,
+    candidate_room_uids: Sequence[str] = (),
+    selected_room_uid: Optional[str] = None,
+    alignment: Any = None,
 ) -> FloorPlanOverlay:
     """Build a diagnostic floorplan overlay from runtime artifacts.
 
@@ -1094,6 +1125,11 @@ def build_floorplan_overlay(
         chosen_frontier: Optional active planner chosen-frontier payload.
         observations: Runtime observation records with optional pose.
         object_states: Runtime prior-object states keyed by prior object uid.
+        robot_position_xyz: Current runtime pose position.
+        current_room_uid: Current runtime room UID.
+        candidate_room_uids: Room UIDs offered to high-level selection.
+        selected_room_uid: Selected high-level room UID.
+        alignment: Optional runtime-to-prior alignment object.
 
     Returns:
         Floorplan overlay that can be rendered without changing planner
@@ -1101,11 +1137,22 @@ def build_floorplan_overlay(
     """
 
     target_uids = _target_prior_uids(prior_result)
-    frontier_points = _frontier_overlay_points(prior_result=prior_result, chosen_frontier=chosen_frontier)
+    frontier_points = _frontier_overlay_points(
+        prior_result=prior_result,
+        chosen_frontier=chosen_frontier,
+        map_data=map_data,
+        alignment=alignment,
+    )
     live_points = _live_detection_overlay_points(map_data, object_states or {})
-    trajectory = _trajectory_overlay_points(observations)
+    trajectory = _trajectory_overlay_points(observations, map_data=map_data, alignment=alignment)
     selected_uid = _text_or_none(_mapping_get(chosen_frontier, "selected_uid")) if chosen_frontier else None
     baseline_uid = _text_or_none(_mapping_get(chosen_frontier, "baseline_selected_uid")) if chosen_frontier else None
+    robot_vector = _vector3_or_none(robot_position_xyz)
+    robot_xy = _runtime_position_to_prior_xy(
+        robot_vector,
+        map_data=map_data,
+        alignment=alignment,
+    ) if robot_vector is not None else None
     return FloorPlanOverlay(
         target_prior_object_uids=tuple(target_uids),
         frontiers=tuple(frontier_points),
@@ -1113,12 +1160,17 @@ def build_floorplan_overlay(
         trajectory_xy=tuple(trajectory),
         selected_frontier_uid=selected_uid,
         baseline_frontier_uid=baseline_uid,
+        robot_position_xy=robot_xy,
+        current_room_uid=current_room_uid,
+        candidate_room_uids=tuple(str(uid) for uid in candidate_room_uids if str(uid)),
+        selected_room_uid=selected_room_uid,
         metadata={
             "authority": "diagnostic_only",
             "chosen_frontier_available": chosen_frontier is not None,
             "frontier_count": len(frontier_points),
             "live_detection_count": len(live_points),
             "trajectory_point_count": len(trajectory),
+            "robot_position_available": robot_xy is not None,
         },
     )
 
@@ -1268,6 +1320,25 @@ def _floorplan_markers(
         payload = point.to_dict()
         payload["marker_type"] = "live_detection"
         markers.append(payload)
+    if overlay.robot_position_xy is not None:
+        markers.append(
+            {
+                "marker_type": "robot",
+                "uid": "runtime_robot",
+                "label": "robot",
+                "xy": list(overlay.robot_position_xy),
+                "current_room_uid": overlay.current_room_uid,
+            }
+        )
+    for room_uid in overlay.candidate_room_uids:
+        markers.append(
+            {
+                "marker_type": "candidate_room",
+                "uid": room_uid,
+                "selected": room_uid == overlay.selected_room_uid,
+                "current": room_uid == overlay.current_room_uid,
+            }
+        )
     return markers
 
 
@@ -1345,6 +1416,8 @@ def _frontier_overlay_points(
     *,
     prior_result: Any,
     chosen_frontier: Optional[Mapping[str, Any]],
+    map_data: PriorMapData,
+    alignment: Any = None,
 ) -> List[FloorPlanOverlayPoint]:
     bias_by_uid: dict[str, Any] = {}
     for bias in _iter_records(_first_attr(prior_result, ("frontier_biases",), ())):
@@ -1356,7 +1429,12 @@ def _frontier_overlay_points(
     points: List[FloorPlanOverlayPoint] = []
     for index, candidate in enumerate(_iter_records(candidates)):
         uid = _text_or_none(_first_attr(candidate, ("frontier_uid", "uid", "id"), None)) or f"frontier_{index}"
-        xy = _candidate_frontier_xy(candidate, bias_by_uid.get(uid))
+        xy = _candidate_frontier_xy(
+            candidate,
+            bias_by_uid.get(uid),
+            map_data=map_data,
+            alignment=alignment,
+        )
         if xy is None:
             continue
         points.append(
@@ -1378,9 +1456,11 @@ def _frontier_overlay_points(
         )
     if points:
         return points
+    # 即使当前没有 planner 的 chosen_frontier，也把 prior/query 提供的
+    # 在线候选画出来；这只是证据可视化，不改变候选的执行权。
     for bias in bias_by_uid.values():
         uid = _text_or_none(_first_attr(bias, ("frontier_uid", "uid"), None))
-        xy = _candidate_frontier_xy({}, bias)
+        xy = _candidate_frontier_xy({}, bias, map_data=map_data, alignment=alignment)
         if uid and xy is not None:
             points.append(
                 FloorPlanOverlayPoint(
@@ -1395,7 +1475,13 @@ def _frontier_overlay_points(
     return points
 
 
-def _candidate_frontier_xy(candidate: Any, bias: Any) -> Optional[Tuple[float, float]]:
+def _candidate_frontier_xy(
+    candidate: Any,
+    bias: Any,
+    *,
+    map_data: PriorMapData,
+    alignment: Any = None,
+) -> Optional[Tuple[float, float]]:
     metadata = _first_attr(bias, ("metadata",), {}) or {}
     prior_xy = _mapping_get(metadata, "frontier_prior_xy")
     vector2 = _vector2_or_none(prior_xy)
@@ -1404,7 +1490,13 @@ def _candidate_frontier_xy(candidate: Any, bias: Any) -> Optional[Tuple[float, f
     position = _first_attr(candidate, ("position", "position_xyz", "world_position_xyz"), None)
     vector = _vector3_or_none(position)
     if vector is not None:
-        return (vector[0], vector[1])
+        frame_id = _text_or_none(_first_attr(candidate, ("frame_id", "map_frame_id"), "")) or ""
+        return _runtime_position_to_prior_xy(
+            vector,
+            map_data=map_data,
+            alignment=alignment,
+            frame_id=frame_id,
+        )
     return None
 
 
@@ -1441,7 +1533,12 @@ def _live_detection_overlay_points(
     return points
 
 
-def _trajectory_overlay_points(observations: Sequence[Any]) -> List[Tuple[float, float]]:
+def _trajectory_overlay_points(
+    observations: Sequence[Any],
+    *,
+    map_data: Optional[PriorMapData] = None,
+    alignment: Any = None,
+) -> List[Tuple[float, float]]:
     points: List[Tuple[float, float]] = []
     for record in observations:
         pose = _first_attr(record, ("pose_xyz",), None)
@@ -1449,8 +1546,65 @@ def _trajectory_overlay_points(observations: Sequence[Any]) -> List[Tuple[float,
         if vector is None:
             continue
         frame_id = _text_or_none(_first_attr(record, ("frame_id",), "")) or ""
-        points.append(_plane_xy_from_xyz(vector, frame_id=frame_id, source_format="runtime"))
+        point = _runtime_position_to_prior_xy(
+            vector,
+            map_data=map_data,
+            alignment=alignment,
+            frame_id=frame_id,
+        )
+        if point is not None:
+            points.append(point)
     return points
+
+
+def _runtime_position_to_prior_xy(
+    position_xyz: Sequence[float],
+    *,
+    map_data: Optional[PriorMapData],
+    alignment: Any = None,
+    frame_id: str = "",
+) -> Optional[Tuple[float, float]]:
+    """Transform a runtime position into the prior-map plane.
+
+    The alignment contract is two-dimensional: it receives coordinates in the
+    runtime navigation plane, not the raw ``(x, y, z)`` tuple.  Habitat uses
+    ``(x, z)`` as that plane, while a ROS ``map`` frame normally uses
+    ``(x, y)``.  Projecting before applying the alignment keeps the same
+    contract for simulation and real-robot overlays.
+
+    Args:
+        position_xyz: Runtime position in a three-dimensional frame.
+        map_data: Loaded prior map, used to infer the plane convention when a
+            runtime frame id is not explicitly available.
+        alignment: Optional runtime-to-prior alignment.
+        frame_id: Observation frame id used when no alignment is available.
+
+    Returns:
+        Position in prior-map plane coordinates, or ``None`` when a runtime
+        position cannot be safely aligned to the prior frame.
+    """
+
+    vector = _vector3_or_none(position_xyz) or (0.0, 0.0, 0.0)
+    runtime_frame = frame_id or str(getattr(alignment, "runtime_frame_id", "") or "")
+    source_format = str(getattr(map_data, "source_format", "") or "") if map_data is not None else ""
+    # A declared runtime frame owns the plane convention.  The prior-map
+    # source format is only a fallback for legacy records without frame data.
+    runtime_source = "" if runtime_frame else source_format
+    runtime_plane = _plane_xy_from_xyz(vector, frame_id=runtime_frame, source_format=runtime_source)
+    if alignment is not None and bool(getattr(alignment, "can_rank_geometry", lambda: False)()):
+        try:
+            # 中文注释：先投影到机器人运动平面，再做二维对齐，避免把相机高度
+            # 当成 BEV 的第二个坐标轴。
+            return tuple(float(value) for value in alignment.runtime_to_prior((*runtime_plane, 0.0)))
+        except Exception:
+            # 中文注释：变换失败时禁止把运行时坐标直接画进先验图，避免制造
+            # 看似精确但实际错误的机器人/前沿位置。
+            return None
+    if alignment is not None:
+        # 中文注释：未完成坐标标定时只输出静态先验图和文本状态，不能伪造
+        # 运行时位置与先验地图的对应关系。
+        return None
+    return runtime_plane
 
 
 def _marker_id(prefix: str, uid: str) -> str:

@@ -14,7 +14,8 @@ import math
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Optional, Sequence
+from contextlib import contextmanager
+from typing import Any, Iterable, Iterator, Optional, Sequence
 
 from .alignment import PriorMapAlignment
 from .contracts import BoundaryXY, PriorMapData, PriorObject, PriorRoom, PriorTopologyEdge, Vector2, Vector3
@@ -36,10 +37,19 @@ class HM3DGroundTruthBuildConfig:
         min_room_area_m2: Minimum connected room mask area to keep.
         mask_dilation_radius_m: Radius in meters used when detecting
             room-room contact between navigable masks.
-        split_disconnected_components: Whether disconnected navigable masks
-            inside one semantic region should become separate room priors.
+        split_disconnected_components: Whether disconnected 2-D navigable masks
+            inside one semantic region should become separate room priors. The
+            projection is performed before connected-component extraction so
+            multiple sampled heights do not duplicate one BEV room.
         include_structural: Whether structural labels such as wall and floor
             should be retained as object priors.
+        include_object_priors: Whether semantic object instances should be
+            emitted into the canonical map. Layout-only builders disable this
+            because runtime ObjectNode identities must remain online facts.
+        use_mesh_region_fallback: Whether to reconstruct invalid semantic
+            region AABBs from semantic-mesh object bounds grouped by parent
+            region. HM3D releases may expose ``[-inf, -inf, -inf]`` region
+            bounds through Habitat-Sim even though the mesh is valid.
         max_grid_cells: Safety limit for top-down grid sampling.
         source: Source label stored in generated contract metadata.
     """
@@ -50,6 +60,8 @@ class HM3DGroundTruthBuildConfig:
     mask_dilation_radius_m: float = 0.35
     split_disconnected_components: bool = True
     include_structural: bool = False
+    include_object_priors: bool = True
+    use_mesh_region_fallback: bool = True
     max_grid_cells: int = 2_000_000
     source: str = "hm3d_groundtruth_semantic_scene"
 
@@ -89,6 +101,25 @@ class HM3DGroundTruthPriorMapBuildResult:
 
 
 @dataclass(frozen=True)
+class HM3DSceneAssets:
+    """Resolved HM3D files used to initialize one Habitat-Sim scene.
+
+    Args:
+        basis_glb: Geometric HM3D mesh.
+        semantic_glb: Semantic HM3D mesh.
+        semantic_txt: Instance-color to semantic-label mapping.
+        navmesh: Habitat navigation mesh.
+        scene_dataset_config: Optional Habitat scene-dataset configuration.
+    """
+
+    basis_glb: Path
+    semantic_glb: Path
+    semantic_txt: Path
+    navmesh: Path
+    scene_dataset_config: Optional[Path] = None
+
+
+@dataclass(frozen=True)
 class _SemanticObjectRecord:
     """Normalized Habitat semantic object metadata."""
 
@@ -116,7 +147,7 @@ class _SemanticRegionRecord:
 
 @dataclass(frozen=True)
 class _RoomComponent:
-    """Connected navigable component derived from one semantic region."""
+    """Connected 2-D navigable component derived from one semantic region."""
 
     region: _SemanticRegionRecord
     component_index: int
@@ -181,11 +212,19 @@ class HM3DGroundTruthPriorMapBuilder:
         if pathfinder is None:
             raise ValueError("sim must expose pathfinder")
 
-        regions = _extract_regions(semantic_scene)
-        objects = _extract_objects(
+        regions = _extract_regions(
             semantic_scene,
-            include_structural=cfg.include_structural,
             mesh_object_bounds=mesh_object_bounds or {},
+            use_mesh_region_fallback=cfg.use_mesh_region_fallback,
+        )
+        objects = (
+            _extract_objects(
+                semantic_scene,
+                include_structural=cfg.include_structural,
+                mesh_object_bounds=mesh_object_bounds or {},
+            )
+            if cfg.include_object_priors
+            else ()
         )
         bounds_min, bounds_max = _pathfinder_bounds(pathfinder, regions, objects)
         traversable_cells = _sample_traversable_cells(
@@ -221,6 +260,9 @@ class HM3DGroundTruthPriorMapBuilder:
                 "mask_dilation_radius_m": cfg.mask_dilation_radius_m,
                 "split_disconnected_components": cfg.split_disconnected_components,
                 "include_structural": cfg.include_structural,
+                "include_object_priors": cfg.include_object_priors,
+                "use_mesh_region_fallback": cfg.use_mesh_region_fallback,
+                "region_geometry_sources": _region_geometry_sources(regions),
                 "raw_region_count": len(regions),
                 "raw_object_count": len(getattr(semantic_scene, "objects", ()) or ()),
                 "object_count": len(prior_objects),
@@ -264,44 +306,80 @@ class HM3DGroundTruthPriorMapBuilder:
             FileNotFoundError: If required scene assets are missing.
         """
 
-        path = Path(scene_dir)
-        basis_glb = _single_scene_asset(path, "*.basis.glb")
-        semantic_glb = _single_scene_asset(path, "*.semantic.glb")
-        semantic_txt = _single_scene_asset(path, "*.semantic.txt")
-        navmesh = _single_scene_asset(path, "*.basis.navmesh")
-        scene_dataset_config = _find_scene_dataset_config(path)
         try:
-            import habitat_sim  # type: ignore
-        except Exception as exc:  # pragma: no cover - depends on local install.
-            raise RuntimeError("Habitat-Sim is required for build_from_scene_dir") from exc
+            with open_hm3d_simulator(scene_dir) as (simulator, assets):
+                inferred_scene_id = scene_id or _infer_scene_id_from_dir(Path(scene_dir))
+                mesh_bounds = {}
+                if config is None or config.include_object_priors or config.use_mesh_region_fallback:
+                    mesh_bounds = _extract_mesh_object_bounds(assets.semantic_glb, assets.semantic_txt)
+                return self.build_from_sim(
+                    simulator,
+                    inferred_scene_id,
+                    config=config,
+                    mesh_object_bounds=mesh_bounds,
+                )
+        except RuntimeError as exc:  # pragma: no cover - depends on Habitat assets.
+            raise RuntimeError(f"Failed to build HM3D prior map from {scene_dir}") from exc
 
-        sim_cfg = habitat_sim.SimulatorConfiguration()
-        sim_cfg.scene_id = str(basis_glb)
-        if scene_dataset_config is not None and hasattr(sim_cfg, "scene_dataset_config_file"):
-            sim_cfg.scene_dataset_config_file = str(scene_dataset_config)
-        if hasattr(sim_cfg, "semantic_scene_id"):
-            sim_cfg.semantic_scene_id = str(semantic_glb)
-        if hasattr(sim_cfg, "enable_physics"):
-            sim_cfg.enable_physics = False
+
+@contextmanager
+def open_hm3d_simulator(scene_dir: str | Path) -> Iterator[tuple[Any, HM3DSceneAssets]]:
+    """Open a Habitat-Sim instance and resolve the HM3D asset contract.
+
+    Args:
+        scene_dir: Directory containing one HM3D basis mesh, semantic mesh,
+            semantic mapping, and NavMesh.
+
+    Yields:
+        A ``(simulator, assets)`` pair. The simulator is closed when the
+        context exits.
+
+    Raises:
+        FileNotFoundError: If a required HM3D asset is missing.
+        RuntimeError: If Habitat-Sim is unavailable or initialization fails.
+
+    Notes:
+        This is the single scene-loading boundary for offline map builders.
+        Keeping it shared prevents the canonical prior-map and FloorPlan export
+        paths from silently using different scene or coordinate inputs.
+    """
+
+    path = Path(scene_dir)
+    assets = HM3DSceneAssets(
+        basis_glb=_single_scene_asset(path, "*.basis.glb"),
+        semantic_glb=_single_scene_asset(path, "*.semantic.glb"),
+        semantic_txt=_single_scene_asset(path, "*.semantic.txt"),
+        navmesh=_single_scene_asset(path, "*.basis.navmesh"),
+        scene_dataset_config=_find_scene_dataset_config(path),
+    )
+    try:
+        import habitat_sim  # type: ignore
+    except Exception as exc:  # pragma: no cover - depends on local install.
+        raise RuntimeError("Habitat-Sim is required to read HM3D assets") from exc
+
+    sim_cfg = habitat_sim.SimulatorConfiguration()
+    sim_cfg.scene_id = str(assets.basis_glb)
+    if assets.scene_dataset_config is not None and hasattr(sim_cfg, "scene_dataset_config_file"):
+        sim_cfg.scene_dataset_config_file = str(assets.scene_dataset_config)
+    if hasattr(sim_cfg, "semantic_scene_id"):
+        sim_cfg.semantic_scene_id = str(assets.semantic_glb)
+    if hasattr(sim_cfg, "enable_physics"):
+        sim_cfg.enable_physics = False
+    simulator = None
+    try:
         agent_cfg = habitat_sim.AgentConfiguration()
-        simulator = None
-        try:
-            simulator = habitat_sim.Simulator(habitat_sim.Configuration(sim_cfg, [agent_cfg]))
-            if navmesh.exists() and hasattr(simulator.pathfinder, "load_nav_mesh"):
-                simulator.pathfinder.load_nav_mesh(str(navmesh))
-            inferred_scene_id = scene_id or _infer_scene_id_from_dir(path)
-            mesh_bounds = _extract_mesh_object_bounds(semantic_glb, semantic_txt)
-            return self.build_from_sim(
-                simulator,
-                inferred_scene_id,
-                config=config,
-                mesh_object_bounds=mesh_bounds,
-            )
-        except Exception as exc:  # pragma: no cover - depends on Habitat assets.
-            raise RuntimeError(f"Failed to build HM3D prior map from {path}") from exc
-        finally:
-            if simulator is not None and hasattr(simulator, "close"):
-                simulator.close()
+        simulator = habitat_sim.Simulator(habitat_sim.Configuration(sim_cfg, [agent_cfg]))
+        if assets.navmesh.exists() and hasattr(simulator.pathfinder, "load_nav_mesh"):
+            simulator.pathfinder.load_nav_mesh(str(assets.navmesh))
+    except Exception as exc:  # pragma: no cover - depends on Habitat assets.
+        if simulator is not None and hasattr(simulator, "close"):
+            simulator.close()
+        raise RuntimeError(f"Failed to initialize HM3D scene from {path}") from exc
+    try:
+        yield simulator, assets
+    finally:
+        if simulator is not None and hasattr(simulator, "close"):
+            simulator.close()
 
 
 def build_hm3d_groundtruth_prior_map_from_sim(
@@ -382,13 +460,57 @@ def write_hm3d_groundtruth_prior_map_with_alignment(
     return paths
 
 
-def _extract_regions(semantic_scene: Any) -> tuple[_SemanticRegionRecord, ...]:
+def _extract_regions(
+    semantic_scene: Any,
+    *,
+    mesh_object_bounds: dict[str, dict[str, Any]],
+    use_mesh_region_fallback: bool,
+) -> tuple[_SemanticRegionRecord, ...]:
+    """Extract semantic regions and repair invalid HM3D region bounds.
+
+    Habitat-Sim can expose the HM3D region list while leaving each region AABB
+    at ``[-inf, -inf, -inf]``. The semantic mesh still contains per-instance
+    geometry and every semantic object points to its parent region. Aggregating
+    those transformed object bounds gives a conservative region envelope that
+    is suitable for intersecting with the NavMesh.
+
+    Args:
+        semantic_scene: Habitat semantic-scene object.
+        mesh_object_bounds: Mesh bounds keyed by Habitat or HM3D instance id.
+        use_mesh_region_fallback: Whether to use grouped mesh geometry when a
+            region AABB is invalid.
+
+    Returns:
+        Normalized semantic regions with a geometry-source marker.
+    """
+
     regions = []
     seen_ids: dict[str, int] = {}
+    mesh_region_bounds = (
+        _mesh_region_bounds(semantic_scene, mesh_object_bounds)
+        if use_mesh_region_fallback and mesh_object_bounds
+        else {}
+    )
     for index, region in enumerate(getattr(semantic_scene, "regions", ()) or ()):
         aabb = _read_aabb(region)
         center = _vector3_or_default(aabb.get("center"), (0.0, 0.0, 0.0))
         sizes = _vector3_or_default(aabb.get("sizes"), (0.0, 0.0, 0.0))
+        geometry_source = "semantic_scene_aabb"
+        fallback: Optional[dict[str, Any]] = None
+        # 中文：无效 AABB 只能保留为语义库存，不能参与房间几何计算。
+        # 否则 inf/nan 会把整个导航平面吸收到一个伪房间中。
+        if not _valid_region_geometry(center, sizes):
+            semantic_id = _read_id(region, fallback=index)
+            fallback = mesh_region_bounds.get(str(semantic_id))
+            if fallback is None:
+                continue
+            center = _vector3_or_default(fallback.get("center"), (0.0, 0.0, 0.0))
+            sizes = _vector3_or_default(fallback.get("sizes"), (0.0, 0.0, 0.0))
+            geometry_source = str(
+                fallback.get("geometry_source", "semantic_glb_region_mesh_bounds")
+            )
+        if not _valid_region_geometry(center, sizes):
+            continue
         semantic_id = _read_id(region, fallback=index)
         unique_region_id = _unique_semantic_id(semantic_id, seen_ids)
         regions.append(
@@ -404,10 +526,75 @@ def _extract_regions(semantic_scene: Any) -> tuple[_SemanticRegionRecord, ...]:
                     "aabb_center": list(center),
                     "aabb_sizes": list(sizes),
                     "floor_id": _read_level(region),
+                    "geometry_source": geometry_source,
+                    "mesh_object_count": fallback.get("object_count") if fallback else None,
                 },
             )
         )
     return tuple(regions)
+
+
+def _mesh_region_bounds(
+    semantic_scene: Any,
+    mesh_object_bounds: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Aggregate transformed semantic-object bounds by parent region.
+
+    Args:
+        semantic_scene: Habitat semantic scene exposing ``objects``.
+        mesh_object_bounds: Bounds already expressed in Habitat world frame.
+
+    Returns:
+        Region id to conservative ``min``/``max``/``center``/``sizes`` bounds.
+    """
+
+    grouped: dict[str, list[tuple[str, dict[str, Any]]]] = {}
+    for obj in getattr(semantic_scene, "objects", ()) or ():
+        region_id = _read_parent_region_id(obj)
+        if region_id is None:
+            continue
+        bound = _mesh_bound_for_semantic_id(mesh_object_bounds, _read_id(obj, fallback=0))
+        if bound is not None:
+            grouped.setdefault(str(region_id), []).append((_category_name(obj, fallback=""), bound))
+
+    result: dict[str, dict[str, Any]] = {}
+    for region_id, labeled_bounds in grouped.items():
+        floor_bounds = [
+            bound
+            for label, bound in labeled_bounds
+            if _norm(label) in {"floor", "ground", "flooring"}
+        ]
+        # 中文：优先使用 floor 几何确定房间的平面范围和楼层高度，避免把
+        # 家具/墙体的竖直包围盒误当成房间高度；没有 floor 标注时才退化到
+        # 该 region 的全部语义网格实例。
+        bounds = floor_bounds or [bound for _, bound in labeled_bounds]
+        points = [point for bound in bounds for point in (bound.get("min"), bound.get("max"))]
+        points = [point for point in points if point is not None]
+        if not points:
+            continue
+        minimum = tuple(min(float(point[index]) for point in points) for index in range(3))
+        maximum = tuple(max(float(point[index]) for point in points) for index in range(3))
+        center = tuple((minimum[index] + maximum[index]) / 2.0 for index in range(3))
+        sizes = tuple(maximum[index] - minimum[index] for index in range(3))
+        result[region_id] = {
+            "min": minimum,
+            "max": maximum,
+            "center": center,
+            "sizes": sizes,
+            "object_count": len(bounds),
+            "geometry_source": "semantic_glb_floor_mesh_bounds" if floor_bounds else "semantic_glb_region_mesh_bounds",
+        }
+    return result
+
+
+def _region_geometry_sources(regions: Sequence[_SemanticRegionRecord]) -> dict[str, int]:
+    """Count region geometry provenance for build diagnostics."""
+
+    counts: dict[str, int] = {}
+    for region in regions:
+        source = str(region.metadata.get("geometry_source", "unknown"))
+        counts[source] = counts.get(source, 0) + 1
+    return dict(sorted(counts.items()))
 
 
 def _extract_objects(
@@ -433,6 +620,9 @@ def _extract_objects(
             center = _vector3_or_default(mesh_bound.get("center"), center)
             sizes = _vector3_or_default(mesh_bound.get("sizes"), sizes)
             geometry_source = "semantic_glb_texture_bounds"
+        if not _valid_object_geometry(center, sizes):
+            # 中文：没有可验证空间范围的对象不进入静态几何层，避免零点投影污染 BEV。
+            continue
         region_id = _read_parent_region_id(obj)
         objects.append(
             _SemanticObjectRecord(
@@ -453,6 +643,25 @@ def _extract_objects(
             )
         )
     return tuple(objects)
+
+
+def extract_hm3d_mesh_object_bounds(
+    semantic_glb: str | Path,
+    semantic_txt: str | Path,
+) -> dict[str, dict[str, Any]]:
+    """Extract semantic-mesh instance bounds in the Habitat world frame.
+
+    Args:
+        semantic_glb: HM3D semantic mesh path.
+        semantic_txt: HM3D color-to-instance annotation path.
+
+    Returns:
+        Mapping from HM3D instance id to transformed AABB metadata. An empty
+        mapping is returned when the optional mesh parsing dependencies are not
+        available or the assets contain no readable textured geometry.
+    """
+
+    return _extract_mesh_object_bounds(Path(semantic_glb), Path(semantic_txt))
 
 
 def _extract_mesh_object_bounds(semantic_glb: Path, semantic_txt: Path) -> dict[str, dict[str, Any]]:
@@ -503,18 +712,38 @@ def _extract_mesh_object_bounds(semantic_glb: Path, semantic_txt: Path) -> dict[
             recognized_faces = _recognized_texture_samples(face_uv, image, target_colors, target_keys, np)
             for key, face_indices in recognized_faces.items():
                 selected = np.unique(faces[face_indices].reshape(-1))
-                selected_vertices = vertices[selected]
+                selected_vertices = _semantic_mesh_to_habitat(vertices[selected], np)
                 if selected_vertices.size == 0:
                     continue
                 _update_mesh_bound(bounds, color_to_instance[key]["instance_id"], selected_vertices, np)
             continue
         recognized_vertices = _recognized_texture_samples(uv, image, target_colors, target_keys, np)
         for key, vertex_indices in recognized_vertices.items():
-            selected_vertices = vertices[vertex_indices]
+            selected_vertices = _semantic_mesh_to_habitat(vertices[vertex_indices], np)
             if selected_vertices.size == 0:
                 continue
             _update_mesh_bound(bounds, color_to_instance[key]["instance_id"], selected_vertices, np)
     return bounds
+
+
+def _semantic_mesh_to_habitat(vertices: Any, np: Any) -> Any:
+    """Convert HM3D semantic-mesh coordinates to Habitat world coordinates.
+
+    HM3D semantic GLB uses an OpenGL-style ``(x, y, z)`` mesh frame while
+    Habitat-Sim exposes the scene in ``(x, y, z)`` with the mesh's vertical
+    axis mapped to Habitat ``y`` and the mesh forward axis mapped to negative
+    Habitat ``z``. Thus ``(x, y, z)_mesh -> (x, z, -y)_habitat``.
+
+    Args:
+        vertices: Array-like mesh vertices in the semantic GLB frame.
+        np: Imported numpy module.
+
+    Returns:
+        Vertices in the Habitat world frame.
+    """
+
+    values = np.asarray(vertices, dtype=float)
+    return np.stack((values[:, 0], values[:, 2], -values[:, 1]), axis=1)
 
 
 def _read_semantic_txt_color_lookup(semantic_txt: Path) -> dict[str, dict[str, Any]]:
@@ -788,10 +1017,14 @@ def _build_room_components(
         )
         if not region_cells:
             continue
+        # 中文：房间先验最终服务于 BEV 和高层语义推理，因此必须先把
+        # NavMesh 的多个采样高度投影到同一楼层的 (x, z) 平面；如果直接
+        # 在 (x, z, y) 索引上做连通域，同一个房间会因高度采样重复。
+        projected_cells = _project_cells_to_floor(region_cells)
         raw_components = (
-            _connected_components(region_cells)
+            _connected_components(projected_cells)
             if config.split_disconnected_components
-            else (region_cells,)
+            else (projected_cells,)
         )
         kept = [
             comp
@@ -818,19 +1051,48 @@ def _build_room_components(
     return tuple(components)
 
 
+def _project_cells_to_floor(cells: frozenset[_GridCell]) -> frozenset[_GridCell]:
+    """Collapse NavMesh samples onto a single semantic-region BEV plane.
+
+    Args:
+        cells: Navigable cells represented as ``(ix, iz, iy)``.
+
+    Returns:
+        One deterministic representative cell for each ``(ix, iz)`` location.
+    """
+
+    representatives: dict[tuple[int, int], _GridCell] = {}
+    for cell in cells:
+        key = (cell[0], cell[1])
+        current = representatives.get(key)
+        if current is None or (cell[2], cell) < (current[2], current):
+            representatives[key] = cell
+    return frozenset(representatives.values())
+
+
 def _connected_components(cells: frozenset[_GridCell]) -> tuple[frozenset[_GridCell], ...]:
-    remaining = set(cells)
+    """Extract four-connected components in the projected ``(ix, iz)`` plane.
+
+    Args:
+        cells: One representative NavMesh cell per 2-D location.
+
+    Returns:
+        Deterministically ordered connected components.
+    """
+
+    by_xy = {(cell[0], cell[1]): cell for cell in cells}
+    remaining = set(by_xy)
     components = []
     while remaining:
         start = remaining.pop()
         queue = deque([start])
-        component = {start}
+        component = {by_xy[start]}
         while queue:
-            ix, iz, iy = queue.popleft()
-            for neighbor in ((ix + 1, iz, iy), (ix - 1, iz, iy), (ix, iz + 1, iy), (ix, iz - 1, iy)):
+            ix, iz = queue.popleft()
+            for neighbor in ((ix + 1, iz), (ix - 1, iz), (ix, iz + 1), (ix, iz - 1)):
                 if neighbor in remaining:
                     remaining.remove(neighbor)
-                    component.add(neighbor)
+                    component.add(by_xy[neighbor])
                     queue.append(neighbor)
         components.append(frozenset(component))
     return tuple(sorted(components, key=lambda comp: (-len(comp), min(comp))))
@@ -870,10 +1132,12 @@ def _room_neighbor_pairs(
     config: HM3DGroundTruthBuildConfig,
 ) -> frozenset[tuple[str, str]]:
     dilation_cells = max(1, int(math.ceil(config.mask_dilation_radius_m / config.topdown_resolution)))
-    cell_owner: dict[_GridCell, int] = {}
+    # 中文：房间已经是 BEV 语义单元，拓扑也必须在同一个二维坐标系中
+    # 判断相邻关系；保留 y 作为 key 会把不同采样高度的相邻区域错误断开。
+    cell_owner: dict[tuple[int, int], int] = {}
     for index, component in enumerate(room_components):
         for cell in component.cells:
-            cell_owner.setdefault(cell, index)
+            cell_owner.setdefault((cell[0], cell[1]), index)
     pairs: set[tuple[str, str]] = set()
     for index, component in enumerate(room_components):
         for ix, iz, iy in component.cells:
@@ -881,7 +1145,7 @@ def _room_neighbor_pairs(
                 for dz in range(-dilation_cells, dilation_cells + 1):
                     if dx * dx + dz * dz > dilation_cells * dilation_cells:
                         continue
-                    owner = cell_owner.get((ix + dx, iz + dz, iy))
+                    owner = cell_owner.get((ix + dx, iz + dz))
                     if owner is None or owner == index:
                         continue
                     left, right = sorted((component.uid, room_components[owner].uid))
@@ -916,7 +1180,7 @@ def _make_rooms(
                     "component_count": component.component_count,
                     "nav_sample_count": len(component.cells),
                     "area_m2": component.area_m2,
-                    "boundary_method": "navigable_mask_aabb",
+                    "boundary_method": "navigable_mask_boundary",
                 },
             )
         )
@@ -1287,12 +1551,74 @@ def _cell_area_m2(cells: Iterable[_GridCell], resolution: float) -> float:
 
 
 def _boundary_from_cells(cells: Iterable[_GridCell], resolution: float) -> BoundaryXY:
+    """Extract the outer polygon of a connected grid component.
+
+    Args:
+        cells: Connected grid cells represented as ``(ix, iz, iy)``.
+        resolution: Cell size in meters.
+
+    Returns:
+        A counter-clockwise polygon in the Habitat ``(x, z)`` plane. If the
+        component cannot be polygonized, its conservative bounding rectangle
+        is returned as a deterministic fallback.
+    """
+
     cell_tuple = tuple(cells)
+    if not cell_tuple:
+        return ()
+    cell_set = set(cell_tuple)
+    edges: set[tuple[tuple[float, float], tuple[float, float]]] = set()
+    half = resolution / 2.0
+
+    for ix, iz, iy in cell_tuple:
+        left, right = ix * resolution - half, ix * resolution + half
+        bottom, top = iz * resolution - half, iz * resolution + half
+        # 中文：只保留没有同层邻居的四条边，得到自由空间连通域的真实轮廓。
+        if (ix - 1, iz, iy) not in cell_set:
+            edges.add(((left, bottom), (left, top)))
+        if (ix + 1, iz, iy) not in cell_set:
+            edges.add(((right, top), (right, bottom)))
+        if (ix, iz - 1, iy) not in cell_set:
+            edges.add(((right, bottom), (left, bottom)))
+        if (ix, iz + 1, iy) not in cell_set:
+            edges.add(((left, top), (right, top)))
+
+    loops: list[list[tuple[float, float]]] = []
+    outgoing: dict[tuple[float, float], list[tuple[float, float]]] = {}
+    for start, end in edges:
+        outgoing.setdefault(start, []).append(end)
+    for key in outgoing:
+        outgoing[key].sort()
+    while edges:
+        start, end = min(edges)
+        edges.remove((start, end))
+        loop = [start, end]
+        current = end
+        while current != start:
+            candidates = [candidate for candidate in outgoing.get(current, ()) if (current, candidate) in edges]
+            if not candidates:
+                break
+            next_point = candidates[0]
+            edges.remove((current, next_point))
+            loop.append(next_point)
+            current = next_point
+        if current == start and len(loop) >= 4:
+            loops.append(loop[:-1])
+
+    if loops:
+        def area(loop: list[tuple[float, float]]) -> float:
+            return abs(sum(
+                loop[index][0] * loop[(index + 1) % len(loop)][1]
+                - loop[(index + 1) % len(loop)][0] * loop[index][1]
+                for index in range(len(loop))
+            ) / 2.0)
+
+        return tuple(max(loops, key=area))
+
     min_ix = min(cell[0] for cell in cell_tuple)
     max_ix = max(cell[0] for cell in cell_tuple)
     min_iz = min(cell[1] for cell in cell_tuple)
     max_iz = max(cell[1] for cell in cell_tuple)
-    half = resolution / 2.0
     min_x = min_ix * resolution - half
     max_x = max_ix * resolution + half
     min_z = min_iz * resolution - half
@@ -1389,6 +1715,27 @@ def _vector3(value: Any) -> Vector3:
     return values
 
 
+def _valid_region_geometry(center: Vector3, sizes: Vector3) -> bool:
+    """Return whether a semantic region has finite horizontal geometry."""
+
+    return (
+        all(math.isfinite(float(value)) for value in center)
+        and all(math.isfinite(float(value)) for value in sizes)
+        and abs(float(sizes[0])) > 1e-6
+        and abs(float(sizes[2])) > 1e-6
+    )
+
+
+def _valid_object_geometry(center: Vector3, sizes: Vector3) -> bool:
+    """Return whether an object has finite center and non-zero extent."""
+
+    return (
+        all(math.isfinite(float(value)) for value in center)
+        and all(math.isfinite(float(value)) for value in sizes)
+        and any(abs(float(value)) > 1e-6 for value in sizes)
+    )
+
+
 def _safe_uid(value: Any) -> str:
     safe = "".join(ch if ch.isalnum() else "_" for ch in str(value)).strip("_")
     return safe or "unknown"
@@ -1415,7 +1762,10 @@ __all__ = [
     "HM3DGroundTruthBuildConfig",
     "HM3DGroundTruthPriorMapBuildResult",
     "HM3DGroundTruthPriorMapBuilder",
+    "HM3DSceneAssets",
     "build_hm3d_groundtruth_prior_map_from_scene_dir",
     "build_hm3d_groundtruth_prior_map_from_sim",
+    "open_hm3d_simulator",
+    "extract_hm3d_mesh_object_bounds",
     "write_hm3d_groundtruth_prior_map_with_alignment",
 ]

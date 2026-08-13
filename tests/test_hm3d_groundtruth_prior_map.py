@@ -170,6 +170,49 @@ def test_splits_disconnected_components_inside_one_semantic_region() -> None:
     assert all("component_" in room.uid for room in result.prior_map.rooms)
 
 
+def test_merges_duplicate_navmesh_heights_before_bev_component_extraction() -> None:
+    """Ensure stacked NavMesh samples do not duplicate one 2-D room."""
+
+    room = _FakeRegion(
+        id="7",
+        category=_FakeCategory("office"),
+        aabb=_FakeAABB(center=(1.0, 1.0, 1.0), sizes=(2.0, 2.0, 2.0)),
+    )
+
+    @dataclass(frozen=True)
+    class _MultiHeightPathfinder:
+        bounds: tuple[tuple[float, float, float], tuple[float, float, float]] = (
+            (0.0, 0.0, 0.0),
+            (2.0, 2.0, 2.0),
+        )
+
+        def get_bounds(self):
+            return self.bounds
+
+        def is_navigable(self, point):
+            x, y, z = point
+            return 0.0 <= x <= 2.0 and 0.0 <= z <= 2.0 and y in {0.0, 2.0}
+
+        def snap_point(self, point):
+            return point
+
+    sim = _FakeSim(
+        semantic_scene=_FakeSemanticScene(regions=(room,), objects=()),
+        pathfinder=_MultiHeightPathfinder(),
+    )
+    result = build_hm3d_groundtruth_prior_map_from_sim(
+        sim,
+        scene_id="multi_height",
+        config=HM3DGroundTruthBuildConfig(
+            topdown_resolution=1.0,
+            floor_height_tolerance=2.0,
+        ),
+    )
+
+    assert len(result.prior_map.rooms) == 1
+    assert result.prior_map.rooms[0].metadata["component_count"] == 1
+
+
 def test_build_from_sim_uses_mesh_bounds_when_semantic_aabb_is_degenerate() -> None:
     living = _FakeRegion(
         id="1",
@@ -212,6 +255,54 @@ def test_build_from_sim_uses_mesh_bounds_when_semantic_aabb_is_degenerate() -> N
     assert tv.position_xyz == pytest.approx((1.2, 0.4, 1.1))
     assert tv.metadata["geometry_source"] == "semantic_glb_texture_bounds"
     assert tv.metadata["semantic_glb_vertex_count"] == 12
+
+
+def test_build_from_sim_reconstructs_invalid_region_from_mesh_bounds() -> None:
+    room = _FakeRegion(
+        id="1",
+        category=_FakeCategory("living room"),
+        aabb=_FakeAABB(
+            center=(0.0, 0.0, 0.0),
+            sizes=(float("-inf"), float("-inf"), float("-inf")),
+        ),
+    )
+    sim = _FakeSim(
+        semantic_scene=_FakeSemanticScene(
+            regions=(room,),
+            objects=(
+                _FakeObject(
+                    id="349",
+                    category=_FakeCategory("tv"),
+                    aabb=_FakeAABB(center=(0.0, 0.0, 0.0), sizes=(0.0, 0.0, 0.0)),
+                    region=room,
+                ),
+            ),
+        ),
+        pathfinder=_FakePathfinder(
+            bounds=((0.0, 0.0, 0.0), (2.0, 0.0, 2.0)),
+            navigable_rectangles=((0.0, 2.0, 0.0, 2.0),),
+        ),
+    )
+
+    result = build_hm3d_groundtruth_prior_map_from_sim(
+        sim,
+        scene_id="scene",
+        config=HM3DGroundTruthBuildConfig(topdown_resolution=1.0),
+        mesh_object_bounds={
+            "349": {
+                "min": (0.0, 0.0, 0.0),
+                "max": (2.0, 2.0, 2.0),
+                "center": (1.0, 1.0, 1.0),
+                "sizes": (2.0, 2.0, 2.0),
+                "vertex_count": 8,
+            }
+        },
+    )
+
+    assert result.prior_map.rooms
+    assert result.prior_map.metadata["region_geometry_sources"] == {
+        "semantic_glb_region_mesh_bounds": 1
+    }
 
 
 def test_write_groundtruth_prior_roundtrips_with_loader_and_alignment(tmp_path: Path) -> None:

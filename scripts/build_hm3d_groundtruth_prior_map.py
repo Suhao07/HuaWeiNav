@@ -63,6 +63,11 @@ def parse_args() -> argparse.Namespace:
         help="Keep structural semantic labels such as wall/floor/window.",
     )
     parser.add_argument("--max_grid_cells", type=int, default=2_000_000, help="Safety cap for grid sampling.")
+    parser.add_argument(
+        "--layout_only",
+        action="store_true",
+        help="Emit a room-only canonical map; static semantic objects are omitted.",
+    )
     return parser.parse_args()
 
 
@@ -81,6 +86,7 @@ def main() -> int:
         mask_dilation_radius_m=args.mask_dilation_radius_m,
         split_disconnected_components=not args.merge_disconnected_components,
         include_structural=args.include_structural,
+        include_object_priors=not args.layout_only,
         max_grid_cells=args.max_grid_cells,
     )
     result = build_hm3d_groundtruth_prior_map_from_scene_dir(

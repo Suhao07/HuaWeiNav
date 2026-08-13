@@ -23,6 +23,8 @@ class PromptContextBundle:
         compact_xml: OSM-like compact XML summary.
         search_prior_summary: Prompt-friendly summary of current query output.
         truncated: Whether any field was truncated by the character budget.
+        multimodal_context: Optional dynamic BEV image metadata. The bytes are
+            packaged only by the high-level selector.
         metadata: JSON-friendly diagnostics such as counts and character limits.
     """
 
@@ -30,6 +32,7 @@ class PromptContextBundle:
     compact_xml: str
     search_prior_summary: str = ""
     truncated: bool = False
+    multimodal_context: dict[str, Any] | None = None
     metadata: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -44,6 +47,7 @@ class PromptContextBundle:
             "compact_xml": self.compact_xml,
             "search_prior_summary": self.search_prior_summary,
             "truncated": self.truncated,
+            "multimodal_context": dict(self.multimodal_context or {}),
             "metadata": dict(self.metadata or {}),
         }
 
@@ -244,12 +248,15 @@ class PriorMapPromptContextBuilder:
         self,
         map_data: PriorMapData,
         prior_result: Optional[SearchPriorResult] = None,
+        *,
+        multimodal_context: Any = None,
     ) -> PromptContextBundle:
         """Build a complete bounded prompt context bundle.
 
         Args:
             map_data: Prior map to render.
             prior_result: Optional query result to summarize.
+            multimodal_context: Optional prior-map multimodal context object.
 
         Returns:
             Prompt context bundle with natural language, XML, and search
@@ -264,12 +271,18 @@ class PriorMapPromptContextBuilder:
             compact_xml=compact_xml,
             search_prior_summary=search_summary,
             truncated=natural_truncated or xml_truncated or search_truncated,
+            multimodal_context=(
+                multimodal_context.to_dict()
+                if hasattr(multimodal_context, "to_dict")
+                else dict(multimodal_context or {})
+            ),
             metadata={
                 "max_chars": self.max_chars,
                 "room_count": len(map_data.rooms),
                 "object_count": len(map_data.objects),
                 "topology_edge_count": len(map_data.topology_edges),
                 "has_search_prior_result": prior_result is not None,
+                "has_multimodal_context": multimodal_context is not None,
             },
         )
 
