@@ -23,6 +23,19 @@ exists and has all of the following exact approved gate values:
   emergency_stop_verified: true
 ```
 
+The same contract is validated by both `strive_instruction_runtime` and
+`SysNavMotionServer`. It must also match the runtime waypoint topic, world
+frame, and action name, and provide positive motion limits, watchdog timeout,
+feedback terminal values, emergency-stop topic, and manual takeover procedure.
+An approved file is mounted read-only into the deployment container. HIL uses
+`require_controller_contract:=false` explicitly because it has no physical
+actuator.
+
 This directory is mounted read-only into the deployment container.  Do not use
 this mechanism to start, change, or take ownership of another project's lower
 controller.
+
+The template is intentionally invalid for live motion (`unapproved`, empty
+interface values, and zero safety limits). Copy it only when a robot-specific
+controller specification is available; do not mark it approved to enable a
+smoke test.

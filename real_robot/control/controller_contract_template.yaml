@@ -8,11 +8,19 @@ controller_contract:
   owner: ""
   allow_strive_waypoint_handoff: false
   cmd_vel_direct_publish: false
+  final_cmd_vel_owner: safety_velocity_mux
+  autonomy_cmd_topic: /cmd_vel/autonomy
+  manual_cmd_topic: /cmd_vel/manual
+  final_cmd_topic: /cmd_vel
+  planner_status_topic: /local_planner/status
+  sensor_watchdog_required: true
 
   waypoint:
     topic: ""
     message_type: ""
     frame_id: "map"
+    action_name: "/strive/execute_waypoint"
+    action_message_type: "strive_motion_msgs/action/ExecuteWaypoint"
     xy_goal_tolerance_m: 0.0
     yaw_goal_tolerance_rad: 0.0
     timeout_s: 0.0
@@ -20,6 +28,7 @@ controller_contract:
   feedback:
     status_topic: ""
     message_type: ""
+    action_result_authoritative: false
     reached_value: ""
     blocked_value: ""
     timeout_value: ""
@@ -27,6 +36,10 @@ controller_contract:
   safety:
     max_linear_speed_mps: 0.0
     max_angular_speed_rps: 0.0
+    max_linear_accel_mps2: 0.0
+    max_angular_accel_rps2: 0.0
+    command_watchdog_timeout_s: 0.0
     emergency_stop_topic: ""
     emergency_stop_verified: false
+    manual_takeover_topic: ""
     manual_takeover_procedure: ""
