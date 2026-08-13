@@ -117,6 +117,30 @@ class ParsedVerification(BaseModel):
     reason: str = ""
 
 
+class ParsedRoomSemantic(BaseModel):
+    """Open-ended room semantic annotation returned from room evidence."""
+
+    label: str = "unknown"
+    description: str = ""
+    confidence: float = 0.0
+    alternatives: list[str] = Field(default_factory=list)
+    evidence_summary: str = ""
+    uncertainty: str = ""
+
+
+class ParsedHighLevelSelection(BaseModel):
+    """Room/frontier selection returned from a dynamic prior-map BEV."""
+
+    selected_uid: str = ""
+    selected_type: str = ""
+    decision: str = "uncertain"
+    confidence: float = 0.0
+    reason: str = ""
+    alternatives: list[str] = Field(default_factory=list)
+    rejected_candidates: list[str] = Field(default_factory=list)
+    uncertainty: str = ""
+
+
 class BBoxObjectLabelResponse(BaseModel):
     steps: list[ReasoningStep] = Field(default_factory=list)
     res: str = "unknown"

@@ -87,13 +87,13 @@ def select_nearest_frontier_room(mapper: Any) -> RoomSelection:
 
 def _prior_room_score_for_node(mapper: Any, node: Any) -> float:
     prior_result = getattr(mapper, "search_prior_result", None)
-    if prior_result is None:
-        return 0.0
     try:
         room = mapper.room_nodes[node.room_idx]
     except Exception:
         return 0.0
     room_terms = {
+        _norm(getattr(node, "uid", "")),
+        _norm(getattr(node, "frontier_uid", "")),
         _norm(getattr(room, "uid", "")),
         _norm(getattr(room, "room_uid", "")),
         _norm(getattr(room, "label", "")),
@@ -103,6 +103,20 @@ def _prior_room_score_for_node(mapper: Any, node: Any) -> float:
         _norm(getattr(node, "room_idx", "")),
     }
     best = 0.0
+    high_level_selection = getattr(mapper, "prior_map_high_level_selection", None)
+    selected_uid = _norm(
+        high_level_selection.get("selected_uid", "")
+        if isinstance(high_level_selection, dict)
+        else getattr(high_level_selection, "selected_uid", "")
+    )
+    # 中文注释：LVLM 只提供已生成候选房间的排序偏好，几何距离仍由本函数计算，
+    # 因而不会凭空创建目标或绕过可达性检查。
+    if selected_uid and selected_uid in room_terms:
+        # 中文注释：高层选择器可以选房间或 frontier，但这里只把合法候选
+        # 转换为软排序分数，实际可达性仍由原有几何规划器决定。
+        best = max(best, 1.0)
+    if prior_result is None:
+        return best
     for prior in getattr(prior_result, "room_rankings", ()) or ():
         prior_terms = {_norm(getattr(prior, "room_uid", "")), _norm(getattr(prior, "label", ""))}
         if room_terms & prior_terms:

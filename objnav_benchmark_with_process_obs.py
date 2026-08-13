@@ -139,6 +139,15 @@ def get_args():
     parser.add_argument("--prior_map_path", type=str, default="")
     parser.add_argument("--prior_map_source", type=str, default="auto")
     parser.add_argument("--prior_map_alignment", type=str, default="identity")
+    parser.add_argument(
+        "--enable_prior_map_vlm",
+        default=False,
+        action="store_true",
+        help="Send dynamic prior-map BEV to the optional high-level room selector.",
+    )
+    parser.add_argument("--prior_map_vlm_interval", type=int, default=10)
+    parser.add_argument("--room_semantic_interval", type=int, default=10)
+    parser.add_argument("--enable_room_semantics", default=False, action="store_true")
     return parser.parse_known_args()[0]
 
 
