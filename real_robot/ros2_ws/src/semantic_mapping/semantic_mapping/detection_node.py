@@ -210,9 +210,12 @@ class DetectNode(Node):
         detections = self.inference(image)
         detection_time = time.time()
 
+        # The annotated-image topic remains part of the detector contract even
+        # when the current frame has no tracks (or annotation is disabled).
+        # Start from the original BGR frame so empty detections cannot leave
+        # image_anno undefined and terminate the real-robot detection node.
+        image_anno = image.copy()
         if self.ANNOTATE:
-            image_anno = image.copy()
-
             bboxes = detections['bboxes']
             labels = detections['labels']
             obj_ids = detections['ids']

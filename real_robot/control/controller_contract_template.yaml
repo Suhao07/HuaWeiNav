@@ -1,0 +1,32 @@
+# Copy to real_robot/control/<robot>_controller_contract.yaml, fill it from
+# the externally owned chassis/local-planner specification, and obtain review
+# before marking approval_status: approved.  This file is a safety gate, not a
+# replacement for the lower controller itself.
+controller_contract:
+  approval_status: unapproved
+  approval_reference: ""
+  owner: ""
+  allow_strive_waypoint_handoff: false
+  cmd_vel_direct_publish: false
+
+  waypoint:
+    topic: ""
+    message_type: ""
+    frame_id: "map"
+    xy_goal_tolerance_m: 0.0
+    yaw_goal_tolerance_rad: 0.0
+    timeout_s: 0.0
+
+  feedback:
+    status_topic: ""
+    message_type: ""
+    reached_value: ""
+    blocked_value: ""
+    timeout_value: ""
+
+  safety:
+    max_linear_speed_mps: 0.0
+    max_angular_speed_rps: 0.0
+    emergency_stop_topic: ""
+    emergency_stop_verified: false
+    manual_takeover_procedure: ""

@@ -1,0 +1,45 @@
+# Do not mark this profile as calibrated until a board/target-based LiDAR-RGB
+# calibration has been recorded and its reprojection error is documented.
+# The transform convention is p_camera = R_lidar_to_camera @ p_lidar + t.
+camera_projection:
+  calibration_status: uncalibrated
+  # These provenance fields are retained with the calibrated asset.  They are
+  # not used to transform points, but make a robot profile auditable.
+  calibration_version: 1
+  sensor_topics:
+    rgb: /camera/image
+    lidar: /cloud_registered
+    odom: /aft_mapped_to_init
+  frame_ids:
+    # Replace these after checking actual message headers / TF.
+    lidar: livox_frame
+    camera_optical: camera_color_optical_frame
+  # Positive means the RGB timestamp is later than the LiDAR timestamp.
+  rgb_minus_lidar_time_offset_s: 0.0
+  model: pinhole
+  image:
+    width: 1280
+    height: 720
+  intrinsics:
+    # Replace all four placeholders with the calibrated Generic USB RGB camera values.
+    fx: 0.0
+    fy: 0.0
+    cx: 0.0
+    cy: 0.0
+  # Keep the distortion record together with the pinhole values.  The current
+  # projection path expects rectified RGB; rectify upstream if coefficients are
+  # non-zero, rather than silently applying an unsupported distortion model.
+  distortion:
+    model: plumb_bob
+    coefficients: []
+  lidar_to_camera:
+    # Replace with the measured MID-360 -> RGB optical-frame transform.
+    translation_m: [0.0, 0.0, 0.0]
+    rotation_rpy_rad: [0.0, 0.0, 0.0]
+  min_depth_m: 0.05
+  validation:
+    # Fill these from the calibration report before changing status above.
+    method: ""
+    calibration_date_utc: ""
+    reprojection_rmse_px: null
+    sample_count: 0

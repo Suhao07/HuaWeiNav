@@ -1,18 +1,34 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-IMAGE_TAG="${IMAGE_TAG:-strive-real-robot:humble}"
+IMAGE_TAG="${IMAGE_TAG:-huawei-vln-realworld:orin}"
 ROS_SETUP="${ROS_SETUP:-/opt/ros/humble/setup.bash}"
 LIVOX_SETUP="${LIVOX_SETUP:-/home/orin26/code/ws_livox/install/setup.bash}"
 POINT_LIO_SETUP="${POINT_LIO_SETUP:-/home/orin26/code/point_lio_ws/install/setup.bash}"
 CHECK_CAMERA="${CHECK_CAMERA:-1}"
+USB_IMAGE_WIDTH="${USB_IMAGE_WIDTH:-1280}"
+USB_IMAGE_HEIGHT="${USB_IMAGE_HEIGHT:-720}"
+USB_PIXEL_FORMAT="${USB_PIXEL_FORMAT:-yuyv}"
+USB_FRAMERATE="${USB_FRAMERATE:-30.0}"
 CHECK_DETECTOR_INIT="${CHECK_DETECTOR_INIT:-0}"
 DETECTOR_INIT_TIMEOUT="${DETECTOR_INIT_TIMEOUT:-180}"
 REQUIRE_ML="${REQUIRE_ML:-0}"
 REQUIRE_ASSETS="${REQUIRE_ASSETS:-0}"
 REQUIRE_LIO="${REQUIRE_LIO:-0}"
+# Keep graph inspection available by default, but allow an explicit GPU/ML-only
+# smoke run to avoid creating diagnostic subscribers on a shared ROS graph.
+# A required LIO gate always enables the read-only sampling checks.
+CHECK_LIO_SAMPLES="${CHECK_LIO_SAMPLES:-1}"
 HZ_TIMEOUT="${HZ_TIMEOUT:-7}"
 ECHO_TIMEOUT="${ECHO_TIMEOUT:-5}"
+
+if [[ "${REQUIRE_LIO}" == "1" ]]; then
+  CHECK_LIO_SAMPLES=1
+fi
+
+# This smoke must not stop, start, or otherwise mutate the host's shared ROS
+# daemon.  Every ROS CLI command discovers the live graph directly.
+export ROS_DISABLE_DAEMON=1
 
 if [[ -z "${SYSNAV_MOBILECLIP_BLT_TS_PATH:-}" && -n "${SYSNAV_MOBILECLIP_BLT_PATH:-}" ]]; then
   mobileclip_ts_candidate="${SYSNAV_MOBILECLIP_BLT_PATH%.*}.ts"
@@ -25,15 +41,27 @@ have_cmd() {
   command -v "$1" >/dev/null 2>&1
 }
 
+bounded_timeout() {
+  # ROS 2 CLI processes can ignore TERM while waiting for DDS discovery.  A
+  # kill-after guard keeps smoke checks genuinely bounded and prevents orphaned
+  # diagnostic subscribers from remaining on the shared robot graph.
+  timeout --kill-after=2s "$@"
+}
+
 section() {
   printf '\n== %s ==\n' "$1"
 }
 
 run_maybe_sudo() {
-  if "$@" >/tmp/strive_sudo_probe.out 2>/tmp/strive_sudo_probe.err; then
-    cat /tmp/strive_sudo_probe.out
+  local probe_out probe_err
+  probe_out="$(mktemp -t strive_sudo_probe.XXXXXX)"
+  probe_err="$(mktemp -t strive_sudo_probe.XXXXXX)"
+  if "$@" >"${probe_out}" 2>"${probe_err}"; then
+    cat "${probe_out}"
+    rm -f "${probe_out}" "${probe_err}"
     return 0
   fi
+  rm -f "${probe_out}" "${probe_err}"
   if have_cmd sudo; then
     if [[ -n "${SUDO_STDIN_PASSWORD:-}" ]]; then
       printf '%s\n' "${SUDO_STDIN_PASSWORD}" | sudo -S -p '' "$@"
@@ -41,7 +69,6 @@ run_maybe_sudo() {
       sudo "$@"
     fi
   else
-    cat /tmp/strive_sudo_probe.err >&2
     return 1
   fi
 }
@@ -61,14 +88,15 @@ source_ros() {
 append_jetson_nvidia_library_args() {
   local -n args_ref=$1
   local cuda_home="${CUDA_HOME_HOST:-}"
+  local cuda_container_mount="${CUDA_CONTAINER_MOUNT:-/opt/strive/host-cuda}"
   local ld_paths=()
 
   if [[ -z "${cuda_home}" && -e /usr/local/cuda ]]; then
     cuda_home="$(readlink -f /usr/local/cuda 2>/dev/null || true)"
   fi
   if [[ -n "${cuda_home}" && -d "${cuda_home}" ]]; then
-    args_ref+=(-v "${cuda_home}:${cuda_home}:ro")
-    ld_paths+=("${cuda_home}/lib64" "${cuda_home}/targets/aarch64-linux/lib")
+    args_ref+=(-v "${cuda_home}:${cuda_container_mount}:ro")
+    ld_paths+=("${cuda_container_mount}/lib64" "${cuda_container_mount}/targets/aarch64-linux/lib")
   fi
 
   for lib in /usr/lib/aarch64-linux-gnu/libcudnn*.so*; do
@@ -188,9 +216,6 @@ fi
 
 section "ROS Graph"
 source_ros
-ros2 daemon stop >/dev/null 2>&1 || true
-ros2 daemon start >/dev/null 2>&1 || true
-sleep 1
 ros2 node list | sort || true
 ros2 topic list -t | sort || true
 
@@ -218,15 +243,20 @@ for topic in \
   ros2 topic info -v "${topic}" 2>&1 | sed -n '1,70p' || true
 done
 
-section "Hardware Topic Samples"
-for topic in /livox/imu /cloud_registered /aft_mapped_to_init /path; do
-  echo "--- hz ${topic}"
-  ROS_DISABLE_DAEMON=1 timeout "${HZ_TIMEOUT}" ros2 topic hz "${topic}" --window 5 2>&1 | sed -n '1,30p' || true
-done
-echo "--- /aft_mapped_to_init once"
-ROS_DISABLE_DAEMON=1 timeout "${ECHO_TIMEOUT}" ros2 topic echo --once /aft_mapped_to_init 2>&1 | sed -n '1,80p' || true
-echo "--- /cloud_registered header once"
-ROS_DISABLE_DAEMON=1 timeout "${ECHO_TIMEOUT}" ros2 topic echo --once /cloud_registered --field header 2>&1 | sed -n '1,60p' || true
+if [[ "${CHECK_LIO_SAMPLES}" == "1" ]]; then
+  section "Hardware Topic Samples"
+  for topic in /livox/imu /cloud_registered /aft_mapped_to_init /path; do
+    echo "--- hz ${topic}"
+    ROS_DISABLE_DAEMON=1 bounded_timeout "${HZ_TIMEOUT}" ros2 topic hz "${topic}" --window 5 2>&1 | sed -n '1,30p' || true
+  done
+  echo "--- /aft_mapped_to_init once"
+  ROS_DISABLE_DAEMON=1 bounded_timeout "${ECHO_TIMEOUT}" ros2 topic echo --once /aft_mapped_to_init 2>&1 | sed -n '1,80p' || true
+  echo "--- /cloud_registered header once"
+  ROS_DISABLE_DAEMON=1 bounded_timeout "${ECHO_TIMEOUT}" ros2 topic echo --once /cloud_registered --field header 2>&1 | sed -n '1,60p' || true
+else
+  section "Hardware Topic Samples"
+  echo "Skipped (CHECK_LIO_SAMPLES=0; GPU/ML-only smoke mode)."
+fi
 
 if [[ "${REQUIRE_LIO}" == "1" ]]; then
   section "Required LIO Sample Gate"
@@ -240,7 +270,7 @@ if [[ "${REQUIRE_LIO}" == "1" ]]; then
     field="${spec##* }"
     echo "--- required ${topic} ${field}"
     sample_output="$(
-      ROS_DISABLE_DAEMON=1 timeout "${ECHO_TIMEOUT}" \
+      ROS_DISABLE_DAEMON=1 bounded_timeout "${ECHO_TIMEOUT}" \
         ros2 topic echo --once "${topic}" --field "${field}" 2>&1 || true
     )"
     printf '%s\n' "${sample_output}" | sed -n '1,40p'
@@ -296,9 +326,9 @@ set +u
 source /opt/ros/humble/setup.bash
 set -u
 echo "--- container /aft_mapped_to_init header"
-timeout 8 ros2 topic echo --once /aft_mapped_to_init --field header
+timeout --kill-after=2s 8 ros2 topic echo --once /aft_mapped_to_init --field header
 echo "--- container /cloud_registered header"
-timeout 8 ros2 topic echo --once /cloud_registered --field header
+timeout --kill-after=2s 8 ros2 topic echo --once /cloud_registered --field header
 '
   )"
   printf '%s\n' "${container_lio_output}" | sed -n '1,80p'
@@ -376,7 +406,7 @@ if [[ "${CHECK_DETECTOR_INIT}" == "1" ]]; then
   section "Container Detector Init Smoke"
   MODEL_ASSET_ARGS=()
   append_model_asset_args MODEL_ASSET_ARGS
-  run_maybe_sudo timeout "${DETECTOR_INIT_TIMEOUT}" docker run --rm --network host --ipc=host "${DOCKER_GPU_ARGS[@]}" "${DOCKER_DDS_ARGS[@]}" "${MODEL_ASSET_ARGS[@]}" "${IMAGE_TAG}" bash -lc '
+  run_maybe_sudo timeout --kill-after=2s "${DETECTOR_INIT_TIMEOUT}" docker run --rm --network host --ipc=host "${DOCKER_GPU_ARGS[@]}" "${DOCKER_DDS_ARGS[@]}" "${MODEL_ASSET_ARGS[@]}" "${IMAGE_TAG}" bash -lc '
 set -eo pipefail
 set +u
 source /opt/ros/humble/setup.bash
@@ -409,18 +439,40 @@ if [[ "${CHECK_CAMERA}" == "1" && -e /dev/video0 ]]; then
   [[ -e /dev/video1 ]] && CAMERA_DEVICE_ARGS+=(--device /dev/video1:/dev/video1)
   run_maybe_sudo docker run --rm --network host --ipc=host "${DOCKER_GPU_ARGS[@]}" "${DOCKER_DDS_ARGS[@]}" \
     "${CAMERA_DEVICE_ARGS[@]}" \
+    -e "USB_IMAGE_WIDTH=${USB_IMAGE_WIDTH}" \
+    -e "USB_IMAGE_HEIGHT=${USB_IMAGE_HEIGHT}" \
+    -e "USB_PIXEL_FORMAT=${USB_PIXEL_FORMAT}" \
+    -e "USB_FRAMERATE=${USB_FRAMERATE}" \
     "${IMAGE_TAG}" bash -lc '
 set -eo pipefail
 v4l2-ctl --list-devices 2>&1 || true
 set +u
 source /opt/ros/humble/setup.bash
 set -u
-timeout 8 ros2 run usb_cam usb_cam_node_exe --ros-args \
+camera_pid=0
+cleanup_camera() {
+  if [[ "${camera_pid}" -gt 0 ]] && kill -0 "${camera_pid}" >/dev/null 2>&1; then
+    # ros2 run launches a child executable.  Give it a separate session and
+    # terminate the entire process group so a camera smoke never leaves a
+    # detached usb_cam node/container behind on the robot.
+    kill -TERM -- "-${camera_pid}" >/dev/null 2>&1 || true
+    sleep 1
+    kill -KILL -- "-${camera_pid}" >/dev/null 2>&1 || true
+  fi
+  wait "${camera_pid}" >/dev/null 2>&1 || true
+}
+trap cleanup_camera EXIT INT TERM
+setsid ros2 run usb_cam usb_cam_node_exe --ros-args \
   -p video_device:=/dev/video0 \
-  -p image_width:=640 \
-  -p image_height:=480 \
-  -p pixel_format:=yuyv \
-  -r image_raw:=/camera/image 2>&1 | sed -n "1,120p" || true
+  -p image_width:="${USB_IMAGE_WIDTH}" \
+  -p image_height:="${USB_IMAGE_HEIGHT}" \
+  -p pixel_format:="${USB_PIXEL_FORMAT}" \
+  -p framerate:="${USB_FRAMERATE}" \
+  -r image_raw:=/camera/image &
+camera_pid=$!
+sleep 8
+cleanup_camera
+trap - EXIT INT TERM
 '
 fi
 

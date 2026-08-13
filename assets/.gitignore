@@ -1,0 +1,5 @@
+# Robot model weights are deployment artifacts, not source code.  Keep the
+# documentation and this guard tracked while preventing accidental commits.
+*
+!.gitignore
+!README.md

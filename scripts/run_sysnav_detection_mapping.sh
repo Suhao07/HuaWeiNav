@@ -8,6 +8,11 @@ ROS_DISTRO_NAME="${ROS_DISTRO:-humble}"
 ROS_SETUP="/opt/ros/${ROS_DISTRO_NAME}/setup.bash"
 OVERLAY_SETUP="${WS_DIR}/install/setup.bash"
 START_STRIVE_RUNTIME="${START_STRIVE_RUNTIME:-0}"
+START_SEMANTIC_MAPPING="${START_SEMANTIC_MAPPING:-true}"
+MAPPING_CONFIG="${MAPPING_CONFIG:-}"
+PROJECTION_CONFIG="${PROJECTION_CONFIG:-}"
+DETECTION_TOPIC="${DETECTION_TOPIC:-/detection_result}"
+OBJECT_NODES_TOPIC="${OBJECT_NODES_TOPIC:-/object_nodes_list}"
 
 usage() {
   cat <<EOF
@@ -125,6 +130,16 @@ runtime_args() {
   append_runtime_arg RUNTIME_ARGS "use_sim_time" "${STRIVE_USE_SIM_TIME:-false}"
 }
 
+mapping_args() {
+  MAPPING_ARGS=(
+    "start_semantic_mapping:=${START_SEMANTIC_MAPPING}"
+    "detection_topic:=${DETECTION_TOPIC}"
+    "object_nodes_topic:=${OBJECT_NODES_TOPIC}"
+  )
+  append_runtime_arg MAPPING_ARGS "mapping_config" "${MAPPING_CONFIG}"
+  append_runtime_arg MAPPING_ARGS "projection_config" "${PROJECTION_CONFIG}"
+}
+
 cleanup() {
   for pid in "${PIDS[@]:-}"; do
     if kill -0 "${pid}" >/dev/null 2>&1; then
@@ -133,9 +148,11 @@ cleanup() {
   done
 }
 
-# 核心：默认只启动 vendored SysNav detector/mapping，输出 /detection_result 和 /object_nodes_list。
+mapping_args
+
+# 核心：默认启动 vendored SysNav detector/mapping；profile 可显式停用未标定的 semantic mapping。
 if ! is_true "${START_STRIVE_RUNTIME}"; then
-  exec ros2 launch strive_sysnav_bringup sysnav_detection_mapping.launch.py "${MODEL_ARGS[@]}" "$@"
+  exec ros2 launch strive_sysnav_bringup sysnav_detection_mapping.launch.py "${MODEL_ARGS[@]}" "${MAPPING_ARGS[@]}" "$@"
 fi
 
 runtime_args
@@ -143,7 +160,7 @@ PIDS=()
 trap 'cleanup; exit 130' INT
 trap 'cleanup; exit 143' TERM
 
-ros2 launch strive_sysnav_bringup sysnav_detection_mapping.launch.py "${MODEL_ARGS[@]}" "$@" &
+ros2 launch strive_sysnav_bringup sysnav_detection_mapping.launch.py "${MODEL_ARGS[@]}" "${MAPPING_ARGS[@]}" "$@" &
 PIDS+=("$!")
 ros2 launch strive_sysnav_bringup strive_instruction_runtime.launch.py "${RUNTIME_ARGS[@]}" &
 PIDS+=("$!")

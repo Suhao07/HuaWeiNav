@@ -1,5 +1,10 @@
 # STRIVE 实物部署接口设计
 
+> **Orin-26 实施状态**：实时执行清单、已验证的硬件观测和未解除的安全门槛维护在
+> [`real_robot_deployment_checklist.md`](real_robot_deployment_checklist.md)。首次部署请从
+> `real_robot/profiles/orin26_livox_mid360_generic_rgb.env` 与
+> `scripts/run_real_robot_profile.sh` 开始；它们默认只读传感器、禁用语义融合和真实运动。
+
 本文档整理 STRIVE 从 HM3D/Habitat 仿真迁移到真实机器人时的接口设计、模块边界、输入输出数据流和上下层规划闭环。目标不是把仿真代码直接搬到机器人上，而是建立一个可插拔的 real-robot runtime，让 STRIVE 的高层语义导航能力复用真实机器人传感器、SLAM 和底层运动控制。
 
 ## 1. 设计目标

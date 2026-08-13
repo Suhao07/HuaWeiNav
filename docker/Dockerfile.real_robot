@@ -1,9 +1,12 @@
-FROM ros:humble-ros-base
+ARG REAL_ROBOT_BASE_IMAGE=ros:humble-ros-base
+FROM ${REAL_ROBOT_BASE_IMAGE}
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG INSTALL_ML_DEPS=0
 ARG INSTALL_LLM_DEPS=1
 ARG UBUNTU_PORTS_MIRROR=https://mirrors.tuna.tsinghua.edu.cn/ubuntu-ports
+ARG JETSON_PYTORCH_INDEX=https://pypi.jetson-ai-lab.io/jp6/cu126
+ARG SKIP_BASE_DEPS=0
 
 SHELL ["/bin/bash", "-lc"]
 
@@ -11,7 +14,7 @@ ENV STRIVE_WS=/workspace/STRIVE
 ENV STRIVE_REAL_ROBOT_WS=/workspace/STRIVE/real_robot/ros2_ws
 ENV PYTHONPATH=/workspace/STRIVE
 
-RUN set -euo pipefail; \
+RUN if [[ "${SKIP_BASE_DEPS}" != "1" ]]; then set -euo pipefail; \
     for file in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do \
       [[ -e "${file}" ]] || continue; \
       sed -i -E \
@@ -21,9 +24,9 @@ RUN set -euo pipefail; \
     done; \
     printf 'Acquire::Retries "5";\nAcquire::http::Timeout "30";\nAcquire::https::Timeout "30";\n' \
       > /etc/apt/apt.conf.d/80-strive-retries; \
-    grep -R "${UBUNTU_PORTS_MIRROR}" /etc/apt/sources.list /etc/apt/sources.list.d || true
+    grep -R "${UBUNTU_PORTS_MIRROR}" /etc/apt/sources.list /etc/apt/sources.list.d || true; fi
 
-RUN apt-get update \
+RUN if [[ "${SKIP_BASE_DEPS}" != "1" ]]; then apt-get update \
  && apt-get install -y --no-install-recommends \
       python3-colcon-common-extensions \
       python3-pip \
@@ -34,26 +37,36 @@ RUN apt-get update \
       ros-humble-pcl-ros \
       ros-humble-tf2-geometry-msgs \
       ros-humble-tf2-ros \
- && rm -rf /var/lib/apt/lists/*
+ && rm -rf /var/lib/apt/lists/*; fi
 
-RUN apt-get update \
+RUN if [[ "${SKIP_BASE_DEPS}" != "1" ]]; then apt-get update \
  && apt-get install -y --no-install-recommends \
       ros-humble-topic-tools \
       ros-humble-usb-cam \
       v4l-utils \
- && rm -rf /var/lib/apt/lists/*
+ && rm -rf /var/lib/apt/lists/*; fi
 
-RUN if [[ "${INSTALL_LLM_DEPS}" == "1" ]]; then \
+RUN if [[ "${SKIP_BASE_DEPS}" != "1" && "${INSTALL_LLM_DEPS}" == "1" ]]; then \
       python3 -m pip install --no-cache-dir \
         "pydantic>=2,<3" openai ; \
     fi
 
-# Optional runtime deps for launching the vendored SysNav detector/mapping
-# nodes. Keep this switch explicit because torch/ultralytics/open3d are heavy
-# and may be provided by the robot image or mounted environment instead.
-RUN if [[ "${INSTALL_ML_DEPS}" == "1" ]]; then \
-      python3 -m pip install --no-cache-dir \
-        pyyaml pillow scipy open3d supervision ultralytics opencv-python-headless ; \
+# JetPack 6.2 does not use the generic x86 PyPI PyTorch wheels.  Keep the
+# Jetson index explicit and install all detector/mapping dependencies in this
+# image, rather than inheriting an opaque host Python environment.
+RUN if [[ "${SKIP_BASE_DEPS}" != "1" && "${INSTALL_ML_DEPS}" == "1" ]]; then \
+      apt-get update \
+      && apt-get install -y --no-install-recommends \
+        build-essential git libjpeg-dev libopenblas-dev libpng-dev ninja-build python3-dev zlib1g-dev \
+      && rm -rf /var/lib/apt/lists/* \
+      && python3 -m pip install --no-cache-dir --upgrade "pip<26" "setuptools<80" wheel \
+      && python3 -m pip install --no-cache-dir "numpy<2" packaging \
+      && python3 -m pip install --no-cache-dir --timeout 120 --retries 10 \
+        --index-url "${JETSON_PYTORCH_INDEX}" torch torchvision \
+      && python3 -m pip install --no-cache-dir \
+        --timeout 120 --retries 10 --extra-index-url "${JETSON_PYTORCH_INDEX}" \
+        pyyaml pillow scipy scikit-learn shapely hydra-core omegaconf iopath tqdm \
+        "opencv-python==4.11.0.86" supervision ultralytics open3d "rerun-sdk==0.18.2" ; \
     fi
 
 WORKDIR ${STRIVE_WS}
