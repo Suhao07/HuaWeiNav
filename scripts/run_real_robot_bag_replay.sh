@@ -27,6 +27,9 @@ Default runtime topic mapping:
 Useful environment variables:
   BAG_LOOP=1
   BAG_RATE=0.5
+  BAG_REQUIRED_TOPICS=/object_nodes_list,/room_nodes_list,/aft_mapped_to_init,/camera/image
+  BAG_REQUIRE_RUNTIME_DECISION=1
+  BAG_RUNTIME_GRACE_S=2
   STRIVE_INSTRUCTION="find a book"
   STRIVE_DATASET_TARGET=book
   STRIVE_POLICY_MODE=semantic_snapshot
@@ -78,6 +81,41 @@ set -u
 
 export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 
+RUN_DIRECTORY="${STRIVE_RUN_DIRECTORY:-/tmp/strive_real_robot_bag_replay}"
+mkdir -p "${RUN_DIRECTORY}"
+
+echo "== Bag info =="
+if ! ros2 bag info "${BAG_PATH}" | tee "${RUN_DIRECTORY}/bag_info.txt"; then
+  echo "Unable to inspect rosbag: ${BAG_PATH}" >&2
+  exit 2
+fi
+
+check_required_topics() {
+  local topic
+  local required_topics="${BAG_REQUIRED_TOPICS:-}"
+  [[ -n "${required_topics}" ]] || return 0
+  IFS=',' read -r -a topics <<< "${required_topics}"
+  for topic in "${topics[@]}"; do
+    topic="$(echo "${topic}" | xargs)"
+    [[ -n "${topic}" ]] || continue
+    if ! grep -Fq "${topic}" "${RUN_DIRECTORY}/bag_info.txt"; then
+      echo "Required rosbag topic is missing: ${topic}" >&2
+      return 1
+    fi
+  done
+}
+
+check_required_topics
+
+printf '%s\n' \
+  "bag_path=${BAG_PATH}" \
+  "required_topics=${BAG_REQUIRED_TOPICS:-}" \
+  "runtime_decision_file=${RUN_DIRECTORY}/runtime_decisions.jsonl" \
+  "lower_controller_enabled=false" \
+  "dry_run=${STRIVE_DRY_RUN:-true}" \
+  "waypoint_to_path_acceptance=native_planner_hil_only" \
+  > "${RUN_DIRECTORY}/replay_config.txt"
+
 BAG_PLAY_ARGS=("--clock")
 if is_true "${BAG_LOOP:-0}"; then
   BAG_PLAY_ARGS+=("--loop")
@@ -100,23 +138,25 @@ RUNTIME_ARGS=(
   "prior_map_path:=${STRIVE_PRIOR_MAP_PATH:-}"
   "prior_map_source:=${STRIVE_PRIOR_MAP_SOURCE:-auto}"
   "prior_map_alignment:=${STRIVE_PRIOR_MAP_ALIGNMENT:-identity}"
-  "run_directory:=${STRIVE_RUN_DIRECTORY:-/tmp/strive_real_robot_bag_replay}"
+  "run_directory:=${RUN_DIRECTORY}"
   "object_topic:=${BAG_OBJECT_TOPIC:-/object_nodes_list}"
   "room_topic:=${BAG_ROOM_TOPIC:-/room_nodes_list}"
   "odom_topic:=${BAG_ODOM_TOPIC:-/aft_mapped_to_init}"
   "image_topic:=${BAG_IMAGE_TOPIC:-/camera/image}"
   "detection_topic:=${BAG_DETECTION_TOPIC:-/detection_result}"
   "path_topic:=${BAG_PATH_TOPIC:-/path}"
-  "planner_status_topic:=${BAG_PLANNER_STATUS_TOPIC:-}"
+  "planner_status_topic:=${BAG_PLANNER_STATUS_TOPIC:-/local_planner/status}"
   "depth_topic:=${BAG_DEPTH_TOPIC:-}"
   "pointcloud_topic:=${BAG_POINTCLOUD_TOPIC:-}"
   "lower_controller_enabled:=false"
 )
 
 cleanup() {
-  for pid in "${PIDS[@]:-}"; do
+  for pid in "${RUNTIME_PID:-}" "${BAG_PID:-}"; do
+    [[ -n "${pid}" ]] || continue
     if kill -0 "${pid}" >/dev/null 2>&1; then
       kill "${pid}" >/dev/null 2>&1 || true
+      wait "${pid}" >/dev/null 2>&1 || true
     fi
   done
 }
@@ -124,21 +164,34 @@ cleanup() {
 trap 'cleanup; exit 130' INT
 trap 'cleanup; exit 143' TERM
 
-echo "== Bag info =="
-ros2 bag info "${BAG_PATH}" || true
-
-PIDS=()
-echo "== Start bag replay =="
-ros2 bag play "${BAG_PATH}" "${BAG_PLAY_ARGS[@]}" &
-PIDS+=("$!")
-
 echo "== Start STRIVE instruction runtime =="
 ros2 launch strive_sysnav_bringup strive_instruction_runtime.launch.py "${RUNTIME_ARGS[@]}" "$@" &
-PIDS+=("$!")
+RUNTIME_PID=$!
 
-set +e
-wait -n "${PIDS[@]}"
-status=$?
-set -e
+# 启动 runtime 后再播放 bag，避免短 bag 在 runtime 完成订阅前已经播放结束。
+echo "== Start bag replay =="
+ros2 bag play "${BAG_PATH}" "${BAG_PLAY_ARGS[@]}" &
+BAG_PID=$!
+
+status=0
+# 中文说明：以 bag 播放完成作为回放生命周期边界；runtime 需要多保留一小段
+# 时间写完最后一条 decision，不能因 rosbag 先退出而被立即强杀。
+while kill -0 "${BAG_PID}" >/dev/null 2>&1; do
+  if ! kill -0 "${RUNTIME_PID}" >/dev/null 2>&1; then
+    wait "${RUNTIME_PID}" || status=$?
+    echo "STRIVE runtime exited before rosbag replay completed." >&2
+    [[ "${status}" -ne 0 ]] || status=1
+    cleanup
+    exit "${status}"
+  fi
+  sleep 0.2
+done
+wait "${BAG_PID}" || status=$?
+sleep "${BAG_RUNTIME_GRACE_S:-2}"
+
+if is_true "${BAG_REQUIRE_RUNTIME_DECISION:-0}" && [[ ! -s "${RUN_DIRECTORY}/runtime_decisions.jsonl" ]]; then
+  echo "Runtime replay produced no decisions: ${RUN_DIRECTORY}/runtime_decisions.jsonl" >&2
+  status=1
+fi
 cleanup
 exit "${status}"
