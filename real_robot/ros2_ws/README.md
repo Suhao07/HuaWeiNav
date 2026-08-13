@@ -21,11 +21,22 @@ src/strive_sysnav_bringup
   Launch and high-level runtime package. It starts detection_node,
   semantic_mapping_node, and the optional STRIVE instruction runtime node
   inside the STRIVE overlay.
+
+src/terrain_analysis, src/local_planner
+  Migrated SysNav lower navigation stack. `localPlanner` consumes the
+  registered cloud, odometry, and `/way_point`; `pathFollower` publishes only
+  `/cmd_vel/autonomy`. The final `/cmd_vel` owner is `SafetyVelocityMux`.
+
+src/strive_motion_msgs, src/strive_sysnav_motion
+  Task-level `ExecuteWaypoint` action server and safety velocity mux. The
+  action server reports motion lifecycle and reason codes; it does not declare
+  natural-language task success.
 ```
 
-The full SysNav C++ exploration/local-planner package is intentionally not
-compiled in this overlay yet. STRIVE publishes `/way_point`; a real robot can
-consume that topic through an existing SysNav/Nav2/local-planner stack.
+The lower SysNav planner is compiled in this overlay. Its original chassis
+output is replaced by `/cmd_vel/autonomy`, and the final velocity path is
+guarded by `SafetyVelocityMux`. Detector weights, localization, chassis driver,
+and hardware safety devices remain deployment inputs.
 
 ## Build
 
@@ -38,7 +49,11 @@ The script builds:
 
 ```text
 tare_planner
+terrain_analysis
+local_planner
 semantic_mapping
+strive_motion_msgs
+strive_sysnav_motion
 strive_sysnav_bringup
 ```
 
@@ -152,6 +167,15 @@ Output:
   /annotated_image_detection
   /annotated_image
   /cloud_image
+
+Motion:
+  /way_point
+  /path
+  /cmd_vel/autonomy
+  /cmd_vel
+  /platform/safety_state
+  /platform/safe_hold
+  /local_planner/cancel
 ```
 
 STRIVE consumes `/object_nodes_list` and `/room_nodes_list` through
@@ -634,3 +658,147 @@ That repository is only a reference for topic contracts; do not modify it from
 this overlay. If the robot does not run a `/way_point` consumer, add a bridge in
 HuaWeiNav or the SysNav/local-planner layer that converts `/way_point` goals into
 the controller's expected local path/waypoint format.
+
+### Aggregate bringup
+
+The aggregate launch keeps the lower controller disabled by default:
+
+```bash
+bash scripts/run_sysnav_detection_mapping.sh
+```
+
+After the robot-specific controller contract has been approved, the complete
+Action-backed motion chain can be enabled explicitly:
+
+```bash
+export START_LOWER_STACK=1
+export STRIVE_DRY_RUN=false
+export STRIVE_LOWER_CONTROLLER_ENABLED=true
+export STRIVE_MOTION_BACKEND=action
+export CONTROL_CONTRACT_FILE=/workspace/STRIVE/real_robot/control/<robot>_controller_contract.yaml
+export STRIVE_POLICY_MODE=semantic_snapshot
+export STRIVE_INSTRUCTION='find a book'
+bash scripts/run_sysnav_detection_mapping.sh
+```
+
+The script fails before launch if the lower-stack prerequisites are not
+present. It starts the detector/mapping graph, instruction runtime,
+`SysNavMotionServer`, migrated `localPlanner`, `pathFollower`, and
+`SafetyVelocityMux` as one graph. The default command remains perception and
+dry-run only.
+
+### Task-Level Motion Action
+
+The native SysNav waypoint topic has no goal identity or result contract. The
+overlay therefore provides an optional task-level action server:
+
+```text
+STRIVE RosActionMotionController
+  -> /strive/execute_waypoint [strive_motion_msgs/ExecuteWaypoint]
+  -> SysNavMotionServer
+  -> /way_point [geometry_msgs/PointStamped]
+  -> SysNav localPlanner / pathFollower
+```
+
+Start it only after the native SysNav lower stack has been validated:
+
+```bash
+ros2 launch strive_sysnav_motion sysnav_motion_server.launch.py \
+  waypoint_topic:=/way_point \
+  odom_topic:=/aft_mapped_to_init \
+  path_topic:=/path \
+  hold_topic:=/platform/safe_hold \
+  cancel_topic:=/local_planner/cancel \
+  controller_contract_file:=/workspace/STRIVE/real_robot/control/<robot>_controller_contract.yaml \
+  require_controller_contract:=true
+```
+
+The Action result is the authoritative motion-attempt outcome. It distinguishes
+`REACHED`, `BLOCKED`, `TIMEOUT`, `PREEMPTED`, `SAFETY_STOP`, manual takeover and
+localization loss. It does not declare the natural-language task successful;
+STRIVE's evidence loop and final verifier retain that authority.
+
+The lower stack also exposes an explicit planner status topic:
+
+```text
+/local_planner/status: std_msgs/String
+  waiting_for_sensor
+  tracking
+  no_feasible_path
+  cancelled
+```
+
+`REACHED` is reported only after the configured position tolerance is met and
+the odometry speed remains below `velocity_tolerance_mps` for
+`stable_reach_time_s`. The final `/cmd_vel` owner is `SafetyVelocityMux`; localization
+or registered point-cloud watchdog failure forces `STALE_INPUT` and zero output.
+
+Before connecting a chassis, run the action-level HIL scenarios:
+
+```bash
+bash scripts/ros_humble_container.sh hil
+STRIVE_HIL_SCENARIO=blocked bash scripts/ros_humble_container.sh hil
+```
+
+The HIL node consumes `/way_point` and publishes only simulated odom/path/
+planner-status/safety feedback; it never publishes `/cmd_vel`.
+
+For a lower-planner integration check, use
+`STRIVE_HIL_SCENARIO=native_planner bash scripts/ros_humble_container.sh hil`.
+This starts the migrated SysNav `localPlanner`; the HIL node provides only
+odometry and an obstacle-free registered scan, while `/path` and
+`/local_planner/status` are produced by `localPlanner` itself.
+The HIL output must include `native_path_received=true`. Production startup
+also validates the same controller contract in the motion server and the
+`SafetyVelocityMux`; pass `require_controller_contract:=false` only to an
+offline HIL that has no actuator.
+
+For the complete software lower-motion chain, use
+`STRIVE_HIL_SCENARIO=native_safety bash scripts/ros_humble_container.sh hil`.
+This adds the migrated `pathFollower` and `SafetyVelocityMux`, then observes
+the final `/cmd_vel` output. The HIL process supplies only synthetic odometry,
+registered scan, and autonomy-enable state; it does not own a chassis.
+The native-safety HIL advances its synthetic pose only from the final muxed
+velocity command, and writes a JSON artifact under `STRIVE_HIL_ARTIFACT_DIR`.
+
+With a recorded sensor bag, the stronger lower-stack replay is:
+
+```bash
+export LOWER_BAG_REQUIRED_TOPICS=/aft_mapped_to_init,/cloud_registered
+export LOWER_BAG_RUN_DIRECTORY=/tmp/strive_lower_planner_bag_001
+bash scripts/run_lower_planner_bag_replay.sh /path/to/sensor_bag
+```
+
+The replay starts only `localPlanner` and `lower_bag_probe`, using isolated
+`/strive/replay_way_point` and `/strive/replay_path` topics. It records the bag
+input counts and whether a valid multi-pose path was produced. It does not
+start `pathFollower`, `SafetyVelocityMux`, or any chassis output.
+
+To verify this replay boundary without real hardware data, run
+`bash scripts/ros_humble_container.sh bag-smoke`. It creates a standard
+synthetic rosbag2 containing odometry and registered point-cloud messages and
+then invokes the same replay script. The result is only a serialization and
+planner-consumption smoke, not a real-sensor validation.
+
+`ExecuteWaypoint` also carries an optional `look_at`. This field is disabled by
+default. Enabling it requires an independently validated
+`strive_motion_msgs/action/AlignView` server at `/strive/align_view`; the motion
+server reports `ALIGNING` feedback after positional reach and never treats a
+missing alignment backend as success.
+
+Use the high-level runtime with the Action backend only after the action server
+is present:
+
+```bash
+bash scripts/run_real_robot_instruction_runtime.sh \
+  instruction:="find a book" \
+  policy_mode:=semantic_snapshot \
+  dry_run:=false \
+  lower_controller_enabled:=true \
+  motion_backend:=action \
+  motion_action_name:=/strive/execute_waypoint
+```
+
+`motion_backend:=waypoint` remains the compatibility path for the original
+read-only status provider. Only one backend may own `/way_point` in a running
+graph.

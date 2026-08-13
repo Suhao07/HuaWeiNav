@@ -568,7 +568,8 @@ semantic / exploration planner
   -> geometry_msgs/PointStamped on /way_point
   -> localPlanner selects a collision-aware local path
   -> nav_msgs/Path on /path
-  -> pathFollower tracks path and publishes /cmd_vel
+  -> pathFollower tracks path and publishes /cmd_vel/autonomy
+  -> SafetyVelocityMux arbitrates and publishes the final /cmd_vel
   -> robot moves asynchronously
   -> sensors publish RGB / LiDAR / odom with latency
 ```
@@ -612,7 +613,7 @@ RosWaypointController
   MotionGoal -> /way_point
   poll_status -> /state_estimation + /path + timeout + progress monitor
   hold -> /stop or controller-specific safe hold
-  cancel -> lower-planner cancel topic or hold fallback
+  cancel -> lower-planner cancel topic + safe hold
 ```
 
 上层 planner 只看到 `MotionGoal` 和 `NavigationStatus`，不关心底层是离散
@@ -628,7 +629,8 @@ hold_topic
   可选 std_msgs/Empty 信号，由平台安全节点解释。
 
 cancel_topic
-  可选 std_msgs/Empty 信号；未配置时 cancel() 回退到 hold_topic。
+  可选 std_msgs/Empty 信号；迁移后的 SysNav localPlanner 接收后清理旧目标
+  并发布单点零路径。cancel() 同时发送 hold，确保安全 mux 立即停止输出。
 
 emergency_stop_topic
   可选 std_msgs/Empty 信号；默认不发布。
@@ -685,7 +687,8 @@ send ViewpointGoal
 SysNav 已经把真实机器人底层拆成可复用链路：
 
 ```text
-/way_point -> localPlanner -> /path -> pathFollower -> /cmd_vel / serial
+/way_point -> localPlanner -> /path -> pathFollower -> /cmd_vel/autonomy
+                                                     -> SafetyVelocityMux -> /cmd_vel
 ```
 
 STRIVE 实物模式应先对接这个最小公共接口，而不是复制 SysNav 的整套 planner。
@@ -731,7 +734,7 @@ final verifier 和 view-control state 都可以保持平台无关。
 5. Planner 输出 NavigationIntent。
 6. ROSNavigationBridge 发布 /way_point。
 7. localPlanner 基于点云和地形生成 /path。
-8. pathFollower 生成 /cmd_vel 或串口控制。
+8. pathFollower 生成 `/cmd_vel/autonomy`，再由 SafetyVelocityMux 生成最终 `/cmd_vel`。
 9. 机器人移动产生新 RGB / LiDAR / odom。
 10. 高层根据新证据更新 verifier / ledger / relation edge。
 ```
@@ -1634,14 +1637,15 @@ final verifier。
 /path
   -> path_available、path_pose_count、path_length_remaining
 
-optional planner_status_topic
+planner_status_topic=/local_planner/status
+  -> waiting_for_sensor / tracking / no_feasible_path / cancelled
   -> blocked / timeout / preempted / reached / failed
 
 active MotionGoal.goal_pose
   -> distance、elapsed、progress、RUNNING/REACHED/BLOCKED/TIMEOUT/PREEMPTED
 ```
 
-默认 `REACHED` 判断只使用 xy 和 z 距离：
+默认 `REACHED` 判断使用 xy/z 距离，并要求平台速度进入稳定范围：
 
 ```text
 xy_goal_tolerance_m=0.35
@@ -1654,6 +1658,195 @@ heading 暂不参与判断，因为当前 `/way_point` 是 `geometry_msgs/PointS
 也不替代 SysNav localPlanner/pathFollower。`planner_status_topic` 的状态会按
 `path_stale_timeout_s` 做 freshness gate，避免旧的 blocked/timeout 状态污染
 新的 motion goal。
+
+`/local_planner/status` 是迁移版 localPlanner 的显式状态源。它在每次新点云或
+地形输入完成规划后发布 `tracking` 或 `no_feasible_path`，取消时发布
+`cancelled`，初始化时发布 `waiting_for_sensor`。状态 provider 按 motion goal
+提交时建立代际边界，只消费该 goal 之后产生的状态，避免旧的 blocked 结果结束新目标。
+
+### 12.6 Motion action 与最终速度安全门
+
+生产启动必须保持单一控制所有权：
+
+```text
+pathFollower -> /cmd_vel/autonomy
+manual input -> /cmd_vel/manual
+                       |
+                       v
+              SafetyVelocityMux -> /cmd_vel
+```
+
+`pathFollower` 在 manual mode 下会将自治通道置零，并将手动候选发布到独立
+`/cmd_vel/manual`。手动输入只有在外部批准的 `/platform/manual_takeover=true`
+时才会被 mux 选为最终输出；joystick 本身不能绕过 mux。
+
+`SafetyVelocityMux` 默认从 `HOLD` 启动，且要求 `/aft_mapped_to_init` 与
+`/cloud_registered` 在 `sensor_watchdog_timeout_s` 内持续有数据。定位或点云断流
+时进入 `STALE_INPUT` 并发布零速度。`/platform/estop_active` 为软件锁存信号，
+只有在人工确认并发布 `/platform/estop_reset=true` 且未处于 manual takeover 时
+才清除；硬件急停链路仍独立于该软件状态。
+
+### 12.7 Motion Action HIL
+
+在连接真实底盘之前，可以使用 HIL lower node 验证任务级闭环：
+
+```bash
+bash scripts/ros_humble_container.sh hil
+STRIVE_HIL_SCENARIO=blocked bash scripts/ros_humble_container.sh hil
+STRIVE_HIL_SCENARIO=timeout bash scripts/ros_humble_container.sh hil
+STRIVE_HIL_SCENARIO=cancel bash scripts/ros_humble_container.sh hil
+STRIVE_HIL_SCENARIO=manual bash scripts/ros_humble_container.sh hil
+STRIVE_HIL_SCENARIO=stale bash scripts/ros_humble_container.sh hil
+```
+
+该测试只启动 `SysNavMotionServer` 和反馈模拟节点，不启动
+`localPlanner/pathFollower/SafetyVelocityMux`，也不发布 `/cmd_vel`。模拟节点
+接收 `/way_point`，回传 `/aft_mapped_to_init`、`/path`、
+`/local_planner/status` 和 `/platform/safety_state`，因此可验证 Action 的
+`REACHED/BLOCKED/TIMEOUT/PREEMPTED/MANUAL_TAKEOVER/SAFETY_STOP` 终态。
+
+视角对齐不由 MotionServer 内置一个对象规则实现。若高层 goal 携带
+`look_at`，必须显式启用 `allow_look_at:=true`，并提供外部
+`/strive/align_view` (`strive_motion_msgs/action/AlignView`) action server。
+MotionServer 先等待位置 `REACHED`，再进入 `ALIGNING`，最后把对齐结果写入
+`ExecuteWaypoint` result；对齐服务不存在时返回
+`view_alignment_unavailable`，不会伪造成功。该接口可由云台控制器、底盘原地旋转
+控制器或其它经过平台验收的执行器实现。
+
+六个 HIL 场景的实测结果为：
+
+```text
+reached -> REACHED / goal_reached
+blocked -> BLOCKED / no_feasible_path
+timeout -> TIMEOUT / goal_timeout
+cancel  -> PREEMPTED / cancelled
+manual  -> MANUAL_TAKEOVER / manual_takeover
+stale   -> SAFETY_STOP / command_stale
+```
+
+上述结果是 ROS overlay 的 lower-feedback HIL 验收，不等价于真实底盘验收；
+真实系统仍需验证 `/way_point` 接收、底盘运动、急停、人工接管和速度限制。
+
+还可以运行 native planner HIL：
+
+```bash
+STRIVE_HIL_SCENARIO=native_planner bash scripts/ros_humble_container.sh hil
+```
+
+该场景启动迁移后的 `localPlanner`，由 HIL 只发布 odometry 和无障碍
+`/hil/registered_scan`。`/path` 与 `/local_planner/status` 均来自真实迁移算法，
+HIL 不发布这两个 topic，也不启动 `pathFollower` 或 `/cmd_vel`。
+日志中的 `native_path_received=true` 是该场景的必要证据，表示 `/path` 确实由迁移后的
+`localPlanner` 产生；它不是 HIL 节点伪造的反馈。
+
+还可以运行完整的 lower-motion HIL：
+
+```bash
+STRIVE_HIL_SCENARIO=native_safety bash scripts/ros_humble_container.sh hil
+```
+
+该场景同时启动迁移后的 `localPlanner`、`pathFollower`、
+`SafetyVelocityMux` 和 `SysNavMotionServer`。HIL 只发布 odometry、无障碍
+registered scan 和 autonomy-enable 信号，并订阅最终 `/cmd_vel`。日志必须同时
+包含 `native_path_received=true` 和非零 final-command 计数，说明路径由迁移后的
+planner 产生、候选速度经 path follower 和安全 mux 后才进入最终控制 topic。
+该 HIL 仍不连接真实底盘，不能替代硬件急停和低速实测。默认证据写入
+`logs/real_robot_hil/strive_motion_hil_native_safety.json`；也可通过
+`STRIVE_HIL_ARTIFACT_DIR` 指定目录。
+
+如果已有真实传感器 rosbag，可进一步验证迁移 planner 对录制输入的消费：
+
+```bash
+export LOWER_BAG_REQUIRED_TOPICS=/aft_mapped_to_init,/cloud_registered
+export LOWER_BAG_RUN_DIRECTORY=/tmp/strive_lower_planner_bag_001
+bash scripts/run_lower_planner_bag_replay.sh /path/to/sensor_bag
+```
+
+该脚本只启动迁移后的 `localPlanner` 和 `lower_bag_probe`。probe 发布隔离的
+`/strive/replay_way_point`，监听隔离的 `/strive/replay_path`，并在
+`lower_planner_probe.json` 中记录输入样本数、planner status 和有效多点 path。
+它不启动 `pathFollower`、`SafetyVelocityMux` 或底盘驱动，因此不会产生
+`/cmd_vel`。没有真实 rosbag 时，只能报告脚本和容器构建通过，不能把 native HIL
+结果写成 bag replay 验收。
+
+为验证 replay 工具本身，可运行合成 rosbag smoke：
+
+```bash
+bash scripts/ros_humble_container.sh bag-smoke
+```
+
+该命令生成标准 rosbag2 目录，写入配对的 `/aft_mapped_to_init` 和
+`/cloud_registered` 消息，再调用同一个 `run_lower_planner_bag_replay.sh`。
+默认结果位于带有运行时间戳的
+`logs/real_robot_bag_smoke_<run_id>/replay/lower_planner_probe.json`，也可通过
+`LOWER_BAG_SMOKE_DIRECTORY` 固定输出目录。它只能
+证明序列化、topic 检查、回放和迁移 planner 消费链正确，不能替代真实传感器
+rosbag 验收。
+
+### 12.7.1 生产控制契约与 SafetyVelocityMux
+
+真实底盘启动前，必须准备一份经过平台负责人确认的
+`real_robot/control/<robot>_controller_contract.yaml`，并通过
+`CONTROL_CONTRACT_FILE` 传入容器。模板是故意不可用于实机的：
+
+```yaml
+controller_contract:
+  approval_status: approved
+  allow_strive_waypoint_handoff: true
+  cmd_vel_direct_publish: false
+  final_cmd_vel_owner: safety_velocity_mux
+  sensor_watchdog_required: true
+```
+
+运行时会在三个边界拒绝不一致配置：
+
+```text
+instruction runtime
+  -> 校验 waypoint topic/frame/action 与批准契约
+SysNavMotionServer
+  -> 校验 ExecuteWaypoint 与 /way_point 接口
+SafetyVelocityMux
+  -> 校验 /cmd_vel owner、速度/加速度/watchdog、人工接管和急停 topic
+```
+
+`SafetyVelocityMux` 只接受 `pathFollower` 发布的
+`/cmd_vel/autonomy` 和人工通道 `/cmd_vel/manual`，并负责最终限速、加速度约束、
+传感器 freshness、软件急停和人工接管。它是唯一的 `/cmd_vel` publisher。HIL 使用
+`require_controller_contract:=false` 是因为没有物理执行器；这不是生产配置。
+
+生产 lower stack 的启动示例：
+
+```bash
+export CONTROL_CONTRACT_FILE=/workspace/STRIVE/real_robot/control/<robot>_controller_contract.yaml
+ros2 launch strive_sysnav_motion sysnav_lower_stack.launch.py \
+  controller_contract_file:="${CONTROL_CONTRACT_FILE}" \
+  require_controller_contract:=true \
+  start_safety_mux:=true
+```
+
+### 12.7.2 Bag replay 的边界
+
+bag replay 只验收录制数据到 STRIVE 高层 runtime 的输入和产物，不启动 lower
+controller，也不证明真实底盘执行成功。可用 `BAG_REQUIRED_TOPICS` 在播放前检查
+录包是否包含所需 topic，并将 `bag_info.txt`、`replay_config.txt` 和
+`runtime_decisions.jsonl` 写入独立 run directory：
+
+```bash
+export BAG_REQUIRED_TOPICS=/object_nodes_list,/room_nodes_list,/aft_mapped_to_init,/camera/image
+export BAG_REQUIRE_RUNTIME_DECISION=1
+export STRIVE_RUN_DIRECTORY=/tmp/strive_real_robot_bag_replay_001
+bash scripts/run_real_robot_bag_replay.sh /path/to/bag \
+  instruction:="find a book" \
+  dataset_target:=book \
+  policy_mode:=semantic_snapshot \
+  dry_run:=true \
+  run_directory:="${STRIVE_RUN_DIRECTORY}"
+```
+
+`/way_point -> /path` 的验收不由这个脚本假设完成，而由
+`STRIVE_HIL_SCENARIO=native_planner bash scripts/ros_humble_container.sh hil`
+验证。这样可以区分：bag 是否提供了完整感知输入、runtime 是否生成了决策，以及
+迁移后的 SysNav planner 是否真的消费 waypoint 并发布 path。
 
 ### 12.5 本仓库内 ROS overlay
 
@@ -1670,6 +1863,46 @@ real_robot/ros2_ws/src/strive_sysnav_bringup
 ```bash
 bash scripts/build_real_robot_ros_ws.sh
 ```
+
+### 12.5.1 完整聚合启动入口
+
+`strive_real_robot_stack.launch.py` 将 detector、semantic mapping、STRIVE
+instruction runtime 和 SysNav lower stack 放进同一个 ROS graph，但 lower stack
+默认关闭：
+
+```bash
+# 默认安全模式：启动感知和高层 runtime，dry-run，不发布运动目标
+bash scripts/run_sysnav_detection_mapping.sh
+```
+
+只有在真实平台 contract 已由负责人批准后，才允许启动完整运动链：
+
+```bash
+export START_LOWER_STACK=1
+export STRIVE_DRY_RUN=false
+export STRIVE_LOWER_CONTROLLER_ENABLED=true
+export STRIVE_MOTION_BACKEND=action
+export CONTROL_CONTRACT_FILE=/workspace/STRIVE/real_robot/control/<robot>_controller_contract.yaml
+export STRIVE_INSTRUCTION='find a book'
+export STRIVE_POLICY_MODE=semantic_snapshot
+bash scripts/run_sysnav_detection_mapping.sh
+```
+
+该入口内部启动：
+
+```text
+detector_node + semantic_mapping_node
+  -> strive_instruction_runtime
+  -> RosActionMotionController
+  -> SysNavMotionServer
+  -> localPlanner -> pathFollower
+  -> SafetyVelocityMux -> /cmd_vel
+```
+
+`START_LOWER_STACK=1` 会在启动前拒绝以下不完整配置：dry-run 仍开启、lower
+controller 未启用、contract 文件不存在或显式选择非 `action` backend。该入口只
+证明 ROS graph 的配置和启动逻辑；真实底盘接入仍需要平台级 HIL、架空轮和低速
+限定区域验收。
 
 运行：
 
@@ -1707,10 +1940,12 @@ bash scripts/run_sysnav_detection_mapping.sh \
 ```
 
 其中 `/room_nodes_list` 仍取决于是否同时启动 room segmentation / local planner
-相关节点。第一版 overlay 已保证 detector 和 semantic mapping 可在 STRIVE
-workspace 内构建；完整 SysNav C++ local planner 后续应作为单独迁移阶段处理。
+相关节点。当前 workspace 已包含迁移后的 SysNav C++ local planner、terrain
+analysis、path follower 和 STRIVE motion bridge；它们已经通过容器内构建与
+合成 HIL 验证。真实 rosbag 回放和真实底盘执行仍属于后续验收，不应由构建
+成功替代。
 
-### 12.5.1 Bag replay runtime
+### 12.5.2 Bag replay runtime
 
 离线 bag replay 不启动 detector/mapping，而是直接回放已经录制好的
 STRIVE-facing topic：
@@ -1955,11 +2190,23 @@ docs/Zhu et al. - 2025 - STRIVE Structured Representation Integrating VLM Reason
 bash scripts/check_real_robot_acceptance.sh
 ```
 
-当前 2026-06-25 本地结果：
+当前本地结果：
 
 ```text
-54 passed
+86 passed
 ```
+
+ROS Humble 容器内已验证：
+
+```text
+native_planner -> native_path_received=true, native_path_messages=8
+native_safety  -> native_path_received=true, final_cmd_messages=154,
+                  nonzero_final_cmd_messages=152, max_linear_speed=0.30 m/s,
+                  outcome=REACHED
+```
+
+HIL 证据写入 `STRIVE_HIL_ARTIFACT_DIR/strive_motion_hil_<scenario>.json`。这些结果证明迁移后的
+软件链路和安全仲裁可运行，不代表真实底盘已接管。
 
 覆盖范围：
 

@@ -17,6 +17,27 @@
 - [x] 增加宿主侧 Livox + Point-LIO 启动 helper：`scripts/start_orin_lio_for_strive.sh`。
 - [x] 增加 Orin bounded smoke：`scripts/smoke_real_robot_orin.sh`。
 - [x] 默认阻塞底层控制器：`BLOCK_LOWER_CONTROLLER=1`、`ENABLE_LOWER_CONTROLLER=0`，不主动发布 `/cmd_vel`。
+- [x] 新增平台无关 `MotionReasonCode`、安全速度策略和 ROS2 `ExecuteWaypoint` action contract。
+- [x] 新增 `strive_sysnav_motion/SysNavMotionServer`：为原生 `/way_point` 增加 goal 生命周期、取消、反馈和结果原因码。
+- [x] 增加可插拔 `AlignView` action：位置到达后进入 `ALIGNING`，视角执行器缺失时显式返回 `view_alignment_unavailable`。
+- [x] 新增 `RosActionMotionController` backend；与原有 `RosWaypointController` 可插拔且不同时拥有 `/way_point`。
+- [x] 新增安全速度策略单测，覆盖 hold、限速、加速度、watchdog 和人工接管。
+- [x] 迁移 SysNav localPlanner 的显式状态 topic：`waiting_for_sensor`、`tracking`、
+  `no_feasible_path`、`cancelled`，并按 motion goal 代际消费状态。
+- [x] 将 pathFollower 的 manual mode 与 autonomy candidate 分流到
+  `/cmd_vel/manual` 和 `/cmd_vel/autonomy`，由唯一 SafetyVelocityMux 选择最终输出。
+- [x] 增加 odometry / registered point-cloud freshness gate、软件 estop latch 和
+  explicit estop reset topic。
+- [x] 增加统一的 robot-specific controller contract，并由高层 runtime、
+  `SysNavMotionServer` 和 `SafetyVelocityMux` 三处校验。
+- [x] 增加 native SysNav `localPlanner` HIL，确认 `/way_point` 由迁移 planner
+  生成 `/path`，而不是由 HIL 伪造。
+- [x] 增加 lower-stack rosbag replay probe：在隔离 topic 上验证录制 odom/点云
+  输入能被迁移 `localPlanner` 消费并产生有效多点 path，不启动任何速度控制器。
+- [x] 增加 guarded aggregate bringup：默认 dry-run；经 contract、backend 和
+  lower-controller 门禁后才启动完整 Action-backed lower stack。
+- [x] 增加完整 lower-motion HIL：验证迁移 localPlanner、pathFollower、
+  SafetyVelocityMux 和 MotionServer 的软件闭环，并写入结构化 HIL artifact。
 
 ## 2. Live ROS Runtime
 
@@ -46,9 +67,12 @@ bash scripts/run_real_robot_instruction_runtime.sh \
 - [x] 订阅 path/local planner 状态，记录是否存在可执行路径。
 - [x] 实现 timeout 判断。
 - [x] 实现 no-progress 判断：连续一段时间距离无下降时返回 `BLOCKED` 或 `TIMEOUT`。
+- [x] 增加速度稳定判定：进入位置阈值后须在 `stable_reach_time_s` 内保持低于
+  `velocity_tolerance_mps`，再报告 `REACHED`。
 - [x] 明确 `REACHED` 阈值：xy tolerance、z tolerance、heading 是否参与判断。
 - [x] 将 `NavigationStatus.metadata` 写入 distance、elapsed、path length、progress samples。
 - [x] 增加 fake odom/path 单元测试，覆盖 `RUNNING/REACHED/BLOCKED/TIMEOUT/PREEMPTED`。
+- [x] 增加 ROS2 lower-feedback HIL，覆盖 `REACHED/BLOCKED/TIMEOUT/PREEMPTED/MANUAL_TAKEOVER/SAFETY_STOP`。
 
 当前默认阈值：
 
@@ -59,12 +83,21 @@ navigation_timeout_s=60.0
 no_progress_timeout_s=12.0
 min_progress_delta_m=0.05
 path_stale_timeout_s=5.0
+velocity_tolerance_mps=0.08
+stable_reach_time_s=0.2
 heading_tolerance_rad=None
 ```
 
 heading 暂不参与 `REACHED` 判断，因为当前 SysNav `/way_point` 接口只消费
 `geometry_msgs/PointStamped`，不携带目标朝向。z 阈值默认较宽，用于兼容
-SysNav waypoint z offset 与真实 odometry z 近似为 0 的情况。
+ SysNav waypoint z offset 与真实 odometry z 近似为 0 的情况。
+
+任务级 Action 已支持每个 goal 的 `xy_tolerance_m`、`yaw_tolerance_rad`、
+`timeout_s`，但只有在 lower planner 能提供相同坐标系下的可靠状态时才应启用
+heading 对齐。Action server 采用单活动 goal 策略，避免 SysNav 原生 topic 被并发
+目标覆盖。
+- [x] 对 goal frame 与 odometry frame 做显式一致性校验；未接入 TF adapter 时拒绝
+  直接计算跨 frame 距离或发布 waypoint。
 
 ## 4. Observation Cache And Evidence
 
@@ -164,7 +197,8 @@ terminal / anchor / relation / verifier 状态机。
 ## 6. Safety Boundary
 
 - [x] 为 `RosWaypointController.hold()` 接入平台安全 hold/stop topic。
-- [x] 为 `cancel()` 接入 lower planner cancel 或 stop 机制。
+- [x] 为 `cancel()` 接入 lower planner cancel 和安全 hold 双层机制；迁移后的
+  `localPlanner` 会清空旧目标并发布单点零路径。
 - [x] 增加 emergency stop 参数，默认不自动覆盖底层安全系统。
 - [x] 确认 STRIVE 永远不直接发布 `/cmd_vel`。
 - [x] 记录 lower controller 是否启用；未启用时只能 dry-run 或发布到测试 topic。
@@ -175,10 +209,21 @@ terminal / anchor / relation / verifier 状态机。
 RosWaypointController
   MotionGoal -> /way_point
   hold() -> optional std_msgs/Empty on hold_topic
-  cancel() -> optional std_msgs/Empty on cancel_topic
-           -> fallback std_msgs/Empty on hold_topic
+  cancel() -> std_msgs/Empty on cancel_topic (planner clears old goal)
+           -> std_msgs/Empty on hold_topic (mux disables output)
   emergency_stop_topic 只有 allow_emergency_stop_publish=true 时才发布
 ```
+
+真实底盘接入仍需平台侧验收：
+
+- [ ] 确认底盘控制器是 `/way_point` 的唯一真实接收者，或提供经过验证的 topic bridge。
+- [ ] 用真实 odometry/path/planner status 验证 `ExecuteWaypoint` 到达、阻塞、超时和取消。
+- [ ] 接通 `/cmd_vel` 下游前完成速度、角速度、加速度限制的实测与急停测试。
+- [ ] 若使用 `look_at`，提供并验收 `/strive/align_view` action server。
+
+`SafetyVelocityPolicy` 已接入 ROS2 `SafetyVelocityMux`。mux 是当前唯一的
+`/cmd_vel` publisher，默认从 `HOLD` 启动，并发布 `/platform/safety_state`。
+硬件急停、人工接管、底盘驱动的最终 contract 仍必须在机器人平台上独立确认。
 
 安全边界：
 
@@ -213,6 +258,7 @@ runtime_safety.allow_emergency_stop_publish
 - [x] 更新 `scripts/run_sysnav_detection_mapping.sh`，明确高层 node 是否一起启动。
 - [x] 新增 `scripts/run_real_robot_instruction_runtime.sh`，只启动 STRIVE 高层 runtime。
 - [x] 增加 bag replay 入口，读取录制的 object/room/odom/image topic。
+- [x] bag replay 默认订阅 `/local_planner/status`，并保留 `dry_run=true`，不触发真实底盘。
 - [x] 更新 Docker run 环境变量：instruction、topic remap、model paths、LLM provider、prior map path。
 - [x] 确保权重、bag、缓存和 build/install/log 产物不进入代码导出。
 
@@ -257,6 +303,8 @@ SYSNAV_DETECTOR_MODEL_PATH / SYSNAV_SAM2_CHECKPOINT / SYSNAV_CLIP_VIT_B32_PATH
 - [x] Orin bounded smoke 脚本已具备，不发布 `/way_point` 或 `/cmd_vel`。
 - [x] Orin LIO topic gate 已记录：`/cloud_registered`、`/aft_mapped_to_init`。
 - [x] Bag replay：能够从 `/object_nodes_list` 生成 `SemanticMapSnapshot`。
+- [x] Bag replay：可选检查 required topics，并保存 bag metadata、replay config
+  和独立 runtime decision 产物。
 - [x] Dry-run：能够生成 `NavigationIntent`，不发布 waypoint。
 - [x] Waypoint smoke：发布一个低风险 `/way_point`，能收到 `RUNNING/REACHED` 状态。
 - [x] Evidence smoke：到达后能生成 `ViewEvidence`，并保存 verifier payload。
@@ -271,8 +319,17 @@ bash scripts/check_real_robot_acceptance.sh
 当前本地结果：
 
 ```text
-54 passed
+86 passed
 ```
+
+当前仍未完成的实机验收包括：
+
+- [ ] 使用真实底盘批准的 contract 启动 lower stack，并确认唯一 `/waypoint` 接收者。
+- [ ] 用真实 odometry、path/status 和底盘反馈验收 `REACHED/BLOCKED/TIMEOUT/CANCEL`。
+- [ ] 在真实底盘上实测速度、角速度、加速度限制，以及软件/硬件急停和人工接管。
+- [ ] 采集真实 rosbag，运行 `BAG_REQUIRED_TOPICS` 检查并复核 runtime decision 产物。
+- [ ] 采集包含 `/aft_mapped_to_init` 与 `/cloud_registered` 的真实传感器 bag，
+  运行 `run_lower_planner_bag_replay.sh` 并复核 `lower_planner_probe.json`。
 
 覆盖范围：
 
