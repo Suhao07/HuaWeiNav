@@ -3,6 +3,7 @@ import json
 import os
 import re
 import sys
+import time
 from types import SimpleNamespace
 from typing import Any, get_origin
 
@@ -138,10 +139,32 @@ def _fallback_payload(response_format) -> dict[str, Any]:
     # 仅用于 smoke 测试：LLM 离线或返回空内容时给出保守默认值，
     # 让 Habitat/视觉/建图主链路能继续验证。
     payload = {}
-    for name, field in response_format.model_fields.items():
-        value = _fallback_scalar_for_name(name, field.annotation)
+    fields = getattr(response_format, "model_fields", None)
+    if fields is None:
+        fields = getattr(response_format, "__fields__", {})
+    if not fields:
+        annotations = getattr(response_format, "__annotations__", {})
+        for name, annotation in annotations.items():
+            value = _fallback_scalar_for_name(name, annotation)
+            payload[name] = [] if value is None else value
+        return payload
+    for name, field in fields.items():
+        annotation = getattr(field, "annotation", None) or getattr(field, "outer_type_", str)
+        value = _fallback_scalar_for_name(name, annotation)
         payload[name] = [] if value is None else value
     return payload
+
+
+def _validate_model(response_format, payload: dict[str, Any]):
+    """Validate a structured response across Pydantic v1 and v2."""
+
+    validator = getattr(response_format, "model_validate", None)
+    if validator is not None:
+        return validator(payload)
+    parser = getattr(response_format, "parse_obj", None)
+    if parser is not None:
+        return parser(payload)
+    return response_format(**payload)
 
 
 class _CogNavParsedChat:
@@ -158,7 +181,7 @@ class _CogNavParsedChat:
         # CogNav LLMClient 不原生支持 OpenAI beta.parse。
         # 因此把 Pydantic schema 注入 system prompt，再把返回 JSON 校验回同一 schema。
         if os.getenv("LLM_OFFLINE", "0") in ("1", "true", "True"):
-            parsed = response_format.model_validate(_fallback_payload(response_format))
+            parsed = _validate_model(response_format, _fallback_payload(response_format))
             return SimpleNamespace(
                 choices=[SimpleNamespace(message=SimpleNamespace(parsed=parsed, content=""))]
             )
@@ -181,6 +204,7 @@ class _CogNavParsedChat:
         if self._client is None:
             raise RuntimeError("CogNav LLM client is unavailable; use LLM_OFFLINE=1 or --vlm ark/openai/gemini")
 
+        started = time.perf_counter()
         completion = self._client.chat_completion(
             messages=normalized,
             model=model,
@@ -195,6 +219,7 @@ class _CogNavParsedChat:
             metadata={
                 "model": model,
                 "response_format": getattr(response_format, "__name__", str(response_format)),
+                "latency_ms": (time.perf_counter() - started) * 1000.0,
             },
         )
         try:
@@ -209,7 +234,7 @@ class _CogNavParsedChat:
                 f"Raw response prefix={str(content)[:300]!r}"
             )
             parsed_payload = _fallback_payload(response_format)
-        parsed = response_format.model_validate(parsed_payload)
+        parsed = _validate_model(response_format, parsed_payload)
         return SimpleNamespace(
             choices=[SimpleNamespace(message=SimpleNamespace(parsed=parsed, content=content))]
         )
@@ -236,12 +261,20 @@ class _TracingParsedCompletions:
 
     def parse(self, *args, **kwargs):
         trace_label = kwargs.pop("trace_label", "parse")
+        started = time.perf_counter()
         completion = self._inner.parse(*args, **kwargs)
         try:
             content = completion.choices[0].message.content
         except Exception:
             content = ""
-        record_call(str(trace_label), raw_response=str(content or ""), metadata={"client": "openai_compatible"})
+        record_call(
+            str(trace_label),
+            raw_response=str(content or ""),
+            metadata={
+                "client": "openai_compatible",
+                "latency_ms": (time.perf_counter() - started) * 1000.0,
+            },
+        )
         return completion
 
 
