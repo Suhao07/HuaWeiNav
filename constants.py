@@ -5,8 +5,8 @@ from cv_utils.object_list.nyu_categories import categories
 DETECT_OBJECTS = [cat['name'].lower() for cat in categories]
 INTEREST_OBJECTS = ['bed', 'chair', 'toilet', 'potted_plant', 'tv_monitor', 'sofa']
 
-# 默认使用 CogNav_ObjNav 的 LLMClient 风格配置；Gemini 仅作为显式后端保留。
-DEFAULT_VLM = os.getenv("STRIVE_LLM_CLIENT", "cognav").lower()
+# 默认使用 OpenAI-compatible Ark 配置；旧 CogNav LLMClient 仅作为显式兼容后端保留。
+DEFAULT_VLM = (os.getenv("STRIVE_LLM_CLIENT") or os.getenv("LLM_PROVIDER") or "ark").lower()
 COGNAV_MODEL_NAME = (
     os.getenv("VLM_MODEL")
     or os.getenv("LLM_MODEL")

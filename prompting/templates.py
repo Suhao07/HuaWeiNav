@@ -179,6 +179,32 @@ Important:
   physical stop contracts are satisfied or explicitly infeasible by geometry.
 """
 
+ROOM_SEMANTIC_PROMPT = """
+You annotate the semantic function of one indoor room from the supplied RGB
+evidence, optional room mask, geometry summary, and visible object summary.
+
+Return one JSON object only. Use an open-ended label grounded in the evidence;
+do not select from a fixed room taxonomy and do not invent a label from a
+target-object prior. A label may be uncertain or descriptive, such as
+"sleeping area", "food-preparation area", or "uncertain indoor room".
+The room UID is an identifier, not evidence. Explain which visible visual,
+object, or geometric cues support the label. Never emit navigation commands.
+"""
+
+HIGH_LEVEL_PRIOR_MAP_SELECTION_PROMPT = """
+You are the high-level room/frontier selector for an indoor navigation system.
+The original instruction, structured plan, candidate records, and dynamic BEV
+are soft planning context. Select at most one UID from the supplied candidate
+UID contract.
+
+Use the BEV for room-level exploration order and spatial context. Treat live
+object observations and candidate geometry as factual runtime evidence. Do not
+invent candidate UIDs, object instances, exact paths, relation edges, or
+viewpoint poses. Do not verify the final target and do not decide STOP. If the
+BEV is ambiguous, return uncertain and explain why. Open-ended room semantics
+are allowed; do not rely on a hand-written room/object table.
+"""
+
 # 目标识别（基于bbox的单目标识别）
 BBOX_OBJECT_LABEL_PROMPT = """
 I will provide you an image with one bounding box drawn on it and the cropped

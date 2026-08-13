@@ -11,12 +11,12 @@ Example:
     --scene_id wcojb4TFT35 \
     --object_category tv \
     --save_dir hm3d_wcojb4TFT35_tv_real_llm \
-    --vlm cognav
+    --vlm ark
 
 Options:
   --episode_rank N      Use the N-th matched episode in this scene/object pair. Default: 0.
   --save_dir NAME      Output directory under logs/. Default: hm3d_${scene}_${object}.
-  --vlm NAME           VLM/LLM backend passed to benchmark. Default: cognav.
+  --vlm NAME           VLM/LLM backend passed to benchmark. Default: ark.
   --max_steps N        Optional cap for quick debugging. Default benchmark cap is 500.
   -h, --help           Show this help.
   ...                  Any remaining args are forwarded to objnav_benchmark_with_process_obs.py.
@@ -27,7 +27,7 @@ SCENE_ID=""
 OBJECT_CATEGORY=""
 EPISODE_RANK="0"
 SAVE_DIR=""
-VLM="cognav"
+VLM="ark"
 EXTRA_ARGS=()
 
 while [ "$#" -gt 0 ]; do

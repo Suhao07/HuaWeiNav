@@ -1,7 +1,7 @@
-ARG COGNAV_BASE_IMAGE=cognav-vln:1.0
-FROM ${COGNAV_BASE_IMAGE}
+ARG BASE_IMAGE=habitat-hm3d:local
+FROM ${BASE_IMAGE}
 
-ARG CONDA_ENV_NAME=cognav
+ARG CONDA_ENV_NAME=strive
 ENV CONDA_ENV_NAME=${CONDA_ENV_NAME}
 ENV PATH=/opt/conda/envs/${CONDA_ENV_NAME}/bin:/opt/conda/bin:${PATH}
 ENV GROUNDING_DINO_PATH=/opt/mmdetection

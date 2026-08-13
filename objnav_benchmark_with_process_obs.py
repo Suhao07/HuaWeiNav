@@ -21,6 +21,8 @@ from llm_utils.lvlm_call_tracker import counts_compact, reset_counts, set_trace_
 from mapper_with_process_obs import Instruct_Mapper
 from mapping_utils.transform import habitat_camera_intrinsic
 from objnav_agent_with_process_obs import HM3D_Objnav_Agent
+from prior_map.evaluation import prior_map_metrics_fields, prior_map_metrics_summary
+from prior_map.simulation import build_prior_map_simulation_runtime, configure_mapper_prior_map
 
 os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 os.environ["MAGNUM_LOG"] = "quiet"
@@ -128,11 +130,24 @@ def get_args():
     parser.add_argument("--no_gpt_seg", default=True, action="store_false")
     parser.add_argument("--relocate", default=False, action="store_true")
     parser.add_argument("--no_gpt_relocate", default=False, action="store_true")
-    parser.add_argument("--vlm", type=str, default="cognav")
+    parser.add_argument("--vlm", type=str, default=DEFAULT_VLM)
     parser.add_argument("--custom_instruction", type=str, default="")
     parser.add_argument("--enable_instruction_adapter", default=False, action="store_true")
     parser.add_argument("--instruction_adapter_backend", type=str, default="llm")
     parser.add_argument("--instruction_adapter_strict_classes", default=False, action="store_true")
+    parser.add_argument("--enable_prior_map", default=False, action="store_true")
+    parser.add_argument("--prior_map_path", type=str, default="")
+    parser.add_argument("--prior_map_source", type=str, default="auto")
+    parser.add_argument("--prior_map_alignment", type=str, default="identity")
+    parser.add_argument(
+        "--enable_prior_map_vlm",
+        default=False,
+        action="store_true",
+        help="Send dynamic prior-map BEV to the optional high-level room selector.",
+    )
+    parser.add_argument("--prior_map_vlm_interval", type=int, default=10)
+    parser.add_argument("--room_semantic_interval", type=int, default=10)
+    parser.add_argument("--enable_room_semantics", default=False, action="store_true")
     return parser.parse_known_args()[0]
 
 
@@ -207,6 +222,13 @@ if __name__ == "__main__":
                 "run_id": run_id,
                 "save_dir": args.save_dir,
                 "started_at_local": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "prior_map": {
+                    "enabled": bool(args.enable_prior_map),
+                    "path": args.prior_map_path,
+                    "source": args.prior_map_source,
+                    "alignment": args.prior_map_alignment,
+                    "authority": "ranking_only",
+                },
             },
             f,
             ensure_ascii=False,
@@ -253,6 +275,15 @@ if __name__ == "__main__":
         strict_available_classes=args.instruction_adapter_strict_classes,
         vlm=args.vlm,
     )
+    prior_map_runtime = build_prior_map_simulation_runtime(args, args.save_dir)
+    configure_mapper_prior_map(habitat_mapper, prior_map_runtime)
+    if prior_map_runtime is not None:
+        logger.info(
+            "Prior map enabled: scene={}, source={}, alignment={}",
+            prior_map_runtime.base_map.scene_id,
+            prior_map_runtime.base_map.source_format,
+            prior_map_runtime.alignment.diagnostics_payload(),
+        )
 
     start_idx = args.start_episode
     if hasattr(habitat_agent.env.episode_iterator, "set_next_episode_by_index"):
@@ -268,6 +299,8 @@ if __name__ == "__main__":
         _set_next_episode_by_index(habitat_agent.env, i)
         habitat_agent.reset(i)
         episode_dir = os.path.join(args.save_dir, f"episode-{i}")
+        if prior_map_runtime is not None:
+            prior_map_runtime.begin_episode(episode_dir, i)
         reset_counts()
         set_trace_dir(os.path.join(episode_dir, "lvlm_calls"))
 
@@ -320,6 +353,11 @@ if __name__ == "__main__":
             flag = habitat_agent.step_mod(idx=i)
 
         habitat_agent.save_trajectory(f"./{args.save_dir}/episode-{i}/")
+        prior_map_summary = (
+            prior_map_runtime.metrics_summary()
+            if prior_map_runtime is not None
+            else prior_map_metrics_summary(enabled=False)
+        )
         evaluation_metrics.append({
             # success/spl 是 Habitat 原始目标类别指标；instruction_success
             # 是自然语言指令 verifier 的终止结果，两者不能混读。
@@ -349,6 +387,7 @@ if __name__ == "__main__":
             'accepted_relation_edge': json.dumps(habitat_agent.accepted_relation_edge, ensure_ascii=False, sort_keys=True),
             'accepted_distance_to_target': habitat_agent.accepted_distance_to_target,
             'accepted_distance_source': habitat_agent.accepted_distance_source,
+            **prior_map_metrics_fields(prior_map_summary),
             'lvlm_call_count_by_type': counts_compact(),
             # 兼容前期文档/脚本中的拼写；规范字段是 lvlm_call_count_by_type。
             'lvml_call_count_by_type': counts_compact(),

@@ -1,0 +1,147 @@
+digraph PriorMapFloorPlanBuilderFlow {
+  graph [
+    rankdir=LR,
+    bgcolor="white",
+    pad="0.30",
+    nodesep="0.55",
+    ranksep="0.70",
+    splines=ortho,
+    fontname="Noto Sans CJK SC",
+    label="HM3D Ground-Truth FloorPlan-Style Prior Map Builder",
+    labelloc=t,
+    fontsize=24
+  ];
+
+  node [
+    shape=box,
+    style="rounded,filled",
+    fontname="Noto Sans CJK SC",
+    fontsize=14,
+    margin="0.14,0.10",
+    color="#4b5563",
+    penwidth=1.4,
+    fillcolor="#f8fafc"
+  ];
+
+  edge [
+    fontname="Noto Sans CJK SC",
+    fontsize=12,
+    color="#475569",
+    penwidth=1.4,
+    arrowsize=0.8
+  ];
+
+  semantic_scene [
+    label="Habitat semantic_scene\nregions + objects\n只提供语义/类别/AABB/父子关系",
+    fillcolor="#eef2ff",
+    color="#4f46e5"
+  ];
+  navmesh [
+    label="sim.pathfinder / navmesh\n可通行空间 + geodesic distance\n坐标: habitat_world (x,z)",
+    fillcolor="#ecfeff",
+    color="#0891b2"
+  ];
+
+  aabb_path [
+    label="当前粗粒度路径\nregion AABB ∩ traversable grid",
+    fillcolor="#fff7ed",
+    color="#f97316"
+  ];
+  rough_prior [
+    label="HM3D semantic-scene\ngeometric cue prior\n可用于 ranking，但不像 FloorPlan",
+    fillcolor="#fffbeb",
+    color="#d97706"
+  ];
+
+  occupancy [
+    label="全局 topdown occupancy raster\nfree / obstacle / unknown\n从 navmesh 采样，不从 episode goal 泄漏",
+    fillcolor="#ecfdf5",
+    color="#059669"
+  ];
+  seeds [
+    label="room seeds / labels\nsemantic region 只做 seed 和命名\n不直接当房间轮廓",
+    fillcolor="#f0fdf4",
+    color="#16a34a"
+  ];
+  segmentation [
+    label="room segmentation on occupancy\nconnected free-space components\n按 seed、门洞、连通性划分",
+    fillcolor="#f0fdf4",
+    color="#16a34a"
+  ];
+  contours [
+    label="contour extraction\n从 room mask 提取 boundary_xy\n得到真实可视轮廓",
+    fillcolor="#f0fdf4",
+    color="#16a34a"
+  ];
+  topology [
+    label="topology construction\nroom-room: door/contact/geodesic\nroom-object: containment / nav-snap",
+    fillcolor="#f0fdf4",
+    color="#16a34a"
+  ];
+  canonical_map [
+    label="canonical PriorMapData\nrooms: contour boundary_xy\nobjects: position_xyz + parent_room\ntopology + metadata",
+    fillcolor="#f5f3ff",
+    color="#7c3aed"
+  ];
+  query [
+    label="PriorMapQueryService\n只改变 room/frontier/candidate 排序\n不能生成 MotionGoal",
+    fillcolor="#fdf2f8",
+    color="#db2777"
+  ];
+  visualizer [
+    label="FloorPlan visualizer\noccupancy/wall underlay\nroom contour + object point\ntrajectory + selected frontier",
+    fillcolor="#eff6ff",
+    color="#2563eb"
+  ];
+
+  runtime_overlay [
+    label="runtime overlay\nfrontiers / trajectory / live detections\n来自 mapper，不来自 prior",
+    fillcolor="#f8fafc",
+    color="#64748b"
+  ];
+  planner [
+    label="existing STRIVE planner / verifier\nlive perception + physical contract\n仍拥有 STOP 权限",
+    fillcolor="#fef2f2",
+    color="#dc2626"
+  ];
+
+  semantic_scene -> aabb_path;
+  navmesh -> aabb_path;
+  aabb_path -> rough_prior [label="现在能给坐标 bias"];
+
+  semantic_scene -> seeds;
+  navmesh -> occupancy;
+  occupancy -> segmentation;
+  seeds -> segmentation;
+  segmentation -> contours;
+  contours -> topology;
+  semantic_scene -> topology [label="object center / parent region"];
+  navmesh -> topology [label="snap + geodesic"];
+  topology -> canonical_map;
+  contours -> canonical_map;
+
+  canonical_map -> query;
+  query -> planner [label="ranking context only"];
+  canonical_map -> visualizer;
+  occupancy -> visualizer;
+  runtime_overlay -> visualizer;
+
+  rough_prior -> visualizer [
+    label="当前图不对的根因",
+    color="#ea580c",
+    fontcolor="#ea580c",
+    style=dashed
+  ];
+
+  planner -> visualizer [
+    label="debug artifacts",
+    color="#64748b",
+    style=dashed
+  ];
+
+  { rank=same; semantic_scene; navmesh; }
+  { rank=same; aabb_path; occupancy; seeds; }
+  { rank=same; rough_prior; segmentation; }
+  { rank=same; contours; topology; }
+  { rank=same; query; visualizer; }
+}

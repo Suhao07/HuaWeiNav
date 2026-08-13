@@ -1,5 +1,72 @@
 # Instruction Adapter Changelog
 
+## 2026-08-12
+
+### Fixed
+
+- HM3D room BEV construction now projects NavMesh samples to 2-D before
+  connected-component extraction, preventing repeated room polygons caused by
+  multiple sampled heights.
+- Added `configs/strive_weights.yaml` and made the Docker benchmark launcher
+  consume local SAM ViT-H and GroundingDINO Swin-L checkpoints without copying
+  model files into the repository.
+
+### Added
+
+- 新增 `prior_map/multimodal.py`、`room_semantics.py` 与
+  `high_level_selector.py`：
+  - `RoomEvidence -> RoomSemanticResult` 使用开放标签的 prompt-first 房间语义
+    标注，并按证据版本缓存；缺少本地 RGB 时保守返回 `unknown`。
+  - 静态房间布局与在线 pose、轨迹、frontier、live object 合成为动态 BEV，
+    通过 `PriorMapMultimodalContext` 送入可选的高层 room/frontier selector。
+  - selector 只允许从已有候选 UID 中选择，结果的 authority 为
+    `ranking_only`，不进入 relation/final verifier 或 STOP 链。
+
+- 统一语义先验地图 bundle：HM3D 布局构建现在强制输出结构化
+  `floorplan.json`、`prior_map_bev.png/svg`、markers 和
+  `prior_map_manifest.json`，BEV 作为仿真与实物共用的 LVLM 地图上下文。
+
+- 新增 `prior_map/floorplan_layout.py`：定义 FloorPlan-VLN-compatible 的
+  `FloorplanLayout`、`FloorplanLevel` 和 `FloorplanRegion`，保留米制坐标与
+  `(x, -z)` 坐标约定。
+- 新增 `prior_map/hm3d_layout.py` 和
+  `scripts/build_hm3d_floorplan_layout.py`：从 HM3D semantic scene/NavMesh
+  生成 room-only `floorplan.json`；静态 object instance 不进入该布局交换层。
+- 新增 `scripts/build_hm3d_floorplan_layouts.py`：批量构建语义先验地图 bundle。
+- 新增 `docker/run_hm3d_floorplan_layout.sh`，将布局构建与 ObjectNav benchmark 的
+  检测器权重检查解耦；支持直接挂载 CogNav `data` 目录。
+- 修复 HM3D 场景的布局构建兼容性：当 Habitat-Sim region AABB 为无效值时，从
+  semantic mesh 实例几何重建 region 包围盒；布局 CLI 在 room 为空时拒绝写出成功产物。
+- `build_hm3d_groundtruth_prior_map.py` 新增 `--layout_only`，旧 canonical
+  builder 可以在不破坏兼容性的情况下省略静态物体先验。
+
+### Changed
+
+- `PromptContextBundle` 现在可记录动态 BEV 的图像路径、哈希、坐标系与证据
+  provenance；默认不启用额外 LVLM 请求，仿真和 ROS2 实物节点均提供显式开关。
+- 房间语义标注增加独立 `room_semantic_interval` 调度；同一运行窗口内不会因
+  每帧 RGB/pose 更新而重复调用 LVLM。实物 ROS adapter 可在显式持久化图像时把
+  SysNav `RoomNode.room_mask` 与当前 RGB 转为本地可读 PNG，再交给同一 classifier。
+
+- 删除正式先验地图中的 Habitat NavMesh 栅格导出；NavMesh 仅作为构建阶段的内部
+  几何辅助，不进入 LVLM、先验查询或实物导航接口。
+
+- HM3D 房间构建过滤非有限或退化的 semantic region AABB，避免无效几何污染
+  全局 BEV。
+- 房间边界从连通导航栅格的外轮廓提取；外轮廓无法闭合时才使用确定性的
+  AABB fallback，并在 metadata 中标记 boundary method。
+- 明确 HM3D 不包含 FloorPlan-VLN 使用的 Matterport `*.house` 输入；STRIVE
+  复用的是 room-level 输出格式，而不是伪造 `.house` 数据。
+- 统一 HM3D scene-directory 与 existing-simulator 的加载边界，避免两个入口使用
+  不同的资产、NavMesh 或坐标约定；补充 region/floor `height_range`。
+- `PriorMapLoader` 对 STRIVE 自生成的 `floorplan_metric` 显式执行一次
+  `(x,-z)->(x,z)` 归一化，避免 FloorPlan 交换坐标和 runtime query 坐标发生镜像。
+
+### Tests
+
+- 新增 `tests/test_floorplan_layout.py`，覆盖 `(x,z)->(x,-z)` 变换、房间拓扑、
+  FloorPlan JSON roundtrip，以及语义 BEV bundle 的写出和无栅格导出约束。
+
 ## 2026-06-13
 
 ### Added
@@ -571,3 +638,8 @@
 - 修复 execution mode 判断使用 `normalize_term()` 导致下划线模式失效的问题。
   - `anchor_first_relation_search` 现在会正确进入 anchor-first 分支。
   - `all_targets_success` 等计数/多目标模式也统一使用 `compact_key()` 比较。
+- Docker HM3D launcher now reads the local CogNav dataset root from
+  `configs/strive_weights.yaml:data_root`, while preserving environment-variable
+  overrides for portable deployments.
+- README and prior-map documentation now describe the same dataset-root precedence,
+  so the documented command does not assume a repository-local `data/` directory.

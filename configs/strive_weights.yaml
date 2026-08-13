@@ -1,0 +1,10 @@
+# Local model and dataset paths for STRIVE Docker runs.
+#
+# Checkpoints and datasets stay outside the repository. The Docker launcher
+# reads this file and mounts them read-only. Environment variables with the
+# same purpose have higher priority and are preferred on another machine.
+data_root: /home/ubuntu/WorkSpace/research/code/Navigation/CogNav_ObjNav/data
+sam_checkpoint: /home/ubuntu/3rdparty/Grounded-Segment-Anything/sam_vit_h_4b8939.pth
+grounding_dino_checkpoint: /home/ubuntu/WorkSpace/research/code/Navigation/CogNav_ObjNav/model/pretrained_model/grounding_dino_swin-l_pretrain_obj365_goldg-34dcdc53.pth
+grounding_dino_path_container: /opt/mmdetection
+grounding_dino_config_container: /opt/mmdetection/configs/mm_grounding_dino/grounding_dino_swin-l_pretrain_all.py

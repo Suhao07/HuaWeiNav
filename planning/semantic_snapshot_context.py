@@ -127,6 +127,12 @@ class SemanticMapSnapshotPolicyContext:
         relation_pair_ledger: Optional relation pair ledger.
         constraint_evaluator: Optional existing constraint evaluator.
         instruction_object_search_policy: Optional existing object search policy.
+        prior_result: Optional `SearchPriorResult` used as ranking evidence.
+        prior_map_policy_adapter: Optional adapter for target annotations.
+        prior_map_prompt_context: Optional bounded prompt context bundle.
+        prior_map_high_level_selection: Optional room/frontier selection result.
+        prior_map_room_semantics: Optional evidence-versioned room labels.
+        prior_map_diagnostics: Optional conflict/alignment diagnostics.
         vlm: VLM provider name used when constructing default matchers.
     """
 
@@ -138,6 +144,12 @@ class SemanticMapSnapshotPolicyContext:
     relation_pair_ledger: Optional[RelationPairLedger] = None
     constraint_evaluator: Optional[ConstraintEvaluator] = None
     instruction_object_search_policy: Optional[InstructionObjectSearchPolicy] = None
+    prior_result: Optional[Any] = None
+    prior_map_policy_adapter: Optional[Any] = None
+    prior_map_prompt_context: Optional[Any] = None
+    prior_map_high_level_selection: Optional[Any] = None
+    prior_map_room_semantics: Optional[dict[str, Any]] = None
+    prior_map_diagnostics: Optional[dict[str, Any]] = None
     vlm: str = "cognav"
 
     def __post_init__(self) -> None:
@@ -151,6 +163,9 @@ class SemanticMapSnapshotPolicyContext:
         self.target = _active_target_name(self.plan)
         self.target_list = list(getattr(self.plan, "target_detector_prompts", []) or [self.target])
         self.target_aliases = list(getattr(self.plan, "target_match_terms", []) or [self.target])
+        self.search_prior_result = self.prior_result
+        self.prior_map_last_result = self.prior_result
+        self.prior_map_diagnostics = dict(self.prior_map_diagnostics or {})
         self.concept_matcher = self.concept_matcher or RuntimeConceptMatcher(vlm=self.vlm)
         self.verification_ledger = self.verification_ledger or VerificationLedger()
         self.anchor_search_ledger = self.anchor_search_ledger or AnchorSearchLedger()
@@ -454,6 +469,7 @@ class SemanticMapSnapshotIntentAdapter:
         plan_provider: Callable[[Optional[str]], InstructionPlan],
         *,
         context: Optional[SemanticMapSnapshotPolicyContext] = None,
+        prior_context_provider: Optional[Callable[[SemanticMapSnapshot, InstructionPlan, int], dict[str, Any]]] = None,
         vlm: str = "cognav",
     ) -> None:
         """Initialize the adapter.
@@ -461,11 +477,14 @@ class SemanticMapSnapshotIntentAdapter:
         Args:
             plan_provider: Callable returning the active `InstructionPlan`.
             context: Optional persistent snapshot policy context.
+            prior_context_provider: Optional callable returning prior-map
+                context kwargs for the current snapshot.
             vlm: VLM provider name used for default matchers in the context.
         """
 
         self.plan_provider = plan_provider
         self.context = context
+        self.prior_context_provider = prior_context_provider
         self.vlm = vlm
         self.step = 0
         self.last_selection: Optional[SnapshotTargetSelection] = None
@@ -510,13 +529,25 @@ class SemanticMapSnapshotIntentAdapter:
                     },
                 )
 
+        prior_context = {}
+        if self.prior_context_provider is not None:
+            prior_context = dict(self.prior_context_provider(snapshot, plan, self.step) or {})
+
         selection = select_target_candidate_from_snapshot(
             snapshot,
             plan=plan,
             context=self.context,
             step=self.step,
             vlm=self.vlm,
+            **prior_context,
         )
+        if not selection.result.found:
+            room_intent = _prior_high_level_room_intent(snapshot, plan, prior_context)
+            if room_intent is not None:
+                self.context = selection.context
+                self.last_selection = selection
+                self.step += 1
+                return room_intent
         self.context = selection.context
         self.last_selection = selection
         self.step += 1
@@ -596,6 +627,8 @@ def select_target_candidate_from_snapshot(
     else:
         context.snapshot = snapshot
         context.plan = plan
+        for key, value in context_kwargs.items():
+            setattr(context, key, value)
         context.__post_init__()
     result = select_target_candidate(context, plan=plan, step=step)
     return SnapshotTargetSelection(context=context, result=result)
@@ -609,6 +642,67 @@ def _active_target_name(plan: Any) -> str:
     if terminals:
         return str(getattr(terminals[0], "name", "") or "")
     return str(getattr(plan, "dataset_target", "") or "")
+
+
+def _prior_high_level_room_intent(
+    snapshot: SemanticMapSnapshot,
+    plan: Any,
+    prior_context: dict[str, Any],
+) -> Optional[NavigationIntent]:
+    """Convert a validated prior room UID into a soft exploration intent.
+
+    The selected room must already exist in the live snapshot. This keeps the
+    BEV selector at the high-level exploration boundary and prevents it from
+    manufacturing a pose or a target object.
+    """
+
+    selection = prior_context.get("prior_map_high_level_selection")
+    if not selection:
+        return None
+    selected_uid = str(
+        selection.get("selected_uid", "")
+        if isinstance(selection, dict)
+        else getattr(selection, "selected_uid", "")
+    ).strip()
+    if not selected_uid:
+        return None
+    room = snapshot.room_by_uid(selected_uid)
+    if room is not None and room.centroid is not None:
+        return NavigationIntent(
+            mode=MotionGoalMode.GO_TO_FRONTIER,
+            goal_pose=Pose3D(
+                position=tuple(float(value) for value in room.centroid),
+                frame_id=snapshot.robot_pose.frame_id,
+                stamp=snapshot.timestamp,
+            ),
+            reason="prior-map high-level room selection",
+            metadata={
+                "policy": "prior_map_high_level_selection",
+                "raw_instruction": str(getattr(plan, "raw_instruction", "") or ""),
+                "selected_room_uid": selected_uid,
+                "authority": "ranking_only",
+            },
+        )
+    frontier = next((item for item in snapshot.frontiers if item.uid == selected_uid), None)
+    if frontier is None:
+        return None
+    # 中文注释：frontier 选择只能复用 live snapshot 中已存在的坐标，不能
+    # 用先验图或 LVLM 输出的 UID 合成新的运动位姿。
+    return NavigationIntent(
+        mode=MotionGoalMode.GO_TO_FRONTIER,
+        goal_pose=Pose3D(
+            position=tuple(float(value) for value in frontier.position),
+            frame_id=snapshot.robot_pose.frame_id,
+            stamp=snapshot.timestamp,
+        ),
+        reason="prior-map high-level frontier selection",
+        metadata={
+            "policy": "prior_map_high_level_selection",
+            "raw_instruction": str(getattr(plan, "raw_instruction", "") or ""),
+            "selected_frontier_uid": selected_uid,
+            "authority": "ranking_only",
+        },
+    )
 
 
 def _selection_metadata(selection: SnapshotTargetSelection, candidate: Any | None) -> dict[str, Any]:
@@ -626,7 +720,39 @@ def _selection_metadata(selection: SnapshotTargetSelection, candidate: Any | Non
         "anchor_record": dict(selection.result.anchor_record or {}),
         "skipped_objs": list(selection.result.skipped_objs or []),
         "concept_debug": list(selection.result.concept_debug or []),
+        "prior_map": _prior_map_metadata(selection.context),
     }
+
+
+def _prior_map_metadata(context: SemanticMapSnapshotPolicyContext) -> dict[str, Any]:
+    prior_result = getattr(context, "prior_result", None)
+    prompt_context = getattr(context, "prior_map_prompt_context", None)
+    diagnostics = dict(getattr(context, "prior_map_diagnostics", {}) or {})
+    payload = {
+        "enabled": prior_result is not None,
+        "diagnostics": diagnostics,
+    }
+    if prior_result is not None:
+        payload["top_rooms"] = [
+            {"room_uid": item.room_uid, "label": item.label, "score": item.score}
+            for item in list(getattr(prior_result, "room_rankings", ()) or ())[:3]
+        ]
+        payload["top_objects"] = [
+            {"object_uid": item.object_uid, "label": item.label, "score": item.score}
+            for item in list(getattr(prior_result, "object_rankings", ()) or ())[:5]
+        ]
+        payload["live_conflicts"] = list((getattr(prior_result, "diagnostics", {}) or {}).get("live_conflicts", []))
+        payload["authority"] = "ranking_only"
+    if prompt_context is not None:
+        payload["prompt_context"] = prompt_context.to_dict() if hasattr(prompt_context, "to_dict") else {}
+    if getattr(context, "prior_map_high_level_selection", None) is not None:
+        selection = context.prior_map_high_level_selection
+        payload["high_level_selection"] = (
+            selection.to_dict() if hasattr(selection, "to_dict") else dict(selection)
+        )
+    if getattr(context, "prior_map_room_semantics", None):
+        payload["room_semantics"] = dict(context.prior_map_room_semantics or {})
+    return payload
 
 
 def _verification_result_from_dict(payload: dict[str, Any]) -> VerificationResult:

@@ -28,6 +28,7 @@ from real_robot.contracts import (
     ViewEvidence,
     ViewpointGoal,
 )
+from real_robot.image_codec import write_ros_image_png
 from real_robot.sysnav_ros_adapters import RosDetectionResultAdapter
 
 
@@ -44,6 +45,7 @@ class _CachedImageRecord:
     storage: str
     raw_path: Optional[str] = None
     metadata_path: Optional[str] = None
+    visual_path: Optional[str] = None
 
     def as_camera_frame(
         self,
@@ -69,9 +71,16 @@ class _CachedImageRecord:
                 "storage": self.storage,
                 "raw_path": self.raw_path,
                 "metadata_path": self.metadata_path,
+                "visual_path": self.visual_path,
                 **dict(metadata or {}),
             },
         )
+
+    @property
+    def readable_image_ref(self) -> Optional[str]:
+        """Return a local image path when one was encoded for vision clients."""
+
+        return self.visual_path or (self.image_ref if Path(self.image_ref).is_file() else None)
 
 
 class RosObservationCache:
@@ -127,6 +136,7 @@ class RosObservationCache:
         self.latest_pointcloud_frame_id: Optional[str] = None
         self.latest_detection_frame: Optional[DetectionFrame] = None
         self.image_records: list[_CachedImageRecord] = []
+        self._room_mask_paths: dict[str, str] = {}
 
         if self.persist_images:
             if self.image_directory is None:
@@ -191,6 +201,45 @@ class RosObservationCache:
 
         return self.latest_pose is not None
 
+    def latest_rgb_visual_path(self) -> str:
+        """Return the latest locally readable RGB path, or an empty string.
+
+        Returns:
+            PNG/JPEG path suitable for a multimodal client. ROS URI references
+            and raw binary transport dumps are intentionally excluded.
+        """
+
+        if self.latest_rgb is None:
+            return ""
+        return str(self.latest_rgb.readable_image_ref or "")
+
+    def persist_room_mask(self, msg: Any, room_id: int) -> str:
+        """Persist one SysNav room mask when image persistence is enabled.
+
+        Args:
+            msg: SysNav ``RoomNode``-like message containing ``room_mask``.
+            room_id: Stable SysNav room id.
+
+        Returns:
+            Local mask path, or an empty string when persistence is disabled or
+            the message has no encodable mask.
+        """
+
+        if not self.persist_images or self.image_directory is None:
+            return ""
+        image = getattr(msg, "room_mask", None)
+        if image is None:
+            return ""
+        stamp = _stamp_from_header(getattr(image, "header", None), default=self.now_fn())
+        key = f"{int(room_id)}:{stamp:.9f}"
+        if key in self._room_mask_paths:
+            return self._room_mask_paths[key]
+        path = self.image_directory / f"room_mask_{int(room_id)}_{_stamp_token(stamp)}.png"
+        written = write_ros_image_png(image, path)
+        if written:
+            self._room_mask_paths[key] = written
+        return written or ""
+
     def latest_observation(self) -> Optional[RealObservation]:
         """Return the latest `RealObservation`, or None when pose/RGB is missing."""
 
@@ -245,11 +294,12 @@ class RosObservationCache:
 
         raw_path = None
         metadata_path = None
+        visual_path = None
         storage = "ros_uri"
         image_ref = f"ros://{topic}/image/{stamp:.9f}"
         if self.persist_images:
             # 只有显式 persist_images 时才写原始 bytes；真机默认避免高频写盘。
-            raw_path, metadata_path = self._write_image_payload(msg, prefix, stamp, topic)
+            raw_path, metadata_path, visual_path = self._write_image_payload(msg, prefix, stamp, topic)
             image_ref = raw_path
             storage = "file"
 
@@ -265,9 +315,10 @@ class RosObservationCache:
             storage=storage,
             raw_path=raw_path,
             metadata_path=metadata_path,
+            visual_path=visual_path,
         )
 
-    def _write_image_payload(self, msg: Any, prefix: str, stamp: float, topic: str) -> Tuple[str, str]:
+    def _write_image_payload(self, msg: Any, prefix: str, stamp: float, topic: str) -> Tuple[str, str, Optional[str]]:
         """Write raw ROS image bytes and sidecar metadata to disk."""
 
         assert self.image_directory is not None
@@ -276,6 +327,10 @@ class RosObservationCache:
         metadata_path = self.image_directory / f"{name}.json"
         data = getattr(msg, "data", b"")
         raw_path.write_bytes(bytes(data))
+        visual_path = self.image_directory / f"{name}.png"
+        visual_path = write_ros_image_png(msg, visual_path)
+        if visual_path is None:
+            visual_path = None
         metadata = {
             "topic": topic,
             "stamp": stamp,
@@ -285,9 +340,10 @@ class RosObservationCache:
             "encoding": getattr(msg, "encoding", None),
             "step": getattr(msg, "step", None),
             "bytes": len(bytes(data)),
+            "visual_path": visual_path,
         }
         metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, sort_keys=True), encoding="utf-8")
-        return str(raw_path), str(metadata_path)
+        return str(raw_path), str(metadata_path), visual_path
 
 
 class ObjectCropEvidenceProvider:

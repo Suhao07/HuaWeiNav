@@ -81,7 +81,8 @@ class InstructionObjectSearchPolicy:
             target_objs.append(obj)
 
         if target_objs:
-            target_objs = sorted(target_objs, key=lambda x: x.confidence.numpy().item(), reverse=True)
+            target_objs, prior_debug = _sort_target_objs_with_prior(mapper, target_objs)
+            concept_debug.extend(prior_debug)
             target_obj = target_objs[0]
             if target_obj.tag != mapper.target:
                 target_obj.tag = mapper.target
@@ -262,6 +263,40 @@ def _distance3(a: Any, b: Any) -> float:
         return sum((av[idx] - bv[idx]) ** 2 for idx in range(3)) ** 0.5
     except Exception:
         return float("inf")
+
+
+def _sort_target_objs_with_prior(mapper: Any, target_objs: list[Any]) -> tuple[list[Any], list[dict[str, Any]]]:
+    adapter = getattr(mapper, "prior_map_policy_adapter", None)
+    prior_result = getattr(mapper, "search_prior_result", None)
+    if adapter is None or prior_result is None:
+        return sorted(target_objs, key=_candidate_confidence, reverse=True), []
+
+    annotations = adapter.annotate_target_candidates(target_objs, prior_result)
+    debug = [
+        {
+            "source": "prior_map_target_annotation",
+            "candidate_uid": getattr(annotation.candidate, "uid", getattr(annotation.candidate, "idx", "")),
+            **dict(annotation.metadata.get("prior_map", {})),
+        }
+        for annotation in annotations
+    ]
+    ranked = sorted(
+        annotations,
+        key=lambda annotation: (float(annotation.prior_score), _candidate_confidence(annotation.candidate)),
+        reverse=True,
+    )
+    return [annotation.candidate for annotation in ranked], debug
+
+
+def _candidate_confidence(obj: Any) -> float:
+    confidence = getattr(obj, "confidence", 0.0)
+    try:
+        return float(confidence.numpy().item())
+    except Exception:
+        try:
+            return float(confidence)
+        except Exception:
+            return 0.0
 
 
 def _pending_pair_association_radius() -> float:

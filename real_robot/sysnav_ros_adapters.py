@@ -164,22 +164,47 @@ class RosObjectNodeAdapter:
 class RosRoomNodeAdapter:
     """Convert SysNav ``RoomNode`` and ``RoomNodeList`` messages."""
 
-    def __init__(self, topic: str = SysNavTopicConfig.room_nodes_list) -> None:
+    def __init__(
+        self,
+        topic: str = SysNavTopicConfig.room_nodes_list,
+        rgb_path_provider: Optional[Callable[[], str]] = None,
+        room_mask_path_provider: Optional[Callable[[Any, int], str]] = None,
+    ) -> None:
+        """Create a room adapter with optional local evidence providers."""
+
         self.topic = topic
+        self.rgb_path_provider = rgb_path_provider
+        self.room_mask_path_provider = room_mask_path_provider
 
     def from_msg(self, msg: Any) -> RoomSnapshot:
         """Return a STRIVE room snapshot for one SysNav room node."""
 
         room_id = int(getattr(msg, "id", -1))
         polygon_points = _polygon_points(getattr(msg, "polygon", None))
+        room_mask = getattr(msg, "room_mask", None)
+        room_mask_path = (
+            self.room_mask_path_provider(msg, room_id)
+            if self.room_mask_path_provider is not None
+            else ""
+        )
         metadata = {
             "ros_topic": self.topic,
             "show_id": getattr(msg, "show_id", None),
             "is_connected": bool(getattr(msg, "is_connected", False)),
             "area": float(getattr(msg, "area", 0.0)),
             "polygon_point_count": len(polygon_points),
-            "room_mask_present": getattr(msg, "room_mask", None) is not None,
+            "room_mask_present": room_mask is not None,
+            "room_mask_ref": room_mask_path
+            or (f"ros://{self.topic}/room_mask/{room_id}" if room_mask is not None else ""),
         }
+        rgb_image_ref = _none_if_empty(
+            getattr(msg, "rgb_image_path", None)
+            or getattr(msg, "room_rgb_path", None)
+            or getattr(msg, "image_ref", None)
+            or (self.rgb_path_provider() if self.rgb_path_provider is not None else "")
+        )
+        if rgb_image_ref:
+            metadata["rgb_image_ref"] = rgb_image_ref
 
         return RoomSnapshot(
             uid=f"sysnav_room:{room_id}",
@@ -187,9 +212,7 @@ class RosRoomNodeAdapter:
             label=None,
             centroid=_point_to_vector3(getattr(msg, "centroid", None)),
             neighbors=tuple(f"sysnav_room:{int(neighbor)}" for neighbor in _as_sequence(getattr(msg, "neighbors", ()))),
-            image_ref=f"ros://{self.topic}/room_mask/{room_id}"
-            if getattr(msg, "room_mask", None) is not None
-            else None,
+            image_ref=rgb_image_ref,
             explored=bool(getattr(msg, "is_connected", False)),
             metadata=metadata,
         )

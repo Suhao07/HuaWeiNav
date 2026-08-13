@@ -34,3 +34,9 @@ TAG_REFINE_OBJECT_LIST = PromptSpec(
 )
 SIMILAR_OBJECTS = PromptSpec("similar_objects.v1", "similar_objects", "SimilarObjectsResponse")
 CHECK_AGAIN_BBOX = PromptSpec("check_again.bbox.v1", "check_again_object_in_bbox", "CheckAgainBBoxResponse")
+ROOM_SEMANTIC = PromptSpec("room.semantic.v1", "room_semantic_annotation", "ParsedRoomSemantic")
+HIGH_LEVEL_PRIOR_SELECTION = PromptSpec(
+    "prior_map.high_level_selection.v1",
+    "prior_map_high_level_selection",
+    "ParsedHighLevelSelection",
+)

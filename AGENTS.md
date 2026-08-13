@@ -47,6 +47,7 @@ When implementing core code:
 - Extract reusable utilities into library modules when two or more scripts need the same behavior.
 - CLI scripts should be thin orchestration layers: parse arguments, call library code, and write artifacts.
 - New versions should make their behavioral differences explicit through class names, config fields, or strategy objects, not hidden conditionals scattered through unrelated code.
+- 禁止补丁式修改：核心功能必须从原理性建模、稳定接口和可复用抽象出发实现，不为单个样例、短期现象或局部失败堆叠特例分支。
 
 ## UrbanNav Benchmark Rules
 

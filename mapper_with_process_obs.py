@@ -45,6 +45,7 @@ from planning.object_search_policy import InstructionObjectSearchPolicy
 from planning.room_policy import select_nearest_frontier_room
 from planning.target_selection_policy import select_target_candidate
 from prompting.templates import OBJECT_PROMPT, RELOCATE_PROMPT, ROOM_PROMPT
+from prior_map.simulation import refresh_mapper_prior_map_query
 from mapping.room_segmenter import (
     fallback_single_room as segmenter_fallback_single_room,
     segment_room as segmenter_segment_room,
@@ -141,6 +142,11 @@ class Instruct_Mapper:
             relation_service=self.instruction_relation_service,
             save_dir=save_dir,
         )
+        self.prior_map_runtime = None
+        self.prior_map_policy_adapter = None
+        self.search_prior_result = None
+        self.prior_map_prompt_context = None
+        self.prior_map_last_observation = None
 
         self.vlm = vlm
         self.frontier_thres = 6
@@ -2064,6 +2070,12 @@ class Instruct_Mapper:
     def get_candidate_room_fully_explored_by_distance(self, instruct_goal, idx=None, step=None):
         """Deterministic relocation policy used when LLM room selection is off."""
 
+        refresh_mapper_prior_map_query(
+            self,
+            plan=getattr(self, "instruction_plan", None),
+            step=step or 0,
+            episode_idx=idx,
+        )
         selection = select_nearest_frontier_room(self)
         os.makedirs(f'{self.save_dir}/episode-{idx}/room_policy', exist_ok=True)
         with open(f'{self.save_dir}/episode-{idx}/room_policy/answer_{step}.txt', 'w') as f:
@@ -2071,7 +2083,13 @@ class Instruct_Mapper:
             f.write(f'Policy: nearest_frontier_room\n')
             f.write(f'Answer: {selection.reason}\n')
             f.write(f'Closest node: {selection.closest_node_idx}\n')
+            f.write(f'Baseline closest node: {selection.baseline_closest_node_idx}\n')
             f.write(f'Distances: {selection.distances or []}\n')
+            f.write(f'Prior scores: {selection.prior_scores or []}\n')
+            f.write(f'Adjusted distances: {selection.adjusted_distances or []}\n')
+            f.write(f'Prior changed selection: {selection.prior_changed_selection}\n')
+            if getattr(self, "search_prior_result", None) is not None:
+                f.write(f'Prior map: {json.dumps(self.search_prior_result.to_dict(), ensure_ascii=False)}\n')
             f.write(f'\n')
 
         logger.info(f'Answer: {selection.reason}')
@@ -2165,6 +2183,7 @@ class Instruct_Mapper:
         """Select a candidate object without the legacy object-planning LLM call."""
 
         plan = getattr(self, "instruction_plan", None)
+        refresh_mapper_prior_map_query(self, plan=plan, step=step or 0, episode_idx=idx)
         json_dict = self.to_json_wo_some_class()
         # transfer this dict to string
         json_str = json.dumps(json_dict)
@@ -2189,6 +2208,11 @@ class Instruct_Mapper:
                 f.write(f'Skipped by final verifier: {json.dumps(result.skipped_objs, ensure_ascii=False)}\n')
             if result.concept_debug:
                 f.write(f'Concept matches: {json.dumps(result.concept_debug, ensure_ascii=False)}\n')
+            if getattr(self, "prior_map_prompt_context", None) is not None:
+                f.write(
+                    "Prior map prompt context: "
+                    f"{json.dumps(self.prior_map_prompt_context.to_dict(), ensure_ascii=False)}\n"
+                )
             f.write(f'\n')
             f.write(f'\n')
 
