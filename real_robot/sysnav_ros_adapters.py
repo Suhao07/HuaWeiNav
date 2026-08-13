@@ -20,6 +20,7 @@ from real_robot.contracts import (
     FrontierSnapshot,
     MotionGoal,
     MotionGoalMode,
+    MotionReasonCode,
     NavigationStatus,
     NavigationStatusCode,
     ObjectNodeSnapshot,
@@ -231,6 +232,8 @@ class _GoalProgressState:
     initial_distance_m: Optional[float] = None
     best_distance_m: Optional[float] = None
     preempted: bool = False
+    reached_since: Optional[float] = None
+    planner_status_baseline_at: Optional[float] = None
     progress_samples: list[Dict[str, float]] = field(default_factory=list)
 
 
@@ -251,6 +254,8 @@ class RosNavigationStatusProvider:
         no_progress_timeout_s: float = 12.0,
         min_progress_delta_m: float = 0.05,
         path_stale_timeout_s: float = 5.0,
+        velocity_tolerance_mps: float = 0.08,
+        stable_reach_time_s: float = 0.0,
         max_progress_samples: int = 20,
         world_frame: str = SysNavTopicConfig.world_frame,
         now_fn: Callable[[], float] = time.monotonic,
@@ -272,6 +277,11 @@ class RosNavigationStatusProvider:
                 progress.
             path_stale_timeout_s: Age after which a cached path is treated as
                 stale for metadata.
+            velocity_tolerance_mps: Maximum planar speed accepted as settled at
+                a geometric goal.
+            stable_reach_time_s: Required continuous settled duration. The
+                action server enables this by default; the platform-neutral
+                adapter keeps zero as a backwards-compatible offline default.
             max_progress_samples: Number of recent distance samples to keep.
             world_frame: Default frame for pose messages without header frame.
             now_fn: Time source used for elapsed/progress calculations.
@@ -284,26 +294,33 @@ class RosNavigationStatusProvider:
         self.no_progress_timeout_s = float(no_progress_timeout_s)
         self.min_progress_delta_m = float(min_progress_delta_m)
         self.path_stale_timeout_s = float(path_stale_timeout_s)
+        self.velocity_tolerance_mps = float(velocity_tolerance_mps)
+        self.stable_reach_time_s = max(0.0, float(stable_reach_time_s))
         self.max_progress_samples = int(max_progress_samples)
         self.world_frame = world_frame
         self.now_fn = now_fn
 
         self.latest_pose: Optional[Pose3D] = None
+        self.latest_velocity: Optional[Tuple[float, float, float]] = None
         self.latest_path_points: Tuple[Tuple[float, float, float], ...] = ()
         self.latest_path_stamp: Optional[float] = None
         self.latest_path_received_at: Optional[float] = None
+        self.latest_path_frame_id: Optional[str] = None
         self.latest_planner_status: Optional[Dict[str, Any]] = None
+        self.latest_safety_state: Optional[Dict[str, Any]] = None
         self._goal_states: Dict[str, _GoalProgressState] = {}
 
     def update_odometry(self, msg: Any) -> None:
         """Cache the latest odometry pose from a ROS-like message."""
 
         self.latest_pose = _pose3d_from_odometry_msg(msg, default_frame=self.world_frame)
+        self.latest_velocity = _velocity_from_odometry_msg(msg)
 
     def update_pose(self, pose: Pose3D) -> None:
         """Cache a platform-neutral pose for offline replay or tests."""
 
         self.latest_pose = pose
+        self.latest_velocity = None
 
     def update_path(self, msg: Any) -> None:
         """Cache the latest local planner path from a ROS-like Path message."""
@@ -311,6 +328,7 @@ class RosNavigationStatusProvider:
         self.latest_path_points = _path_points_from_msg(msg)
         self.latest_path_stamp = _stamp_from_header(getattr(msg, "header", None), default=self.now_fn())
         self.latest_path_received_at = self.now_fn()
+        self.latest_path_frame_id = _frame_id_from_header(getattr(msg, "header", None)) or None
 
     def update_local_planner_status(self, msg: Any) -> None:
         """Cache a generic local planner status message.
@@ -326,6 +344,51 @@ class RosNavigationStatusProvider:
             "text": str(value).strip().lower(),
             "received_at": self.now_fn(),
         }
+
+    def update_safety_state(self, msg: Any) -> None:
+        """Cache the final velocity mux state for task-level feedback."""
+
+        state_names = {
+            0: "clear",
+            1: "hold",
+            2: "manual_takeover",
+            3: "estop",
+            4: "stale_input",
+            5: "controller_fault",
+        }
+        raw_state = getattr(msg, "state", msg)
+        try:
+            state_key = int(raw_state)
+        except (TypeError, ValueError):
+            state_key = -1
+        self.latest_safety_state = {
+            "state": state_names.get(state_key, str(raw_state).lower()),
+            "reason_code": str(getattr(msg, "reason_code", "") or ""),
+            "autonomy_enabled": bool(getattr(msg, "autonomy_enabled", False)),
+            "manual_takeover": bool(getattr(msg, "manual_takeover", False)),
+            "estop_active": bool(getattr(msg, "estop_active", False)),
+            "received_at": self.now_fn(),
+        }
+
+    def begin_goal(self, goal_id: str, _: MotionGoal) -> None:
+        """Start a progress record before publishing a new waypoint.
+
+        Establishing the planner-status generation before the topic publish is
+        important because ROS callbacks may deliver ``no_feasible_path`` before
+        the first Action feedback poll.
+        """
+
+        now = self.now_fn()
+        self._goal_states[goal_id] = _GoalProgressState(
+            goal_id=goal_id,
+            started_at=now,
+            last_progress_at=now,
+            planner_status_baseline_at=(
+                None
+                if self.latest_planner_status is None
+                else float(self.latest_planner_status.get("received_at", now))
+            ),
+        )
 
     def create_ros_subscriptions(
         self,
@@ -385,7 +448,16 @@ class RosNavigationStatusProvider:
         state = self._goal_states.get(goal_id)
         if state is None:
             # 每个 /way_point 目标独立维护进度，避免新目标继承旧目标的 timeout/no-progress 状态。
-            state = _GoalProgressState(goal_id=goal_id, started_at=now, last_progress_at=now)
+            state = _GoalProgressState(
+                goal_id=goal_id,
+                started_at=now,
+                last_progress_at=now,
+                planner_status_baseline_at=(
+                    None
+                    if self.latest_planner_status is None
+                    else float(self.latest_planner_status.get("received_at", now))
+                ),
+            )
             self._goal_states[goal_id] = state
 
         if state.preempted:
@@ -396,6 +468,7 @@ class RosNavigationStatusProvider:
                 current_pose=self.latest_pose,
                 stamp=now,
                 message="goal preempted by STRIVE waypoint controller",
+                reason_code=MotionReasonCode.CANCELLED,
                 metadata=self._metadata(goal, state, now),
             )
 
@@ -421,6 +494,46 @@ class RosNavigationStatusProvider:
                 metadata=self._metadata(goal, state, now),
             )
 
+        # 安全状态优先于几何进度：急停/人工接管不能因为 odom 暂时缺失而
+        # 被降级成 QUEUED 或等待普通导航 timeout。
+        safety_status = self._safety_status_code()
+        if safety_status is not None:
+            safety_code, safety_reason = safety_status
+            return NavigationStatus(
+                safety_code,
+                goal_id=goal_id,
+                current_pose=self.latest_pose,
+                stamp=now,
+                message="final velocity safety mux denied motion",
+                reason_code=safety_reason,
+                safety_state=str(self.latest_safety_state.get("state", "unknown")),
+                metadata=self._metadata(goal, state, now),
+            )
+
+        if self._safety_hold_active():
+            elapsed_s = now - state.started_at
+            metadata = self._metadata(goal, state, now)
+            if elapsed_s >= self._timeout_for_goal(goal):
+                return NavigationStatus(
+                    NavigationStatusCode.TIMEOUT,
+                    goal_id=goal_id,
+                    current_pose=self.latest_pose,
+                    stamp=now,
+                    message="motion goal timed out while safety mux remained in hold",
+                    reason_code=MotionReasonCode.GOAL_TIMEOUT,
+                    safety_state="hold",
+                    metadata=metadata,
+                )
+            return NavigationStatus(
+                NavigationStatusCode.QUEUED,
+                goal_id=goal_id,
+                current_pose=self.latest_pose,
+                stamp=now,
+                message="waiting for external autonomy enable",
+                safety_state="hold",
+                metadata=metadata,
+            )
+
         if self.latest_pose is None:
             # 没有 odom 时不能估计距离或进度，只能保持 QUEUED，不能盲目判定 blocked。
             return NavigationStatus(
@@ -428,6 +541,22 @@ class RosNavigationStatusProvider:
                 goal_id=goal_id,
                 stamp=now,
                 message="waiting for odometry before evaluating navigation status",
+                metadata=self._metadata(goal, state, now),
+            )
+
+        if goal.goal_pose is not None and self.latest_pose.frame_id != goal.goal_pose.frame_id:
+            # 中文说明：不同坐标系不能直接做欧氏距离。没有 TF 转换就显式报告
+            # localization_lost，禁止把 frame 错配伪装成正常导航进度。
+            return NavigationStatus(
+                NavigationStatusCode.LOCALIZATION_LOST,
+                goal_id=goal_id,
+                current_pose=self.latest_pose,
+                stamp=now,
+                message=(
+                    f"pose frame {self.latest_pose.frame_id!r} does not match "
+                    f"goal frame {goal.goal_pose.frame_id!r}"
+                ),
+                reason_code=MotionReasonCode.LOCALIZATION_LOST,
                 metadata=self._metadata(goal, state, now),
             )
 
@@ -446,21 +575,66 @@ class RosNavigationStatusProvider:
         metadata = self._metadata(goal, state, now, distances=distances, path_length_remaining=path_length)
         progress = self._progress_fraction(state, distances["distance_3d_m"])
 
-        if self._is_reached(distances):
-            # REACHED 先由几何阈值确认；是否语义成功必须交给 final verifier。
+        safety_status = self._safety_status_code()
+        if safety_status is not None:
+            safety_code, safety_reason = safety_status
             return NavigationStatus(
-                NavigationStatusCode.REACHED,
+                safety_code,
                 goal_id=goal_id,
                 current_pose=self.latest_pose,
                 distance_to_goal=distances["distance_3d_m"],
                 path_length_remaining=path_length,
-                progress=1.0,
+                progress=progress,
                 stamp=now,
-                message="goal reached within configured tolerance",
+                message="final velocity safety mux denied motion",
+                reason_code=safety_reason,
+                safety_state=str(self.latest_safety_state.get("state", "unknown")),
                 metadata=metadata,
             )
 
-        planner_status = self._fresh_planner_status_code(now)
+        if self._is_reached(distances, goal):
+            # 中文说明：距离阈值只证明“进入目标邻域”，还要确认底盘已经
+            # 停稳一段时间，避免运动中的瞬时 odom 触发最终证据采集。
+            speed_mps = self._planar_speed_mps()
+            if speed_mps <= self.velocity_tolerance_mps:
+                if state.reached_since is None:
+                    state.reached_since = now
+            else:
+                state.reached_since = None
+            metadata["speed_mps"] = speed_mps
+            metadata["stable_reach_time_s"] = self.stable_reach_time_s
+            metadata["settled_since"] = state.reached_since
+            stable = state.reached_since is not None and now - state.reached_since >= self.stable_reach_time_s
+            if stable:
+                # REACHED 只代表运动合同完成；语义是否满足仍由上层 verifier 决定。
+                return NavigationStatus(
+                    NavigationStatusCode.REACHED,
+                    goal_id=goal_id,
+                    current_pose=self.latest_pose,
+                    distance_to_goal=distances["distance_3d_m"],
+                    path_length_remaining=path_length,
+                    progress=1.0,
+                    stamp=now,
+                    message="goal reached and platform is settled",
+                    reason_code=MotionReasonCode.GOAL_REACHED,
+                    current_velocity=self.latest_velocity,
+                    metadata=metadata,
+                )
+            return NavigationStatus(
+                NavigationStatusCode.RUNNING,
+                goal_id=goal_id,
+                current_pose=self.latest_pose,
+                distance_to_goal=distances["distance_3d_m"],
+                path_length_remaining=path_length,
+                progress=progress,
+                stamp=now,
+                message="goal is within tolerance but platform is settling",
+                reason_code=MotionReasonCode.NONE,
+                current_velocity=self.latest_velocity,
+                metadata=metadata,
+            )
+
+        planner_status = self._fresh_planner_status_code(now, state)
         if planner_status in {
             NavigationStatusCode.REACHED,
             NavigationStatusCode.BLOCKED,
@@ -478,11 +652,13 @@ class RosNavigationStatusProvider:
                 progress=progress,
                 stamp=now,
                 message=f"local planner reported {planner_status.value}",
+                reason_code=_planner_reason_code(self.latest_planner_status),
+                current_velocity=self.latest_velocity,
                 metadata=metadata,
             )
 
         elapsed_s = now - state.started_at
-        if elapsed_s >= self.timeout_s:
+        if elapsed_s >= self._timeout_for_goal(goal):
             # timeout 是本次 motion attempt 的执行超时，不代表语义任务失败。
             return NavigationStatus(
                 NavigationStatusCode.TIMEOUT,
@@ -493,6 +669,7 @@ class RosNavigationStatusProvider:
                 progress=progress,
                 stamp=now,
                 message="navigation goal timed out before reaching target",
+                reason_code=MotionReasonCode.GOAL_TIMEOUT,
                 metadata=metadata,
             )
 
@@ -508,6 +685,7 @@ class RosNavigationStatusProvider:
                 progress=progress,
                 stamp=now,
                 message="navigation made no measurable progress",
+                reason_code=MotionReasonCode.NO_PROGRESS,
                 metadata=metadata,
             )
 
@@ -520,8 +698,17 @@ class RosNavigationStatusProvider:
             progress=progress,
             stamp=now,
             message="navigation goal is running",
+            reason_code=MotionReasonCode.NONE,
+            current_velocity=self.latest_velocity,
             metadata=metadata,
         )
+
+    def _planar_speed_mps(self) -> float:
+        """Return the current planar speed used by the settled-goal contract."""
+
+        if self.latest_velocity is None:
+            return 0.0
+        return math.hypot(float(self.latest_velocity[0]), float(self.latest_velocity[1]))
 
     def _distances_to_goal(self, goal: MotionGoal) -> Dict[str, float]:
         """Return x/y/z/3-D distance facts from latest pose to goal."""
@@ -542,21 +729,40 @@ class RosNavigationStatusProvider:
             "distance_3d_m": math.sqrt(dx * dx + dy * dy + dz * dz),
         }
 
-    def _is_reached(self, distances: Dict[str, float]) -> bool:
-        """Return whether distance facts satisfy configured reach thresholds."""
+    def _is_reached(self, distances: Dict[str, float], goal: MotionGoal) -> bool:
+        """Return whether distance and optional heading satisfy goal thresholds."""
 
-        if distances["xy_distance_m"] > self.xy_tolerance_m:
+        xy_tolerance = float(goal.tolerance.get("xy_goal_tolerance_m", self.xy_tolerance_m))
+        z_tolerance = goal.tolerance.get("z_goal_tolerance_m", self.z_tolerance_m)
+        if distances["xy_distance_m"] > xy_tolerance:
             return False
-        if self.z_tolerance_m is not None and distances["z_distance_m"] > self.z_tolerance_m:
+        if z_tolerance is not None and distances["z_distance_m"] > float(z_tolerance):
             return False
+        yaw_tolerance = goal.tolerance.get("yaw_tolerance_rad", self.heading_tolerance_rad)
+        if yaw_tolerance is not None and float(yaw_tolerance) > 0 and goal.goal_pose is not None and self.latest_pose is not None:
+            current_yaw = _yaw_from_quaternion(self.latest_pose.orientation_xyzw)
+            target_yaw = _yaw_from_quaternion(goal.goal_pose.orientation_xyzw)
+            if abs(_angle_delta(current_yaw, target_yaw)) > float(yaw_tolerance):
+                return False
         return True
+
+    def _timeout_for_goal(self, goal: MotionGoal) -> float:
+        """Return a goal-specific timeout when the action supplied one."""
+
+        value = goal.metadata.get("timeout_s")
+        if value is None:
+            return self.timeout_s
+        return max(0.0, float(value))
 
     def _path_length_remaining(self) -> Optional[float]:
         """Return path length from current pose through cached path points."""
 
-        if self.latest_pose is None or not self.latest_path_points:
+        if not self.latest_path_points:
             return None
-        return _path_length((self.latest_pose.position, *self.latest_path_points))
+        # 中文说明：SysNav /path 是 vehicle 局部坐标，不能与 map 下的 odom
+        # 位置直接拼接。局部路径从 vehicle 原点开始，长度在同一 frame 内计算。
+        origin = (0.0, 0.0, 0.0)
+        return _path_length((origin, *self.latest_path_points))
 
     def _record_progress_sample(self, state: _GoalProgressState, stamp: float, distance_m: float) -> None:
         """Append one bounded progress sample."""
@@ -609,22 +815,59 @@ class RosNavigationStatusProvider:
             "distance": distances or {},
             "path_available": path_available,
             "path_pose_count": len(self.latest_path_points),
+            "path_frame_id": self.latest_path_frame_id,
             "path_age_s": path_age_s,
             "path_length_remaining": path_length_remaining,
             "planner_status": self.latest_planner_status,
             "planner_status_age_s": planner_status_age_s,
             "planner_status_fresh": planner_status_age_s is not None and planner_status_age_s <= self.path_stale_timeout_s,
+            "velocity_mps": self._planar_speed_mps(),
+            "velocity_tolerance_mps": self.velocity_tolerance_mps,
+            "stable_reach_time_s": self.stable_reach_time_s,
+            "settled_since": state.reached_since,
             "progress_samples": list(state.progress_samples),
+            "safety_state": self.latest_safety_state,
         }
 
-    def _fresh_planner_status_code(self, now: float) -> Optional[NavigationStatusCode]:
-        """Return a planner status only when the cached status is fresh."""
+    def _safety_status_code(self) -> Optional[Tuple[NavigationStatusCode, MotionReasonCode]]:
+        """Map an active lower safety state to a terminal motion status."""
+
+        if not self.latest_safety_state:
+            return None
+        state = str(self.latest_safety_state.get("state", "")).lower()
+        if state == "estop":
+            return NavigationStatusCode.SAFETY_STOP, MotionReasonCode.ESTOP_ACTIVE
+        if state == "manual_takeover":
+            return NavigationStatusCode.MANUAL_TAKEOVER, MotionReasonCode.MANUAL_TAKEOVER
+        if state == "stale_input":
+            return NavigationStatusCode.SAFETY_STOP, MotionReasonCode.COMMAND_STALE
+        if state == "controller_fault":
+            return NavigationStatusCode.SAFETY_STOP, MotionReasonCode.CONTROLLER_FAULT
+        # HOLD 是安全门的等待态，不是一次运动失败；由 action timeout 或
+        # 显式 cancel 结束任务，避免底盘尚未获准时把目标误判为 blocked。
+        return None
+
+    def _safety_hold_active(self) -> bool:
+        """Return whether the final velocity mux is waiting for enablement."""
+
+        return bool(
+            self.latest_safety_state
+            and str(self.latest_safety_state.get("state", "")).lower() == "hold"
+            and not self.latest_safety_state.get("autonomy_enabled", False)
+        )
+
+    def _fresh_planner_status_code(self, now: float, state: _GoalProgressState) -> Optional[NavigationStatusCode]:
+        """Return a fresh planner status generated after this goal was submitted."""
 
         if self.latest_planner_status is None:
             return None
         received_at = float(self.latest_planner_status.get("received_at", now))
         if now - received_at > self.path_stale_timeout_s:
             # 过期的 blocked/timeout 不能污染后续新目标。
+            return None
+        if state.planner_status_baseline_at is not None and received_at <= state.planner_status_baseline_at:
+            # 中文说明：/local_planner/status 没有 goal_id，因此用提交时的
+            # 状态代际作为最小隔离边界，禁止旧 no_feasible_path 终止新目标。
             return None
         return _planner_status_code(self.latest_planner_status)
 
@@ -692,6 +935,11 @@ class RosWaypointController:
         self._last_goal_id = goal_id
         self._last_goal = goal
 
+        if self.status_provider is not None and hasattr(self.status_provider, "begin_goal"):
+            # 中文说明：先记录状态代际，再发布 /way_point，避免 ROS 异步回调
+            # 在首次 poll 之前抢先产生 planner 终态而被误当成旧消息。
+            self.status_provider.begin_goal(goal_id, goal)
+
         if not goal.requires_motion():
             # STOP/WAIT 是高层状态，不应伪造成 /way_point，否则会触发下层无意义移动。
             status = NavigationStatusCode.REACHED if goal.mode == MotionGoalMode.STOP else NavigationStatusCode.IDLE
@@ -734,8 +982,10 @@ class RosWaypointController:
             # 如果有状态 provider，它也要同步 preempted，避免下一次 poll 又返回 RUNNING。
             self.status_provider.cancel(target_goal_id)
         cancel_published = self._publish_empty(self.cancel_publisher)
-        # 没有 cancel topic 时退化为 hold topic，保证“撤销目标”和“停止继续推进”仍有硬件出口。
-        hold_fallback_published = False if cancel_published else self._publish_empty(self.hold_publisher)
+        # 取消分成两层：通知 planner 清理目标，同时让唯一安全 mux 进入 hold。
+        # SysNav 原生 localPlanner 没有统一 cancel contract，不能把 cancel topic
+        # 当作已经停止底盘的证明；即使 cancel 已发布，也必须保留 hold 闭环。
+        hold_published = self._publish_empty(self.hold_publisher)
         self._last_status = NavigationStatus(
             NavigationStatusCode.PREEMPTED,
             goal_id=target_goal_id,
@@ -744,7 +994,8 @@ class RosWaypointController:
                 "cancel_topic": self.cancel_topic,
                 "hold_topic": self.hold_topic,
                 "cancel_signal_published": cancel_published,
-                "hold_fallback_published": hold_fallback_published,
+                "hold_signal_published": hold_published,
+                "hold_fallback_published": hold_published and not cancel_published,
             },
         )
 
@@ -774,9 +1025,16 @@ class RosWaypointController:
         if goal.goal_pose is None:
             raise ValueError("MotionGoal.goal_pose is required for SysNav waypoint publication")
 
+        frame_id = goal.goal_pose.frame_id or self.world_frame
+        if frame_id != self.world_frame:
+            raise ValueError(
+                f"waypoint frame {frame_id!r} does not match configured world frame {self.world_frame!r}; "
+                "transform the goal in a geometry adapter before publishing"
+            )
+
         msg = self._point_stamped_type()
         # SysNav /way_point 只消费三维点；朝向/look_at 由后续 controller 或证据采集层处理。
-        msg.header.frame_id = goal.goal_pose.frame_id or self.world_frame
+        msg.header.frame_id = frame_id
         _set_stamp_now(msg, self.node)
         msg.point.x = float(goal.goal_pose.position[0])
         msg.point.y = float(goal.goal_pose.position[1])
@@ -998,6 +1256,20 @@ def _pose3d_from_odometry_msg(msg: Any, default_frame: str) -> Pose3D:
     return _pose3d_from_pose_msg(pose_msg, getattr(msg, "header", None), default_frame)
 
 
+def _velocity_from_odometry_msg(msg: Any) -> Optional[Tuple[float, float, float]]:
+    """Return linear velocity from a ROS-like odometry message, if present."""
+
+    twist_with_covariance = getattr(msg, "twist", None)
+    twist_msg = getattr(twist_with_covariance, "twist", twist_with_covariance)
+    linear = getattr(twist_msg, "linear", None)
+    if linear is None:
+        return None
+    values = tuple(getattr(linear, axis, None) for axis in ("x", "y", "z"))
+    if any(value is None for value in values):
+        return None
+    return tuple(float(value) for value in values)
+
+
 def _pose3d_from_pose_stamped_msg(msg: Any, default_frame: str) -> Pose3D:
     """Return `Pose3D` from a ROS-like `geometry_msgs/PoseStamped` message."""
 
@@ -1027,6 +1299,19 @@ def _orientation_to_xyzw(orientation: Any) -> Tuple[float, float, float, float]:
         float(getattr(orientation, "z", 0.0)),
         float(getattr(orientation, "w", 1.0)),
     )
+
+
+def _yaw_from_quaternion(quaternion: Tuple[float, float, float, float]) -> float:
+    """Return planar yaw from an ``xyzw`` quaternion."""
+
+    x, y, z, w = quaternion
+    return math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+
+
+def _angle_delta(first: float, second: float) -> float:
+    """Return the shortest signed angular difference."""
+
+    return (first - second + math.pi) % (2.0 * math.pi) - math.pi
 
 
 def _path_points_from_msg(msg: Any) -> Tuple[Tuple[float, float, float], ...]:
@@ -1070,7 +1355,7 @@ def _planner_status_code(status: Optional[Dict[str, Any]]) -> Optional[Navigatio
         return None
     if text in {"reached", "success", "succeeded", "done"}:
         return NavigationStatusCode.REACHED
-    if text in {"blocked", "no_path", "no path", "path_blocked", "stuck"}:
+    if text in {"blocked", "no_path", "no path", "path_blocked", "stuck", "no_feasible_path"}:
         return NavigationStatusCode.BLOCKED
     if text in {"timeout", "timed_out", "time out"}:
         return NavigationStatusCode.TIMEOUT
@@ -1081,6 +1366,23 @@ def _planner_status_code(status: Optional[Dict[str, Any]]) -> Optional[Navigatio
     if text == "false":
         return NavigationStatusCode.BLOCKED
     return None
+
+
+def _planner_reason_code(status: Optional[Dict[str, Any]]) -> MotionReasonCode:
+    """Map an explicit local-planner status to a stable motion reason."""
+
+    text = str((status or {}).get("text", "")).strip().lower()
+    if text in {"blocked", "no_path", "no path", "path_blocked", "stuck", "no_feasible_path"}:
+        return MotionReasonCode.NO_FEASIBLE_PATH
+    if text in {"timeout", "timed_out", "time out"}:
+        return MotionReasonCode.GOAL_TIMEOUT
+    if text in {"preempted", "cancelled", "canceled", "preempt"}:
+        return MotionReasonCode.CANCELLED
+    if text in {"failed", "failure", "error"}:
+        return MotionReasonCode.CONTROLLER_FAULT
+    if text in {"reached", "success", "succeeded", "done"}:
+        return MotionReasonCode.GOAL_REACHED
+    return MotionReasonCode.NONE
 
 
 def normalize_ros_topic_name(topic: str) -> str:

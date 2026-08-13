@@ -31,7 +31,15 @@ def _pose_msg(x, y, z):
 
 
 def _odom_msg(x, y, z, sec=1):
-    return SimpleNamespace(header=_header(sec=sec), pose=SimpleNamespace(pose=_pose_msg(x, y, z)))
+    return SimpleNamespace(
+        header=_header(sec=sec),
+        pose=SimpleNamespace(pose=_pose_msg(x, y, z)),
+        twist=SimpleNamespace(
+            twist=SimpleNamespace(
+                linear=SimpleNamespace(x=0.0, y=0.0, z=0.0),
+            )
+        ),
+    )
 
 
 def _path_msg(*points):
@@ -275,6 +283,22 @@ def test_waypoint_controller_rejects_direct_cmd_vel_topics() -> None:
         )
 
 
+def test_waypoint_controller_rejects_untransformed_goal_frame() -> None:
+    controller = RosWaypointController(
+        node=SimpleNamespace(),
+        publisher=FakePublisher(),
+        point_stamped_type=FakePointStamped,
+        world_frame="map",
+    )
+    goal = MotionGoal(
+        mode=MotionGoalMode.GO_TO_OBJECT,
+        goal_pose=Pose3D(position=(1.0, 0.0, 0.0), frame_id="odom"),
+    )
+
+    with pytest.raises(ValueError, match="does not match configured world frame"):
+        controller.send_goal(goal)
+
+
 def test_waypoint_controller_hold_publishes_hold_without_emergency_by_default() -> None:
     waypoint_publisher = FakePublisher()
     hold_publisher = FakePublisher()
@@ -349,9 +373,11 @@ def test_waypoint_controller_cancel_publishes_cancel_signal() -> None:
     status = controller.poll_status(goal_id)
 
     assert len(cancel_publisher.published) == 1
-    assert hold_publisher.published == []
+    # Planner cancellation and the independent safety hold are both required.
+    assert len(hold_publisher.published) == 1
     assert status.status == NavigationStatusCode.PREEMPTED
     assert status.metadata["cancel_signal_published"] is True
+    assert status.metadata["hold_signal_published"] is True
     assert status.metadata["hold_fallback_published"] is False
 
 
@@ -395,6 +421,7 @@ def test_navigation_status_provider_reports_running_and_reached_from_odom_and_pa
     assert running.status == NavigationStatusCode.RUNNING
     assert running.distance_to_goal == 1.0
     assert running.path_length_remaining == 1.0
+    assert running.metadata["path_frame_id"] == "map"
     assert running.metadata["path_available"] is True
     assert running.metadata["heading_checked"] is False
 
@@ -454,8 +481,10 @@ def test_navigation_status_provider_respects_local_planner_blocked_status() -> N
     clock = {"t": 0.0}
     provider = RosNavigationStatusProvider(path_stale_timeout_s=5.0, now_fn=lambda: clock["t"])
     provider.update_odometry(_odom_msg(0.0, 0.0, 0.0))
-    provider.update_local_planner_status(SimpleNamespace(data="blocked"))
     goal = MotionGoal(mode=MotionGoalMode.GO_TO_OBJECT, goal_pose=Pose3D(position=(2.0, 0.0, 0.0)))
+    assert provider("goal-planner-blocked", goal).status == NavigationStatusCode.RUNNING
+    clock["t"] = 1.0
+    provider.update_local_planner_status(SimpleNamespace(data="blocked"))
 
     status = provider("goal-planner-blocked", goal)
 
@@ -463,11 +492,47 @@ def test_navigation_status_provider_respects_local_planner_blocked_status() -> N
     assert status.metadata["planner_status"]["text"] == "blocked"
     assert status.metadata["planner_status_fresh"] is True
 
-    clock["t"] = 6.0
+    clock["t"] = 6.1
     stale = provider("goal-planner-stale", goal)
 
     assert stale.status == NavigationStatusCode.RUNNING
     assert stale.metadata["planner_status_fresh"] is False
+
+
+def test_navigation_status_provider_maps_planner_no_feasible_path_reason() -> None:
+    clock = {"t": 0.0}
+    provider = RosNavigationStatusProvider(now_fn=lambda: clock["t"])
+    provider.update_odometry(_odom_msg(0.0, 0.0, 0.0))
+    goal = MotionGoal(mode=MotionGoalMode.GO_TO_OBJECT, goal_pose=Pose3D(position=(2.0, 0.0, 0.0)))
+    assert provider("goal-no-path", goal).status == NavigationStatusCode.RUNNING
+    clock["t"] = 1.0
+    provider.update_local_planner_status(SimpleNamespace(data="no_feasible_path"))
+
+    status = provider("goal-no-path", goal)
+
+    assert status.status == NavigationStatusCode.BLOCKED
+    assert status.reason_code.value == "no_feasible_path"
+
+
+def test_waypoint_controller_starts_planner_generation_before_publish() -> None:
+    clock = {"t": 0.0}
+    provider = RosNavigationStatusProvider(now_fn=lambda: clock["t"])
+    provider.update_odometry(_odom_msg(0.0, 0.0, 0.0))
+    provider.update_local_planner_status(SimpleNamespace(data="tracking"))
+    publisher = FakePublisher()
+    controller = RosWaypointController(
+        node=SimpleNamespace(),
+        publisher=publisher,
+        point_stamped_type=FakePointStamped,
+        status_provider=provider,
+    )
+    goal = MotionGoal(mode=MotionGoalMode.GO_TO_OBJECT, goal_pose=Pose3D(position=(1.0, 0.0, 0.0)))
+
+    goal_id = controller.send_goal(goal)
+    clock["t"] = 0.1
+    provider.update_local_planner_status(SimpleNamespace(data="no_feasible_path"))
+
+    assert controller.poll_status(goal_id).status == NavigationStatusCode.BLOCKED
 
 
 def test_waypoint_controller_cancel_marks_status_provider_preempted() -> None:

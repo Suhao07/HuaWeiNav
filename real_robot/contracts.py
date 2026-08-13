@@ -51,6 +51,32 @@ class NavigationStatusCode(str, Enum):
     TIMEOUT = "timeout"
     PREEMPTED = "preempted"
     FAILED = "failed"
+    SAFETY_STOP = "safety_stop"
+    MANUAL_TAKEOVER = "manual_takeover"
+    LOCALIZATION_LOST = "localization_lost"
+
+
+class MotionReasonCode(str, Enum):
+    """Stable reason codes for motion-task results and safety transitions."""
+
+    NONE = "none"
+    GOAL_REACHED = "goal_reached"
+    NO_FEASIBLE_PATH = "no_feasible_path"
+    NO_PROGRESS = "no_progress"
+    GOAL_TIMEOUT = "goal_timeout"
+    ODOMETRY_STALE = "odometry_stale"
+    POINTCLOUD_STALE = "pointcloud_stale"
+    LOCALIZATION_LOST = "localization_lost"
+    MANUAL_TAKEOVER = "manual_takeover"
+    ESTOP_ACTIVE = "estop_active"
+    CONTROLLER_FAULT = "controller_fault"
+    COMMAND_STALE = "command_stale"
+    CANCELLED = "cancelled"
+    UNKNOWN_GOAL = "unknown_goal"
+    INVALID_GOAL = "invalid_goal"
+    LOOK_AT_UNSUPPORTED = "look_at_unsupported"
+    VIEW_ALIGNMENT_UNAVAILABLE = "view_alignment_unavailable"
+    VIEW_ALIGNMENT_FAILED = "view_alignment_failed"
 
 
 class EvidenceSource(str, Enum):
@@ -367,6 +393,9 @@ class NavigationStatus:
     stamp: Optional[float] = None
     message: str = ""
     metadata: Dict[str, Any] = field(default_factory=dict)
+    reason_code: MotionReasonCode = MotionReasonCode.NONE
+    safety_state: str = "unknown"
+    current_velocity: Optional[Vector3] = None
 
     def is_terminal(self) -> bool:
         """Return whether the controller finished this goal attempt."""
@@ -378,6 +407,9 @@ class NavigationStatus:
             NavigationStatusCode.TIMEOUT,
             NavigationStatusCode.PREEMPTED,
             NavigationStatusCode.FAILED,
+            NavigationStatusCode.SAFETY_STOP,
+            NavigationStatusCode.MANUAL_TAKEOVER,
+            NavigationStatusCode.LOCALIZATION_LOST,
         }
 
     def succeeded(self) -> bool:

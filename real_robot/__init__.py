@@ -14,6 +14,7 @@ from real_robot.contracts import (
     FrontierSnapshot,
     MotionGoal,
     MotionGoalMode,
+    MotionReasonCode,
     NavigationIntent,
     NavigationStatus,
     NavigationStatusCode,
@@ -50,6 +51,13 @@ from real_robot.sysnav_ros_adapters import (
     SysNavTopicConfig,
     build_semantic_map_snapshot,
 )
+from real_robot.motion_safety import SafetyDecision, SafetyState, SafetyVelocityPolicy, VelocityCommand, VelocityLimits
+from real_robot.control.controller_contract import (
+    ControllerContract,
+    ControllerContractError,
+    load_controller_contract,
+    validate_controller_contract,
+)
 from real_robot.sysnav_runtime import (
     DryRunMotionController,
     FinalInstructionVerifierAdapter,
@@ -74,6 +82,7 @@ __all__ = [
     "FrontierSnapshot",
     "MotionGoal",
     "MotionGoalMode",
+    "MotionReasonCode",
     "NavigationIntent",
     "NavigationStatus",
     "NavigationStatusCode",
@@ -103,6 +112,15 @@ __all__ = [
     "RosWaypointController",
     "SysNavTopicConfig",
     "build_semantic_map_snapshot",
+    "SafetyDecision",
+    "SafetyState",
+    "SafetyVelocityPolicy",
+    "VelocityCommand",
+    "VelocityLimits",
+    "ControllerContract",
+    "ControllerContractError",
+    "load_controller_contract",
+    "validate_controller_contract",
     "DryRunMotionController",
     "FinalInstructionVerifierAdapter",
     "FirstObjectSmokePolicy",
