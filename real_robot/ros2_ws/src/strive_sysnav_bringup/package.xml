@@ -13,6 +13,12 @@
   <exec_depend>rclpy</exec_depend>
   <exec_depend>sensor_msgs</exec_depend>
   <exec_depend>std_msgs</exec_depend>
+  <exec_depend>tf2_geometry_msgs</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
+  <exec_depend>strive_motion_msgs</exec_depend>
+  <exec_depend>strive_sysnav_motion</exec_depend>
+  <exec_depend>local_planner</exec_depend>
+  <exec_depend>terrain_analysis</exec_depend>
   <exec_depend>semantic_mapping</exec_depend>
   <exec_depend>tare_planner</exec_depend>
 

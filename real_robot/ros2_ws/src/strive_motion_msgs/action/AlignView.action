@@ -1,0 +1,24 @@
+geometry_msgs/PoseStamped target_pose
+geometry_msgs/PointStamped look_at
+bool has_look_at
+float32 yaw_tolerance_rad
+float32 timeout_s
+string target_object_uid
+string anchor_object_uid
+---
+uint8 ALIGNED=0
+uint8 BLOCKED=1
+uint8 TIMEOUT=2
+uint8 PREEMPTED=3
+uint8 FAILED=4
+uint8 outcome
+string reason_code
+geometry_msgs/PoseStamped final_pose
+string message
+---
+uint8 ALIGNING=0
+uint8 HOLDING=1
+uint8 SAFETY_STOP=2
+geometry_msgs/PoseStamped current_pose
+float32 yaw_error_rad
+string reason_code
