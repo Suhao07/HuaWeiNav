@@ -91,3 +91,43 @@ time_offset_status = unidentifiable / not accepted
 - 记录 calibration id、分辨率、畸变模型、日期、样本数、误差和数据路径。
 
 在这些条件满足前，继续保持 semantic mapping 关闭是正确的安全状态。
+
+## 2026-08-14 重新评估（仍未批准）
+
+已使用增强版只读脚本对既有 `debug-motion-02` bag 做交替样本 held-out 复核：
+
+```text
+scripts/evaluate_rgb_lidar_time_offset.py --held-out-split
+```
+
+结果（历史 640x480 内参，仅用于复核该 bag）：
+
+| 指标 | train | held-out（train offset = -4 ms） |
+| --- | ---: | ---: |
+| offset | -4 ms | -4 ms |
+| median depth residual | 0.230 m | 0.283 m |
+| RMSE | 0.655 m | 0.631 m |
+| P90 | 1.248 m | 1.095 m |
+| projected / valid depth / inlier | 193 / 192 / 176 | 197 / 195 / 175 |
+| depth inlier ratio | 0.917 | 0.897 |
+
+held-out `pass=false`（median 超过当前 0.25 m 工作阈值），所以这个既有 bag
+不能把 `calibration_status` 改成 `calibrated`。增强脚本现在会同时记录有效投影
+点数和深度 inlier ratio；它仍不是棋盘四边形像素距离的一一对应误差，正式验收仍
+需要新的 RGB-D + LiDAR 手持动态标定数据和真实 LiDAR–图像投影误差。
+
+## 2026-08-14 对象坐标量级防护
+
+此前出现的 `x/y/z≈10^5–10^6 m` 对象位置与同一时段 Point-LIO 位姿发散一致，
+不是 D435i 外参本身的证据。项目 semantic-mapping 源码已增加可配置的 odometry
+质量门：默认拒绝非有限位姿、`max(abs(position))>200 m`、线速度超过 5 m/s 或
+角速度超过 10 rad/s 的样本；对应 D435i mapping YAML 已同步到机器人。该门只
+丢弃异常传感器样本，不发布或改变任何底盘控制；semantic mapping 仍需在新镜像
+构建后、标定通过后才可打开。
+
+在 semantic mapping 关闭、detector 运行期间，`scripts/check_real_robot_pose_scale.py`
+对 `/aft_mapped_to_init` 做了 30 s 只读检查：2998 个样本全部有限，
+`max_abs_position=0.0297 m`、位置范数 P95 为 `0.0314 m`、最大线速度
+`0.0230 m/s`，pose-scale proxy `pass=true`。这证明 Point-LIO 修正后输入位姿
+已回到合理量级，但不等价于对象点云/投影误差验收；实际对象列表仍需在标定通过
+后再启用 semantic mapping 验证。

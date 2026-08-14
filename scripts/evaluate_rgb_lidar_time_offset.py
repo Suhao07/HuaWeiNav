@@ -122,6 +122,8 @@ def score_offset(cameras, lidars, odom_times, odom_poses, t_cam_from_lidar, t_ba
     lidar_times = [x[0] for x in lidars]
     residuals = []
     correspondences = 0
+    projected_count = 0
+    depth_valid_count = 0
     pairs = 0
     for t_rgb, depth_raw, encoding in cameras:
         target = t_rgb - offset
@@ -151,10 +153,12 @@ def score_offset(cameras, lidars, odom_times, odom_poses, t_cam_from_lidar, t_ba
         v = np.rint(pixels[:, 1]).astype(int)
         inside = (u >= 1) & (u < depth.shape[1] - 1) & (v >= 1) & (v < depth.shape[0] - 1)
         u, v, z = u[inside], v[inside], camera[inside, 2]
+        projected_count += len(z)
         if len(z) == 0:
             continue
         measured = depth[v, u]
         valid_depth = np.isfinite(measured) & (measured > 0.15) & (measured < 15.0)
+        depth_valid_count += int(np.count_nonzero(valid_depth))
         diff = np.abs(z[valid_depth] - measured[valid_depth])
         # Reject obvious foreground/background mismatches while retaining a
         # robust surface alignment statistic.
@@ -164,7 +168,17 @@ def score_offset(cameras, lidars, odom_times, odom_poses, t_cam_from_lidar, t_ba
             correspondences += len(diff)
             pairs += 1
     if not residuals:
-        return {"offset_s": offset, "score_rmse_m": None, "score_median_abs_m": None, "pairs": pairs, "correspondences": 0}
+        return {
+            "offset_s": offset,
+            "score_rmse_m": None,
+            "score_median_abs_m": None,
+            "score_p90_abs_m": None,
+            "pairs": pairs,
+            "projected_count": projected_count,
+            "depth_valid_count": depth_valid_count,
+            "correspondences": 0,
+            "depth_inlier_ratio": None,
+        }
     arr = np.asarray(residuals)
     return {
         "offset_s": float(offset),
@@ -172,8 +186,19 @@ def score_offset(cameras, lidars, odom_times, odom_poses, t_cam_from_lidar, t_ba
         "score_median_abs_m": float(np.median(arr)),
         "score_p90_abs_m": float(np.percentile(arr, 90)),
         "pairs": pairs,
+        "projected_count": int(projected_count),
+        "depth_valid_count": int(depth_valid_count),
         "correspondences": int(len(arr)),
+        "depth_inlier_ratio": float(len(arr) / max(depth_valid_count, 1)),
     }
+
+
+def choose_best(scores, min_correspondences=100):
+    usable = [
+        s for s in scores
+        if s["score_median_abs_m"] is not None and s["correspondences"] >= min_correspondences
+    ]
+    return min(usable, key=lambda x: x["score_median_abs_m"]) if usable else None
 
 
 def main():
@@ -188,6 +213,11 @@ def main():
     p.add_argument("--min-offset", type=float, default=-0.20)
     p.add_argument("--max-offset", type=float, default=0.20)
     p.add_argument("--step", type=float, default=0.010)
+    p.add_argument(
+        "--held-out-split",
+        action="store_true",
+        help="Score alternating camera samples separately and report held-out metrics.",
+    )
     args = p.parse_args()
     ext = json.loads(Path(args.extrinsics).read_text())
     t_cam_lidar = np.asarray(ext["T_camera_from_lidar"], dtype=float)
@@ -199,18 +229,55 @@ def main():
     k = np.array([[args.fx, 0, args.cx], [0, args.fy, args.cy], [0, 0, 1]], dtype=float)
     offsets = np.arange(args.min_offset, args.max_offset + args.step * 0.5, args.step)
     scores = [score_offset(cameras, lidars, odom_times, odom_poses, t_cam_lidar, t_base_lidar, t_base_camera, k, float(x)) for x in offsets]
-    usable = [s for s in scores if s["score_median_abs_m"] is not None and s["correspondences"] >= 100]
-    usable.sort(key=lambda x: x["score_median_abs_m"])
-    best = usable[0] if usable else None
+    best = choose_best(scores)
     result = {
         "bag": str(Path(args.bag)),
         "timestamp_basis": "sensor message header stamps; candidate delta=t_rgb-t_lidar",
         "input_counts": {"camera_depth_samples": len(cameras), "lidar_packets": len(lidars), "odom_samples": len(odoms)},
         "scan": scores,
         "best": best,
-        "identifiable": bool(best and best["correspondences"] >= 100 and best["score_median_abs_m"] < 0.25),
+        "identifiable": bool(
+            best
+            and best["correspondences"] >= 100
+            and best["score_median_abs_m"] < 0.25
+            and best["depth_inlier_ratio"] >= 0.10
+        ),
         "warning": "This is a depth-consistency estimate; approve only after checking the curve, inlier count, and a held-out run.",
     }
+    if args.held_out_split:
+        train_cameras = cameras[::2]
+        heldout_cameras = cameras[1::2]
+        train_scores = [
+            score_offset(train_cameras, lidars, odom_times, odom_poses, t_cam_lidar, t_base_lidar, t_base_camera, k, float(x))
+            for x in offsets
+        ]
+        heldout_scores = [
+            score_offset(heldout_cameras, lidars, odom_times, odom_poses, t_cam_lidar, t_base_lidar, t_base_camera, k, float(x))
+            for x in offsets
+        ]
+        train_best = choose_best(train_scores)
+        heldout_at_train = None
+        if train_best is not None:
+            heldout_at_train = min(
+                heldout_scores,
+                key=lambda x: abs(x["offset_s"] - train_best["offset_s"]),
+            )
+        heldout_best = choose_best(heldout_scores)
+        result["held_out"] = {
+            "split": "alternating_camera_samples",
+            "train_camera_samples": len(train_cameras),
+            "heldout_camera_samples": len(heldout_cameras),
+            "train_best": train_best,
+            "heldout_at_train_offset": heldout_at_train,
+            "heldout_best": heldout_best,
+            "pass": bool(
+                train_best
+                and heldout_at_train
+                and heldout_at_train["correspondences"] >= 100
+                and heldout_at_train["depth_inlier_ratio"] >= 0.10
+                and heldout_at_train["score_median_abs_m"] < 0.25
+            ),
+        }
     out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(result, indent=2), encoding="utf-8")

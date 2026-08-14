@@ -139,6 +139,12 @@ class MappingNode(Node):
         self.declare_parameter("cloud_sync_max_gap_s", 1.25)
         self.declare_parameter("allow_latest_odom", False)
         self.declare_parameter("odom_max_age_s", 0.5)
+        # Reject numerically divergent external odometry before it can be
+        # transformed into map/object coordinates.  Limits are configurable
+        # per robot and are a data-quality gate, not a controller.
+        self.declare_parameter("pose_max_abs_m", 200.0)
+        self.declare_parameter("pose_max_linear_speed_mps", 5.0)
+        self.declare_parameter("pose_max_angular_speed_rps", 10.0)
         self.declare_parameter("filter_depth_jumps", True)
         self.declare_parameter("mask_erosion_iterations", 2)
         # Point-LIO body clouds are high-bandwidth.  The mapping stage only
@@ -196,6 +202,9 @@ class MappingNode(Node):
         self.cloud_sync_max_gap_s = self.get_parameter('cloud_sync_max_gap_s').get_parameter_value().double_value
         self.allow_latest_odom = self.get_parameter('allow_latest_odom').get_parameter_value().bool_value
         self.odom_max_age_s = self.get_parameter('odom_max_age_s').get_parameter_value().double_value
+        self.pose_max_abs_m = self.get_parameter('pose_max_abs_m').get_parameter_value().double_value
+        self.pose_max_linear_speed_mps = self.get_parameter('pose_max_linear_speed_mps').get_parameter_value().double_value
+        self.pose_max_angular_speed_rps = self.get_parameter('pose_max_angular_speed_rps').get_parameter_value().double_value
         self.filter_depth_jumps = self.get_parameter('filter_depth_jumps').get_parameter_value().bool_value
         self.mask_erosion_iterations = self.get_parameter('mask_erosion_iterations').get_parameter_value().integer_value
         self.cloud_processing_interval_s = self.get_parameter('cloud_processing_interval_s').get_parameter_value().double_value
@@ -205,6 +214,8 @@ class MappingNode(Node):
             raise ValueError("cloud synchronization windows must be non-negative")
         if self.odom_max_age_s < 0.0:
             raise ValueError("odom_max_age_s must be non-negative")
+        if self.pose_max_abs_m <= 0.0 or self.pose_max_linear_speed_mps <= 0.0 or self.pose_max_angular_speed_rps <= 0.0:
+            raise ValueError("odometry quality limits must be positive")
         if self.mask_erosion_iterations < 0:
             raise ValueError("mask_erosion_iterations must be non-negative")
         if self.cloud_processing_interval_s < 0.0:
@@ -215,6 +226,7 @@ class MappingNode(Node):
             raise ValueError("mapping_processing_interval_s must be positive")
         self.last_cloud_processing_wall = 0.0
         self.last_mapping_detection_stamp = None
+        self.invalid_odom_count = 0
 
         print(
             f'Platform: {self.platform}\n,\
@@ -486,11 +498,39 @@ class MappingNode(Node):
 
     def odom_callback(self, msg):
         with self.odom_cbk_lock:
+            position = np.asarray(
+                [msg.pose.pose.position.x, msg.pose.pose.position.y, msg.pose.pose.position.z],
+                dtype=float,
+            )
+            linear_velocity = np.asarray(
+                [msg.twist.twist.linear.x, msg.twist.twist.linear.y, msg.twist.twist.linear.z],
+                dtype=float,
+            )
+            angular_velocity = np.asarray(
+                [msg.twist.twist.angular.x, msg.twist.twist.angular.y, msg.twist.twist.angular.z],
+                dtype=float,
+            )
+            if (
+                not np.isfinite(position).all()
+                or not np.isfinite(linear_velocity).all()
+                or not np.isfinite(angular_velocity).all()
+                or np.max(np.abs(position)) > self.pose_max_abs_m
+                or np.linalg.norm(linear_velocity) > self.pose_max_linear_speed_mps
+                or np.linalg.norm(angular_velocity) > self.pose_max_angular_speed_rps
+            ):
+                self.invalid_odom_count += 1
+                self.get_logger().warning(
+                    "dropping numerically invalid odometry before object fusion: "
+                    f"position={position.tolist()} linear_speed={float(np.linalg.norm(linear_velocity)):.3f} "
+                    f"angular_speed={float(np.linalg.norm(angular_velocity)):.3f} "
+                    f"count={self.invalid_odom_count}"
+                )
+                return
             odom = {}
-            odom['position'] = [msg.pose.pose.position.x, msg.pose.pose.position.y, msg.pose.pose.position.z]
+            odom['position'] = position.tolist()
             odom['orientation'] = [msg.pose.pose.orientation.x, msg.pose.pose.orientation.y, msg.pose.pose.orientation.z, msg.pose.pose.orientation.w]
-            odom['linear_velocity'] = [msg.twist.twist.linear.x, msg.twist.twist.linear.y, msg.twist.twist.linear.z]
-            odom['angular_velocity'] = [msg.twist.twist.angular.x, msg.twist.twist.angular.y, msg.twist.twist.angular.z]
+            odom['linear_velocity'] = linear_velocity.tolist()
+            odom['angular_velocity'] = angular_velocity.tolist()
 
             self.odom_stack.append(odom)
             self.odom_stamps.append(msg.header.stamp.sec + msg.header.stamp.nanosec / 1e9)

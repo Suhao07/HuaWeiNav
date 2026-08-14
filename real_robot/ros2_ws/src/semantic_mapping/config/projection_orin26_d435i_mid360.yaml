@@ -7,8 +7,8 @@ camera_projection:
   sensor_model: intel_realsense_d435i
   extrinsics_source: real_robot/calibration/orin26_d435i_mid360_targetless_v009_r009_extrinsics.json
   sensor_topics:
-    rgb: /camera/d435i/color/image_raw
-    camera_info: /camera/d435i/color/camera_info
+    rgb: /camera/d435i/d435i_camera/color/image_raw
+    camera_info: /camera/d435i/d435i_camera/color/camera_info
     lidar: /cloud_registered
     odom: /aft_mapped_to_init
   frame_ids:

@@ -22,6 +22,11 @@ semantic_mapping_node:
     cloud_sync_max_gap_s: 1.25
     allow_latest_odom: true
     odom_max_age_s: 0.5
+    # Fail closed if Point-LIO ever diverges; this prevents million-metre
+    # object coordinates from entering the semantic map. Tune per robot.
+    pose_max_abs_m: 200.0
+    pose_max_linear_speed_mps: 5.0
+    pose_max_angular_speed_rps: 10.0
     # Body cloud is sparse/accumulated at runtime; do not apply the legacy
     # packet-order depth-jump heuristic during this data-layer acceptance.
     filter_depth_jumps: false

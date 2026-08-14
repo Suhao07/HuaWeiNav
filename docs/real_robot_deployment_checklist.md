@@ -162,6 +162,17 @@
 - [ ] 在人工监控、急停可达、限速和受控场地中验证真实 `/way_point` handoff。
 - [ ] 验证 REACHED/BLOCKED/TIMEOUT/PREEMPTED、HOLD 与故障降级行为。
 
+### 2026-08-14 当前验收快照
+
+- [x] 机器人实际 D435i topic 已核对并写入 profile：`/camera/d435i/d435i_camera/color/image_raw`、`/camera/d435i/d435i_camera/depth/image_rect_raw` 及对应 CameraInfo。
+- [x] Point-LIO 已按机器人原 `mapping_mid360_orin.launch.py` 参数恢复；LIO-only 与 detector-only 60 秒测量均保持 body cloud 约 9.5 Hz、odom 约 100 Hz。
+- [x] Point-LIO 运行时 per-PID core limit 已设为 unlimited；系统 `core_pattern` 仍为 apport pipe，未修改全局配置。
+- [x] 只读资源监控已保存温度、CPU/RSS、cloud/odom 频率和 Point-LIO 日志：`logs/diagnostics/resources/20260814T091053Z/`。
+- [x] waypoint adapter 在容器内 `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest -q tests/test_waypoint_adapter.py` 通过 5 tests；8 秒 ROS dry-run `output_enabled=false` 日志显示 adapter ready，`/waypoint`、`/way_point`、`/cmd_vel` 均无 publisher。
+- [ ] controller contract 仍为 `approval_status: unapproved`；owner、急停 topic/流程、BLOCKED/TIMEOUT 回执和底盘所有权未获外部批准，因此不能批准真实 waypoint handoff。
+- [ ] held-out 标定复核失败（held-out median depth residual 0.283 m），`calibration_status` 必须继续保持 `extrinsics_only`，semantic mapping 继续关闭。
+- [ ] 需要补采新的 30–60 s RGB-D + LiDAR 手持动态数据，完成棋盘区域像素误差、深度 RMSE/median/P90、有效投影数和 inlier ratio；之后再构建含 pose-quality gate 的 mapping 镜像并做对象坐标量级验收。
+
 ## 8. 回滚
 
 - [x] 回滚仅允许停止/删除 `huawei-vln-realworld` 容器，保留日志与工件。

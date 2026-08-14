@@ -97,3 +97,73 @@ segmentation fault。长窗口略低于 35 秒窗口，作为 Orin-26 的保守�
 2. 生成正式 RGB–LiDAR 时间偏移和 held-out 重投影误差报告，并将 calibration status 从 `extrinsics_only` 改为 `calibrated` 前再决定是否长期启用 semantic mapping。
 3. 仅在填写并批准 robot-specific controller contract 后，做 waypoint adapter 的无运动格式验证；真实底盘控制仍保持关闭。
 4. 独立配置 Point-LIO core dump/backtrace 采集，不修改机器人其他工作空间。
+
+## 2026-08-14 重新连接后的根因定位与复测
+
+### Point-LIO 启动参数修正
+
+本次发现此前的直接 `ros2 run point_lio pointlio_mapping` 漏掉了机器人原有
+`mapping_mid360_orin.launch.py` 的关键参数：`use_imu_as_input`、
+`prop_at_freq_of_imu`、`point_filter_num=6`、`space_down_sample=true`、
+`filter_size_surf/map=0.5`、`ivox_nearby_type=6` 等。漏参时 Point-LIO 日志反复
+出现 `Drop old lidar frames to reduce lag!`，并把 `/aft_mapped_to_init` 推到
+百万米量级；这不是标定外参导致的对象尺度问题。
+
+现已恢复机器人原 launch 契约，只通过运行时参数打开：
+
+```text
+publish.scan_publish_en=true
+publish.scan_bodyframe_pub_en=true
+```
+
+项目脚本 `scripts/start_orin_lio_for_strive.sh` 已显式携带上述原 launch 参数，
+不修改机器人 Point-LIO 工作空间中的 YAML。复测时 Point-LIO 进程为单实例，
+并保留原有 Livox 驱动。
+
+### 60 秒传感器与资源测量
+
+LIO-only 60 秒记录：
+
+- `/cloud_registered_body`：约 9.52 Hz；
+- `/aft_mapped_to_init`：约 100.0 Hz；
+- Point-LIO 进程约 57% CPU、约 159 MB RSS；
+- Jetson `tegrastats` 最高结温约 60.4 °C，GPU 约 56.6 °C；
+- 运行过程中位姿保持厘米级，未再出现百万米坐标。
+
+恢复 detector（semantic mapping 仍关闭）后再次做 60 秒共存 soak：
+
+- `/cloud_registered_body`：约 9.43–9.50 Hz；
+- `/aft_mapped_to_init`：约 99.1–100.1 Hz；
+- Point-LIO CPU 约 54.8–55.0%、RSS 约 162.8 MB；
+- 结温约 60.8–61.2 °C；
+- 本 60 秒窗口无新的高延迟（>20 ms）记录；日志中较早的 110 条 drop warning 均发生在本次干净启动/soak 之前。
+
+证据目录：
+
+```text
+/home/orin26/HuaweiVLN/logs/diagnostics/resources/20260814T091053Z/
+/home/orin26/HuaweiVLN/logs/diagnostics/lio-crash/configure-20260814T090856Z.txt
+```
+
+### 崩溃捕获配置
+
+已添加 `scripts/configure_real_robot_lio_crash_capture.sh`。它只对指定 PID 执行
+`prlimit --core=unlimited`，记录 `/proc/<pid>/limits`、`core_pattern`、内核和
+进程命令行，并生成不自动执行的 GDB post-mortem 命令。当前机器人状态仍是：
+
+```text
+core limit (Point-LIO PID): unlimited
+core_pattern: apport pipe
+coredumpctl: absent
+gdb: /usr/bin/gdb
+```
+
+没有修改系统 sysctl、没有安装软件包；如要把 apport crash 文件解包或启用全局
+core 目录，需要机器人管理员另行批准。
+
+### 题点与下一步
+
+- D435i 实际 topic 已修正为 `/camera/d435i/d435i_camera/...`，profile 与投影配置已同步；
+- semantic mapping 仍保持关闭，直到标定验收通过；
+- `scripts/monitor_real_robot_resources.sh` 提供可重复的只读长时监控；
+- 旧的 1 Hz 结论应归因于漏参启动和未清理的 Point-LIO 实例，不再归因于“Orin 必然无法共存”。
