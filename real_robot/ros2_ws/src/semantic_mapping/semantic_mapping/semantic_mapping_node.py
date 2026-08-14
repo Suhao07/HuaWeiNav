@@ -33,6 +33,7 @@ from tare_planner.msg import ViewpointRep, ObjectType, TargetObjectInstruction
 import rclpy
 from rclpy.node import Node
 from rclpy.time import Time
+from rclpy.qos import qos_profile_sensor_data
 from cv_bridge import CvBridge
 from sensor_msgs.msg import Image
 from sensor_msgs.msg import PointCloud2
@@ -140,6 +141,13 @@ class MappingNode(Node):
         self.declare_parameter("odom_max_age_s", 0.5)
         self.declare_parameter("filter_depth_jumps", True)
         self.declare_parameter("mask_erosion_iterations", 2)
+        # Point-LIO body clouds are high-bandwidth.  The mapping stage only
+        # needs a recent cloud for each detector result, so deployments can
+        # throttle conversion and cap the retained point count without
+        # changing the upstream LIO topic.
+        self.declare_parameter("cloud_processing_interval_s", 0.0)
+        self.declare_parameter("max_cloud_points", 0)
+        self.declare_parameter("mapping_processing_interval_s", 0.5)
 
         # class global containers
         self.cloud_stack = []
@@ -190,12 +198,23 @@ class MappingNode(Node):
         self.odom_max_age_s = self.get_parameter('odom_max_age_s').get_parameter_value().double_value
         self.filter_depth_jumps = self.get_parameter('filter_depth_jumps').get_parameter_value().bool_value
         self.mask_erosion_iterations = self.get_parameter('mask_erosion_iterations').get_parameter_value().integer_value
+        self.cloud_processing_interval_s = self.get_parameter('cloud_processing_interval_s').get_parameter_value().double_value
+        self.max_cloud_points = self.get_parameter('max_cloud_points').get_parameter_value().integer_value
+        self.mapping_processing_interval_s = self.get_parameter('mapping_processing_interval_s').get_parameter_value().double_value
         if self.cloud_sync_before_s < 0.0 or self.cloud_sync_after_s < 0.0 or self.cloud_sync_max_gap_s < 0.0:
             raise ValueError("cloud synchronization windows must be non-negative")
         if self.odom_max_age_s < 0.0:
             raise ValueError("odom_max_age_s must be non-negative")
         if self.mask_erosion_iterations < 0:
             raise ValueError("mask_erosion_iterations must be non-negative")
+        if self.cloud_processing_interval_s < 0.0:
+            raise ValueError("cloud_processing_interval_s must be non-negative")
+        if self.max_cloud_points < 0:
+            raise ValueError("max_cloud_points must be non-negative")
+        if self.mapping_processing_interval_s <= 0.0:
+            raise ValueError("mapping_processing_interval_s must be positive")
+        self.last_cloud_processing_wall = 0.0
+        self.last_mapping_detection_stamp = None
 
         print(
             f'Platform: {self.platform}\n,\
@@ -208,7 +227,9 @@ class MappingNode(Node):
             f"Cloud input frame: {self.cloud_input_frame}; "
             f"sync window=[-{self.cloud_sync_before_s:.3f}, +{self.cloud_sync_after_s:.3f}]s; "
             f"latest odom fallback={self.allow_latest_odom}; "
-            f"mask erosion iterations={self.mask_erosion_iterations}"
+            f"mask erosion iterations={self.mask_erosion_iterations}; "
+            f"cloud throttle={self.cloud_processing_interval_s:.3f}s; "
+            f"max cloud points={self.max_cloud_points}"
         )
 
         self.mask_predictor = mask_predictor
@@ -275,7 +296,7 @@ class MappingNode(Node):
             PointCloud2,
             '/registered_scan',
             self.cloud_callback,
-            10,
+            qos_profile_sensor_data,
             callback_group=MutuallyExclusiveCallbackGroup()
         )
 
@@ -284,7 +305,7 @@ class MappingNode(Node):
                 Odometry,
                 '/aft_mapped_to_init_incremental',
                 self.odom_callback,
-                50,
+                qos_profile_sensor_data,
                 callback_group=MutuallyExclusiveCallbackGroup()
             )
         else:
@@ -292,7 +313,7 @@ class MappingNode(Node):
                 Odometry,
                 '/state_estimation',
                 self.odom_callback,
-                50,
+                qos_profile_sensor_data,
                 callback_group=MutuallyExclusiveCallbackGroup()
             )
 
@@ -343,7 +364,7 @@ class MappingNode(Node):
         )
 
         self.detection_counter = 0
-        self.mapping_timer = self.create_timer(0.5, self.mapping_callback)
+        self.mapping_timer = self.create_timer(self.mapping_processing_interval_s, self.mapping_callback)
 
         self.obj_cloud_pub = self.create_publisher(PointCloud2, '/obj_points', 10)
         self.obj_box_pub = self.create_publisher(MarkerArray, '/obj_boxes', 10)
@@ -400,8 +421,18 @@ class MappingNode(Node):
             self.obj_mapper.save_queue.task_done()
 
     def cloud_callback(self, msg):
+        now = time.monotonic()
+        if (
+            self.cloud_processing_interval_s > 0.0
+            and now - self.last_cloud_processing_wall < self.cloud_processing_interval_s
+        ):
+            return
+        self.last_cloud_processing_wall = now
         with self.cloud_cbk_lock:
             points_numpy = point_cloud2.read_points_numpy(msg, field_names=("x", "y", "z"))
+            if self.max_cloud_points > 0 and len(points_numpy) > self.max_cloud_points:
+                stride = int(np.ceil(len(points_numpy) / self.max_cloud_points))
+                points_numpy = points_numpy[::stride]
             stamp_seconds = msg.header.stamp.sec + msg.header.stamp.nanosec / 1e9
             self.cloud_stack.append(points_numpy)
             self.cloud_stamps.append(stamp_seconds)
@@ -730,6 +761,8 @@ class MappingNode(Node):
             # image = self.rgb_stack[target_index].copy()
             # self.get_logger().info(f'Using detection index: {target_index}')
             detection_stamp = self.detection_results_stamps[target_index]
+            if self.last_mapping_detection_stamp is not None and detection_stamp == self.last_mapping_detection_stamp:
+                return
             detections = self.detection_results_stack[target_index] 
             image = self.rgb_stack[target_index].copy()
 
@@ -839,6 +872,7 @@ class MappingNode(Node):
 
         # threading.Thread(target=self.mapping_processing, args=(image, camera_odom, detections, detection_stamp, neighboring_cloud, viewpoint_stamp_to_process)).start()
         self.mapping_processing(image, camera_odom, detections, detection_stamp, neighboring_cloud, viewpoint_stamp_to_process)
+        self.last_mapping_detection_stamp = detection_stamp
 
     def publish_map(self, stamp):
         seconds = int(stamp)

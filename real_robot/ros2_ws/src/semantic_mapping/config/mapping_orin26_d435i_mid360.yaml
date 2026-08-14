@@ -27,14 +27,22 @@ semantic_mapping_node:
     filter_depth_jumps: false
     # Keep detector masks intact for sparse Livox projections; tune per robot.
     mask_erosion_iterations: 0
+    # Mapping consumes at most two body clouds per second; Point-LIO remains
+    # untouched and continues publishing its full-rate body cloud upstream.
+    cloud_processing_interval_s: 1.0
+    max_cloud_points: 10000
+    mapping_processing_interval_s: 2.0
 
 detection_node:
   ros__parameters:
     platform: mecanum
     # Run detector at a bounded rate and reject stale camera frames so the
     # detection timestamp remains close enough to Point-LIO for fusion.
-    max_input_age_s: 1.0
-    image_processing_interval: 0.5
+    max_input_age_s: 0.75
+    # One inference per second keeps the detector from starving the host LIO
+    # callback thread on Orin-26.  The RGB stream remains available at camera
+    # rate; stale frames are discarded at the callback boundary.
+    image_processing_interval: 2.0
     visualize: false
     vis_interval: 0.5
     annotate_image: false

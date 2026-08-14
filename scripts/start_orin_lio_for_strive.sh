@@ -62,10 +62,19 @@ ros2 run tf2_ros static_transform_publisher \
   --frame-id aft_mapped --child-frame-id base \
   --ros-args -r __node:=tf_aft_mapped_to_base &
 TF_PID=\$!
-taskset -c 0-3 nice -n -10 ros2 run point_lio pointlio_mapping --ros-args \
+LIO_CMD=(ros2 run point_lio pointlio_mapping --ros-args \
   -r __node:=laserMapping \
   --params-file '${POINT_LIO_CONFIG}' \
-  ${point_lio_params[*]}
+  ${point_lio_params[*]})
+# Negative nice requires elevated scheduling privileges and previously caused
+# the ordinary orin26 tmux pane to exit before Point-LIO started.  Bind to the
+# first four CPUs when available, but never make deployment depend on it.
+if command -v taskset >/dev/null 2>&1 && taskset -c 0-3 true >/dev/null 2>&1; then
+  taskset -c 0-3 "\${LIO_CMD[@]}"
+else
+  echo '[odom] taskset unavailable; starting Point-LIO without CPU affinity'
+  "\${LIO_CMD[@]}"
+fi
 kill \$TF_PID 2>/dev/null || true
 exec /bin/zsh
 "

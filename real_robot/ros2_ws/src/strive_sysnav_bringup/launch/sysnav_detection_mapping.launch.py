@@ -17,6 +17,8 @@ def launch_setup(context, *args, **kwargs):
     object_file = LaunchConfiguration("object_file").perform(context)
     detector_model_path = LaunchConfiguration("detector_model_path").perform(context)
     detector_model_type = LaunchConfiguration("detector_model_type").perform(context)
+    detector_device = LaunchConfiguration("detector_device").perform(context)
+    detector_imgsz = int(LaunchConfiguration("detector_imgsz").perform(context))
     sam2_checkpoint = LaunchConfiguration("sam2_checkpoint").perform(context)
     platform = LaunchConfiguration("platform").perform(context)
     use_sim_time = LaunchConfiguration("use_sim_time").perform(context).lower() in ("1", "true", "yes", "on")
@@ -48,6 +50,8 @@ def launch_setup(context, *args, **kwargs):
             "use_sim_time": use_sim_time,
             "object_file": object_file,
             "detector_model_type": detector_model_type,
+            "device": detector_device,
+            "detector_imgsz": detector_imgsz,
         },
     ]
     if _non_empty(detector_model_path):
@@ -146,6 +150,8 @@ def generate_launch_description():
             DeclareLaunchArgument("object_file", default_value=""),
             DeclareLaunchArgument("detector_model_type", default_value="yoloe"),
             DeclareLaunchArgument("detector_model_path", default_value=""),
+            DeclareLaunchArgument("detector_device", default_value="cuda:0"),
+            DeclareLaunchArgument("detector_imgsz", default_value="640"),
             DeclareLaunchArgument("sam2_checkpoint", default_value=""),
             DeclareLaunchArgument("camera_topic", default_value="/camera/image"),
             DeclareLaunchArgument("cloud_topic", default_value="/registered_scan"),

@@ -1,0 +1,84 @@
+<mxfile host="app.diagrams.net" modified="2026-08-13T00:00:00.000Z" agent="Codex" version="24.7.17" type="device">
+  <diagram id="d435i-ros-node-graph" name="D435i ROS Node Graph">
+    <mxGraphModel dx="1600" dy="1000" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1800" pageHeight="1200" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+
+        <mxCell id="title" value="Orin-26 D435i ROS 节点关系图（无控制发布）" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;fontSize=22;fontStyle=1;fontColor=#0f172a;" vertex="1" parent="1">
+          <mxGeometry x="40" y="20" width="900" height="40" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="camera_node" value="/camera/d435i&lt;br&gt;realsense2_camera&lt;br&gt;&lt;font style=&quot;font-size:11px&quot;&gt;D435i 驱动节点&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dbeafe;strokeColor=#2563eb;strokeWidth=2;fontColor=#0f172a;" vertex="1" parent="1">
+          <mxGeometry x="70" y="130" width="230" height="80" as="geometry"/>
+        </mxCell>
+        <mxCell id="livox_node" value="/livox_lidar_publisher&lt;br&gt;livox_ros_driver2_node&lt;br&gt;&lt;font style=&quot;font-size:11px&quot;&gt;MID-360 驱动节点&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dcfce7;strokeColor=#16a34a;strokeWidth=2;fontColor=#0f172a;" vertex="1" parent="1">
+          <mxGeometry x="70" y="390" width="230" height="80" as="geometry"/>
+        </mxCell>
+        <mxCell id="lio_node" value="/laserMapping&lt;br&gt;pointlio_mapping&lt;br&gt;&lt;font style=&quot;font-size:11px&quot;&gt;Point-LIO 定位/点云节点&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dcfce7;strokeColor=#16a34a;strokeWidth=2;fontColor=#0f172a;" vertex="1" parent="1">
+          <mxGeometry x="420" y="390" width="250" height="80" as="geometry"/>
+        </mxCell>
+        <mxCell id="det_node" value="/detection_node&lt;br&gt;semantic_mapping/detection_node&lt;br&gt;&lt;font style=&quot;font-size:11px&quot;&gt;YOLOE 检测节点&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fef3c7;strokeColor=#d97706;strokeWidth=2;fontColor=#0f172a;" vertex="1" parent="1">
+          <mxGeometry x="420" y="130" width="250" height="80" as="geometry"/>
+        </mxCell>
+        <mxCell id="map_node" value="/d435i_body_semantic_mapping&lt;br&gt;semantic_mapping_node&lt;br&gt;&lt;font style=&quot;font-size:11px&quot;&gt;body-frame 语义建图节点&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fef3c7;strokeColor=#d97706;strokeWidth=2;fontColor=#0f172a;" vertex="1" parent="1">
+          <mxGeometry x="810" y="260" width="290" height="90" as="geometry"/>
+        </mxCell>
+        <mxCell id="object_consumer" value="对象结果消费者&lt;br&gt;当前未启动&lt;br&gt;&lt;font style=&quot;font-size:11px&quot;&gt;ObjectNodeList 下游&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8fafc;strokeColor=#64748b;strokeWidth=2;fontColor=#334155;dashed=1;" vertex="1" parent="1">
+          <mxGeometry x="1190" y="260" width="230" height="90" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="waypoint_source" value="STRIVE waypoint source&lt;br&gt;当前未启动" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fee2e2;strokeColor=#dc2626;strokeWidth=2;fontColor=#7f1d1d;dashed=1;" vertex="1" parent="1">
+          <mxGeometry x="810" y="570" width="230" height="80" as="geometry"/>
+        </mxCell>
+        <mxCell id="adapter_node" value="/waypoint_adapter&lt;br&gt;当前未启动&lt;br&gt;output_enabled=false" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fee2e2;strokeColor=#dc2626;strokeWidth=2;fontColor=#7f1d1d;dashed=1;" vertex="1" parent="1">
+          <mxGeometry x="1130" y="570" width="230" height="80" as="geometry"/>
+        </mxCell>
+        <mxCell id="base_node" value="底盘控制器&lt;br&gt;当前未接入&lt;br&gt;所有权/急停待批准" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fee2e2;strokeColor=#dc2626;strokeWidth=2;fontColor=#7f1d1d;dashed=1;" vertex="1" parent="1">
+          <mxGeometry x="1130" y="760" width="230" height="80" as="geometry"/>
+        </mxCell>
+        <mxCell id="cmd_warning" value="/cmd_vel&lt;br&gt;禁止直接发布" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fee2e2;strokeColor=#dc2626;fontColor=#7f1d1d;dashed=1;" vertex="1" parent="1">
+          <mxGeometry x="810" y="760" width="230" height="80" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="e_cam_det" value="/camera/d435i/color/image_raw&lt;br&gt;sensor_msgs/Image" edge="1" parent="1" source="camera_node" target="det_node" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;strokeColor=#2563eb;fontColor=#1e3a8a;labelBackgroundColor=#ffffff;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e_cam_map_info" value="/camera/d435i/color/camera_info&lt;br&gt;sensor_msgs/CameraInfo（配置/核对）" edge="1" parent="1" source="camera_node" target="map_node" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=open;dashed=1;strokeColor=#64748b;fontColor=#334155;labelBackgroundColor=#ffffff;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e_livox_lidar" value="/livox/lidar&lt;br&gt;livox_ros_driver2/msg/CustomMsg" edge="1" parent="1" source="livox_node" target="lio_node" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;strokeColor=#16a34a;fontColor=#166534;labelBackgroundColor=#ffffff;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e_livox_imu" value="/livox/imu&lt;br&gt;sensor_msgs/Imu" edge="1" parent="1" source="livox_node" target="lio_node" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;strokeColor=#16a34a;fontColor=#166534;labelBackgroundColor=#ffffff;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e_lio_cloud" value="/cloud_registered_body&lt;br&gt;sensor_msgs/PointCloud2（frame=body）" edge="1" parent="1" source="lio_node" target="map_node" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;strokeColor=#16a34a;fontColor=#166534;labelBackgroundColor=#ffffff;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e_lio_odom" value="/aft_mapped_to_init&lt;br&gt;nav_msgs/Odometry" edge="1" parent="1" source="lio_node" target="map_node" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;strokeColor=#16a34a;fontColor=#166534;labelBackgroundColor=#ffffff;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e_det_map" value="/huawei_vln/d435i_detection_result&lt;br&gt;tare_planner/msg/DetectionResult" edge="1" parent="1" source="det_node" target="map_node" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;strokeColor=#d97706;fontColor=#92400e;labelBackgroundColor=#ffffff;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e_map_obj" value="/huawei_vln/d435i_body_object_nodes_list&lt;br&gt;tare_planner/msg/ObjectNodeList" edge="1" parent="1" source="map_node" target="object_consumer" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;strokeColor=#d97706;fontColor=#92400e;labelBackgroundColor=#ffffff;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e_source_way" value="/way_point&lt;br&gt;geometry_msgs/PointStamped" edge="1" parent="1" source="waypoint_source" target="adapter_node" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=open;dashed=1;strokeColor=#dc2626;fontColor=#991b1b;labelBackgroundColor=#ffffff;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e_adapter_base" value="/waypoint&lt;br&gt;std_msgs/Float32MultiArray" edge="1" parent="1" source="adapter_node" target="base_node" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=open;dashed=1;strokeColor=#dc2626;fontColor=#991b1b;labelBackgroundColor=#ffffff;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e_cmd_base" value="/cmd_vel（禁止）" edge="1" parent="1" source="cmd_warning" target="base_node" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=open;dashed=1;strokeColor=#dc2626;fontColor=#991b1b;labelBackgroundColor=#ffffff;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="legend" value="图例：蓝色=相机节点；绿色=传感器/LIO 节点；黄色=感知/建图节点；红色虚线=未启动、未批准或禁止的控制关系；实线=已验证 ROS topic 连接。" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8fafc;strokeColor=#94a3b8;fontColor=#334155;" vertex="1" parent="1">
+          <mxGeometry x="70" y="940" width="1350" height="65" as="geometry"/>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

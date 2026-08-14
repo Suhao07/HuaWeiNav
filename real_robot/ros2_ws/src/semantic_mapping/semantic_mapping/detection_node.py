@@ -26,6 +26,7 @@ LOGGER.setLevel("ERROR")
 # ========== ROS2 Core ==========
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
 from rclpy.time import Time
 
 # ========== ROS2 Messages ==========
@@ -73,6 +74,7 @@ class DetectNode(Node):
         self.declare_parameter('annotate_image', True)
         self.declare_parameter('image_processing_interval', 0.5)
         self.declare_parameter('max_input_age_s', 1.0)
+        self.declare_parameter('detector_imgsz', 640)
         self.declare_parameter('object_file', str(self.CONFIG_DIR / 'config' / 'objects.yaml'))
         self.declare_parameter('detector_model_type', 'yoloe')
         self.declare_parameter('detector_model_path', str(self.CONFIG_DIR / 'external' / 'yoloe-26x-seg.engine'))
@@ -82,6 +84,8 @@ class DetectNode(Node):
         self.grounding_score_thresh = self.get_parameter('grounding_score_thresh').get_parameter_value().double_value
         self.image_processing_interval = self.get_parameter('image_processing_interval').get_parameter_value().double_value
         self.max_input_age_s = self.get_parameter('max_input_age_s').get_parameter_value().double_value
+        self.detector_imgsz = self.get_parameter('detector_imgsz').get_parameter_value().integer_value
+        self.device = self.get_parameter('device').get_parameter_value().string_value.strip() or device
         if self.image_processing_interval < 0.0:
             raise ValueError('image_processing_interval must be non-negative')
         if self.max_input_age_s < 0.0:
@@ -115,7 +119,17 @@ class DetectNode(Node):
             if detector_model_path.suffix.lower() in (".pt", ".pth") and hasattr(self.grounding_model, "set_classes"):
                 self.grounding_model.set_classes(self.text_prompt_list.tolist())
 
-        self.device = device
+        # Some Ultralytics YOLOE/PT versions leave parts of the model on CPU
+        # unless it is explicitly moved before the first inference.  Keep
+        # engine backends on their own device management path.
+        if detector_model_path.suffix.lower() in (".pt", ".pth") and hasattr(self.grounding_model, "to"):
+            try:
+                self.grounding_model.to(self.device)
+                self.log_info(f"Detector model moved to {self.device}")
+            except Exception as exc:
+                self.get_logger().warning(
+                    f"Could not move detector model to {self.device}; continuing with backend default: {exc}"
+                )
 
         if self.ANNOTATE:
             self.box_annotator = sv.BoxAnnotator(color=ColorPalette.DEFAULT)
@@ -142,8 +156,7 @@ class DetectNode(Node):
             Image,
             '/camera/image',
             self.image_callback,
-            10,
-            # qos_profile=QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT),
+            qos_profile_sensor_data,
         )
 
         self.annotated_image_pub = self.create_publisher(Image, '/annotated_image_detection', 10)
@@ -166,7 +179,15 @@ class DetectNode(Node):
         image = cv_image[:, :, ::-1]  # BGR to RGB
         # image = image.copy()
         start_time = time.time()
-        results = self.grounding_model.track(image, imgsz=(640, 1920), half=True, conf=self.grounding_score_thresh, persist=True, tracker=self.CONFIG_DIR / "config/botsort.yaml")
+        results = self.grounding_model.track(
+            image,
+            imgsz=self.detector_imgsz,
+            half=True,
+            device=self.device,
+            conf=self.grounding_score_thresh,
+            persist=True,
+            tracker=self.CONFIG_DIR / "config/botsort.yaml",
+        )
         time1 = time.time()
         boxes = results[0].boxes  # Boxes 对象
 

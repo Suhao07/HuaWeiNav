@@ -1,9 +1,18 @@
 # Orin-26 实物部署实时 Checklist
 
-> 最后更新：2026-08-12
+> 最后更新：2026-08-14
 > 工作区：`/home/orin26/HuaweiVLN`
 > 代码分支：`realworld`
 > 原则：不修改其他工作区；只有在明确批准的诊断动作中调用原有 LIO helper；STRIVE 不直接发布 `/cmd_vel`。
+
+> **2026-08-14 最新复测覆盖（以本段为准）**：干净重启 Point-LIO 后，LIO-only 的
+> `/cloud_registered_body` 约 9.47 Hz、`/aft_mapped_to_init` 约 99.99 Hz；detector-only
+> 约 9.43 Hz；detector + semantic mapping（detector 绑定 CPU 6–7、mapping 绑定 CPU 5，
+> 点云节流 1 s、最多 10000 点、mapping timer 2 s）下 body cloud 约 9.3 Hz、里程计约
+> 63–68 Hz；追加约 60 秒 soak 时 body cloud 约 8.4–8.6 Hz。semantic mapping 已输出 `/huawei_vln/d435i_object_nodes_list`，但 RGB–LiDAR
+> 时间偏移/重投影误差和对象坐标量级尚未完成正式标定验收，因此 calibration status 仍不能
+> 改为 `calibrated`。控制门控仍关闭，`/waypoint`、`/way_point`、`/cmd_vel` 当前无
+> publisher。详细证据见 [`docs/real_robot_lio_resource_diagnostic_20260813.md`](real_robot_lio_resource_diagnostic_20260813.md)。
 
 本文档是实物部署的执行记录，而不是设计愿景。只有有明确命令输出、测试结果或
 落盘工件的项才可勾选。任何失败都保持在 dry-run 或 detector-only 阶段。
@@ -22,7 +31,7 @@
 - [x] 2026-08-11 Point-LIO 的只读 tmux 日志确认正在处理首帧 LiDAR/IMU 并持续输出 mapping 时延；未修改该 session。
 - [x] 2026-08-11 只读核对 `/dev/video0`：udev 身份为 Generic USB Camera（VID `0bda`、PID `3035`、序列号 `200901010001`），`/dev/v4l/by-id/usb-Generic_USB_Camera_200901010001-video-index0` 指向该设备。
 - [x] 2026-08-11 只读核对当前 ROS graph：`/depth_camera_adapter`、`/laserMapping`、`/livox_lidar_publisher`、`/tf_aft_mapped_to_base` 存在；没有控制节点。`/depth_camera_adapter` 仅订阅 `/camera/camera/depth/image_rect_raw`，发布 `/depth_camera`，frame=`depth_camera`，输出 32×24、范围 0.05–2.5 m。
-- [x] 2026-08-12 按原有 `/home/orin26/code/HuaWeiNav/scripts/start_orin_lio_for_strive.sh` 重启 `livox_odom`，只覆盖 `publish.scan_publish_en=true`、`scan_bodyframe_pub_en=false`；未修改 Point-LIO 配置文件、未启动控制器。
+- [x] 2026-08-13 按本项目 `/home/orin26/HuaweiVLN/scripts/start_orin_lio_for_strive.sh` 重启 `livox_odom`，只通过运行时参数覆盖 `publish.scan_publish_en=true`、`publish.scan_bodyframe_pub_en=true`；未修改 Point-LIO 配置文件、未启动控制器。
 - [x] 已提供 `lio-diagnostics` profile 子命令：只读采集 ROS/DDS 环境、LIO endpoint QoS 与实际 header 样本，并将报告仅写入本工作区 `logs/diagnostics/`。
 - [x] 2026-08-11 已生成 `logs/diagnostics/lio_dds_20260811T060757Z.md`：host Fast DDS 默认 transport、domain 0 下 Point-LIO 参数服务可读，但四个实际 header 样本均在 8 秒内超时；保持 `START_SEMANTIC_MAPPING=false`，不重启外部 `livox_odom`。
 - [x] 2026-08-12 重新诊断确认 `/livox/lidar`、`/livox/imu`、`/cloud_registered`、`/aft_mapped_to_init` 均收到实际 header；`/cloud_registered` 样本存在丢包/高负载警告，需在融合启动前继续记录稳定频率。
@@ -71,7 +80,7 @@
 - [x] 已从机器人上 VEOcc-Rywang 项目只读导入 D435i↔MID-360 外参参数：`real_robot/calibration/orin26_d435i_mid360_targetless_v009_r009_extrinsics.json`。源文件路径和 SHA-256 已记录，未修改源项目。
 - [x] 已生成独立 D435i 投影配置 `real_robot/ros2_ws/src/semantic_mapping/config/projection_orin26_d435i_mid360.yaml`，导入 `T_camera_from_lidar`；配置明确 `rgb_minus_lidar_time_offset_s=0` 只是未验证初始假设，仍不得启用融合。
 - [x] 已从机器人只读导入 `camera_x001_intrinsics.yaml`：1920×1080、`fx=fy=749.2058`、`cx=1003.1`、`cy=526.5258`、radial-3 畸变、离线 RMSE 0.69 px；当前 Generic USB profile 绑定同一分辨率，D435i 使用独立配置。
-- [ ] RealSense D435i driver、RGB-D topic 和 device 权限按独立 profile 验证。
+- [x] 2026-08-13 RealSense D435i driver、RGB-D topic、序列号 `233522079589` 和 device 权限按独立 `orin26_livox_mid360_d435i` profile 验证；详见 [`docs/real_robot_reconnect_evidence_20260813.md`](real_robot_reconnect_evidence_20260813.md)。
 - [x] 2026-08-13 D435i driver、实时 CameraInfo、Point-LIO body cloud、检测和语义对象输出已在隔离容器完成数据层闭环验证；详见 [`docs/real_robot_d435i_dataflow_evidence_20260813.md`](real_robot_d435i_dataflow_evidence_20260813.md)。
 - [ ] Point-LIO 位姿和对象坐标通过合理量级/初始化/单位检查；2026-08-13 采样发现位置约为 `5e5–8e5`，暂不得用于导航闭环。
 - [x] 已定位该异常的直接诱因是无限制隔离 mapping 与 LIO 的 CPU 争用；停止旧容器并重启 LIO 后恢复米级位姿，mapping smoke 必须使用 CPU 限额。
@@ -118,7 +127,7 @@
 - [x] 已构建 ARM64 ROS overlay 镜像 `huawei-vln-realworld:orin-r36.5`；当前 image ID 为 `sha256:0da648cc2028…`；使用独立代码副本与只读基础镜像，不挂载旧工作区。
 - [x] 已验证容器内 ROS Humble、`tare_planner`、`semantic_mapping`、`strive_sysnav_bringup` import/overlay。
 - [x] 已验证 CUDA/torch/Ultralytics/Open3D 等依赖导入，`torch.cuda.is_available()=True`。
-- [ ] 验证容器经 host DDS 只读接收 LIO 点云与里程计。
+- [x] 2026-08-13 独立 detector-only 容器经 host DDS 只读接收 D435i 图像并输出检测消息；Point-LIO 真实点云/里程计已由独立 `lio-diagnostics` 报告验收。semantic mapping 仍按未完成标定门禁关闭。
 - [x] 2026-08-10 detector-only 容器已启动验证：`detection_node` 仅发布 `/huawei_vln/detection_result`，模型为 YOLOE。
 - [x] 已确认该容器启动时 `/cmd_vel`、`/way_point` 均不存在；日志显示 lower controller 被 blocked-control gate 阻断。
 - [x] 验证后已仅停止/删除 `huawei-vln-realworld` 容器，保留构建与 smoke 日志。
