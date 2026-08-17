@@ -117,6 +117,18 @@ RUN_ARGS=(
   --ipc host
   "${ENV_FILE_FLAG[@]}"
   -e "STRIVE_LLM_CLIENT=${STRIVE_LLM_CLIENT:-ark}"
+  -e "VLN_LVLM_BASE_URL=${VLN_LVLM_BASE_URL:-}"
+  -e "VLN_LVLM_API_KEY=${VLN_LVLM_API_KEY:-}"
+  -e "VLN_LVLM_MODEL=${VLN_LVLM_MODEL:-}"
+  -e "VLN_LVLM_TIMEOUT_S=${VLN_LVLM_TIMEOUT_S:-45}"
+  -e "VLN_LVLM_TRANSPORT_RETRIES=${VLN_LVLM_TRANSPORT_RETRIES:-2}"
+  -e "VLN_LVLM_PARSE_RETRIES=${VLN_LVLM_PARSE_RETRIES:-1}"
+  -e "STRIVE_LVLM_BASE_URL=${STRIVE_LVLM_BASE_URL:-}"
+  -e "STRIVE_LVLM_API_KEY=${STRIVE_LVLM_API_KEY:-}"
+  -e "STRIVE_LVLM_MODEL=${STRIVE_LVLM_MODEL:-}"
+  -e "STRIVE_LVLM_TIMEOUT_S=${STRIVE_LVLM_TIMEOUT_S:-45}"
+  -e "STRIVE_LVLM_TRANSPORT_RETRIES=${STRIVE_LVLM_TRANSPORT_RETRIES:-2}"
+  -e "STRIVE_LVLM_PARSE_RETRIES=${STRIVE_LVLM_PARSE_RETRIES:-1}"
   -e "ARK_API_KEY=${ARK_API_KEY:-}"
   -e "OPENAI_API_KEY=${OPENAI_API_KEY:-}"
   -e "MAP_PROVIDER=${MAP_PROVIDER:-}"
@@ -136,7 +148,7 @@ RUN_ARGS=(
   -e "GROUNDING_DINO_PATH=$(yaml_value grounding_dino_path_container || printf '/opt/mmdetection')"
   -e "GROUNDING_DINO_CONFIG=$(yaml_value grounding_dino_config_container || printf '/opt/mmdetection/configs/mm_grounding_dino/grounding_dino_swin-l_pretrain_all.py')"
   -e "GROUNDING_DINO_CHECKPOINT=/weights/grounding_dino_swin-l_pretrain_obj365_goldg-34dcdc53.pth"
-  # STRIVE 可写挂载；数据和权重独立挂载。
+  # VLN 可写挂载；数据和权重独立挂载。
   -v "$STRIVE_ROOT":/workspace/STRIVE
   -v "$DATA_ROOT":/workspace/data:ro
   -v "$HF_HOME_HOST":/root/.cache/huggingface:ro

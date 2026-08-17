@@ -1,14 +1,16 @@
-import ast
-import json
 import os
-import re
 import sys
 import time
 from types import SimpleNamespace
-from typing import Any, get_origin
 
 from constants import COGNAV_MODEL_NAME, DEFAULT_VLM, GEMINI_MODEL_NAME, require_gemini_key
 from llm_utils.lvlm_call_tracker import record_call
+from llm_utils.structured_output import (
+    extract_json_object as _extract_json_object,
+    fallback_payload as _fallback_payload,
+    inject_json_schema,
+    validate_response_model as _validate_model,
+)
 
 
 def _openai_client_class():
@@ -23,148 +25,6 @@ def _add_cognav_to_path() -> None:
         return
     if os.path.isdir(cognav_root) and cognav_root not in sys.path:
         sys.path.insert(0, cognav_root)
-
-
-def _strip_json_fence(text: str) -> str:
-    text = (text or "").strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*", "", text)
-        text = re.sub(r"\s*```$", "", text)
-    return text.strip()
-
-
-def _json_candidates(text: str) -> list[str]:
-    # STRIVE 调用方期望拿到结构化 JSON；模型偶尔会包 markdown，
-    # 这里尽量抽取第一个 JSON object，再交给 Pydantic 做严格校验。
-    text = _strip_json_fence(text)
-    candidates = [text]
-
-    start = text.find("{")
-    end = text.rfind("}")
-    if start >= 0 and end > start:
-        candidates.append(text[start:end + 1])
-    return candidates
-
-
-def _loads_json_like(candidate: str) -> dict[str, Any]:
-    candidate = candidate.strip()
-    try:
-        return json.loads(candidate)
-    except json.JSONDecodeError:
-        pass
-
-    # 常见格式问题：尾逗号。保持修复范围很小，避免把自由文本误修成 JSON。
-    without_trailing_commas = re.sub(r",\s*([}\]])", r"\1", candidate)
-    if without_trailing_commas != candidate:
-        try:
-            return json.loads(without_trailing_commas)
-        except json.JSONDecodeError:
-            pass
-
-    # 常见格式问题：{res: "book"} 这类裸 key。只修复 object key 位置，
-    # 不对普通文本做全局替换，避免误伤解释内容。
-    quoted_keys = re.sub(
-        r'([{,]\s*)([A-Za-z_][A-Za-z0-9_-]*)(\s*:)',
-        r'\1"\2"\3',
-        without_trailing_commas,
-    )
-    if quoted_keys != without_trailing_commas:
-        try:
-            return json.loads(quoted_keys)
-        except json.JSONDecodeError:
-            pass
-        json_booleans = re.sub(r"\bTrue\b", "true", quoted_keys)
-        json_booleans = re.sub(r"\bFalse\b", "false", json_booleans)
-        json_booleans = re.sub(r"\bNone\b", "null", json_booleans)
-        try:
-            return json.loads(json_booleans)
-        except json.JSONDecodeError:
-            pass
-        try:
-            parsed = ast.literal_eval(quoted_keys)
-            if isinstance(parsed, dict):
-                return parsed
-        except Exception:
-            pass
-
-    # Ark/VLM 偶尔返回 Python dict 风格：单引号、True/False/None。
-    # literal_eval 比 eval 安全，解析后仍要求是 dict，再交给 Pydantic 校验。
-    try:
-        parsed = ast.literal_eval(candidate)
-        if isinstance(parsed, dict):
-            return parsed
-    except Exception:
-        pass
-
-    raise ValueError("candidate is not a JSON object")
-
-
-def _extract_json_object(text: str) -> dict[str, Any]:
-    for candidate in _json_candidates(text):
-        try:
-            return _loads_json_like(candidate)
-        except Exception:
-            continue
-    raise ValueError(f"LLM response is not JSON: {text[:500]}")
-
-
-def _fallback_value(annotation):
-    origin = get_origin(annotation)
-    if origin in (list, tuple):
-        return []
-    if annotation is bool:
-        return False
-    if annotation is int:
-        return 0
-    if annotation is float:
-        return 0.0
-    if annotation is str:
-        return "fallback"
-    return None
-
-
-def _fallback_scalar_for_name(name: str, annotation):
-    if annotation is str:
-        lowered = name.lower()
-        if lowered in ("res", "result", "label", "object", "target"):
-            return "unknown"
-        if lowered == "decision":
-            return "uncertain"
-        if lowered in ("reason", "explanation", "view_feedback", "preferred_view_goal"):
-            return "fallback"
-    return _fallback_value(annotation)
-
-
-def _fallback_payload(response_format) -> dict[str, Any]:
-    # 仅用于 smoke 测试：LLM 离线或返回空内容时给出保守默认值，
-    # 让 Habitat/视觉/建图主链路能继续验证。
-    payload = {}
-    fields = getattr(response_format, "model_fields", None)
-    if fields is None:
-        fields = getattr(response_format, "__fields__", {})
-    if not fields:
-        annotations = getattr(response_format, "__annotations__", {})
-        for name, annotation in annotations.items():
-            value = _fallback_scalar_for_name(name, annotation)
-            payload[name] = [] if value is None else value
-        return payload
-    for name, field in fields.items():
-        annotation = getattr(field, "annotation", None) or getattr(field, "outer_type_", str)
-        value = _fallback_scalar_for_name(name, annotation)
-        payload[name] = [] if value is None else value
-    return payload
-
-
-def _validate_model(response_format, payload: dict[str, Any]):
-    """Validate a structured response across Pydantic v1 and v2."""
-
-    validator = getattr(response_format, "model_validate", None)
-    if validator is not None:
-        return validator(payload)
-    parser = getattr(response_format, "parse_obj", None)
-    if parser is not None:
-        return parser(payload)
-    return response_format(**payload)
 
 
 class _CogNavParsedChat:
@@ -186,20 +46,7 @@ class _CogNavParsedChat:
                 choices=[SimpleNamespace(message=SimpleNamespace(parsed=parsed, content=""))]
             )
 
-        schema = response_format.model_json_schema()
-        schema_prompt = (
-            "Return only one JSON object that conforms to this JSON schema. "
-            "Do not include markdown or extra text.\n"
-            f"{json.dumps(schema, ensure_ascii=False)}"
-        )
-        normalized = list(messages)
-        if normalized and normalized[0].get("role") == "system":
-            normalized[0] = {
-                **normalized[0],
-                "content": f"{normalized[0].get('content', '')}\n\n{schema_prompt}",
-            }
-        else:
-            normalized.insert(0, {"role": "system", "content": schema_prompt})
+        normalized = inject_json_schema(messages, response_format)
 
         if self._client is None:
             raise RuntimeError("CogNav LLM client is unavailable; use LLM_OFFLINE=1 or --vlm ark/openai/gemini")
@@ -295,7 +142,7 @@ class TracingOpenAICompatibleClient:
 
 
 def get_client_and_model(vlm: str):
-    # 统一 LLM 入口：STRIVE 上层使用 OpenAI-compatible parse 形式。
+    # 统一 LLM 入口：VLN 上层使用 OpenAI-compatible parse 形式。
     # 离线 smoke 使用本文件内的保守 fallback，不依赖外部 LLM client。
     backend = (vlm or DEFAULT_VLM or "cognav").lower()
     if os.getenv("LLM_OFFLINE", "0") in ("1", "true", "True"):
@@ -312,6 +159,18 @@ def get_client_and_model(vlm: str):
             )),
             GEMINI_MODEL_NAME,
         )
+    if backend in ("self_hosted", "self-hosted", "ms_swift", "ms-swift", "qwen_local", "qwen-local"):
+        from llm_utils.self_hosted_llm_adapter import SelfHostedOpenAICompatibleClient
+
+        model = (
+            os.getenv("VLN_LVLM_MODEL")
+            or os.getenv("STRIVE_LVLM_MODEL")
+            or os.getenv("STRIVE_LVLM_SERVED_MODEL")
+            or os.getenv("VLM_MODEL")
+            or os.getenv("LLM_MODEL")
+            or COGNAV_MODEL_NAME
+        )
+        return SelfHostedOpenAICompatibleClient.from_environment(), model
     if backend in ("ark", "openai_compatible", "openai-compatible"):
         OpenAI = _openai_client_class()
         api_key = os.getenv("ARK_API_KEY") or os.getenv("OPENAI_API_KEY")
