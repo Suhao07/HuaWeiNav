@@ -23,7 +23,7 @@ from deployment.lvlm_server.schema_smoke import build_schema_cases, run_schema_c
 from deployment.lvlm_server.smoke_client import image_data_url, request_json, request_status
 
 
-DEFAULT_MS_SWIFT_REVISION = "0f3875d40ebda34862519971100e7188a00273e3"
+DEFAULT_MS_SWIFT_REVISION = ""
 
 
 @dataclass(frozen=True)
@@ -210,11 +210,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-path", required=True, type=Path)
-    parser.add_argument("--ms-swift-root", type=Path, default=Path(os.getenv("MS_SWIFT_ROOT", "/opt/strive/ms-swift")))
-    parser.add_argument("--expected-ms-swift-revision", default=DEFAULT_MS_SWIFT_REVISION)
+    parser.add_argument("--ms-swift-root", type=Path, default=Path(os.getenv("MS_SWIFT_ROOT", "/opt/vln/ms-swift")))
+    parser.add_argument(
+        "--expected-ms-swift-revision",
+        default=os.getenv("MS_SWIFT_REVISION", DEFAULT_MS_SWIFT_REVISION),
+    )
     parser.add_argument("--base-url", default="http://127.0.0.1:8000/v1")
-    parser.add_argument("--served-model", default="strive-qwen2.5-vl-7b")
-    parser.add_argument("--api-key", default=os.getenv("STRIVE_LVLM_API_KEY", ""))
+    parser.add_argument("--served-model", default="vln-qwen2.5-vl-7b")
+    parser.add_argument(
+        "--api-key",
+        default=os.getenv("VLN_LVLM_API_KEY", os.getenv("STRIVE_LVLM_API_KEY", "")),
+    )
     parser.add_argument("--image", required=True, type=Path)
     parser.add_argument("--timeout", type=float, default=90.0)
     parser.add_argument("--parse-retries", type=int, default=1)

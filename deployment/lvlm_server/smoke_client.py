@@ -127,7 +127,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", default="http://127.0.0.1:8000/v1")
-    parser.add_argument("--model", default="strive-qwen2.5-vl-7b")
+    parser.add_argument("--model", default="vln-qwen2.5-vl-7b")
     parser.add_argument("--api-key", default="")
     parser.add_argument("--image", type=Path)
     parser.add_argument("--timeout", type=float, default=90.0)

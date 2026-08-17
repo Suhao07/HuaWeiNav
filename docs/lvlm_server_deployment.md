@@ -1,9 +1,5 @@
 # VLN 自托管 LVLM 服务部署规范
 
-> 命名约定：本文正文使用 VLN 作为项目名称。已有 `STRIVE_LVLM_*`、
-> `STRIVE_LLM_*` 环境变量和 `strive.*` 回执 schema 是兼容接口，继续保留；新部署
-> 可优先使用 `VLN_LVLM_*` 别名。
-
 ## 1. 目的与边界
 
 VLN 的 instruction parser、concept grounding、runtime concept matcher、
@@ -30,46 +26,54 @@ VLN 客户端拥有：
 模型服务不得直接发布 ROS topic，也不得解释 waypoint 是否可达。机器人侧不得
 依赖服务器本地图片路径，所有视觉输入统一使用 HTTP URL 或 base64 data URL。
 
-## 2. 当前可用模型审计
+## 2. 模型选择、获取与完整性校验
 
-开发机实际检查结果如下：
 
-| 模型 | 本地位置 | 完整性 | 结论 |
-|---|---|---:|---|
-| Qwen2.5-VL-7B-Instruct | `research/code/CoRL2025/AKGVP/Qwen/Qwen2.5-VL-7B-Instruct` | 5/5 safetensors，16,584,414,560 bytes | 默认迁移候选 |
-| Qwen2.5-VL-3B-Instruct | `research/code/STH/embodied_reasoner/Qwen2.5-VL-3B-Instruct` | 2/2 safetensors，7,509,337,976 bytes | 低显存备选 |
-| Qwen3-VL-8B-Instruct | `~/.cache/modelscope/hub/models/Qwen/Qwen3-VL-8B-Instruct` | 4/4 safetensors，17,534,339,512 bytes | 完整，但不作为本次指定系列的默认模型 |
-| Qwen2.5-VL Hugging Face cache | `~/.cache/huggingface/hub` | 存在 `.incomplete` shard | 不可部署 |
-| Qwen3.5-VL | 未发现 | 无本地快照 | 需要另行获取 |
+推荐使用与 `transformers`、`ms-swift` 和 vLLM 兼容的 Qwen-VL 指令模型。质量优先时
+选择 7B 级别模型；显存受限时选择同系列的较小模型。实际模型 ID、来源和版本应记录
+在部署环境的私有配置或发布清单中，不写入代码和公开文档。
 
-“缓存目录存在”不能作为权重完整证明。正式迁移必须检查
-`model.safetensors.index.json` 中引用的每一个 shard，并记录文件大小和 SHA256。
-`deployment/lvlm_server/preflight.py` 已执行 shard 和运行环境检查。
+### 2.1 在目标服务器准备模型
 
-### 2.1 权重迁移
-
-默认迁移 7B 模型。开发机先生成包含 shard 哈希的 manifest：
+以下变量是部署参数，请按目标设备修改：
 
 ```bash
-python deployment/lvlm_server/preflight.py \
-  --model /home/ubuntu/WorkSpace/research/code/CoRL2025/AKGVP/Qwen/Qwen2.5-VL-7B-Instruct \
+export VLN_ROOT=/opt/vln
+export MODEL_ROOT=/models
+export MODEL_ID=Qwen/Qwen2.5-VL-7B-Instruct
+export MODEL_PATH="$MODEL_ROOT/Qwen2.5-VL-7B-Instruct"
+```
+
+可以通过组织内部模型仓库、受控对象存储或已批准的模型镜像获取模型。以 Hugging
+Face 兼容下载工具为例：
+
+```bash
+mkdir -p "$MODEL_ROOT"
+huggingface-cli download "$MODEL_ID" \
+  --local-dir "$MODEL_PATH" \
+  --local-dir-use-symlinks False
+```
+
+如果模型已由运维系统传输到服务器，直接使用该目录即可。目录必须保留完整的
+`config.json`、tokenizer、processor、generation config、
+`model.safetensors.index.json` 和其引用的全部 safetensors shard。
+
+### 2.2 生成并保存模型清单
+
+在源目录和目标目录分别执行以下命令：
+
+```bash
+python "$VLN_ROOT/deployment/lvlm_server/preflight.py" \
+  --model "$MODEL_PATH" \
   --model-only \
   --sha256 \
-  > qwen2.5-vl-7b.source.json
+  > "$MODEL_PATH.model-manifest.json"
 ```
 
-再将完整目录复制到推理服务器。目录级复制必须保留所有 tokenizer、processor、
-generation config、weight index 和 safetensors shard：
-
-```bash
-rsync -a --info=progress2 \
-  /home/ubuntu/WorkSpace/research/code/CoRL2025/AKGVP/Qwen/Qwen2.5-VL-7B-Instruct/ \
-  USER@LVLM_SERVER:/models/Qwen2.5-VL-7B-Instruct/
-```
-
-在目标服务器使用同一脚本生成 `qwen2.5-vl-7b.target.json`，逐项比较
-`weight_bytes`、`weight_shards` 和 `weight_sha256`。不能用目录总大小代替 shard
-校验。3B 模型采用相同流程，只替换源目录和目标目录。
+清单至少应包含模型配置、索引引用的 shard 列表、每个 shard 的文件大小和 SHA256。
+迁移验收时逐项比较 `weight_shards`、`weight_bytes` 和 `weight_sha256`；不能以缓存
+目录存在、目录总大小或部分 shard 数量替代校验。模型清单应与部署回执一起归档，
+不要提交到 Git。
 
 ## 3. 部署拓扑
 
@@ -99,10 +103,10 @@ flowchart LR
 推荐目录：
 
 ```text
-/opt/strive/STRIVE/              VLN checkout
-/opt/strive/ms-swift/            ms-swift checkout
-/models/Qwen2.5-VL-7B-Instruct/  只读模型目录
-/var/log/strive-lvlm/            服务日志
+$VLN_ROOT/                       VLN checkout
+$VLN_ROOT/ms-swift/              ms-swift checkout
+$MODEL_PATH/                     只读模型目录
+/var/log/vln-lvlm/               服务日志
 ```
 
 权重不写入 Git，也不固化进 VLN 的 ROS2 镜像。服务器镜像或环境只读挂载模型
@@ -110,16 +114,21 @@ flowchart LR
 
 ## 4. 服务端启动合同
 
-建议在服务器使用独立 Python 环境，并固定已经审计的 ms-swift 源码 revision：
+在服务器使用独立 Python 环境，并在部署配置中固定经验证的 ms-swift tag 或 commit。
+下面的 revision 是部署参数，不属于仓库默认值：
 
 ```bash
-git clone git@github.com:Suhao07/UrbanNav.git /opt/strive/ms-swift
-git -C /opt/strive/ms-swift checkout 0f3875d40ebda34862519971100e7188a00273e3
+export VLN_ROOT=/opt/vln
+export MS_SWIFT_ROOT="$VLN_ROOT/ms-swift"
+export MS_SWIFT_REVISION=<approved-ms-swift-tag-or-commit>
 
-python3 -m venv /opt/strive/venvs/lvlm
-source /opt/strive/venvs/lvlm/bin/activate
+git clone https://github.com/modelscope/ms-swift.git "$MS_SWIFT_ROOT"
+git -C "$MS_SWIFT_ROOT" checkout "$MS_SWIFT_REVISION"
+
+python3 -m venv "$VLN_ROOT/venvs/lvlm"
+source "$VLN_ROOT/venvs/lvlm/bin/activate"
 python -m pip install --upgrade pip
-python -m pip install -e /opt/strive/ms-swift
+python -m pip install -e "$MS_SWIFT_ROOT"
 python -m pip install vllm openai
 ```
 
@@ -136,7 +145,7 @@ deployment/lvlm_server/model_profile.env.example
 启动入口：
 
 ```bash
-source /private/config/strive_qwen.env
+source /private/config/vln_lvlm.env
 bash deployment/lvlm_server/run_server.sh
 ```
 
@@ -144,12 +153,12 @@ bash deployment/lvlm_server/run_server.sh
 
 ```bash
 python3 -m swift.cli.deploy \
-  --model /models/Qwen2.5-VL-7B-Instruct \
+  --model "$MODEL_PATH" \
   --infer_backend vllm \
-  --served_model_name strive-qwen2.5-vl-7b \
+  --served_model_name "$SERVED_MODEL" \
   --host 0.0.0.0 \
   --port 8000 \
-  --api_key "$STRIVE_LVLM_API_KEY" \
+  --api_key "$VLN_LVLM_API_KEY" \
   --vllm_gpu_memory_utilization 0.85 \
   --vllm_max_model_len 8192 \
   --vllm_limit_mm_per_prompt '{"image":8,"video":0}' \
@@ -173,7 +182,7 @@ VLN 实际请求形式：
 
 ```jsonc
 {
-  "model": "strive-qwen2.5-vl-7b",
+  "model": "<served-model-name>",
   "messages": [
     {
       "role": "system",
@@ -217,7 +226,7 @@ relation verifier 和 final verifier 不感知网络传输细节。
 export LLM_PROVIDER=self_hosted
 export VLN_LVLM_BASE_URL=http://<lvlm-server>:8000/v1
 export VLN_LVLM_API_KEY=<private-server-token>
-export VLN_LVLM_MODEL=strive-qwen2.5-vl-7b
+export VLN_LVLM_MODEL=<served-model-name>
 ```
 
 兼容配置 `STRIVE_LVLM_BASE_URL`、`STRIVE_LVLM_API_KEY`、`STRIVE_LVLM_MODEL` 仍然
@@ -276,7 +285,7 @@ export STRIVE_VLM=self_hosted
 export STRIVE_INSTRUCTION_PLAN_BACKEND=llm
 export STRIVE_LVLM_BASE_URL=http://LVLM_SERVER:8000/v1
 export STRIVE_LVLM_API_KEY=<private-token>
-export STRIVE_LVLM_MODEL=strive-qwen2.5-vl-7b
+export STRIVE_LVLM_MODEL=<served-model-name>
 export STRIVE_LVLM_TIMEOUT_S=45
 export STRIVE_LVLM_TRANSPORT_RETRIES=2
 export STRIVE_LVLM_PARSE_RETRIES=1
@@ -287,7 +296,7 @@ export STRIVE_LVLM_PARSE_RETRIES=1
 ```bash
 export VLN_LVLM_BASE_URL=http://LVLM_SERVER:8000/v1
 export VLN_LVLM_API_KEY=<private-token>
-export VLN_LVLM_MODEL=strive-qwen2.5-vl-7b
+export VLN_LVLM_MODEL=<served-model-name>
 ```
 
 `LLM_PROVIDER=ark` 与 `self_hosted` 是 provider 配置，不应散落为 parser、matcher、
@@ -297,32 +306,32 @@ provider；直接调用 ROS2 launch 时需要显式传入 `vlm:=self_hosted`。
 
 ## 9. 验收分层
 
-### 8.1 静态 preflight
+### 9.1 静态 preflight
 
 - `config.json` 和 tokenizer/processor 文件存在；
 - weight index 引用的 shard 全部存在且非空；
 - `swift`、`transformers`、`vllm`、`torch` 可导入；
 - CUDA 可见，模型与运行库版本兼容。
 
-### 8.2 API smoke
+### 9.2 API smoke
 
 ```bash
 python deployment/lvlm_server/smoke_client.py \
   --base-url http://LVLM_SERVER:8000/v1 \
-  --model strive-qwen2.5-vl-7b \
-  --api-key "$STRIVE_LVLM_API_KEY" \
+  --model "$VLN_LVLM_SERVED_MODEL" \
+  --api-key "$VLN_LVLM_API_KEY" \
   --image /path/to/frame.jpg
 ```
 
-### 8.3 VLN schema smoke
+### 9.3 VLN schema smoke
 
 从 VLN 侧使用一张具有代表性的导航 RGB 帧执行生产 schema 验收：
 
 ```bash
 python -m deployment.lvlm_server.schema_smoke \
   --base-url http://LVLM_SERVER:8000/v1 \
-  --model strive-qwen2.5-vl-7b \
-  --api-key "$STRIVE_LVLM_API_KEY" \
+  --model "$VLN_LVLM_SERVED_MODEL" \
+  --api-key "$VLN_LVLM_API_KEY" \
   --image /path/to/navigation_frame.jpg \
   --output artifacts/lvlm_schema_smoke_receipt.json
 ```
@@ -341,18 +350,18 @@ python -m deployment.lvlm_server.schema_smoke \
 `decision=accept`，整体验收必须失败。只有进程退出码为 `0` 且回执
 `success=true` 时，才能认为服务满足 VLN 的结构化接口合同。
 
-### 8.4 目标服务器正式验收
+### 9.4 目标服务器正式验收
 
 在目标 GPU 服务器的 VLN 仓库根目录运行统一验收器：
 
 ```bash
 python -m deployment.lvlm_server.accept_deployment \
-  --model-path /models/Qwen2.5-VL-7B-Instruct \
-  --ms-swift-root /opt/strive/ms-swift \
-  --expected-ms-swift-revision 0f3875d40ebda34862519971100e7188a00273e3 \
+  --model-path "$MODEL_PATH" \
+  --ms-swift-root "$MS_SWIFT_ROOT" \
+  --expected-ms-swift-revision "$MS_SWIFT_REVISION" \
   --base-url http://127.0.0.1:8000/v1 \
-  --served-model strive-qwen2.5-vl-7b \
-  --api-key "$STRIVE_LVLM_API_KEY" \
+  --served-model "$VLN_LVLM_SERVED_MODEL" \
+  --api-key "$VLN_LVLM_API_KEY" \
   --image /path/to/navigation_frame.jpg \
   --sha256 \
   --output artifacts/lvlm_deployment_acceptance.json
@@ -371,7 +380,7 @@ five production structured schemas
 验收器会拒绝 dirty 或 revision 不匹配的 ms-swift checkout。服务启动和正式验收必须
 使用同一 `--ms-swift-root`，不能只检查一个干净副本、却从另一个工作区加载服务代码。
 
-### 8.5 性能验收
+### 9.5 性能验收
 
 记录每个 trace label 的：
 
@@ -386,5 +395,4 @@ GPU memory and utilization
 ```
 
 模型服务上线的最低条件不是“端口可访问”，而是五类结构化调用全部通过且失败路径
-保持保守，并保留上述验收回执。当前开发机没有可用 NVIDIA driver，GPU 加载与延迟
-验收仍需在目标服务器完成。
+保持保守，并保留正式验收回执。GPU 加载、吞吐和延迟必须在实际部署目标上完成验收。
