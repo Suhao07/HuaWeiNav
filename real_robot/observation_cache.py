@@ -1,4 +1,4 @@
-"""Observation cache and evidence providers for STRIVE real-robot runtime.
+"""Observation cache and evidence providers for VLN real-robot runtime.
 
 This module keeps ROS sensor payloads at the adapter/runtime boundary. Public
 contracts only receive lightweight references such as `image_ref` and
@@ -84,7 +84,7 @@ class _CachedImageRecord:
 
 
 class RosObservationCache:
-    """Cache latest ROS sensor messages as STRIVE real-robot observations.
+    """Cache latest ROS sensor messages as VLN real-robot observations.
 
     The cache stores heavy data only as file or ROS URI references. It is safe
     to pass `latest_observation()` into high-level runtime code because the
@@ -489,7 +489,7 @@ def _select_image_ref(
     """Return image reference and source label for the evidence mode."""
 
     if mode in {"auto", "bbox_crop"} and target_object is not None and target_object.image_ref:
-        # SysNav object image_ref 通常是对象裁剪或标注图，优先给 verifier 看目标局部。
+        # object image_ref 通常是对象裁剪或标注图，优先给 verifier 看目标局部。
         return target_object.image_ref, "object_image_ref"
     if camera is not None:
         # 没有对象图像时退回当前整帧 RGB，避免伪造 crop。
