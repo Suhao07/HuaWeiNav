@@ -75,7 +75,7 @@ source "${ROS_SETUP}"
 source "${OVERLAY_SETUP}"
 set -u
 
-# ROS nodes import the platform-neutral STRIVE contracts from the repository
+# ROS nodes import the platform-neutral VLN contracts from the repository
 # root. Keep this overlay importable when the motion server is launched alone.
 export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 
@@ -115,7 +115,9 @@ runtime_args() {
   append_runtime_arg RUNTIME_ARGS "motion_backend" "${STRIVE_MOTION_BACKEND:-waypoint}"
   append_runtime_arg RUNTIME_ARGS "motion_action_name" "${STRIVE_MOTION_ACTION_NAME:-/strive/execute_waypoint}"
   append_runtime_arg RUNTIME_ARGS "controller_contract_file" "${CONTROL_CONTRACT_FILE:-}"
-  append_runtime_arg RUNTIME_ARGS "vlm" "${STRIVE_VLM:-cognav}"
+  # 统一沿用 VLN 的 provider 优先级；显式 ROS override 仍具有最高优先级。
+  runtime_vlm="${STRIVE_VLM:-${STRIVE_LLM_CLIENT:-${LLM_PROVIDER:-cognav}}}"
+  append_runtime_arg RUNTIME_ARGS "vlm" "${runtime_vlm}"
   append_runtime_arg RUNTIME_ARGS "enable_final_verifier" "${STRIVE_ENABLE_FINAL_VERIFIER:-false}"
   append_runtime_arg RUNTIME_ARGS "evidence_mode" "${STRIVE_EVIDENCE_MODE:-auto}"
   append_runtime_arg RUNTIME_ARGS "prior_map_path" "${STRIVE_PRIOR_MAP_PATH:-}"

@@ -164,6 +164,7 @@ def test_production_aggregate_launch_is_explicit_and_action_backed() -> None:
     assert 'STRIVE_DRY_RUN:-true' in runner
     assert 'STRIVE_LOWER_CONTROLLER_ENABLED:-false' in runner
     assert "CONTROL_CONTRACT_FILE" in runner
+    assert 'runtime_vlm="${STRIVE_VLM:-${STRIVE_LLM_CLIENT:-${LLM_PROVIDER:-cognav}}}"' in runner
 
 
 def test_native_safety_hil_starts_the_complete_lower_motion_chain() -> None:

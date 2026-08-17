@@ -1,8 +1,8 @@
-"""Runtime helpers for the first SysNav-backed STRIVE real-robot loop.
+"""Runtime helpers for the first SysNav-backed VLN real-robot loop.
 
-The classes here compose the lower-level ROS adapters with STRIVE planning
+The classes here compose the lower-level ROS adapters with VLN planning
 interfaces. They do not own detection or mapping models; SysNav continues to
-publish object/room nodes, while STRIVE consumes snapshots and emits waypoint
+publish object/room nodes, while VLN consumes snapshots and emits waypoint
 goals through the motion bridge.
 """
 
@@ -47,6 +47,12 @@ class MotionControllerProtocol(Protocol):
     def poll_status(self, goal_id: str) -> NavigationStatus:
         """Return current lower-level execution status."""
 
+    def cancel(self, goal_id: Optional[str] = None) -> None:
+        """Cancel one active goal, or all goals when no id is provided."""
+
+    def hold(self) -> None:
+        """Request a platform-safe hold without publishing velocity directly."""
+
 
 class EvidenceProviderProtocol(Protocol):
     """Evidence acquisition hook for reached viewpoint goals."""
@@ -63,7 +69,7 @@ class FinalVerifierProtocol(Protocol):
 
 
 class InstructionPolicyProtocol(Protocol):
-    """High-level STRIVE policy interface for real-robot snapshots."""
+    """High-level VLN policy interface for real-robot snapshots."""
 
     def decide(self, snapshot: SemanticMapSnapshot, instruction: Optional[str] = None) -> NavigationIntent:
         """Return the next semantic navigation intent."""
@@ -272,7 +278,7 @@ class DryRunMotionController:
         """Record one goal and return a dry-run goal id.
 
         Args:
-            goal: Motion request produced by STRIVE high-level policy.
+            goal: Motion request produced by VLN high-level policy.
 
         Returns:
             Stable dry-run goal id for this recorded request.
@@ -319,6 +325,37 @@ class DryRunMotionController:
                 metadata={"dry_run": True},
             ),
         )
+
+    def cancel(self, goal_id: Optional[str] = None) -> None:
+        """Mark one recorded goal, or all recorded goals, as preempted.
+
+        Args:
+            goal_id: Optional dry-run goal id. ``None`` selects every record.
+        """
+
+        selected_ids = [goal_id] if goal_id is not None else list(self._statuses)
+        for selected_id in selected_ids:
+            if selected_id not in self._statuses:
+                continue
+            self._statuses[selected_id] = NavigationStatus(
+                NavigationStatusCode.PREEMPTED,
+                goal_id=selected_id,
+                message="dry-run goal cancelled",
+                metadata={"dry_run": True},
+            )
+
+    def hold(self) -> None:
+        """Place all non-terminal dry-run goals into a safe idle state."""
+
+        for goal_id, status in list(self._statuses.items()):
+            if status.is_terminal():
+                continue
+            self._statuses[goal_id] = NavigationStatus(
+                NavigationStatusCode.IDLE,
+                goal_id=goal_id,
+                message="dry-run safe hold requested",
+                metadata={"dry_run": True},
+            )
 
 
 class WaitInstructionPolicy:
@@ -407,7 +444,7 @@ class FirstObjectSmokePolicy:
 
 @dataclass
 class SysNavSemanticMapBridge:
-    """Cache SysNav object/room node topics and expose STRIVE map snapshots."""
+    """Cache SysNav object/room node topics and expose VLN map snapshots."""
 
     robot_pose_provider: Callable[[], Pose3D]
     object_adapter: RosObjectNodeAdapter = field(default_factory=RosObjectNodeAdapter)
@@ -418,7 +455,7 @@ class SysNavSemanticMapBridge:
     def update_object_nodes(self, msg: Any) -> None:
         """Store the latest SysNav ``/object_nodes_list`` message."""
 
-        # 核心：SysNav semantic_mapping_node 是对象图唯一写入方，STRIVE runtime 只缓存只读消息。
+        # 核心：SysNav semantic_mapping_node 是对象图唯一写入方，VLN runtime 只缓存只读消息。
         self.latest_object_list_msg = msg
 
     def update_room_nodes(self, msg: Any) -> None:
@@ -432,7 +469,7 @@ class SysNavSemanticMapBridge:
         return self.latest_object_list_msg is not None
 
     def build_snapshot(self, timestamp: Optional[float] = None) -> Optional[SemanticMapSnapshot]:
-        """Build a STRIVE semantic map snapshot from cached SysNav messages."""
+        """Build a VLN semantic map snapshot from cached SysNav messages."""
 
         if self.latest_object_list_msg is None:
             return None
@@ -475,7 +512,7 @@ class SysNavSemanticMapBridge:
 
 @dataclass
 class SysNavInstructionRuntime:
-    """Dispatch STRIVE navigation intents to SysNav waypoint execution."""
+    """Dispatch VLN navigation intents to SysNav waypoint execution."""
 
     semantic_map_bridge: SysNavSemanticMapBridge
     high_level_policy: InstructionPolicyProtocol
@@ -693,7 +730,7 @@ class SysNavInstructionRuntime:
                     metadata={"viewpoint_result": runtime_viewpoint_result_to_dict(viewpoint_result)},
                 )
 
-        # 核心：STRIVE 输出 NavigationIntent，RosWaypointController 负责变成 /way_point。
+        # 核心：VLN 输出 NavigationIntent，RosWaypointController 负责变成 /way_point。
         return RuntimeDecision(
             timestamp=snapshot.timestamp,
             intent=intent,
