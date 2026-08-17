@@ -1,151 +1,266 @@
-# VLN 实物导航框架与平台适配规范
+# VLN 实物模式接口与数据流
 
-本文档中的 VLN 是高层语义导航框架名称。现有 `real_robot` ROS 包仍使用
-`strive_*` 命名，这是已经发布的 ROS contract，不在本次品牌迁移中改动。
+本文是当前仓库实物模式的唯一接口说明。内容以 `real_robot/` 和其内置 ROS2
+workspace 的实际代码为准，描述传感器输入、SysNav 感知建图、VLN 语义决策、运动交接
+和证据验证的边界。
 
-## 1. 文档目的
+本文不把某一台机器人、某一种相机或某个底盘 SDK 写进高层逻辑。真实平台只需要提供
+本文定义的输入、反馈和安全合同，即可替换传感器、检测器、局部规划器或底盘执行器。
 
-本文档描述当前 `real_robot` 代码的模块边界、输入输出合同、异步控制流和平台扩展
-接口。它面向将 VLN 迁移到不同轮式、全向、四足或其他移动机器人，不绑定某个
-具体相机、SLAM、局部规划器或底盘 SDK。
+> LVLM 服务是实物模式的前置依赖，但不属于 ROS 控制链。商业 API 和自部署公网 HTTPS
+> 服务的配置见 [`lvlm_server_deployment.md`](lvlm_server_deployment.md)。
 
-本文使用三种实现状态：
+## 1. 当前实现边界
 
-- **已实现**：当前仓库存在代码和离线测试；
-- **部分实现**：公共 contract 已存在，但需要平台消息或真机配置；
-- **扩展点**：文档定义接口，具体机器人部署时实现。
+当前实物模式采用单一 ROS2 运行环境承载 SysNav 感知建图和 VLN runtime；LVLM 可以部署
+在独立 GPU 服务器上，由机器人通过 HTTPS 请求。
 
-软件/HIL 通过不等于真机验收。底盘急停、人工接管、传感器时间同步和真实运动反馈
-必须在目标机器人上单独验证。
+```text
+机器人 ROS2 环境
+  SysNav detector + semantic mapping
+  VLN instruction runtime + observation cache + motion adapter
 
-## 2. 架构原则
+独立 LVLM 服务
+  商业 API 或自部署模型服务器
+  POST /v1/chat/completions
+```
 
-1. VLN 高层不继承 Habitat Agent，也不输出离散仿真 action。
-2. ROS message、Habitat observation 和平台 SDK 不进入平台无关 contract。
-3. 高层只输出 `NavigationIntent`，执行层只接收 `MotionGoal`。
-4. 物理到达由 motion layer 判断，语义满足由 verifier 判断。
-5. VLN 不发布最终 `/cmd_vel`；局部避障、跟踪、限速和急停归底层控制栈。
-6. target、anchor、relation edge 的 UID 贯穿规划、执行、证据和 verifier。
-7. active goal 执行期间不重复调用高层策略产生新 waypoint。
+核心所有权如下：
 
-## 3. 总体数据流
+| 层级 | 当前实现 | 负责内容 | 不负责内容 |
+|---|---|---|---|
+| 传感器与定位 | 机器人驱动、SLAM、Point-LIO 等外部节点 | RGB、点云、位姿和状态发布 | 自然语言语义判断 |
+| SysNav 感知建图 | `real_robot/ros2_ws/src/semantic_mapping` | 检测、跟踪、分割、对象融合和对象节点发布 | VLN 任务是否满足 |
+| ROS adapter | `real_robot/sysnav_ros_adapters.py` | ROS message 与平台无关 contract 的转换 | 写入 SysNav 地图、硬编码语义 alias |
+| VLN runtime | `real_robot/sysnav_runtime.py`、`instruction_runtime_node.py` | snapshot、指令策略、活动目标、证据和 verifier 编排 | 直接发布 `/cmd_vel` |
+| LVLM | 远程 HTTP 服务 | 指令解析、概念 grounding、关系和最终视觉判断 | 物理可达性、速度控制、急停 |
+| SysNav motion stack | local planner、path follower、安全 mux | waypoint 执行、避障、跟踪、限速、急停和 `/cmd_vel` | 自然语言任务成功 |
+
+当前已经有平台无关 Python contract 和 SysNav adapter；真实传感器、目标底盘和急停链
+仍需要在对应设备上验收。代码 smoke、ROS bag replay 和 HIL 不能代替实物运动验收。
+
+## 2. 总体架构
 
 ```mermaid
 flowchart LR
-  subgraph Sensors["传感器与状态输入"]
-    RGB["RGB / panorama"]
-    Depth["Depth / LiDAR cloud"]
-    Odom["SLAM pose / odom"]
-    Safety["estop / manual / controller state"]
+  subgraph S[传感器与定位输入]
+    RGB[/camera/image/]
+    Cloud[/cloud_registered/]
+    Odom[/aft_mapped_to_init/]
+    Safety[急停 / 人工接管 / 控制器状态]
   end
 
-  subgraph Perception["感知与语义地图"]
-    Cache["Observation Cache"]
-    Detector["Detector + tracker"]
-    Mapper["Semantic Mapping"]
-    Snapshot["SemanticMapSnapshot"]
+  subgraph N[SysNav 感知与建图]
+    Detector[detection_node]
+    Mapping[semantic_mapping_node]
+    DetOut[/detection_result/]
+    ObjOut[/object_nodes_list/]
+    RoomOut[/room_nodes_list 可选/]
   end
 
-  subgraph VLN["VLN 高层"]
-    Plan["InstructionPlan"]
-    Policy["Instruction Policy"]
-    Intent["NavigationIntent"]
-    Verify["Relation / Final Verifier"]
+  subgraph V[VLN 语义运行时]
+    Cache[RosObservationCache]
+    Adapter[SysNav ROS adapters]
+    Snapshot[SemanticMapSnapshot]
+    Policy[InstructionPlan / 高层策略]
+    Intent[NavigationIntent]
+    Evidence[ViewEvidence]
+    Verifier[Relation / Final verifier]
   end
 
-  subgraph Motion["平台执行层"]
-    Goal["MotionGoal"]
-    Controller["MotionController"]
-    Planner["Local planner / platform SDK"]
-    Base["Robot base"]
-    Status["NavigationStatus"]
+  subgraph M[运动执行与安全]
+    Goal[MotionGoal / ViewpointGoal]
+    Bridge[Action 或 RosWaypointController]
+    Waypoint[/way_point/]
+    Planner[SysNav local planner]
+    Path[/path/]
+    Follower[pathFollower]
+    Mux[SafetyVelocityMux]
+    Cmd[/cmd_vel/]
+    Status[NavigationStatus]
   end
 
+  RGB --> Detector --> DetOut --> Mapping
+  Cloud --> Mapping
+  Odom --> Mapping
+  Mapping --> ObjOut --> Adapter
+  Mapping -. 可选 .-> RoomOut -.-> Adapter
   RGB --> Cache
-  Depth --> Cache
+  DetOut --> Cache
+  Cloud --> Cache
   Odom --> Cache
-  Cache --> Detector --> Mapper --> Snapshot
-  Plan --> Policy
-  Snapshot --> Policy --> Intent --> Goal --> Controller --> Planner --> Base
-  Safety --> Controller
-  Planner --> Status --> Controller
-  Controller -->|"REACHED"| Cache
-  Cache -->|"ViewEvidence"| Verify
-  Verify -->|"accept / replan"| Policy
+  Adapter --> Snapshot --> Policy --> Intent --> Goal --> Bridge
+  Bridge --> Waypoint --> Planner --> Path --> Follower --> Mux --> Cmd
+  Odom --> Status
+  Path --> Status
+  Safety --> Mux
+  Status --> Bridge
+  Status --> Policy
+  Cache --> Evidence --> Verifier --> Policy
+  Verifier -. 需要 LVLM .-> Policy
 ```
 
-该链路不是单向的“传感器输入、waypoint 输出”。一个可运行的机器人接口必须同时
-具备 `NavigationStatus` 反馈，否则 VLN 无法区分 running、reached、blocked、
-timeout、safety stop 和 manual takeover。
+图中的箭头表示数据或状态边界，不表示所有节点必须由本仓库启动。当前 launch 通过
+参数和 remap 接入具体机器人 topic。
 
-## 4. 当前模块清单
+## 3. 输入接口
 
-| 模块 | 状态 | 责任 |
-|---|---|---|
-| `real_robot/contracts.py` | 已实现 | 平台无关 value objects |
-| `real_robot/sysnav_ros_adapters.py` | 已实现 | SysNav detection/object/room/waypoint/status 转换 |
-| `real_robot/sysnav_runtime.py` | 已实现 | snapshot、active goal、evidence、verifier 编排 |
-| `real_robot/action_motion_controller.py` | 已实现 | `ExecuteWaypoint` ROS Action 客户端 |
-| `real_robot/observation_cache.py` | 已实现 | RGB/depth/detection/pose 缓存和 crop evidence |
-| `real_robot/detector_vocabulary.py` | 已实现 | detector label/prompt provenance |
-| `real_robot/motion_safety.py` | 已实现 | 平台无关速度安全策略 |
-| `real_robot/ros2_ws/src/semantic_mapping` | 已实现 | 迁移的 SysNav detector/mapping |
-| `real_robot/ros2_ws/src/local_planner` | 已实现 | SysNav 局部规划组件 |
-| `real_robot/ros2_ws/src/strive_motion_msgs` | 已实现 | waypoint action 与 safety 消息 |
-| `real_robot/ros2_ws/src/strive_sysnav_motion` | 已实现 | action server、alignment、safety mux |
-| 相机驱动与同步 profile | 部分实现 | 已有 topic/profile，需绑定目标硬件 |
-| LiDAR-camera 投影 | 扩展点 | 依赖标定、相机模型和目标机器人传感器 |
-| 机器人专用 MotionController | 扩展点 | 对接 Nav2、厂商 SDK 或其他 planner |
-| 真机 runtime bringup | 部分实现 | 需要目标设备 topic/frame/safety 配置 |
+### 3.1 传感器与定位
 
-`camera_adapter.py`、`depth_projection.py`、`runtime_node.py` 等名称曾出现在规划文档
-中，但当前仓库没有这些文件。它们是扩展职责，不应标记为已经实现。
+| 输入 | 默认 topic | ROS 类型 | 消费方 | 作用 |
+|---|---|---|---|---|
+| RGB | `/camera/image` | `sensor_msgs/Image` | detector、runtime cache | 目标检测、房间语义和最终证据 |
+| 注册点云 | `/cloud_registered` | `sensor_msgs/PointCloud2` | semantic mapping、可选 cache | 三维对象融合和局部几何 |
+| 位姿 | `/aft_mapped_to_init` | `nav_msgs/Odometry` | runtime、status provider | 当前机器人位姿和运动进度 |
+| 路径 | `/path` | `nav_msgs/Path` | status provider | 局部规划路径和剩余进度 |
+| 规划器状态 | `/local_planner/status` | `std_msgs/String` | status provider，可选 | blocked、running 等状态补充 |
+| 对齐深度 | 参数指定 | `sensor_msgs/Image` | observation cache，可选 | RealSense 或点云投影的局部深度 |
 
-## 5. 平台无关数据合同
+实际 SysNav semantic mapping 内部使用的 topic 可以是 `/registered_scan` 和
+`/state_estimation`，由 `sysnav_detection_mapping.launch.py` 将机器人 profile 中的
+`cloud_topic`、`odom_topic` 映射进去。上层 runtime 使用统一的 `/cloud_registered`、
+`/aft_mapped_to_init` 默认值，迁移时通过 launch 参数修改，不修改 Python 逻辑。
 
-### 5.1 观测与语义地图
+传感器合同至少需要：
+
+```text
+RGB、点云和位姿具有可比较的时间戳；
+位姿声明 frame_id，目标位置和 waypoint 使用同一 world frame；
+图像引用可被 observation cache 或 evidence provider 读取；
+定位失效、数据过期和 frame 不一致能够被显式检测。
+```
+
+Ricoh Theta Z1 可以作为全景 RGB 输入，RealSense 可以作为 pinhole RGB-D 输入。上层
+只读取 `CameraModel.PANORAMA` 或 `CameraModel.PINHOLE`，不依赖相机品牌。LiDAR 点云
+可以通过平台 adapter 投影为稀疏深度，但稀疏深度中的未知像素必须保留为 unknown，
+不能伪装成 Habitat 的稠密深度。
+
+### 3.2 SysNav 感知与地图 topic
+
+```text
+/camera/image
+  -> detection_node
+  -> /detection_result
+  -> semantic_mapping_node
+  -> /object_nodes_list
+  -> RosObjectNodeAdapter
+  -> SemanticMapSnapshot
+```
+
+当前迁移的 `semantic_mapping_node.py` 明确发布 `/object_nodes_list`。`room_nodes_list`
+是 adapter 和 runtime 支持的兼容输入，可由外部 SysNav 房间节点或后续房间语义节点
+提供；当前文档不把它假设为每台机器人必然存在的输出。
+
+检测器词表由 SysNav `objects.yaml` 提供给
+`DetectorVocabularyAdapter`。adapter 只保存 detector label、prompt 和 provenance，
+不在 ROS 层把 `shelf`、`bookshelf` 等自然语言概念写成别名规则；概念 grounding 由
+VLN instruction/concept 模块完成。
+
+### 3.3 任务与 LVLM 输入
+
+实物任务指令通过 runtime 参数进入：
+
+```text
+instruction
+dataset_target 可选
+instruction_plan_backend
+vlm
+```
+
+在 `semantic_snapshot`、`instruction` 或 `instruction_plan` policy 模式下，runtime
+把原始指令交给现有 instruction compiler。需要 LLM 时，客户端按
+[`lvlm_server_deployment.md`](lvlm_server_deployment.md) 访问商业 API 或远程自部署 LVLM。
+
+LVLM 请求只包含指令、候选对象、地图/几何事实、关系证据和图像引用；模型服务不订阅
+ROS topic，也不访问 `/cmd_vel`、`/way_point` 或底盘 SDK。
+
+## 4. 平台无关数据合同
+
+`real_robot/contracts.py` 是实物模式的稳定边界，不导入 ROS、Habitat、检测器或某个
+机器人 SDK。
+
+### 4.1 观测与地图
 
 ```python
 CameraFrame:
-    image_ref              # 图像引用；原始数组由 cache/provider 管理
-    camera_model           # panorama / pinhole / unknown
+    image_ref                  # 原始图像由 cache/provider 管理
+    camera_model               # panorama / pinhole / unknown
     timestamp
     frame_id
     rgb_shape
     depth_ref
+    depth_valid_mask_ref
     intrinsics
     extrinsics
+    fov
 
 RealObservation:
     timestamp
-    cameras                # 一个或多个 CameraFrame
-    robot_pose             # Pose3D，必须声明 frame_id
+    robot_pose                 # Pose3D，必须声明 frame_id
+    camera_frames
     pointcloud_ref
-    metadata               # 同步误差、传感器健康等
+    pointcloud_frame_id
+    odom_frame_id
+    metadata
+
+DetectionFrame:
+    timestamp
+    image_ref
+    boxes_xyxy
+    labels
+    confidences
+    track_ids
+    masks_ref
+    source
+    metadata
+
+ObjectNodeSnapshot:
+    uid                         # SysNav object id 的稳定包装
+    label
+    position
+    confidence
+    bbox2d_xyxy
+    bbox3d_center / bbox3d_extent
+    room_id
+    image_ref / pointcloud_ref
+    visible_viewpoints
+    track_ids
+    verified_state
+
+RoomSnapshot:
+    uid
+    label                       # SysNav room 没有语义名时可以为空
+    centroid
+    neighbors / objects / frontiers
+    image_ref
+    explored
 
 SemanticMapSnapshot:
     timestamp
     robot_pose
-    objects                # ObjectNodeSnapshot，只读运行时对象图
-    rooms                  # RoomSnapshot，可为空
+    objects
+    rooms
+    viewpoints
     frontiers
     source
+    metadata
 ```
 
-大图、深度和点云不直接塞进 contract，避免跨进程复制。contract 保存引用、时间戳、
-坐标系和标定；具体数组由 ROS cache、共享内存或文件 artifact 管理。
+大图、点云和深度不直接复制进 map contract。contract 保存引用、时间戳、坐标系和
+标定信息；`RosObservationCache` 和 `ObjectCropEvidenceProvider` 负责图像缓存、裁剪
+和证据路径。
 
-### 5.2 高层意图与运动请求
+### 4.2 语义意图与运动请求
 
 ```python
 NavigationIntent:
-    mode                   # explore / go_to_object / improve_view / stop ...
+    mode                       # explore / go_to_object / improve_view / stop / wait
     goal_pose
-    look_at
     target_object_uid
     anchor_object_uid
     relation_edge_id
     stop_allowed
+    priority
     reason
     metadata
 
@@ -159,24 +274,35 @@ MotionGoal:
     tolerance
     reason
     metadata
+
+ViewpointGoal:
+    pose
+    purpose                    # verify_target / verify_relation / improve_view
+    look_at
+    target_object_uid
+    anchor_object_uid
+    relation_edge_id
+    evidence_requirements
+    tolerance
 ```
 
-`NavigationIntent` 表达语义理由，`MotionGoal` 表达可执行请求。adapter 可以做 frame
-转换、容差映射和 action message 构造，但不能改变 terminal/anchor 角色或自行声明
-任务已经完成。
+`NavigationIntent` 是高层语义决策，`MotionGoal` 是执行层请求，`ViewpointGoal` 是需要
+在到达后采集证据的运动目标。adapter 可以转换坐标系、容差和 ROS message，但不能
+改变 target/anchor UID、relation edge 或 `stop_allowed` 的语义。
 
-### 5.3 执行状态与视觉证据
+### 4.3 执行状态与证据
 
 ```python
 NavigationStatus:
-    status                 # queued/running/reached/blocked/timeout/...
+    status                     # queued / running / reached / blocked / timeout / ...
     goal_id
     current_pose
     distance_to_goal
     path_length_remaining
     progress
-    safety_state
     reason_code
+    safety_state
+    current_velocity
     metadata
 
 ViewEvidence:
@@ -184,313 +310,347 @@ ViewEvidence:
     timestamp
     pose
     image_ref
+    camera_model
     bbox_xyxy
     target_object_uid
     anchor_object_uid
     relation_edge_id
     quality
     verifier_payload
+    metadata
+
+RuntimeDecision:
+    timestamp
+    intent
+    motion_goal
+    navigation_status
+    accepted_candidate_uid
+    accepted_relation_edge_id
+    verifier_decision
+    lower_planner_state
+    reason
+    metadata
 ```
 
-只有 `NavigationStatus.succeeded()` 后才能采集 reached-view evidence。blocked、timeout
-或 localization lost 不得伪装成 best-available visual evidence。
+`NavigationStatus.REACHED` 只代表物理 motion goal 到达；它不等于自然语言任务成功。
+`ViewEvidence` 只有在运动层确认到达后才允许进入 final verifier。`RuntimeDecision` 会
+由 `RuntimeDecisionJsonlWriter` 写入运行目录，作为控制流复盘记录。
 
-## 6. 控制流
+## 5. 控制流
+
+实物模式不是 Habitat 的同步 `env.step(action)`。机器人运动是异步过程：发送 goal、
+等待底层反馈、采集当前证据，再决定停止或继续。
 
 ```mermaid
 sequenceDiagram
-  participant Sensors as Sensors / SysNav
-  participant Bridge as SemanticMapBridge
-  participant Runtime as SysNavInstructionRuntime
-  participant Policy as VLN Policy
+  participant Sensor as Sensor / SysNav
+  participant Runtime as VLN Runtime
+  participant Policy as Instruction Policy
   participant Motion as MotionController
-  participant Lower as Local Planner / Base
-  participant Evidence as EvidenceProvider
-  participant VLM as Final Verifier
+  participant Lower as SysNav Lower Stack
+  participant Evidence as Evidence Provider
+  participant LVLM as Remote LVLM
 
-  Sensors->>Bridge: object/room nodes + pose
-  Runtime->>Bridge: build_snapshot()
-  Bridge-->>Runtime: SemanticMapSnapshot
-  Runtime->>Policy: decide(snapshot, instruction)
+  Sensor->>Runtime: object/room snapshot + RGB + pose
+  Runtime->>Runtime: readiness gate
+  Runtime->>Policy: SemanticMapSnapshot + instruction
   Policy-->>Runtime: NavigationIntent
-  Runtime->>Motion: send_goal(MotionGoal)
-  Motion->>Lower: Action goal or /way_point
+  Runtime->>Motion: MotionGoal
+  Motion->>Lower: Action goal 或 /way_point
 
-  loop active goal
+  loop 每个 runtime timer tick
     Runtime->>Motion: poll_status(goal_id)
-    Motion-->>Runtime: RUNNING + progress/safety
+    Motion-->>Runtime: RUNNING + progress + safety
   end
 
-  Lower-->>Motion: REACHED / BLOCKED / TIMEOUT
-  Motion-->>Runtime: terminal NavigationStatus
-  alt reached
+  Lower-->>Motion: REACHED / BLOCKED / TIMEOUT / PREEMPTED
+  Motion-->>Runtime: NavigationStatus
+  alt REACHED
     Runtime->>Evidence: capture(ViewpointGoal, status)
     Evidence-->>Runtime: ViewEvidence
-    Runtime->>VLM: verify(evidence, instruction context)
-    VLM-->>Runtime: accept / need_better_view / reject
-  else motion failed
-    Runtime->>Policy: update execution ledger and replan
+    Runtime->>LVLM: final verifier，包含原始指令和证据
+    LVLM-->>Runtime: accept / need_better_view / reject / uncertain
+  else 运动失败或安全中断
+    Runtime->>Policy: 记录失败原因并在下一轮重新决策
   end
 ```
 
-核心控制逻辑：
+对应当前 `SysNavInstructionRuntime.step()` 的最小伪代码如下：
 
 ```python
-snapshot = semantic_map_provider.build_snapshot()
+def step(instruction):
+    readiness = readiness_provider()
+    if not readiness.ready:
+        return WAIT  # 输入未齐时不调用策略，也不发送运动目标
 
-if not readiness.ready:
-    return WAIT  # 输入缺失时不调用策略，不发布 waypoint
+    snapshot = semantic_map_bridge.build_snapshot()
+    if snapshot is None:
+        return WAIT  # 没有对象图时不把空地图交给导航策略
 
-if active_goal:
-    status = motion_controller.poll_status(active_goal.id)
-    if not status.is_terminal():
-        return TRACK_ACTIVE_GOAL  # 执行期间禁止重复生成目标
-    if status.succeeded():
-        evidence = evidence_provider.capture(active_goal.viewpoint, status)
-        decision = final_verifier.verify(evidence, active_goal.context)
-        return apply_verifier_decision(decision)
-    return recover_from_motion_failure(status)
+    active = state.poll_active(motion_controller)
+    if active is not None:
+        if not active.status.is_terminal():
+            return TRACK_ACTIVE_GOAL  # active goal 未结束时禁止反复发布 waypoint
+        if active.status.succeeded():
+            evidence = evidence_loop.verify_reached(active.goal, active.status)
+            return APPLY_VERIFIER_DECISION(evidence)
+        return HANDLE_MOTION_FAILURE(active.status)
 
-intent = instruction_policy.decide(snapshot, instruction)
-goal = intent.to_motion_goal()
-goal_id = motion_controller.send_goal(goal)
-return DISPATCHED(goal_id)
+    intent = policy.decide(snapshot, instruction)
+    if intent.mode == WAIT:
+        return WAIT
+
+    goal_id = motion_controller.send_goal(intent.to_motion_goal())
+    state.bind_active(goal_id, intent, intent.to_motion_goal())
+    return DISPATCHED(goal_id)
 ```
 
-这些状态描述的是异步执行生命周期，不包含 `book`、`TV` 等目标规则。目标语义仍由
-InstructionPlan、ConceptQuery、runtime grounding 和 verifier 决定。
+这里的 `APPLY_VERIFIER_DECISION` 只允许 final verifier 在语义、关系和视觉证据满足时
+生成 `STOP`；`REACHED` 本身不能授权 STOP。若 VLM 返回 `need_better_view`，上层策略
+应保留 target/anchor/relation 上下文并生成下一个 `ViewpointGoal`，而不是把运动失败
+伪装成任务完成。
 
-## 7. 执行器扩展接口
+## 6. 输出接口与所有权
 
-所有机器人执行器实现同一个最小协议：
+### 6.1 VLN 内部输出
 
-```python
-class MotionControllerProtocol(Protocol):
-    def send_goal(self, goal: MotionGoal) -> str:
-        """提交目标并返回稳定 goal id。"""
+| 输出 | 类型 | 下游 | 说明 |
+|---|---|---|---|
+| 语义意图 | `NavigationIntent` | runtime | 表达目标对象、anchor、关系和原因 |
+| 运动请求 | `MotionGoal` | motion controller | 表达可执行位姿和容差 |
+| 视角请求 | `ViewpointGoal` | motion controller/evidence | 到达后需要采集视觉证据 |
+| 证据 | `ViewEvidence` | relation/final verifier | 绑定 pose、图像、bbox 和 UID |
+| 决策记录 | `RuntimeDecision` | JSONL artifact | 记录一次控制周期的输入摘要和输出 |
 
-    def poll_status(self, goal_id: str) -> NavigationStatus:
-        """返回当前进度、物理到达状态和安全状态。"""
+### 6.2 ROS 输出
 
-    def cancel(self, goal_id: str | None = None) -> None:
-        """取消指定目标；不能把 cancel topic 当成底盘已经停止的证明。"""
-
-    def hold(self) -> None:
-        """请求平台安全保持；高层不能自行发布零速度接管底盘。"""
-```
-
-推荐实现：
+支持两种互斥的运动后端：
 
 ```text
-SysNav legacy /way_point  -> RosWaypointController + RosNavigationStatusProvider
-VLN ExecuteWaypoint    -> RosActionMotionController
-Nav2                      -> Nav2ActionMotionController
-Vendor robot SDK          -> VendorActionMotionController
-Offline rosbag            -> ReplayMotionController
-Unit tests                -> DryRunMotionController
+方式 A：Action backend
+  MotionGoal
+    -> RosActionMotionController
+    -> /strive/execute_waypoint
+    -> SysNavMotionServer
+    -> /way_point
+
+方式 B：Waypoint backend
+  MotionGoal
+    -> RosWaypointController
+    -> geometry_msgs/PointStamped on /way_point
 ```
 
-新平台优先采用 Action，而不是裸 topic。Action 可以承载 goal ID、feedback、result、
-cancel、look-at 和稳定 reason code；`PointStamped /way_point` 需要额外状态 provider
-补足这些信息。
+两种后端不能同时成为 `/way_point` owner。Action backend 适合承载 goal id、feedback、
+result、cancel 和 safety reason；Waypoint backend 兼容现有 SysNav 原生 topic，但必须
+依赖 `RosNavigationStatusProvider` 从 odom、path、timeout 和 progress 推断状态。
 
-平台实现模板：
-
-```python
-class VendorActionMotionController(MotionControllerProtocol):
-    def send_goal(self, goal: MotionGoal) -> str:
-        platform_goal = self.adapter.to_platform_goal(goal)
-        # 这里仅转换位姿、容差和 look-at，不改写语义目标身份。
-        return self.client.send(platform_goal)
-
-    def poll_status(self, goal_id: str) -> NavigationStatus:
-        feedback = self.client.feedback(goal_id)
-        # 将厂商状态稳定映射为公共 status/reason_code。
-        return self.adapter.to_navigation_status(feedback)
-
-    def cancel(self, goal_id: str | None = None) -> None:
-        self.client.cancel(goal_id)
-
-    def hold(self) -> None:
-        self.safety_client.request_hold()
-```
-
-### 7.1 新平台代码组织模板
-
-平台实现应放在独立包中，不在 `SysNavInstructionRuntime` 内增加机器人型号分支：
+下层执行链为：
 
 ```text
-real_robot/platforms/<platform_id>/
-  profile.yaml                 # topic、frame、容差、watchdog 和能力声明
-  observation_adapter.py       # 平台消息 -> RealObservation
-  semantic_map_adapter.py      # 可选：平台地图 -> SemanticMapSnapshot
-  motion_goal_adapter.py       # MotionGoal -> action/topic/SDK request
-  navigation_status_adapter.py # feedback/result -> NavigationStatus
-  motion_controller.py         # MotionControllerProtocol 实现
-  bringup.launch.py            # 平台节点、remap 和参数装配
-  tests/
-    test_contract_mapping.py
-    test_status_lifecycle.py
-    test_cancel_hold.py
+/way_point
+  -> SysNav local planner
+  -> /path
+  -> path follower
+  -> /cmd_vel/autonomy
+  -> SafetyVelocityMux
+  -> /cmd_vel
 ```
 
-若平台直接复用 SysNav detector/mapping，则不需要重写
-`semantic_map_adapter.py`，只需复用 `SysNavSemanticMapBridge`。不同执行器采用以下边界：
+`/cmd_vel` 只能由底层安全 mux 发布。VLN、instruction runtime、LVLM 和 evidence
+provider 都不得直接发布 `/cmd_vel` 或其变体。
 
-| 执行器类型 | `send_goal` | `poll_status` | `cancel/hold` | 适用条件 |
-|---|---|---|---|---|
-| ROS2 Action / Nav2 | 发送带 goal id 的 action | 读取 action feedback/result | 使用 action cancel 与安全 hold service | 首选，生命周期完整 |
-| SysNav `/way_point` | 发布 `PointStamped` | 独立订阅 planner path/status/odom | 发布 cancel/hold topic，并等待底层确认 | 兼容已有 SysNav |
-| 厂商异步 SDK | SDK goal handle | SDK callback 写入线程安全状态缓存 | SDK cancel + 平台急停接口 | SDK 原生支持反馈 |
-| 厂商同步 SDK | 后台 worker 执行阻塞调用 | worker 状态 + pose watchdog | 中断 worker 请求并触发安全 hold | 不能阻塞 ROS decision timer |
+### 6.3 安全信号
 
-裸 waypoint topic 本身不是完整 `MotionController`。只有同时具备稳定 goal id、当前目标
-关联、进度、到达、阻塞、超时和安全状态来源后，才能适配为公共执行合同。厂商 SDK
-也不得直接从回调中调用 final verifier；它只更新 `NavigationStatus`，由 runtime 在下一
-个控制周期采集 reached-view evidence。
-
-### 7.2 执行器最小验收合同
-
-每个平台 adapter 至少证明以下状态序列：
+安全 topic 由平台 profile 注入，当前 launch 支持：
 
 ```text
-send_goal
-  -> QUEUED/RUNNING
-  -> REACHED | BLOCKED | TIMEOUT | PREEMPTED | SAFETY_STOPPED
+hold_topic             例如 /platform/safe_hold
+cancel_topic           例如 /local_planner/cancel
+emergency_stop_topic   默认关闭，需显式允许
+manual takeover        由底盘安全链处理
 ```
 
-并满足：
+`dry_run=true` 是默认安全模式，不创建真实 waypoint 交接；需要测试 waypoint 时应
+使用独立的 `test_waypoint_topic`，不能把测试 topic 指向 `/cmd_vel`。真实 waypoint
+交接必须满足：
 
-1. 任一时刻只有一个 active goal 拥有运动控制权；
-2. `poll_status(goal_id)` 不会把其他目标的反馈关联到当前目标；
-3. `REACHED` 同时满足位姿容差、低速度和稳定时间，而不只是 path 消失；
-4. `cancel()` 返回后仍需等待 terminal feedback；
-5. `hold()` 走平台安全控制链，不由高层直接发布 `/cmd_vel=0`；
-6. 重启、通信中断和 stale odom 都映射为显式失败状态，不能保持 RUNNING；
-7. status 只证明物理执行结果，最终任务成功仍由 reached-view verifier 决定。
+```text
+dry_run=false
+lower_controller_enabled=true
+controller_contract_file 已配置且 approval_status=approved
+waypoint、frame、feedback、速度限制和急停字段全部通过校验
+```
 
-## 8. 传感器与地图扩展接口
+## 7. 实物模块与适配接口
 
-不同机器人通常只需替换三类 provider：
+### 7.1 已实现模块
+
+```text
+real_robot/contracts.py
+  平台无关的观测、地图、意图、运动、状态和证据合同。
+
+real_robot/detector_vocabulary.py
+  读取 SysNav objects.yaml，保存 detector label/prompt provenance。
+
+real_robot/sysnav_ros_adapters.py
+  RosDetectionResultAdapter
+  RosObjectNodeAdapter
+  RosRoomNodeAdapter
+  RosNavigationStatusProvider
+  RosWaypointController
+
+real_robot/observation_cache.py
+  RGB、depth、pointcloud、pose、detection 缓存和目标 crop evidence。
+
+real_robot/sysnav_runtime.py
+  SysNavSemanticMapBridge
+  SysNavInstructionRuntime
+  ViewpointEvidenceLoop
+  RuntimeDecisionJsonlWriter
+
+real_robot/action_motion_controller.py
+  ExecuteWaypoint Action client；通过 SysNavMotionServer 交接 waypoint。
+
+real_robot/motion_safety.py
+  平台无关速度限制和安全决策模型。
+
+real_robot/control/controller_contract.py
+  校验 waypoint、反馈、速度限制、watchdog、急停和人工接管合同。
+```
+
+ROS2 workspace 中与当前链路相关的包：
+
+```text
+real_robot/ros2_ws/src/semantic_mapping
+  detector_node.py
+  semantic_mapping_node.py
+
+real_robot/ros2_ws/src/strive_sysnav_bringup
+  sysnav_detection_mapping.launch.py
+  strive_instruction_runtime.launch.py
+  strive_real_robot_stack.launch.py
+  instruction_runtime_node.py
+
+real_robot/ros2_ws/src/strive_motion_msgs
+  ExecuteWaypoint.action
+  SafetyState.msg
+```
+
+`ros2_ws/build`、`install` 和 `log` 是编译产物，不是接口源码，也不应作为迁移依据。
+
+### 7.2 平台扩展协议
+
+替换硬件时，优先实现以下三个边界，而不是在 `SysNavInstructionRuntime` 中添加平台
+分支：
 
 ```python
 class ObservationProvider(Protocol):
-    def readiness(self) -> RuntimeReadiness: ...
     def latest_observation(self) -> RealObservation | None: ...
 
 class SemanticMapProvider(Protocol):
-    def build_snapshot(self, timestamp: float | None = None) -> SemanticMapSnapshot | None: ...
+    def build_snapshot(self, timestamp: float | None = None): ...
 
-class EvidenceProvider(Protocol):
-    def capture(self, goal: ViewpointGoal, status: NavigationStatus) -> ViewEvidence: ...
+class MotionControllerProtocol(Protocol):
+    def send_goal(self, goal: MotionGoal) -> str: ...
+    def poll_status(self, goal_id: str) -> NavigationStatus: ...
+    def cancel(self, goal_id: str | None = None) -> None: ...
+    def hold(self) -> None: ...
 ```
 
-第一版 SysNav 链路：
+推荐的平台目录结构：
 
 ```text
-/camera/image
-  -> detection_node
-  -> /detection_result
-  -> semantic_mapping_node
-  -> /object_nodes_list, /room_nodes_list
-  -> SysNavSemanticMapBridge
-  -> SemanticMapSnapshot
+real_robot/platforms/<platform_id>/
+  profile.yaml
+  observation_adapter.py
+  semantic_map_adapter.py       # 复用 SysNav 时可以省略
+  motion_goal_adapter.py
+  navigation_status_adapter.py
+  motion_controller.py
+  bringup.launch.py
+  tests/
 ```
 
-如果替换检测器，保持 `DetectionFrame` 和对象 UID 生命周期合同；词表通过
-`DetectorVocabularyAdapter` 提供 provenance，不能在 ROS adapter 内写同义词规则。
-
-如果替换 semantic mapper，只需提供 `SemanticMapSnapshot`。VLN 不应读取新 mapper
-的私有内部对象，也不应反向修改其地图。
-
-## 9. 平台 profile
-
-每台机器人使用独立 YAML/env profile，至少声明：
-
-```yaml
-platform_id: robot_a
-frames:
-  world: map
-  base: base_link
-  camera: camera_link
-topics:
-  rgb: /camera/image
-  depth: /camera/aligned_depth_to_color/image_raw
-  pointcloud: /cloud_registered
-  odometry: /aft_mapped_to_init
-  objects: /huawei_vln/object_nodes_list
-  rooms: /huawei_vln/room_nodes_list
-motion:
-  backend: execute_waypoint_action
-  action_name: /strive/execute_waypoint
-  xy_tolerance_m: 0.35
-  timeout_s: 60.0
-safety:
-  state_topic: /strive/safety_state
-  hold_topic: /strive/hold
-  manual_topic: /cmd_vel/manual
-  final_velocity_topic: /cmd_vel
-sync:
-  max_rgb_pose_delta_s: 0.15
-  max_cloud_pose_delta_s: 0.20
-```
-
-配置只描述平台能力和 topic/frame，不包含 `cup -> table` 等任务语义。
-
-## 10. 安全与故障语义
-
-优先级必须固定：
+如果继续使用 SysNav detector 和 semantic mapping，只需保证：
 
 ```text
-ESTOP / manual takeover
-  > localization lost / stale odom
-  > controller fault / stale command
-  > no feasible path / blocked / timeout
-  > semantic replanning
+平台传感器 -> SysNav 输入 topic
+SysNav 输出 /object_nodes_list -> RosObjectNodeAdapter
+VLN MotionGoal -> SysNav waypoint/action 接口
+SysNav odom/path/status -> NavigationStatus
 ```
 
-- final `/cmd_vel` 只能由平台安全 mux 发布；
-- VLM 超时只能产生 uncertain/wait/replan，不能产生 STOP；
-- motion `REACHED` 不能替代语义 verifier；
-- verifier `accept` 不能替代物理到达；
-- frame mismatch、stale pose、stale image 必须拒绝目标执行或证据采集；
-- cancel 后仍要等待底层 hold/safety 状态，不能仅凭消息已发布宣称停止。
+检测器可以替换，但必须继续输出 `DetectionFrame` 或兼容 SysNav 的
+`DetectionResult`，并保留稳定的 track/object identity 和 label provenance。
 
-## 11. 迁移与验收
+## 8. 运行模式
 
-### 阶段 A：代码与配置迁移
+### 8.1 等待模式
 
-- 复制 VLN、ROS2 workspace 和平台 profile；
-- 编译 ROS packages；
-- 检查 message/action type 和 topic ownership；
-- 连接独立 LVLM 服务，不在控制容器加载大模型。
+```text
+policy_mode=wait
+```
 
-### 阶段 B：离线 contract 测试
+只验证 ROS 输入和 runtime readiness，不编译或调用自然语言策略，不发布 waypoint。
 
-- Python contract/import 测试；
-- fake ROS message adapter 测试；
-- MotionGoal/NavigationStatus 状态映射；
-- schema fallback 不产生 accept；
-- no `/cmd_vel` ownership violation。
+### 8.2 first-object smoke
 
-### 阶段 C：rosbag 与 HIL
+```text
+policy_mode=first_object_smoke
+```
 
-- RGB/LiDAR/odom 时间戳；
-- object/room snapshot；
-- waypoint action feedback；
-- blocked/timeout/cancel/hold；
-- reached 后采集 evidence；
-- final verifier raw response 和决策写入 artifact。
+只用于验证 snapshot 到 motion bridge 的连通性，选择第一个有三维位置的对象，不解释
+自然语言，也不代表 ObjectNav 能力。
 
-### 阶段 D：真机验收
+### 8.3 语义指令模式
 
-- 静态目标与低速短距离 waypoint；
-- 局部避障和不可达目标；
-- emergency stop 与人工接管；
-- 网络中断和 LVLM 超时；
-- `find chair`、属性目标、`book on shelf` 等语义任务；
-- 保存传感器、intent、motion feedback、evidence、verifier 和安全日志。
+```text
+policy_mode=semantic_snapshot
+instruction="find a book on a shelf"
+instruction_plan_backend=llm
+enable_final_verifier=true
+```
 
-当前仓库已经具备平台无关 contract、SysNav 消息适配、两种 motion controller、
-status provider 和 reached-view evidence loop。尚不能从软件测试推导真实底盘验收完成；
-目标设备的传感器同步、标定、控制器反馈和安全链仍是迁移时必须完成的工作。
+该模式才会编译 `InstructionPlan`，运行概念 grounding、关系约束、视角证据和 final
+verifier。若启用 `llm` backend，机器人必须配置 LVLM HTTP 服务。
+
+### 8.4 motion 安全开关
+
+```text
+dry_run=true
+  记录 RuntimeDecision，不发布真实 /way_point。
+
+dry_run=false, lower_controller_enabled=false
+  只允许显式配置的 test waypoint，不能连接真实底盘。
+
+dry_run=false, lower_controller_enabled=true
+  需要通过 controller contract，才允许交给真实下层控制器。
+```
+
+## 9. 接口验收范围
+
+当前仓库可以进行：
+
+- Python contract、ROS adapter、runtime 状态生命周期和安全 topic 校验；
+- fake ROS message / dry-run / bag replay；
+- SysNav detector、semantic mapping、VLN runtime 的 ROS graph smoke；
+- 远程 LVLM 的 HTTP 和结构化 schema smoke。
+
+以下内容不由本仓库离线测试替代：
+
+- 真实相机、Livox、SLAM 的时间同步与 frame 标定；
+- 真实 `/way_point` 到底盘的路径跟踪和到达反馈；
+- 速度、角速度、加速度限制的实测；
+- 急停、人工接管、通信中断和底盘故障；
+- 目标机器人上的最终导航成功率。
+
+真机验收应从 `dry_run` 开始，依次经过 test waypoint、低速短距离、受控场地，再启用
+真实 lower controller。任何阶段都不得绕过 controller contract 或直接增加 VLN 的
+`/cmd_vel` publisher。
+
+## 10. 相关文档
+
+- [LVLM 接入与部署基础](lvlm_server_deployment.md)
+- [SysNav 真实机器人 ROS2 workspace](../real_robot/ros2_ws/README.md)
+- [技术白皮书](project_technical_whitepaper.md)
+- [文档与运行产物目录约定](README.md)

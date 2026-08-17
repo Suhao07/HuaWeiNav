@@ -97,3 +97,56 @@ def test_smoke_client_exercises_health_models_and_chat(monkeypatch, capsys) -> N
     ]
     assert {record["authorization"] for record in requests} == {"Bearer test-token"}
     assert requests[-1]["payload"]["model"] == "strive-qwen2.5-vl-7b"
+
+
+def test_smoke_client_can_call_provider_without_optional_discovery_endpoints(
+    monkeypatch, capsys
+) -> None:
+    """Verify commercial OpenAI-compatible APIs only need chat completion."""
+
+    requests: list[dict] = []
+
+    def fake_urlopen(request, *, timeout):
+        """Return a completion and fail if an optional endpoint is requested."""
+
+        path = urlsplit(request.full_url).path
+        requests.append({"path": path, "timeout": timeout})
+        if path != "/v1/chat/completions":
+            raise AssertionError(f"unexpected optional endpoint: {path}")
+        return _Response(
+            json.dumps(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": (
+                                    '{"ok":true,"image_received":false,'
+                                    '"summary":"provider-ready"}'
+                                )
+                            }
+                        }
+                    ]
+                }
+            ).encode("utf-8")
+        )
+
+    monkeypatch.setattr(smoke_client.urllib.request, "urlopen", fake_urlopen)
+
+    result = smoke_client.main(
+        [
+            "--base-url",
+            "https://provider.example/v1",
+            "--model",
+            "provider-model",
+            "--api-key",
+            "provider-token",
+            "--skip-health",
+            "--skip-model-discovery",
+        ]
+    )
+
+    output = json.loads(capsys.readouterr().out)
+    assert result == 0
+    assert output["health_status"] is None
+    assert output["models"] == []
+    assert [record["path"] for record in requests] == ["/v1/chat/completions"]

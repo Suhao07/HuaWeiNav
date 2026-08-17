@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 from deployment.lvlm_server.schema_smoke import (
     _check_final_guard,
+    build_parser,
     build_schema_cases,
     run_schema_cases,
 )
@@ -101,3 +102,19 @@ def test_schema_smoke_rejects_unsafe_final_accept() -> None:
     assert len(failures) == 2
     assert any("satisfied=true" in failure for failure in failures)
     assert any("decision=accept" in failure for failure in failures)
+
+
+def test_schema_smoke_exposes_optional_provider_endpoint_skips() -> None:
+    """Verify commercial providers can skip non-standard discovery endpoints."""
+
+    args = build_parser().parse_args(
+        [
+            "--image",
+            "frame.jpg",
+            "--skip-health",
+            "--skip-model-discovery",
+        ]
+    )
+
+    assert args.skip_health is True
+    assert args.skip_model_discovery is True

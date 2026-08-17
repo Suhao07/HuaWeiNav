@@ -1,51 +1,68 @@
-# VLN Real-Robot ROS2 Overlay
+# VLN 实物模式 ROS2 Workspace
 
-This workspace vendors the first SysNav detector and semantic mapping stack
-needed by VLN real-robot deployment.
+本 workspace 保存当前 VLN 实物模式所需的 SysNav ROS2 组件。它负责真实机器人上的
+检测、语义建图、局部规划、运动 action 和安全速度链路；VLN 高层 Python contract
+与运行时位于上一级 `real_robot/` 目录。
 
-## Packages
+完整的数据流、控制流和平台适配边界见：
+
+- [`docs/real_robot_framework.md`](../../docs/real_robot_framework.md)
+- [`docs/lvlm_server_deployment.md`](../../docs/lvlm_server_deployment.md)
+
+实物模式采用单一 ROS2 运行环境和远程 LVLM 服务：
 
 ```text
-src/tare_planner
-  Message-only compatibility package. It provides the SysNav message types
-  consumed by semantic_mapping, including DetectionResult, ObjectNode,
-  ObjectNodeList, RoomNode, RoomNodeList, TargetObjectInstruction, and related
-  VLM/navigation query messages.
+机器人 ROS2 workspace
+  SysNav detector / semantic mapping
+  VLN instruction runtime
+  local planner / path follower / SafetyVelocityMux
 
-src/semantic_mapping
-  Vendored SysNav detector_node and semantic_mapping_node.
-  It subscribes /camera/image, /registered_scan, /state_estimation, and
-  publishes /detection_result and /object_nodes_list.
-
-src/strive_sysnav_bringup
-  Launch and high-level runtime package. It starts detection_node,
-  semantic_mapping_node, and the optional VLN instruction runtime node
-  inside the VLN overlay.
-
-src/terrain_analysis, src/local_planner
-  Migrated SysNav lower navigation stack. `localPlanner` consumes the
-  registered cloud, odometry, and `/way_point`; `pathFollower` publishes only
-  `/cmd_vel/autonomy`. The final `/cmd_vel` owner is `SafetyVelocityMux`.
-
-src/strive_motion_msgs, src/strive_sysnav_motion
-  Task-level `ExecuteWaypoint` action server and safety velocity mux. The
-  action server reports motion lifecycle and reason codes; it does not declare
-  natural-language task success.
+独立 LVLM 服务器或商业 API
+  <- OpenAI-compatible HTTPS ->
+  机器人 VLN runtime
 ```
 
-The lower SysNav planner is compiled in this overlay. Its original chassis
-output is replaced by `/cmd_vel/autonomy`, and the final velocity path is
-guarded by `SafetyVelocityMux`. Detector weights, localization, chassis driver,
-and hardware safety devices remain deployment inputs.
+## 1. Workspace 结构
 
-## Build
+```text
+src/tare_planner/
+  SysNav 兼容消息包。
+  提供 DetectionResult、ObjectNode、ObjectNodeList、RoomNode、RoomNodeList、
+  TargetObjectInstruction 等消息类型。
+
+src/semantic_mapping/
+  迁移的 SysNav detector_node 和 semantic_mapping_node。
+  detector_node 订阅 RGB，发布 /detection_result；
+  semantic_mapping_node 融合检测、点云和位姿，发布 /object_nodes_list。
+
+src/strive_sysnav_bringup/
+  VLN 实物模式 launch 和高层 runtime 节点。
+  负责启动感知建图、instruction runtime，以及可选的下层控制链。
+
+src/terrain_analysis/
+src/local_planner/
+  迁移的 SysNav 局部规划组件。
+  localPlanner 消费点云、位姿和 /way_point，输出 /path；
+  pathFollower 跟踪路径并发布 /cmd_vel/autonomy。
+
+src/strive_motion_msgs/
+src/strive_sysnav_motion/
+  ExecuteWaypoint action、运动生命周期反馈和安全速度 mux。
+```
+
+`build/`、`install/` 和 `log/` 是 colcon 生成的本地产物，不是源码依赖，也不应作为
+迁移代码提交。迁移时只需要 `src/` 和对应的部署配置。
+
+## 2. 编译
+
+从仓库根目录执行：
 
 ```bash
-cd /home/ubuntu/WorkSpace/project/Huawei\ Nav/Code/STRIVE
+cd "/home/ubuntu/WorkSpace/project/Huawei Nav/Code/STRIVE"
 bash scripts/build_real_robot_ros_ws.sh
 ```
 
-The script builds:
+脚本会编译：
 
 ```text
 tare_planner
@@ -57,118 +74,124 @@ strive_sysnav_motion
 strive_sysnav_bringup
 ```
 
-## Runtime Assets
+编译完成后，在同一个 shell 中加载 workspace：
 
-Detector and SAM2 weights are deployment assets and are not committed to the
-repository. Configure them explicitly:
+```bash
+source real_robot/ros2_ws/install/setup.bash
+```
+
+目标设备需要安装与 ROS2 发行版、CUDA、PyTorch 和 Jetson/amd64 架构匹配的依赖。
+编译成功不代表检测器权重、传感器、DDS 网络或底盘已经验收。
+
+## 3. 运行时模型与检测器资产
+
+检测器和 SAM2 权重属于部署资产，不提交到 Git。启动前显式配置：
 
 ```bash
 export SYSNAV_DETECTOR_MODEL_TYPE=yoloe
-export SYSNAV_DETECTOR_MODEL_PATH=/path/to/yoloe-26x-seg.engine
+export SYSNAV_DETECTOR_MODEL_PATH=/path/to/yoloe-model.engine
 export SYSNAV_SAM2_CHECKPOINT=/path/to/sam2.1_hiera_base_plus.pt
 ```
 
-If the model path is omitted, `detection_node` falls back to the package-local
-default under `semantic_mapping/external`. The run script checks explicitly
-provided paths before launching.
-
-## Run
-
-For the real robot, use the guarded framework entrypoint from inside the
-container. It checks the live LIO topics, keeps lower controller startup blocked
-by default, then starts camera, detector, and semantic mapping:
+某些 YOLOE `.pt` 回退模型还需要文本编码器资产：
 
 ```bash
-bash scripts/start_real_robot_framework.sh
+export SYSNAV_CLIP_VIT_B32_PATH=/path/to/ViT-B-32.pt
+export SYSNAV_MOBILECLIP_BLT_TS_PATH=/path/to/mobileclip_blt.ts
 ```
 
-The robot-side Docker entrypoint calls this script automatically:
+当前 detector 词表由 SysNav 的 `objects.yaml` 提供。`DetectorVocabularyAdapter` 只
+记录 detector 的 label、prompt 和 provenance，不在 ROS 层硬编码自然语言别名。
 
-```bash
-SUDO_STDIN_PASSWORD=1 ./docker_en.sh start
+## 4. 感知与语义建图链路
+
+第一版 SysNav 复用链路如下：
+
+```text
+/camera/image
+  -> detection_node
+  -> /detection_result
+  -> semantic_mapping_node
+  -> /object_nodes_list
+  -> RosObjectNodeAdapter
+  -> SemanticMapSnapshot
 ```
 
-The lower controller remains blocked unless these are set explicitly:
+semantic mapping 的输入由 launch 参数映射：
 
-```bash
-BLOCK_LOWER_CONTROLLER=0 \
-ENABLE_LOWER_CONTROLLER=1 \
-LOWER_CONTROLLER_CMD='<controller launch command>' \
-bash scripts/start_real_robot_framework.sh
+```text
+相机：      /camera/image
+注册点云：  /cloud_registered 或 /registered_scan
+位姿：      /aft_mapped_to_init 或 /state_estimation
+视角：      /viewpoint_rep_header，可选
 ```
 
-```bash
-cd /home/ubuntu/WorkSpace/project/Huawei\ Nav/Code/STRIVE
-bash scripts/run_sysnav_detection_mapping.sh
+VLN runtime 主要消费：
+
+```text
+/object_nodes_list       tare_planner/ObjectNodeList
+/room_nodes_list         tare_planner/RoomNodeList，可选
+/aft_mapped_to_init      nav_msgs/Odometry
+/camera/image            sensor_msgs/Image
+/detection_result        tare_planner/DetectionResult
+/path                    nav_msgs/Path，可选
+/local_planner/status    std_msgs/String，可选
 ```
 
-Extra launch arguments can be passed through:
+当前迁移的 `semantic_mapping_node` 主要发布 `/object_nodes_list`；`/room_nodes_list`
+是 runtime adapter 支持的可选输入，不能假定每个 SysNav 版本都会发布。
+
+## 5. 启动感知建图
+
+### 5.1 使用已存在的相机和定位节点
 
 ```bash
-bash scripts/run_sysnav_detection_mapping.sh \
-  platform:=mecanum \
-  use_sim_time:=false
-```
+cd "/home/ubuntu/WorkSpace/project/Huawei Nav/Code/STRIVE"
 
-`run_sysnav_detection_mapping.sh` does not start the VLN instruction runtime
-unless explicitly requested:
-
-```bash
-START_STRIVE_RUNTIME=1 \
-STRIVE_INSTRUCTION="find a book" \
-STRIVE_DATASET_TARGET=book \
-STRIVE_POLICY_MODE=semantic_snapshot \
-STRIVE_INSTRUCTION_PLAN_BACKEND=rules \
-STRIVE_DRY_RUN=true \
-bash scripts/run_sysnav_detection_mapping.sh \
-  platform:=mecanum \
-  cloud_topic:=/cloud_registered \
-  odom_topic:=/aft_mapped_to_init \
-  camera_topic:=/camera/image
-```
-
-On the current Orin/Mid-360 robot, Point-LIO publishes the registered cloud
-and odometry under its native topic names. Start the VLN overlay with
-explicit remaps:
-
-```bash
 bash scripts/run_sysnav_detection_mapping.sh \
   platform:=mecanum \
   use_sim_time:=false \
+  camera_topic:=/camera/image \
   cloud_topic:=/cloud_registered \
   odom_topic:=/aft_mapped_to_init
 ```
 
-If no camera driver is already publishing `/camera/image`, the bringup launch
-can start `usb_cam` from the USB camera device and remap it into VLN:
+脚本只启动检测和语义建图，默认不启动 VLN instruction runtime，也不接通真实底盘。
+
+### 5.2 同时启动 USB 相机
+
+如果机器人没有其他节点发布 `/camera/image`，可以由 bringup 启动 `usb_cam`：
 
 ```bash
 bash docker/run_real_robot_sysnav_stack.sh \
   platform:=mecanum \
-  cloud_topic:=/cloud_registered \
-  odom_topic:=/aft_mapped_to_init \
   start_usb_cam:=true \
   usb_video_device:=/dev/video0 \
-  camera_topic:=/camera/image
+  camera_topic:=/camera/image \
+  cloud_topic:=/cloud_registered \
+  odom_topic:=/aft_mapped_to_init
 ```
 
-Expected topics:
+Theta 全景相机和 RealSense 都通过 `/camera/image` 接入。RealSense 的对齐深度可通过
+`depth_topic` 额外传给 observation cache；相机型号、内参和外参由平台 profile 提供。
+
+### 5.3 预期 topic
 
 ```text
-Input:
+感知输入：
   /camera/image
-  /registered_scan
-  /state_estimation
-  /viewpoint_rep_header
+  /registered_scan 或 /cloud_registered
+  /state_estimation 或 /aft_mapped_to_init
+  /viewpoint_rep_header，可选
 
-Output:
+感知输出：
   /detection_result
   /object_nodes_list
   /annotated_image_detection
   /annotated_image
   /cloud_image
 
-Motion:
+运动与安全：
   /way_point
   /path
   /cmd_vel/autonomy
@@ -178,104 +201,43 @@ Motion:
   /local_planner/cancel
 ```
 
-VLN consumes `/object_nodes_list` and `/room_nodes_list` through
-`real_robot.sysnav_runtime.SysNavSemanticMapBridge`, then publishes waypoint
-goals with `real_robot.sysnav_ros_adapters.RosWaypointController`.
+topic 名称必须以机器人 profile 和 launch 参数为准。启动前应使用 `ros2 topic list`、
+`ros2 topic info` 和消息频率检查确认真实输入，而不是只检查 topic 是否存在。
 
-### Bag Replay Runtime
+## 6. 启动 VLN 高层 runtime
 
-Use bag replay when the recorded bag already contains STRIVE-facing topics such
-as `/object_nodes_list`, `/room_nodes_list`, `/aft_mapped_to_init`, and
-`/camera/image`. This path does not start detector/mapping.
+高层节点是 `strive_instruction_runtime`。它订阅 SysNav object/room snapshot、RGB、
+位姿和运动反馈，调用现有 instruction/concept/verifier 模块，输出
+`NavigationIntent -> MotionGoal`。
 
-```bash
-bash scripts/run_real_robot_bag_replay.sh /path/to/recorded_bag \
-  instruction:="find a book" \
-  dataset_target:=book \
-  policy_mode:=semantic_snapshot \
-  instruction_plan_backend:=rules \
-  dry_run:=true \
-  run_directory:=/tmp/strive_real_robot_bag_replay
-```
+### 6.1 安全 WAIT smoke
 
-If the bag used different topic names, set the corresponding env vars before
-launch:
-
-```text
-BAG_OBJECT_TOPIC=/object_nodes_list
-BAG_ROOM_TOPIC=/room_nodes_list
-BAG_ODOM_TOPIC=/aft_mapped_to_init
-BAG_IMAGE_TOPIC=/camera/image
-BAG_DETECTION_TOPIC=/detection_result
-BAG_PATH_TOPIC=/path
-```
-
-### Offline Acceptance
-
-Run this before Orin deployment or before replaying a new bag:
+该模式只验证启动、订阅、readiness gate 和 JSONL 记录，不编译指令计划，也不发布
+`/way_point`：
 
 ```bash
-bash scripts/check_real_robot_acceptance.sh
-```
-
-Current local acceptance coverage:
-
-```text
-fake object/room messages -> SemanticMapSnapshot
-semantic dry-run -> NavigationIntent without waypoint publisher
-fake waypoint controller -> RUNNING / REACHED
-REACHED -> ViewEvidence + verifier_payload
-snapshot -> waypoint -> final verifier accept -> STOP
-```
-
-This is not a hardware run. Real `/way_point`, local planner, and chassis smoke
-must still be run on the robot.
-
-### High-Level Runtime Test Commands
-
-The high-level runtime node subscribes `/object_nodes_list`,
-`/room_nodes_list`, `/aft_mapped_to_init`, `/camera/image`, and
-`/detection_result`. The wrapper script sources ROS and the overlay, then adds
-the repository root to `PYTHONPATH` for the shared VLN `real_robot` package.
-
-Run tests in this order. Do not skip directly to `dry_run:=false`.
-
-#### 1. Safe WAIT Smoke
-
-This verifies launch, subscriptions, readiness gates, and JSONL logging. It
-does not compile an instruction plan and never publishes `/way_point`.
-
-```bash
-cd /home/ubuntu/WorkSpace/project/Huawei\ Nav/Code/STRIVE
 bash scripts/run_real_robot_instruction_runtime.sh \
   instruction:="find a book" \
   policy_mode:=wait \
   dry_run:=true \
-  run_directory:=/tmp/strive_real_robot_runtime_wait
+  run_directory:=/tmp/vln_real_robot_wait
 ```
 
-Inspect the decisions:
+检查运行记录：
 
 ```bash
-tail -n 20 /tmp/strive_real_robot_runtime_wait/runtime_decisions.jsonl
+tail -n 20 /tmp/vln_real_robot_wait/runtime_decisions.jsonl
 ```
 
-Expected result:
+预期结果：
 
 ```text
 intent.mode == "wait"
 motion_goal == null
-no /way_point publication
+没有 /way_point 发布
 ```
 
-#### 2. Semantic Snapshot Dry-Run
-
-This compiles the instruction into an `InstructionPlan`, adapts
-`SemanticMapSnapshot` through `SemanticMapSnapshotPolicyContext`, and emits a
-`NavigationIntent`. It still does not publish `/way_point`.
-
-Use `instruction_plan_backend:=rules` for offline wiring tests. Use
-`instruction_plan_backend:=llm` only when the LLM/VLM runtime is configured.
+### 6.2 语义 snapshot dry-run
 
 ```bash
 bash scripts/run_real_robot_instruction_runtime.sh \
@@ -285,422 +247,143 @@ bash scripts/run_real_robot_instruction_runtime.sh \
   instruction_plan_backend:=rules \
   dry_run:=true \
   enable_final_verifier:=false \
-  run_directory:=/tmp/strive_real_robot_runtime_semantic_dry
+  run_directory:=/tmp/vln_real_robot_semantic_dry
 ```
 
-Inspect:
+该模式将输入编译为 `InstructionPlan`，通过
+`SemanticMapSnapshotIntentAdapter` 输出高层意图，但 dry-run 不会把目标发送到真实
+`/way_point`。
 
-```bash
-tail -n 20 /tmp/strive_real_robot_runtime_semantic_dry/runtime_decisions.jsonl
-```
+需要远程 LVLM 时，将 `instruction_plan_backend` 改为 `llm`，并按
+[`docs/lvlm_server_deployment.md`](../../docs/lvlm_server_deployment.md) 配置商业 API
+或公网 HTTPS 自部署服务。
 
-Expected result after object snapshots arrive:
+### 6.3 证据与 final verifier dry-run
 
-```text
-intent.mode in {"go_to_object", "go_to_anchor", "wait"}
-motion_goal is present only for go_to_* intents
-navigation_status.metadata.dry_run == true for dispatched dry-run goals
-no /way_point publication
-```
-
-#### 3. Semantic Dry-Run With Evidence Files
-
-This is useful before enabling final verifier. It persists observation images
-for replay/debug. It still does not publish `/way_point`, and it does not run
-the final verifier unless a reached status is reported.
+确认 snapshot、目标候选和 evidence cache 正常后，再开启 final verifier：
 
 ```bash
 bash scripts/run_real_robot_instruction_runtime.sh \
-  instruction:="find a book" \
-  dataset_target:=book \
-  policy_mode:=semantic_snapshot \
-  instruction_plan_backend:=rules \
-  dry_run:=true \
-  enable_final_verifier:=false \
-  persist_observation_images:=true \
-  observation_image_directory:=/tmp/strive_real_robot_runtime_semantic_evidence/observations \
-  run_directory:=/tmp/strive_real_robot_runtime_semantic_evidence
-```
-
-Inspect:
-
-```bash
-tail -n 20 /tmp/strive_real_robot_runtime_semantic_evidence/runtime_decisions.jsonl
-find /tmp/strive_real_robot_runtime_semantic_evidence -maxdepth 3 -type f | sort | head -50
-```
-
-#### 4. Final Verifier Dry-Run
-
-Enable this only after semantic dry-run produces reasonable target intents and
-the evidence cache is available. Verifier `accept` is the only semantic STOP
-authority. `dry_run_status:=reached` simulates the lower planner reporting
-`NavigationStatus.REACHED`, so `ViewpointEvidenceLoop.verify_reached(...)` runs
-without publishing `/way_point`.
-
-```bash
-bash scripts/run_real_robot_instruction_runtime.sh \
-  instruction:="find a book" \
-  dataset_target:=book \
+  instruction:="find a book on a shelf" \
   policy_mode:=semantic_snapshot \
   instruction_plan_backend:=llm \
   dry_run:=true \
   dry_run_status:=reached \
   enable_final_verifier:=true \
-  evidence_mode:=auto \
   persist_observation_images:=true \
-  observation_image_directory:=/tmp/strive_real_robot_runtime_verifier/observations \
-  run_directory:=/tmp/strive_real_robot_runtime_verifier
+  observation_image_directory:=/tmp/vln_real_robot_verifier/observations \
+  run_directory:=/tmp/vln_real_robot_verifier
 ```
 
-Expected result:
+这里 `dry_run_status:=reached` 只是模拟下层返回 `NavigationStatus.REACHED`，不代表
+真实底盘到达。预期控制流是：
 
 ```text
-NavigationStatus.REACHED -> ViewpointEvidenceLoop.verify_reached(...)
-verifier_decision appears in runtime_decisions.jsonl
-verifier accept -> intent.mode == "stop"
-dry_run still prevents /way_point publication
+REACHED
+  -> ViewpointEvidenceLoop.verify_reached()
+  -> ViewEvidence
+  -> final verifier
+  -> accept 才能产生 stop intent
 ```
 
-#### 5. Publish Waypoints To Lower Planner
+### 6.4 测试 waypoint
 
-Run this only after `/path`, `/aft_mapped_to_init`, and the local planner are
-healthy, and only when the robot safety boundary is already handled outside
-STRIVE. This publishes `/way_point`; VLN still never publishes `/cmd_vel`.
-The launch will reject this mode unless `lower_controller_enabled:=true` is
-set, or unless `waypoint_topic` is changed to the configured test topic.
+如果需要测试 ROS waypoint 交接，但尚未批准真实底盘，可以将输出指向独立测试 topic：
 
 ```bash
 bash scripts/run_real_robot_instruction_runtime.sh \
   instruction:="find a book" \
-  dataset_target:=book \
   policy_mode:=semantic_snapshot \
   instruction_plan_backend:=rules \
   dry_run:=false \
+  lower_controller_enabled:=false \
+  waypoint_topic:=/strive/test_way_point \
+  run_directory:=/tmp/vln_real_robot_test_waypoint
+```
+
+测试 topic 不得连接真实速度控制器。
+
+## 7. LVLM 接入
+
+实物机器人只运行 VLN 客户端，不加载 LVLM 权重。LVLM 可以是商业 API，也可以是独立
+GPU 服务器上的自部署模型：
+
+```text
+机器人 VLN runtime
+  -- HTTPS /v1/chat/completions -->
+公网 DNS + TLS + 认证反向代理
+  --> GPU 模型服务器
+```
+
+机器人端配置示例：
+
+```bash
+export LLM_PROVIDER=self_hosted
+export STRIVE_LLM_CLIENT=self_hosted
+export STRIVE_VLM=self_hosted
+export VLN_LVLM_BASE_URL=https://<public-domain>/v1
+export VLN_LVLM_API_KEY=<same-token-as-server>
+export VLN_LVLM_MODEL=<served-model-name>
+export VLN_LVLM_TIMEOUT_S=45
+export VLN_LVLM_TRANSPORT_RETRIES=2
+export VLN_LVLM_PARSE_RETRIES=1
+```
+
+模型服务器不需要加入机器人 ROS 网络，也不访问 `/cmd_vel`、`/way_point` 或传感器
+topic。网络、解析或 schema 失败时，runtime 必须产生保守的 wait/replan 结果，不能
+产生 final STOP。
+
+## 8. 运动控制边界
+
+VLN 不直接发布离散 Habitat action，也不直接发布 `/cmd_vel`。运动链路为：
+
+```text
+NavigationIntent
+  -> MotionGoal
+  -> RosWaypointController 或 RosActionMotionController
+  -> /way_point / ExecuteWaypoint
+  -> SysNav localPlanner
+  -> /path
+  -> pathFollower
+  -> /cmd_vel/autonomy
+  -> SafetyVelocityMux
+  -> /cmd_vel
+```
+
+### 8.1 Waypoint backend
+
+```bash
+bash scripts/run_real_robot_instruction_runtime.sh \
+  instruction:="find a book" \
+  policy_mode:=semantic_snapshot \
+  instruction_plan_backend:=rules \
+  motion_backend:=waypoint \
+  dry_run:=false \
   lower_controller_enabled:=true \
-  enable_final_verifier:=false \
   waypoint_topic:=/way_point \
   hold_topic:=/platform/safe_hold \
   cancel_topic:=/local_planner/cancel \
-  path_topic:=/path \
   odom_topic:=/aft_mapped_to_init \
-  run_directory:=/tmp/strive_real_robot_runtime_waypoint
+  path_topic:=/path \
+  controller_contract_file:=/workspace/STRIVE/real_robot/control/<robot>_controller_contract.yaml
 ```
 
-Inspect from another terminal:
+该模式由 `RosWaypointController` 发布 `geometry_msgs/PointStamped`，状态由
+`RosNavigationStatusProvider` 根据 odom、path、超时和进度推断。
 
-```bash
-ros2 topic echo /way_point --once
-tail -n 20 /tmp/strive_real_robot_runtime_waypoint/runtime_decisions.jsonl
-```
+### 8.2 Action backend
 
-Only after the waypoint path is verified should `enable_final_verifier:=true`
-be used with `dry_run:=false`.
-
-#### Useful Runtime Parameters
+Action backend 用于需要 goal id、feedback、cancel 和 result 的完整生命周期：
 
 ```text
-policy_mode:=wait | first_object_smoke | semantic_snapshot
-instruction:=...
-dataset_target:=...
-instruction_plan_backend:=rules | llm
-vlm:=cognav
-dry_run:=true | false
-dry_run_status:=idle | queued | running | reached | blocked | timeout | preempted | failed
-enable_final_verifier:=false | true
-evidence_mode:=auto | full_image | bbox_crop
-run_directory:=/tmp/strive_real_robot_runtime
-lower_controller_enabled:=false | true
-waypoint_topic:=/way_point
-test_waypoint_topic:=/strive/test_way_point
-hold_topic:=
-cancel_topic:=
-emergency_stop_topic:=
-allow_emergency_stop_publish:=false | true
-```
-
-Safety defaults:
-
-```text
-dry_run:=true never publishes /way_point.
-dry_run:=false requires lower_controller_enabled:=true unless waypoint_topic is the test topic.
-emergency_stop_topic is never published unless allow_emergency_stop_publish:=true.
-Any /cmd_vel or */cmd_vel publish topic is rejected before publishers are created.
-```
-
-The node also keeps a lightweight observation cache for evidence acquisition.
-By default image refs stay as ROS URI strings and no camera bytes are written:
-
-```text
-detection_topic:=/detection_result
-depth_topic:=
-pointcloud_topic:=
-persist_observation_images:=false
-observation_image_directory:=
-```
-
-Set `persist_observation_images:=true` only when replay/debug evidence files are
-needed. The contract still records only `image_ref` and sidecar metadata paths.
-
-When `dry_run:=false`, the node injects `RosNavigationStatusProvider` into the
-waypoint controller. It reads `/aft_mapped_to_init` and `/path`, plus an
-optional string `planner_status_topic`, then writes distance, elapsed time,
-path length, and progress samples into `NavigationStatus.metadata`.
-
-Useful launch parameters:
-
-```text
-path_topic:=/path
-planner_status_topic:=
-xy_goal_tolerance_m:=0.35
-z_goal_tolerance_m:=1.0
-navigation_timeout_s:=60.0
-no_progress_timeout_s:=12.0
-min_progress_delta_m:=0.05
-path_stale_timeout_s:=5.0
-```
-
-The same stale timeout is used for `planner_status_topic`, so an old
-`blocked`/`timeout` message does not permanently affect later goals.
-
-Observed hardware topics on the Orin robot:
-
-```text
-Livox driver:
-  /livox/lidar                 livox_ros_driver2/msg/CustomMsg
-  /livox/imu                   sensor_msgs/msg/Imu
-
-Point-LIO:
-  /cloud_registered            sensor_msgs/msg/PointCloud2
-  /cloud_registered_body       sensor_msgs/msg/PointCloud2
-  /aft_mapped_to_init          nav_msgs/msg/Odometry
-  /base_odom                   nav_msgs/msg/Odometry
-  /path                        nav_msgs/msg/Path
-
-USB camera device:
-  /dev/video0, /dev/video1
-```
-
-The robot did not have `/registered_scan`, `/state_estimation`, `/camera/image`,
-`/way_point`, or `/cmd_vel` active during the first smoke pass, so VLN bringup
-must either use the launch remaps above or start the missing camera/local-planner
-nodes before running the full stack.
-
-Point-LIO's installed `mapping_mid360_orin.launch.py` loads
-`publish.scan_publish_en: false` from its config, so `/cloud_registered` can
-exist in the ROS graph without emitting live `PointCloud2` samples. For VLN,
-start the Livox/LIO tmux session through the HuaWeiNav host helper, which keeps
-the external repositories unchanged and applies runtime parameter overrides:
-
-```bash
-cd /home/orin26/code/HuaWeiNav
-bash scripts/start_orin_lio_for_strive.sh
-```
-
-The helper starts `livox_ros_driver2` and runs `point_lio` with:
-
-```text
-publish.scan_publish_en:=true
-```
-
-`/cloud_registered_body` is optional for VLN and is disabled by default to
-reduce Point-LIO load. Enable it only when debugging body-frame clouds:
-
-```bash
-ENABLE_BODY_CLOUD_PUBLISH=1 bash scripts/start_orin_lio_for_strive.sh
-```
-
-After this, the observed smoke rates were roughly:
-
-```text
-/livox/lidar          ~100 Hz
-/aft_mapped_to_init   ~100 Hz
-/cloud_registered     ~96-102 Hz
-/cloud_registered_body ~9 Hz when ENABLE_BODY_CLOUD_PUBLISH=1
-```
-
-## Orin Smoke Check
-
-Run the bounded smoke script on the robot before starting the full stack:
-
-```bash
-cd /home/orin26/code/HuaWeiNav
-bash scripts/smoke_real_robot_orin.sh
-```
-
-For the hardware-topic gate, run:
-
-```bash
-IMAGE_TAG=huawei-nav-real:orin REQUIRE_LIO=1 CHECK_CAMERA=1 \
-  bash scripts/smoke_real_robot_orin.sh
-```
-
-The smoke script only observes the ROS graph and starts short-lived container
-checks. It does not publish `/way_point` or `/cmd_vel`, and it does not start the
-AgileX/WebSocket bridge.
-
-The current Orin is JetPack 6.2.2 / L4T R36.5 with Python 3.10. The final
-real-robot runtime image is:
-
-```text
-huawei-nav-real:orin
-```
-
-It contains the ROS overlay and Jetson-compatible runtime packages. Large model
-weights stay outside the image and are mounted by `docker_en.sh`.
-
-```text
-Required Python packages for full detector/mapping launch:
-  torch
-  torchvision
-  ultralytics
-  supervision
-  open3d
-  opencv-python==4.11.0.86
-  scikit-learn
-  shapely
-  hydra-core / omegaconf / iopath
-  rerun-sdk==0.18.2
-
-Required deployment assets:
-  SYSNAV_DETECTOR_MODEL_PATH
-  SYSNAV_SAM2_CHECKPOINT
-  SYSNAV_CLIP_VIT_B32_PATH (only needed by YOLOE .pt fallback models)
-  SYSNAV_MOBILECLIP_BLT_TS_PATH (only needed by YOLOE .pt fallback models)
-```
-
-On the current Orin, the following smoke-test assets have been downloaded under
-the HuaWeiNav checkout:
-
-```text
-SYSNAV_SAM2_CHECKPOINT=/home/orin26/code/HuaWeiNav/real_robot/ros2_ws/src/semantic_mapping/semantic_mapping/external/sam2/checkpoints/sam2.1_hiera_base_plus.pt
-SYSNAV_DETECTOR_MODEL_PATH=/home/orin26/code/HuaWeiNav/real_robot/ros2_ws/src/semantic_mapping/semantic_mapping/external/yoloe-11s-seg.pt
-SYSNAV_CLIP_VIT_B32_PATH=/home/orin26/code/HuaWeiNav/real_robot/ros2_ws/src/semantic_mapping/semantic_mapping/external/ViT-B-32.pt
-SYSNAV_MOBILECLIP_BLT_TS_PATH=/home/orin26/code/HuaWeiNav/real_robot/ros2_ws/src/semantic_mapping/semantic_mapping/external/mobileclip_blt.ts
-SYSNAV_DETECTOR_MODEL_TYPE=yoloe
-```
-
-`yoloe-11s-seg.pt` is a lightweight public fallback for startup validation. The
-preferred offline real-robot asset remains a TensorRT engine exported with the
-deployment vocabulary, such as `yoloe-26x-seg.engine`, because YOLOE `.pt`
-models may need extra text-encoder dependencies during `set_classes()`. If
-`SYSNAV_MOBILECLIP_BLT_PATH=/.../mobileclip_blt.pt` is set and
-`/.../mobileclip_blt.ts` exists next to it, the run scripts auto-mount the `.ts`
-asset into `/workspace/STRIVE/mobileclip_blt.ts`.
-
-The strict smoke pass used on the Orin was:
-
-```bash
-SYSNAV_DETECTOR_MODEL_TYPE=yoloe \
-SYSNAV_DETECTOR_MODEL_PATH=/home/orin26/code/HuaWeiNav/real_robot/ros2_ws/src/semantic_mapping/semantic_mapping/external/yoloe-11s-seg.pt \
-SYSNAV_SAM2_CHECKPOINT=/home/orin26/code/HuaWeiNav/real_robot/ros2_ws/src/semantic_mapping/semantic_mapping/external/sam2/checkpoints/sam2.1_hiera_base_plus.pt \
-SYSNAV_CLIP_VIT_B32_PATH=/home/orin26/code/HuaWeiNav/real_robot/ros2_ws/src/semantic_mapping/semantic_mapping/external/ViT-B-32.pt \
-SYSNAV_MOBILECLIP_BLT_TS_PATH=/home/orin26/code/HuaWeiNav/real_robot/ros2_ws/src/semantic_mapping/semantic_mapping/external/mobileclip_blt.ts \
-IMAGE_TAG=huawei-nav-real:orin \
-REQUIRE_ASSETS=1 REQUIRE_LIO=1 REQUIRE_ML=1 CHECK_CAMERA=1 CHECK_DETECTOR_INIT=0 \
-HZ_TIMEOUT=3 ECHO_TIMEOUT=5 \
-bash scripts/smoke_real_robot_orin.sh
-```
-
-Use the single real-robot Docker entrypoint for deployment:
-
-```bash
-cd /home/orin26/code/HuaWeiNav
-SUDO_STDIN_PASSWORD=1 ./docker_en.sh start
-SUDO_STDIN_PASSWORD=1 ./docker_en.sh enter
-SUDO_STDIN_PASSWORD=1 ./docker_en.sh status
-```
-
-The real-robot Docker runner defaults `FASTDDS_BUILTIN_TRANSPORTS=UDPv4`.
-On this Orin, ROS graph discovery worked from the container without it, but
-host-published LIO data did not cross the Docker boundary until FastDDS shared
-memory transport was disabled for the container.
-
-Docker runtime envs used by `docker_en.sh` include:
-
-```text
-START_STRIVE_RUNTIME
-STRIVE_INSTRUCTION
-STRIVE_DATASET_TARGET
-STRIVE_POLICY_MODE
-STRIVE_INSTRUCTION_PLAN_BACKEND
-STRIVE_VLM
-STRIVE_PRIOR_MAP_PATH
-STRIVE_OBJECT_TOPIC / STRIVE_ROOM_TOPIC / STRIVE_ODOM_TOPIC / STRIVE_IMAGE_TOPIC
-STRIVE_WAYPOINT_TOPIC / STRIVE_HOLD_TOPIC / STRIVE_CANCEL_TOPIC
-LLM_PROVIDER / LLM_MODEL / LLM_API_BASE_URL / ARK_API_KEY / GEMINI_API_KEY
-SYSNAV_DETECTOR_MODEL_PATH / SYSNAV_SAM2_CHECKPOINT / SYSNAV_CLIP_VIT_B32_PATH
-```
-
-For code-only transfer, use:
-
-```bash
-bash scripts/export_code_only.sh
-```
-
-The export script excludes `.git`, local env files, model weights, rosbag
-files, runtime output, caches, and `real_robot/ros2_ws/{build,install,log}`.
-
-## Motion Interface
-
-VLN should stay above the low-level controller boundary:
-
-```text
-VLN NavigationIntent / MotionGoal
-  -> RosWaypointController
-  -> /way_point
-  -> existing local planner / path follower / PD controller
-  -> /cmd_vel or chassis bridge
-```
-
-The reference PD controller observed on the robot side consumes ego-frame
-waypoint arrays on `/waypoint` and publishes `geometry_msgs/Twist` on `/cmd_vel`.
-That repository is only a reference for topic contracts; do not modify it from
-this overlay. If the robot does not run a `/way_point` consumer, add a bridge in
-HuaWeiNav or the SysNav/local-planner layer that converts `/way_point` goals into
-the controller's expected local path/waypoint format.
-
-### Aggregate bringup
-
-The aggregate launch keeps the lower controller disabled by default:
-
-```bash
-bash scripts/run_sysnav_detection_mapping.sh
-```
-
-After the robot-specific controller contract has been approved, the complete
-Action-backed motion chain can be enabled explicitly:
-
-```bash
-export START_LOWER_STACK=1
-export STRIVE_DRY_RUN=false
-export STRIVE_LOWER_CONTROLLER_ENABLED=true
-export STRIVE_MOTION_BACKEND=action
-export CONTROL_CONTRACT_FILE=/workspace/STRIVE/real_robot/control/<robot>_controller_contract.yaml
-export STRIVE_POLICY_MODE=semantic_snapshot
-export STRIVE_INSTRUCTION='find a book'
-bash scripts/run_sysnav_detection_mapping.sh
-```
-
-The script fails before launch if the lower-stack prerequisites are not
-present. It starts the detector/mapping graph, instruction runtime,
-`SysNavMotionServer`, migrated `localPlanner`, `pathFollower`, and
-`SafetyVelocityMux` as one graph. The default command remains perception and
-dry-run only.
-
-### Task-Level Motion Action
-
-The native SysNav waypoint topic has no goal identity or result contract. The
-overlay therefore provides an optional task-level action server:
-
-```text
-VLN RosActionMotionController
-  -> /strive/execute_waypoint [strive_motion_msgs/ExecuteWaypoint]
+RosActionMotionController
+  -> /strive/execute_waypoint [ExecuteWaypoint]
   -> SysNavMotionServer
-  -> /way_point [geometry_msgs/PointStamped]
-  -> SysNav localPlanner / pathFollower
+  -> /way_point
+  -> localPlanner / pathFollower
 ```
 
-Start it only after the native SysNav lower stack has been validated:
+启动 action server 的示例：
 
 ```bash
 ros2 launch strive_sysnav_motion sysnav_motion_server.launch.py \
@@ -713,92 +396,126 @@ ros2 launch strive_sysnav_motion sysnav_motion_server.launch.py \
   require_controller_contract:=true
 ```
 
-The Action result is the authoritative motion-attempt outcome. It distinguishes
-`REACHED`, `BLOCKED`, `TIMEOUT`, `PREEMPTED`, `SAFETY_STOP`, manual takeover and
-localization loss. It does not declare the natural-language task successful;
-VLN's evidence loop and final verifier retain that authority.
+同一运行图中只能有一个 `/way_point` owner。Action server 返回的 `REACHED`、
+`BLOCKED`、`TIMEOUT`、`PREEMPTED`、`SAFETY_STOP`、人工接管和定位丢失，只描述运动
+尝试结果，不表示自然语言任务成功。
 
-The lower stack also exposes an explicit planner status topic:
+## 9. 安全开关
+
+真实运动交接必须满足：
 
 ```text
-/local_planner/status: std_msgs/String
-  waiting_for_sensor
-  tracking
-  no_feasible_path
-  cancelled
+dry_run=false
+lower_controller_enabled=true
+controller_contract_file 已配置
+controller_contract.approval_status == approved
+waypoint frame、反馈、速度限制、watchdog、急停和人工接管字段通过校验
 ```
 
-`REACHED` is reported only after the configured position tolerance is met and
-the odometry speed remains below `velocity_tolerance_mps` for
-`stable_reach_time_s`. The final `/cmd_vel` owner is `SafetyVelocityMux`; localization
-or registered point-cloud watchdog failure forces `STALE_INPUT` and zero output.
+默认行为：
 
-Before connecting a chassis, run the action-level HIL scenarios:
+```text
+dry_run=true
+  只写 runtime_decisions.jsonl，不发布 /way_point。
 
-```bash
-bash scripts/ros_humble_container.sh hil
-STRIVE_HIL_SCENARIO=blocked bash scripts/ros_humble_container.sh hil
+dry_run=false 且 lower_controller_enabled=false
+  只允许显式配置的 test waypoint，不连接真实下层控制器。
+
+任何模式
+  VLN 都不得创建 /cmd_vel 或 */cmd_vel publisher。
 ```
 
-The HIL node consumes `/way_point` and publishes only simulated odom/path/
-planner-status/safety feedback; it never publishes `/cmd_vel`.
+安全优先级为：
 
-For a lower-planner integration check, use
-`STRIVE_HIL_SCENARIO=native_planner bash scripts/ros_humble_container.sh hil`.
-This starts the migrated SysNav `localPlanner`; the HIL node provides only
-odometry and an obstacle-free registered scan, while `/path` and
-`/local_planner/status` are produced by `localPlanner` itself.
-The HIL output must include `native_path_received=true`. Production startup
-also validates the same controller contract in the motion server and the
-`SafetyVelocityMux`; pass `require_controller_contract:=false` only to an
-offline HIL that has no actuator.
-
-For the complete software lower-motion chain, use
-`STRIVE_HIL_SCENARIO=native_safety bash scripts/ros_humble_container.sh hil`.
-This adds the migrated `pathFollower` and `SafetyVelocityMux`, then observes
-the final `/cmd_vel` output. The HIL process supplies only synthetic odometry,
-registered scan, and autonomy-enable state; it does not own a chassis.
-The native-safety HIL advances its synthetic pose only from the final muxed
-velocity command, and writes a JSON artifact under `STRIVE_HIL_ARTIFACT_DIR`.
-
-With a recorded sensor bag, the stronger lower-stack replay is:
-
-```bash
-export LOWER_BAG_REQUIRED_TOPICS=/aft_mapped_to_init,/cloud_registered
-export LOWER_BAG_RUN_DIRECTORY=/tmp/strive_lower_planner_bag_001
-bash scripts/run_lower_planner_bag_replay.sh /path/to/sensor_bag
+```text
+急停 / 人工接管
+  > 定位丢失 / 传感器过期
+  > 控制器故障 / 命令 watchdog
+  > blocked / timeout / no feasible path
+  > VLN 语义重规划
 ```
 
-The replay starts only `localPlanner` and `lower_bag_probe`, using isolated
-`/strive/replay_way_point` and `/strive/replay_path` topics. It records the bag
-input counts and whether a valid multi-pose path was produced. It does not
-start `pathFollower`, `SafetyVelocityMux`, or any chassis output.
+## 10. Bag replay 与离线验收
 
-To verify this replay boundary without real hardware data, run
-`bash scripts/ros_humble_container.sh bag-smoke`. It creates a standard
-synthetic rosbag2 containing odometry and registered point-cloud messages and
-then invokes the same replay script. The result is only a serialization and
-planner-consumption smoke, not a real-sensor validation.
-
-`ExecuteWaypoint` also carries an optional `look_at`. This field is disabled by
-default. Enabling it requires an independently validated
-`strive_motion_msgs/action/AlignView` server at `/strive/align_view`; the motion
-server reports `ALIGNING` feedback after positional reach and never treats a
-missing alignment backend as success.
-
-Use the high-level runtime with the Action backend only after the action server
-is present:
+如果 rosbag 已经包含 `/object_nodes_list`、`/room_nodes_list`、`/aft_mapped_to_init`
+和 `/camera/image`，可以只回放这些 VLN-facing topic，不启动 detector/mapping：
 
 ```bash
-bash scripts/run_real_robot_instruction_runtime.sh \
+bash scripts/run_real_robot_bag_replay.sh /path/to/recorded_bag \
   instruction:="find a book" \
+  dataset_target:=book \
   policy_mode:=semantic_snapshot \
-  dry_run:=false \
-  lower_controller_enabled:=true \
-  motion_backend:=action \
-  motion_action_name:=/strive/execute_waypoint
+  instruction_plan_backend:=rules \
+  dry_run:=true \
+  run_directory:=/tmp/vln_real_robot_bag_replay
 ```
 
-`motion_backend:=waypoint` remains the compatibility path for the original
-read-only status provider. Only one backend may own `/way_point` in a running
-graph.
+离线验收入口：
+
+```bash
+bash scripts/check_real_robot_acceptance.sh
+```
+
+离线测试可以覆盖：
+
+```text
+fake ROS object/room message -> SemanticMapSnapshot
+semantic dry-run -> NavigationIntent，且没有 waypoint publisher
+fake motion controller -> RUNNING / REACHED
+REACHED -> ViewEvidence + verifier_payload
+verifier accept -> stop intent
+```
+
+这些测试不等于真实相机、LiDAR、局部规划器、底盘或急停验收。
+
+## 11. Orin / Jetson 运行入口
+
+目标设备使用仓库提供的单一实物 Docker 入口：
+
+```bash
+SUDO_STDIN_PASSWORD=1 ./docker_en.sh start
+SUDO_STDIN_PASSWORD=1 ./docker_en.sh enter
+SUDO_STDIN_PASSWORD=1 ./docker_en.sh status
+```
+
+启动前应检查：
+
+```text
+ROS_DOMAIN_ID、RMW/DDS transport
+相机、点云和 odom topic 是否有实际消息
+frame_id 和时间戳是否正确
+检测器、SAM2 和文本编码器权重是否存在
+LVLM endpoint、模型名和 API key 是否可用
+controller contract 是否批准
+```
+
+容器可以承载 SysNav detector/mapping 和 VLN runtime；大模型权重不放入机器人镜像，
+LVLM 通过公网 HTTPS 访问。代码迁移可使用：
+
+```bash
+bash scripts/export_code_only.sh
+```
+
+该脚本排除 `.git`、私有环境文件、模型权重、rosbag、runtime output、缓存以及
+`real_robot/ros2_ws/{build,install,log}`。
+
+## 12. 当前不由本 workspace 保证的事项
+
+- 真实设备的相机内参、LiDAR-camera 外参和时间同步；
+- Point-LIO 或其他 SLAM 的定位稳定性；
+- 真实 `/way_point` 到底盘的接收、路径跟踪和到达判定；
+- 速度、角速度、加速度限制的实测；
+- 急停、人工接管、通信中断和底盘故障；
+- 特定机器人上的 ObjectNav 成功率。
+
+建议按以下顺序推进：
+
+```text
+1. ROS graph 和传感器消息 smoke
+2. detector / semantic mapping 输出检查
+3. VLN WAIT 和 semantic dry-run
+4. test waypoint 与 fake/HIL status
+5. controller contract 审批
+6. 低速、短距离、人工监控下的真实 waypoint
+7. final verifier 和完整任务闭环
+```

@@ -325,6 +325,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--timeout", type=float, default=90.0)
     parser.add_argument("--parse-retries", type=int, default=1)
     parser.add_argument("--output", type=Path, default=Path("lvlm_schema_smoke_receipt.json"))
+    parser.add_argument(
+        "--skip-health",
+        action="store_true",
+        help="Skip the optional deployment-specific /health endpoint.",
+    )
+    parser.add_argument(
+        "--skip-model-discovery",
+        action="store_true",
+        help="Skip the optional /v1/models discovery endpoint.",
+    )
     return parser
 
 
@@ -341,11 +351,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     base_url = str(args.base_url).rstrip("/")
     server_root = base_url[:-3] if base_url.endswith("/v1") else base_url
-    health_status = request_status(server_root + "/health", api_key=args.api_key, timeout_s=args.timeout)
-    models = request_json(base_url + "/models", api_key=args.api_key, timeout_s=args.timeout)
-    model_ids = [str(item.get("id", "")) for item in models.get("data", [])]
-    if args.model not in model_ids:
-        raise RuntimeError(f"served model {args.model!r} not found in {model_ids}")
+    health_status = None
+    if not args.skip_health:
+        health_status = request_status(
+            server_root + "/health", api_key=args.api_key, timeout_s=args.timeout
+        )
+    model_ids: list[str] = []
+    if not args.skip_model_discovery:
+        models = request_json(base_url + "/models", api_key=args.api_key, timeout_s=args.timeout)
+        model_ids = [str(item.get("id", "")) for item in models.get("data", [])]
+        if args.model not in model_ids:
+            raise RuntimeError(f"served model {args.model!r} not found in {model_ids}")
 
     client = SelfHostedOpenAICompatibleClient(
         base_url=base_url,

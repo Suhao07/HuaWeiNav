@@ -9,18 +9,21 @@ VLN 是面向 HM3D ObjectNav 和实物机器人部署的语义导航框架。
 ## 目录
 
 - [文档目录与产物边界](docs/README.md)
+- [LVLM 接入与部署基础](docs/lvlm_server_deployment.md)
+- [HM3D 语义先验地图与对比评测](docs/hm3d_prior_map_evaluation.md)
 - [推荐环境](#推荐环境)
 - [仿真器构建流程](#仿真器构建流程)
 - [运行 HM3D 仿真评测](#运行-hm3d-仿真评测)
-- [构建真实 HM3D 几何先验地图](#构建真实-hm3d-几何先验地图)
-- [先验地图 A/B 对比测试](#先验地图-ab-对比测试)
 - [本地源码安装备选方案](#本地源码安装备选方案)
 - [环境变量](#环境变量)
 - [输出结果](#输出结果)
 - [实物机器人入口](#实物机器人入口)
-- [技术报告配图建议](#技术报告配图建议)
 
 ## 推荐环境
+
+运行仿真或实物导航前，先完成 LVLM 接入。项目支持直接调用商业 API，也支持将模型
+部署在独立 GPU 服务器后由机器人通过 OpenAI-compatible HTTP API 访问；配置、验收和
+公网 HTTPS 反向代理要求见 [LVLM 接入与部署基础](docs/lvlm_server_deployment.md)。
 
 推荐使用 Docker 跑仿真，原因是 Habitat-Sim、Habitat-Lab、MMDetection、CUDA、PyTorch 和 HM3D 数据路径之间的版本耦合较强。
 
@@ -423,214 +426,8 @@ bash docker/run_scene_object_nav.sh \
 --instruction_adapter_backend rules
 ```
 
-## 构建真实 HM3D 几何先验地图
-
-真实几何先验地图从 Habitat `semantic_scene + navmesh` 构建，读取房间、物体和拓扑，不读取 ObjectNav 回合中的目标位置，因此不会泄漏当前任务答案。
-
-### FloorPlan-VLN-compatible room layout
-
-HM3D v0.2 不包含 Matterport3D 的 `house_segmentations/*.house` 文件。若需要
-FloorPlan-VLN 风格、便于迁移的 BEV/floorplan 格式，应使用 HM3D 的
-`semantic.glb + semantic.txt + basis.navmesh` 构建 room-only layout：
-
-```bash
-COGNAV_ROOT=/home/ubuntu/WorkSpace/research/code/Navigation/CogNav_ObjNav \
-IMAGE_TAG=strive-hm3d:local \
-bash docker/run_hm3d_floorplan_layout.sh \
-  /workspace/data/scene_datasets/hm3d_v0.2/val/00802-wcojb4TFT35 \
-  --scene_id wcojb4TFT35 \
-  --output logs/prior_maps/wcojb4TFT35_floorplan.json \
-  --quality_output logs/prior_maps/wcojb4TFT35_floorplan_quality.json \
-  --topdown_resolution 0.25
-```
-
-这个入口不检查 SAM/DINO，也不检查 ObjectNav episode，只挂载 CogNav 的
-`data` 和当前 VLN workspace；因此 `conda activate CogNav` 不是必要条件，真正
-运行环境由 `IMAGE_TAG` 指定的 Docker 镜像决定。
-
-不要将 `docker/run_hm3d_baseline.sh` 用于布局构建。它是 ObjectNav benchmark
-入口，会在启动容器前检查 SAM、GroundingDINO 和 episode 文件；布局入口只需要
-Habitat-Sim 与 HM3D 的 basis/semantic/NavMesh 文件。
-
-该输出使用 FloorPlan-VLN 同构的 `levels -> regions -> boundaries / center /
-connectivity` 结构，但坐标仍保持米制：Habitat 的 `(x, z)` 平面转换为
-floorplan 的 `(x, -z)` 平面。PNG 只是渲染视图，不能直接作为 motion goal。
-若 Habitat-Sim 暴露的 semantic region AABB 无效，builder 会优先使用 semantic
-mesh 中的 floor 几何按 parent region 聚合出保守区域包围盒，并在 quality metadata
-中记录来源；若仍无法生成任何 room，CLI 会失败而不是写出空布局。
-
-场景目录入口同时生成与实物模式对齐的语义 BEV bundle：
-
-```text
-logs/prior_maps/wcojb4TFT35_floorplan.json
-logs/prior_maps/prior_map_bev.png
-logs/prior_maps/prior_map_bev.svg
-logs/prior_maps/prior_map_bev_markers.json
-logs/prior_maps/prior_map_manifest.json
-```
-
-`prior_map_bev.png` 与 `floorplan.json` 同源，包含房间区域、拓扑和语义标签，
-作为 LVLM 的地图上下文。正式先验地图不再包含 Habitat NavMesh 导出的 `.npy`；
-NavMesh 仅在构建阶段帮助恢复房间几何，不进入 prompt、先验查询或实物接口。
-
-`floorplan.json` 的 `frame_id` 为 `floorplan_metric`，并在 metadata 中保留
-`source_frame_id=habitat_world`；这表示文件中的房间多边形已经采用 `(x,-z)` 平面，
-不是 Habitat 原始三维坐标的直接副本。质量报告还会给出房间边界覆盖率、房间拓扑边数和
-语义 BEV 产物信息。
-
-同一 semantic region 内的 NavMesh 样本会先投影到二维 BEV 再提取连通组件，避免
-不同高度采样造成重复房间。`component_N` 是几何组件标识，不是 HM3D 的自然语言
-房间类别。
-
-完整 ObjectNav 的检测权重由 `configs/strive_weights.yaml` 管理。当前配置复用本机
-的 SAM ViT-H 和 GroundingDINO Swin-L 文件；权重只读挂载到容器，不进入仓库。迁移
-机器时修改该 YAML，或通过 `SAM_CHECKPOINT`、`GROUNDING_DINO_CHECKPOINT` 覆盖。
-
-layout-only 模式不写入静态 object instance；运行时目标身份仍来自 mapper 或
-SysNav `ObjectNode`。因此该文件只影响 room/frontier 搜索先验，不拥有 STOP 权限。
-
-批量构建同一数据 split：
-
-```bash
-bash docker/run_hm3d_baseline.sh bash -lc '
-  cd /workspace/STRIVE
-  python scripts/build_hm3d_floorplan_layouts.py \
-    /workspace/data/scene_datasets/hm3d_v0.2/val \
-    --output_root logs/prior_maps/hm3d_val_floorplans \
-    --topdown_resolution 0.25
-'
-```
-
-批处理会为每个场景写出 `floorplan.json`、语义 BEV、`quality.json` 和
-`prior_map_manifest.json`，并在输出根目录生成批处理 `manifest.json`。质量报告中的
-`object_instances_omitted=true` 是设计约束，不是构建失败。
-
-### 1. 在容器内构建先验地图
-
-示例场景：`wcojb4TFT35`
-
-```bash
-bash docker/run_hm3d_baseline.sh bash -lc '
-cd /workspace/STRIVE
-python scripts/build_hm3d_groundtruth_prior_map.py \
-  /workspace/data/scene_datasets/hm3d_v0.2/val/00802-wcojb4TFT35 \
-  --scene_id wcojb4TFT35 \
-  --output logs/prior_maps/wcojb4TFT35_groundtruth_prior_map.json \
-  --alignment_output logs/prior_maps/wcojb4TFT35_groundtruth_alignment.json \
-  --topdown_resolution 0.25 \
-  --min_room_area_m2 0.25 \
-  --mask_dilation_radius_m 0.35
-'
-```
-
-输出文件：
-
-```text
-logs/prior_maps/wcojb4TFT35_groundtruth_prior_map.json
-logs/prior_maps/wcojb4TFT35_groundtruth_alignment.json
-```
-
-先验地图格式：
-
-```text
-source_format = hm3d_groundtruth_semantic_scene
-frame_id      = habitat_world
-authority     = semantic_scene_plus_navmesh
-```
-
-### 2. 验证先验地图内容
-
-```bash
-python - <<'PY'
-import json
-p = "logs/prior_maps/wcojb4TFT35_groundtruth_prior_map.json"
-d = json.load(open(p))
-print("scene:", d["scene_id"])
-print("rooms:", len(d["rooms"]))
-print("objects:", len(d["objects"]))
-print("edges:", len(d["topology_edges"]))
-print("tv:", [o for o in d["objects"] if o["label"].lower() == "tv"][:1])
-PY
-```
-
-### 3. 可视化先验地图
-
-启用先验地图的运行会在每个回合产物中自动保存：
-
-```text
-logs/<save_dir>/episode-*/prior_map/floorplan_global.png
-logs/<save_dir>/episode-*/prior_map/floorplan_global.svg
-logs/<save_dir>/episode-*/prior_map/floorplan_global_markers.json
-logs/<save_dir>/episode-*/prior_map/floorplan_step_*.png
-logs/<save_dir>/episode-*/prior_map/floorplan_chosen_frontier_*.png
-logs/<save_dir>/episode-*/prior_map/som_global.png
-logs/<save_dir>/episode-*/prior_map/search_prior_result_*.json
-logs/<save_dir>/episode-*/prior_map/chosen_frontier_*.json
-```
-
-其中 `floorplan_chosen_frontier_*.png` 会叠加：
-
-- 房间边界
-- 房间到房间的拓扑边
-- 先验物体点位
-- 目标先验物体
-- frontier 候选点
-- 被选中的 frontier
-- 运行轨迹
-- 与先验物体匹配的在线检测结果
-
-## 先验地图 A/B 对比测试
-
-### 开启先验地图
-
-```bash
-bash docker/run_scene_object_nav.sh \
-  --scene_id wcojb4TFT35 \
-  --object_category tv \
-  --save_dir hm3d_prior_gt_ab_on \
-  --vlm ark \
-  --enable_prior_map \
-  --prior_map_path logs/prior_maps/wcojb4TFT35_groundtruth_prior_map.json \
-  --prior_map_source canonical_json \
-  --prior_map_alignment logs/prior_maps/wcojb4TFT35_groundtruth_alignment.json
-```
-
-### 关闭先验地图
-
-```bash
-bash docker/run_scene_object_nav.sh \
-  --scene_id wcojb4TFT35 \
-  --object_category tv \
-  --save_dir hm3d_prior_gt_ab_off \
-  --vlm ark
-```
-
-### 对比指标
-
-```bash
-python - <<'PY'
-import csv
-for run in ["hm3d_prior_gt_ab_on", "hm3d_prior_gt_ab_off"]:
-    path = f"logs/{run}/metrics.csv"
-    row = next(csv.DictReader(open(path)))
-    print("\\n", run)
-    for key in [
-        "prior_map_enabled",
-        "success",
-        "spl",
-        "distance_to_goal",
-        "Episode Steps",
-        "travel distance",
-        "Found Goal",
-        "final_stop_accept_step",
-        "prior_map_top_object_label",
-        "prior_map_top_object_score",
-    ]:
-        print(key, row.get(key, ""))
-PY
-```
-
-先验地图只影响搜索排序、frontier 排序和房间排序，不直接生成运动目标，也不绕过最终验证器。最终停止权仍由现有物理停止约束、在线感知和最终验证器决定。
+HM3D 语义先验地图的生成、批量构建、运行接入和有/无先验对比评测见
+[HM3D 语义先验地图与对比评测](docs/hm3d_prior_map_evaluation.md)。
 
 ## 本地源码安装备选方案
 
@@ -745,55 +542,12 @@ episode-*/final_verifier/
 episode-*/prior_map/
 ```
 
-先验地图关键产物：
-
-```text
-prior_map/base_map.json
-prior_map/alignment.json
-prior_map/query_*.json
-prior_map/search_prior_result_*.json
-prior_map/runtime_state_*.json
-prior_map/floorplan_global.png
-prior_map/floorplan_step_*.png
-prior_map/floorplan_chosen_frontier_*.png
-prior_map/som_global.png
-prior_map/dynamic_prior_map_bev_*.png
-prior_map/dynamic_prior_map_bev_*_markers.json
-```
-
-启用高层 BEV 选择和在线房间语义标注：
-
-```bash
-python objnav_benchmark_with_process_obs.py \
-  --enable_prior_map \
-  --prior_map_path logs/prior_maps/<scene>_floorplan.json \
-  --enable_prior_map_vlm \
-  --enable_room_semantics \
-  --prior_map_vlm_interval 10
-```
-
-动态 BEV 只提供 room/frontier 搜索上下文。它不改变目标确认、关系验证或
-STOP authority；没有可读 RGB room evidence 时房间标签保持 `unknown`。
-
-该高层接口使用统一的 `HighLevelCandidate` 表达房间和 frontier。候选 UID 必须
-来自 mapper/SysNav snapshot，LVLM 只能在候选集合中排序，不能创建位姿、路径或
-STOP。每步可复核产物包括 `room_semantics_<step>.json`、
-`high_level_selection_<step>.json`、动态 BEV markers 和 LVLM raw trace；其中保存
-证据哈希、候选 UID、prompt/model 版本、解析结果和请求耗时，不保存图像 base64。
-
-未完成 prior/runtime 坐标标定时，动态 BEV 仍可作为静态语义上下文送入 LVLM，
-但不会绘制未经变换的机器人、轨迹或 frontier 位置。
-
-实物 ROS2 运行时如需复用 SysNav 的“RGB + room mask”房间语义输入，需显式打开
-`enable_room_semantics:=true` 和 `persist_observation_images:=true`；调用间隔由
-`room_semantic_interval` 控制。未持久化 RGB 时不会把 ROS URI 伪装成图像，也不会
-发起无效的 LVLM 请求。
+先验地图运行产物、动态 BEV、room/frontier 语义选择和 A/B 对比指标见独立文档。
 
 ## 实物机器人入口
 
-实物机器人部署详见 [docs/real_robot_deployment.md](docs/real_robot_deployment.md)，
-平台无关 contract、数据/控制流与执行器模板见
-[docs/real_robot_framework.md](docs/real_robot_framework.md)。独立 Qwen2.5-VL 推理服务器
+实物机器人模式的输入输出、数据流、控制流和可插拔接口见
+[docs/real_robot_framework.md](docs/real_robot_framework.md)。独立 LVLM 推理服务器
 及 VLN 客户端配置见 [docs/lvlm_server_deployment.md](docs/lvlm_server_deployment.md)。
 
 常用入口：
