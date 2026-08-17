@@ -1,8 +1,7 @@
 # VLN-CogNav Object Navigation 技术白皮书
 
-项目 pipeline 示意图：
-
-![HuaWeiVLN Navigation Pipeline](/home/ubuntu/Downloads/HuaWeiVLN_Nav-Pipeline.png)
+项目 pipeline 示意图由文档图表源文件生成。本文不引用开发机绝对路径；若补充正式
+管线图，应将素材放入 `docs/assets/`，并在发布版本中记录其来源和版本。
 
 ## 1. 系统定位
 

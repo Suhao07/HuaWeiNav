@@ -10,6 +10,9 @@ logs
 logs/
 output/
 outputs/
+!outputs/
+outputs/*
+!outputs/README.md
 data/
 datasets/
 weights/

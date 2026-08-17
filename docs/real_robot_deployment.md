@@ -2183,7 +2183,7 @@ logs/ output/ outputs/ data/ datasets/
 real_robot/ros2_ws/build/
 real_robot/ros2_ws/install/
 real_robot/ros2_ws/log/
-docs/Zhu et al. - 2025 - VLN Structured Representation Integrating VLM Reasoning for Efficient Object Navigation.pdf
+references/papers/Zhu et al. - 2025 - STRIVE Structured Representation Integrating VLM Reasoning for Efficient Object Navigation.pdf
 ```
 
 ### 12.7 Smoke and acceptance

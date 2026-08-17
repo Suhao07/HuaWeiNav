@@ -79,7 +79,7 @@ RSYNC_EXCLUDES=(
   "--exclude=*.avi"
   "--exclude=*.mov"
   "--exclude=*.ply"
-  "--exclude=docs/Zhu et al. - 2025 - STRIVE Structured Representation Integrating VLM Reasoning for Efficient Object Navigation.pdf"
+  "--exclude=references/papers/Zhu et al. - 2025 - STRIVE Structured Representation Integrating VLM Reasoning for Efficient Object Navigation.pdf"
 )
 
 if command -v rsync >/dev/null 2>&1; then

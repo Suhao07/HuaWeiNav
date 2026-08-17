@@ -102,7 +102,13 @@ grounding、动态语义关系边和实物 ROS 适配层。设计目标是让语
 
 \begin{figure}[htbp]
   \centering
-  \includegraphics[width=\textwidth]{/home/ubuntu/Downloads/HuaWeiVLN_Nav-Pipeline.png}
+  \IfFileExists{assets/vln_navigation_pipeline.png}{%
+    \includegraphics[width=\textwidth]{assets/vln_navigation_pipeline.png}%
+  }{%
+    \fbox{\parbox{0.88\textwidth}{\centering
+      项目管线图素材未随当前代码版本发布。请将正式图稿放入
+      \texttt{docs/assets/vln_navigation_pipeline.png} 后重新编译。}}
+  }
   \caption{VLN--CogNav Object Navigation 系统管线示意图。}
   \label{fig:pipeline}
 \end{figure}
