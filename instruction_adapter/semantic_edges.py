@@ -18,7 +18,7 @@ class RelationQuery:
 
     subject/object are runtime object records, not parser concepts. The parser
     only declares relation constraints; this module verifies them on candidate
-    pairs when STRIVE has actual map objects and shared observations.
+    pairs when VLN has actual map objects and shared observations.
     """
 
     subject_id: str

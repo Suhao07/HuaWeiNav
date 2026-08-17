@@ -1,4 +1,4 @@
-"""JSON serializers for STRIVE mapper state.
+"""JSON serializers for VLN mapper state.
 
 The mapper owns runtime state; this module owns only the presentation format
 used by LLM prompts, debug files, and metrics artifacts.

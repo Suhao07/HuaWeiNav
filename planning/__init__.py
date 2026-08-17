@@ -1,2 +1,2 @@
-"""Planning policies used by STRIVE agent and mapper runtime."""
+"""Planning policies used by VLN agent and mapper runtime."""
 

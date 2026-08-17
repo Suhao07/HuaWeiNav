@@ -1,4 +1,4 @@
-"""Bring up the complete STRIVE real-robot perception and motion stack.
+"""Bring up the complete VLN real-robot perception and motion stack.
 
 The lower controller is intentionally conditional.  A default launch only
 starts perception and the high-level runtime in dry-run mode; production

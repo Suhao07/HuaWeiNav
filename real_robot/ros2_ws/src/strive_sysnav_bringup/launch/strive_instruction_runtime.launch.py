@@ -1,4 +1,4 @@
-"""Launch the STRIVE high-level instruction runtime node."""
+"""Launch the VLN high-level instruction runtime node."""
 
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument

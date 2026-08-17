@@ -1,1 +1,1 @@
-"""Mapping services extracted from the STRIVE mapper runtime."""
+"""Mapping services extracted from the VLN mapper runtime."""

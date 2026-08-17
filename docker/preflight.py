@@ -24,7 +24,7 @@ def check_path(name, *, required=True):
 
 
 def main():
-    """Run deterministic STRIVE HM3D simulation preflight checks.
+    """Run deterministic VLN HM3D simulation preflight checks.
 
     Args:
         None.

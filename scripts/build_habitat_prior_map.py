@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a STRIVE prior map from a Habitat ObjectNav dataset."""
+"""Build a VLN prior map from a Habitat ObjectNav dataset."""
 
 from __future__ import annotations
 

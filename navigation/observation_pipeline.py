@@ -1,4 +1,4 @@
-"""Observation utilities for STRIVE agent.
+"""Observation utilities for VLN agent.
 
 The panoramic segmentation loop is still in the agent because it touches many
 mutable runtime buffers. This module starts the split by extracting reusable

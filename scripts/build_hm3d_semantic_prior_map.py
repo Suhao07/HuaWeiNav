@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a STRIVE prior map from HM3D semantic txt annotations."""
+"""Build a VLN prior map from HM3D semantic txt annotations."""
 
 from __future__ import annotations
 

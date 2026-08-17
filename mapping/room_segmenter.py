@@ -1,4 +1,4 @@
-"""Room-level map segmentation for STRIVE mapper runtime.
+"""Room-level map segmentation for VLN mapper runtime.
 
 This module owns the room partition algorithm. It mutates the mapper state passed
 in by the compatibility wrapper, but keeps the heavy image/mask/region logic out

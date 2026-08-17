@@ -1,4 +1,4 @@
-"""ROS2 node for the STRIVE SysNav-backed high-level runtime."""
+"""ROS2 node for the VLN SysNav-backed high-level runtime."""
 
 from __future__ import annotations
 
@@ -47,7 +47,7 @@ from real_robot.sysnav_runtime import (
 
 
 class StriveInstructionRuntimeNode(Node):
-    """Bridge SysNav semantic map topics into STRIVE high-level decisions."""
+    """Bridge SysNav semantic map topics into VLN high-level decisions."""
 
     def __init__(self) -> None:
         """Create subscriptions, runtime helpers, and the periodic decision timer."""
@@ -559,7 +559,7 @@ def _same_topic(left: str, right: str) -> bool:
 
 
 def main(args: Optional[list[str]] = None) -> None:
-    """Run the STRIVE instruction runtime ROS2 node."""
+    """Run the VLN instruction runtime ROS2 node."""
 
     rclpy.init(args=args)
     node = StriveInstructionRuntimeNode()

@@ -2,7 +2,7 @@
 
 The package starts with platform-independent contracts. Platform adapters
 should live in sibling modules and translate ROS/SysNav/Habitat-specific data
-into these contracts before invoking STRIVE planning or verification logic.
+into these contracts before invoking VLN planning or verification logic.
 """
 
 from real_robot.contracts import (

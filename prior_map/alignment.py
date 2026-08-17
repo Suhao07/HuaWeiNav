@@ -1,4 +1,4 @@
-"""Coordinate alignment for STRIVE prior-map mode.
+"""Coordinate alignment for VLN prior-map mode.
 
 This module owns only coordinate transforms between a prior-map frame and a
 runtime frame. It does not inspect mapper state, rank frontiers, or publish

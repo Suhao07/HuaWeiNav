@@ -162,7 +162,7 @@ def habitat_path_to_strive_points(
     mapper_initial_position: np.ndarray,
     target_height: float,
 ) -> np.ndarray:
-    """Convert Habitat xyz path points into STRIVE's local x/z/y convention."""
+    """Convert Habitat xyz path points into VLN's local x/z/y convention."""
 
     points = np.asarray(points, dtype=float)
     if points.size == 0:

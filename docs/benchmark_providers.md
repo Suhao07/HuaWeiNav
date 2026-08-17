@@ -1,6 +1,6 @@
-# STRIVE Benchmark Provider 设计文档
+# VLN Benchmark Provider 设计文档
 
-本文档说明 STRIVE 当前的 benchmark 抽离层。目标不是改变导航策略，而是把
+本文档说明 VLN 当前的 benchmark 抽离层。目标不是改变导航策略，而是把
 Habitat 数据集选择、单 episode 过滤、success distance 和 provenance 从
 `objnav_benchmark_with_process_obs.py` 中抽出来，形成可复现、可扩展的输入接口。
 
@@ -25,7 +25,7 @@ target verification
 stop decision
 ```
 
-因此 provider 不会改变 STRIVE 的主导航链：
+因此 provider 不会改变 VLN 的主导航链：
 
 ```text
 observation -> mapper/agent -> selected viewpoint/action -> Habitat metrics
@@ -156,7 +156,7 @@ Habitat config success distance
 ```text
 BenchmarkProvider -> 只决定数据与 config
 InstructionAdapter -> 只决定自然语言目标结构化
-STRIVE Agent -> 只决定导航行为
+VLN Agent -> 只决定导航行为
 Habitat Env -> 只决定 benchmark metrics
 ```
 

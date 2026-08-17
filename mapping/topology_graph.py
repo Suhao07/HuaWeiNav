@@ -1,4 +1,4 @@
-"""Topology graph operations for STRIVE mapper runtime.
+"""Topology graph operations for VLN mapper runtime.
 
 The mapper still owns graph state for compatibility. This module provides the
 operations that mutate or query that state, keeping node/object graph mechanics

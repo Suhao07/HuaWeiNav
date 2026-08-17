@@ -1,4 +1,4 @@
-"""Runtime memory for STRIVE prior-map mode.
+"""Runtime memory for VLN prior-map mode.
 
 The memory layer keeps monotonic runtime state derived from simulation mappers
 or real-robot semantic snapshots. It never mutates the immutable

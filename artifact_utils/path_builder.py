@@ -1,4 +1,4 @@
-"""Path builders for STRIVE debug artifacts.
+"""Path builders for VLN debug artifacts.
 
 The runtime writes many images and point clouds while building maps and
 verifying targets. Keeping path construction here prevents navigation and

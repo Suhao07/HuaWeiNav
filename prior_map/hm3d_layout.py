@@ -28,7 +28,7 @@ class HM3DLayoutBuildResult:
 
     Args:
         layout: FloorPlan-compatible metric room layout.
-        prior_map: Canonical room-only STRIVE map used to create the layout.
+        prior_map: Canonical room-only VLN map used to create the layout.
         metadata: JSON-friendly build diagnostics.
     """
 

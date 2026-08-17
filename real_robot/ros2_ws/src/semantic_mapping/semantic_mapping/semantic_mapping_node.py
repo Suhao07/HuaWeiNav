@@ -10,7 +10,7 @@ from pathlib import Path
 PACKAGE_DIR = Path(__file__).resolve().parent
 LOCAL_SAM2_ROOT = PACKAGE_DIR / "external" / "sam2"
 if LOCAL_SAM2_ROOT.exists():
-    # 核心：优先使用随 STRIVE vendor workspace 迁入的 SysNav SAM2 代码。
+    # 核心：优先使用随 VLN vendor workspace 迁入的 SysNav SAM2 代码。
     sys.path.insert(0, str(LOCAL_SAM2_ROOT))
 import numpy as np
 import torch

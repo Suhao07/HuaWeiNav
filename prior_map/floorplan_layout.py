@@ -1,4 +1,4 @@
-"""FloorPlan-compatible room-layout contracts for STRIVE prior maps.
+"""FloorPlan-compatible room-layout contracts for VLN prior maps.
 
 The layout contract deliberately contains room geometry and room topology only.
 Object instances remain optional search hints and are not part of the canonical
@@ -206,7 +206,7 @@ def _room_neighbors(edges: Sequence[PriorTopologyEdge]) -> dict[str, set[str]]:
 
 
 def _habitat_xz_to_floorplan(boundary: BoundaryXY) -> BoundaryXY:
-    """Convert STRIVE room coordinates from ``(x, z)`` to ``(x, -z)``."""
+    """Convert VLN room coordinates from ``(x, z)`` to ``(x, -z)``."""
 
     return tuple((float(x), -float(z)) for x, z in boundary)
 

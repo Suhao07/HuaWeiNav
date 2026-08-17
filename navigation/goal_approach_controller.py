@@ -1,4 +1,4 @@
-"""Goal-approach helpers for STRIVE target verification.
+"""Goal-approach helpers for VLN target verification.
 
 This module handles geometric movement around an already selected target
 candidate. It does not run the final instruction verifier; the agent remains

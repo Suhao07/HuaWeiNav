@@ -1,4 +1,4 @@
-# STRIVE 实物部署待做 Checklist
+# VLN 实物部署待做 Checklist
 
 本文档跟踪实物兼容部署分支的剩余工作。原则是先打通可测试闭环，再接入真实硬件；
 所有新增代码都应保持 `real_robot/contracts.py` 的平台无关边界。
@@ -7,7 +7,7 @@
 
 - [x] 定义 `RealObservation`、`DetectionFrame`、`SemanticMapSnapshot`、`NavigationIntent`、`MotionGoal`、`ViewEvidence` 等实物 contract。
 - [x] 实现 SysNav detector vocabulary provenance：`real_robot/detector_vocabulary.py`。
-- [x] 实现 `/detection_result`、`/object_nodes_list`、`/room_nodes_list` 到 STRIVE snapshot 的 adapter。
+- [x] 实现 `/detection_result`、`/object_nodes_list`、`/room_nodes_list` 到 VLN snapshot 的 adapter。
 - [x] 实现 `RosWaypointController`，将 `MotionGoal` 发布到 `/way_point`。
 - [x] 实现 `SysNavSemanticMapBridge`、`SysNavInstructionRuntime` 和 `ViewpointEvidenceLoop` 骨架。
 - [x] Vendor 第一版 SysNav ROS2 overlay：`tare_planner` messages、`semantic_mapping`、`strive_sysnav_bringup`。
@@ -200,7 +200,7 @@ terminal / anchor / relation / verifier 状态机。
 - [x] 为 `cancel()` 接入 lower planner cancel 和安全 hold 双层机制；迁移后的
   `localPlanner` 会清空旧目标并发布单点零路径。
 - [x] 增加 emergency stop 参数，默认不自动覆盖底层安全系统。
-- [x] 确认 STRIVE 永远不直接发布 `/cmd_vel`。
+- [x] 确认 VLN 永远不直接发布 `/cmd_vel`。
 - [x] 记录 lower controller 是否启用；未启用时只能 dry-run 或发布到测试 topic。
 
 当前实现：
@@ -256,7 +256,7 @@ runtime_safety.allow_emergency_stop_publish
 - [x] 提供 `scripts/start_orin_lio_for_strive.sh`，覆盖 Point-LIO `publish.scan_publish_en:=true`。
 - [x] 提供 `scripts/smoke_real_robot_orin.sh`，做 LIO、相机、容器 DDS、CUDA/ML、detector 初始化检查。
 - [x] 更新 `scripts/run_sysnav_detection_mapping.sh`，明确高层 node 是否一起启动。
-- [x] 新增 `scripts/run_real_robot_instruction_runtime.sh`，只启动 STRIVE 高层 runtime。
+- [x] 新增 `scripts/run_real_robot_instruction_runtime.sh`，只启动 VLN 高层 runtime。
 - [x] 增加 bag replay 入口，读取录制的 object/room/odom/image topic。
 - [x] bag replay 默认订阅 `/local_planner/status`，并保留 `dry_run=true`，不触发真实底盘。
 - [x] 更新 Docker run 环境变量：instruction、topic remap、model paths、LLM provider、prior map path。
@@ -270,7 +270,7 @@ scripts/run_sysnav_detection_mapping.sh
   START_STRIVE_RUNTIME=1 时才并行启动 strive_instruction_runtime。
 
 scripts/run_real_robot_instruction_runtime.sh
-  只启动 STRIVE 高层 runtime。
+  只启动 VLN 高层 runtime。
 
 scripts/run_real_robot_bag_replay.sh BAG_PATH
   ros2 bag play --clock

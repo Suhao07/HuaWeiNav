@@ -1,7 +1,7 @@
 """Adapters for reusing SysNav ROS detection, mapping, and waypoint topics.
 
 The adapters in this module are intentionally thin. They translate SysNav ROS
-messages into STRIVE real-robot contracts and translate STRIVE motion goals
+messages into VLN real-robot contracts and translate VLN motion goals
 back to SysNav's `/way_point` interface. ROS message imports are lazy so this
 module remains importable in unit tests and offline analysis environments.
 """
@@ -37,7 +37,7 @@ from real_robot.detector_vocabulary import (
 
 @dataclass(frozen=True)
 class SysNavTopicConfig:
-    """Topic names used by the first SysNav-backed STRIVE real-robot runtime."""
+    """Topic names used by the first SysNav-backed VLN real-robot runtime."""
 
     camera_image: str = "/camera/image"
     detection_result: str = "/detection_result"
@@ -50,7 +50,7 @@ class SysNavTopicConfig:
 
 
 class RosDetectionResultAdapter:
-    """Convert SysNav ``tare_planner/DetectionResult`` messages to STRIVE detections."""
+    """Convert SysNav ``tare_planner/DetectionResult`` messages to VLN detections."""
 
     def __init__(
         self,
@@ -110,9 +110,9 @@ class RosObjectNodeAdapter:
         self.detector_vocabulary = detector_vocabulary
 
     def from_msg(self, msg: Any) -> ObjectNodeSnapshot:
-        """Return a STRIVE object snapshot for one SysNav object node."""
+        """Return a VLN object snapshot for one SysNav object node."""
 
-        # 核心：SysNav object_id 是运行时对象身份，应作为 STRIVE ledger/cache 的主键来源。
+        # 核心：SysNav object_id 是运行时对象身份，应作为 VLN ledger/cache 的主键来源。
         object_ids = tuple(int(obj_id) for obj_id in _as_sequence(getattr(msg, "object_id", ())))
         position = _point_to_vector3(getattr(msg, "position", None))
         # bbox3d 是几何证据，不在 adapter 层解释“是不是目标”或“关系是否成立”。
@@ -130,7 +130,7 @@ class RosObjectNodeAdapter:
         metadata = {
             "ros_topic": self.topic,
             "frame_id": _frame_id_from_header(getattr(msg, "header", None)),
-            # 保留 SysNav 原始 id，便于回放时对齐 SysNav 日志和 STRIVE 决策日志。
+            # 保留 SysNav 原始 id，便于回放时对齐 SysNav 日志和 VLN 决策日志。
             "sysnav_object_ids": object_ids,
             "status": bool(getattr(msg, "status", False)),
             "is_asked_vlm": bool(getattr(msg, "is_asked_vlm", False)),
@@ -178,7 +178,7 @@ class RosRoomNodeAdapter:
         self.room_mask_path_provider = room_mask_path_provider
 
     def from_msg(self, msg: Any) -> RoomSnapshot:
-        """Return a STRIVE room snapshot for one SysNav room node."""
+        """Return a VLN room snapshot for one SysNav room node."""
 
         room_id = int(getattr(msg, "id", -1))
         polygon_points = _polygon_points(getattr(msg, "polygon", None))
@@ -209,7 +209,7 @@ class RosRoomNodeAdapter:
 
         return RoomSnapshot(
             uid=f"sysnav_room:{room_id}",
-            # SysNav RoomNode 不直接给语义房间名；room label 仍由 STRIVE/VLM room policy 推断。
+            # SysNav RoomNode 不直接给语义房间名；room label 仍由 VLN/VLM room policy 推断。
             label=None,
             centroid=_point_to_vector3(getattr(msg, "centroid", None)),
             neighbors=tuple(f"sysnav_room:{int(neighbor)}" for neighbor in _as_sequence(getattr(msg, "neighbors", ()))),
@@ -461,7 +461,7 @@ class RosNavigationStatusProvider:
             self._goal_states[goal_id] = state
 
         if state.preempted:
-            # cancel/hold 只改变 STRIVE bridge 状态；真正急停仍应由平台安全系统处理。
+            # cancel/hold 只改变 VLN bridge 状态；真正急停仍应由平台安全系统处理。
             return NavigationStatus(
                 NavigationStatusCode.PREEMPTED,
                 goal_id=goal_id,
@@ -873,7 +873,7 @@ class RosNavigationStatusProvider:
 
 
 class RosWaypointController:
-    """Publish STRIVE motion goals to SysNav's ``/way_point`` interface."""
+    """Publish VLN motion goals to SysNav's ``/way_point`` interface."""
 
     def __init__(
         self,
@@ -928,10 +928,10 @@ class RosWaypointController:
         )
 
     def send_goal(self, goal: MotionGoal) -> str:
-        """Submit one STRIVE motion goal to SysNav and return a stable goal id."""
+        """Submit one VLN motion goal to SysNav and return a stable goal id."""
 
         goal_id = f"sysnav_goal:{uuid.uuid4().hex}"
-        # goal_id 是 STRIVE 侧的跟踪 id；SysNav /way_point 本身没有 action goal id。
+        # goal_id 是 VLN 侧的跟踪 id；SysNav /way_point 本身没有 action goal id。
         self._last_goal_id = goal_id
         self._last_goal = goal
 
@@ -947,7 +947,7 @@ class RosWaypointController:
             return goal_id
 
         point_msg = self._make_point_stamped(goal)
-        # 核心：STRIVE 只发布 waypoint，局部避障、速度控制和急停继续由 SysNav 下层负责。
+        # 核心：VLN 只发布 waypoint，局部避障、速度控制和急停继续由 SysNav 下层负责。
         self.publisher.publish(point_msg)
         self._last_status = NavigationStatus(
             NavigationStatusCode.RUNNING,
@@ -1069,14 +1069,14 @@ def build_semantic_map_snapshot(
     object_adapter: Optional[RosObjectNodeAdapter] = None,
     room_adapter: Optional[RosRoomNodeAdapter] = None,
 ) -> SemanticMapSnapshot:
-    """Build a STRIVE map snapshot from SysNav object and room list messages."""
+    """Build a VLN map snapshot from SysNav object and room list messages."""
 
     object_adapter = object_adapter or RosObjectNodeAdapter()
     room_adapter = room_adapter or RosRoomNodeAdapter()
     objects = object_adapter.from_list_msg(object_list_msg)
     rooms = room_adapter.from_list_msg(room_list_msg) if room_list_msg is not None else ()
 
-    # 核心：SysNav 继续负责 detector/mapping，STRIVE 只消费只读 snapshot 做语义规划。
+    # 核心：SysNav 继续负责 detector/mapping，VLN 只消费只读 snapshot 做语义规划。
     # 这里不能反向修改 SysNav object/room 状态，否则会破坏两个系统的职责边界。
     return SemanticMapSnapshot(
         timestamp=timestamp if timestamp is not None else _stamp_from_header(getattr(object_list_msg, "header", None), default=time.time()),
@@ -1121,7 +1121,7 @@ def _boxes_from_parallel_arrays(
 ) -> Tuple[BBox2D, ...]:
     """Return bbox tuples after validating SysNav parallel arrays."""
 
-    # SysNav DetectionResult 使用并行数组；进入 STRIVE 前必须先保证长度一致。
+    # SysNav DetectionResult 使用并行数组；进入 VLN 前必须先保证长度一致。
     lengths = {len(x1_values), len(y1_values), len(x2_values), len(y2_values)}
     if len(lengths) != 1:
         raise ValueError("SysNav DetectionResult bbox arrays must have the same length")
@@ -1206,7 +1206,7 @@ def _bbox3d_center_extent(points: Tuple[Tuple[float, float, float], ...]) -> Tup
 
 
 def _object_uid(object_ids: Tuple[int, ...], label: Any, position: Optional[Tuple[float, float, float]]) -> str:
-    """Return a stable STRIVE uid for one SysNav object node."""
+    """Return a stable VLN uid for one SysNav object node."""
 
     # object_id 优先级最高；无 id 时才退化到 label+position，避免同类物体互相污染 ledger。
     if object_ids:

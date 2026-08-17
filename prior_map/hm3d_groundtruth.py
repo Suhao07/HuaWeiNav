@@ -1,7 +1,7 @@
 """Build geometric HM3D prior maps from Habitat semantic-scene ground truth.
 
 This module converts a Habitat simulator's semantic scene and navigation mesh
-into STRIVE's canonical ``PriorMapData`` schema. It does not read ObjectNav
+into VLN's canonical ``PriorMapData`` schema. It does not read ObjectNav
 episode goal positions and does not depend on runtime mapper outputs, so the
 result is a static scene prior rather than leaked task evidence.
 """

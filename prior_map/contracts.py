@@ -1,4 +1,4 @@
-"""Platform-neutral contracts for STRIVE prior-map mode.
+"""Platform-neutral contracts for VLN prior-map mode.
 
 The contracts in this module describe static or slowly changing map priors and
 query results. They intentionally avoid ROS, Habitat, OpenCV, detector, mapper,
@@ -659,7 +659,7 @@ class SupportRegionPrior:
 
 @dataclass(frozen=True)
 class SearchPriorResult:
-    """Prior-map query result consumed by STRIVE ranking adapters.
+    """Prior-map query result consumed by VLN ranking adapters.
 
     Args:
         room_rankings: Soft room rankings.

@@ -1,4 +1,4 @@
-"""Benchmark provider contracts for STRIVE ObjectNav entrypoints.
+"""Benchmark provider contracts for VLN ObjectNav entrypoints.
 
 The benchmark layer is intentionally thin: it selects a Habitat-compatible
 dataset/config and records provenance.  It must not change navigation policy,
@@ -13,7 +13,7 @@ from typing import Any, Dict, Optional
 
 @dataclass(frozen=True)
 class BenchmarkSpec:
-    """Resolved benchmark input for one STRIVE run.
+    """Resolved benchmark input for one VLN run.
 
     ``dataset_path`` is the concrete Habitat dataset JSON used by the run.  For
     single-scene debugging this may be a filtered temporary dataset; in that

@@ -1,10 +1,10 @@
-# STRIVE
+# VLN
 
-STRIVE 是面向 HM3D ObjectNav 和实物机器人部署的语义导航框架。当前仓库主要包含三条主线：
+VLN 是面向 HM3D ObjectNav 和实物机器人部署的语义导航框架。
 
 - HM3D / Habitat 仿真评测：`objnav_benchmark_with_process_obs.py`
-- 真实 HM3D 几何先验地图模式：`prior_map/`
 - SysNav 实物机器人适配与部署：`real_robot/`
+
 
 ## 目录
 
@@ -68,7 +68,7 @@ HM3D v0.2 场景数据使用 Matterport 官方公开 tar 链接下载，不需�
 
 - `https://github.com/matterport/habitat-matterport-3dresearch`
 
-STRIVE 需要每个 split 的四类文件：
+VLN 需要每个 split 的四类文件：
 
 ```text
 hm3d-<split>-glb-v0.2.tar
@@ -139,7 +139,7 @@ find "$STRIVE_DATA_ROOT/scene_datasets/hm3d_v0.2/val" -maxdepth 2 -name "*.seman
 
 ### 2. 准备 HM3D ObjectNav 回合数据
 
-ObjectNav 回合数据只保存 episode、scene id、起点和目标类别，不保存 STRIVE 运行时的在线地图。推荐目录：
+ObjectNav 回合数据只保存 episode、scene id、起点和目标类别，不保存 VLN 运行时的在线地图。推荐目录：
 
 ```text
 $STRIVE_DATA_ROOT/
@@ -215,7 +215,7 @@ HM3D 仿真链路是 Habitat / Python / CUDA 环境，不是 ROS2 运行环境�
 
 ```text
 habitat-hm3d:local   基础镜像：CUDA、Conda、PyTorch、Habitat-Sim、Habitat-Lab
-strive-hm3d:local    STRIVE overlay：MMDetection、SAM、pathfinding 和本项目运行依赖
+strive-hm3d:local    VLN overlay：MMDetection、SAM、pathfinding 和本项目运行依赖
 ```
 
 先从 0 构建 Habitat 基础镜像：
@@ -259,14 +259,14 @@ print("torch:", torch.__version__, "cuda:", torch.cuda.is_available())
 PY
 ```
 
-然后构建 STRIVE overlay 镜像，默认输出镜像名为 `strive-hm3d:local`：
+然后构建 VLN overlay 镜像，默认输出镜像名为 `strive-hm3d:local`：
 
 ```bash
 BASE_IMAGE=habitat-hm3d:local \
 bash docker/build.sh
 ```
 
-STRIVE overlay 镜像会在基础 Habitat 环境上补齐：
+VLN overlay 镜像会在基础 Habitat 环境上补齐：
 
 - `mmengine`
 - `mmcv`
@@ -444,7 +444,7 @@ bash docker/run_hm3d_floorplan_layout.sh \
 ```
 
 这个入口不检查 SAM/DINO，也不检查 ObjectNav episode，只挂载 CogNav 的
-`data` 和当前 STRIVE workspace；因此 `conda activate CogNav` 不是必要条件，真正
+`data` 和当前 VLN workspace；因此 `conda activate CogNav` 不是必要条件，真正
 运行环境由 `IMAGE_TAG` 指定的 Docker 镜像决定。
 
 不要将 `docker/run_hm3d_baseline.sh` 用于布局构建。它是 ObjectNav benchmark
@@ -790,7 +790,10 @@ STOP。每步可复核产物包括 `room_semantics_<step>.json`、
 
 ## 实物机器人入口
 
-实物机器人部署详见 [docs/real_robot_deployment.md](docs/real_robot_deployment.md)。
+实物机器人部署详见 [docs/real_robot_deployment.md](docs/real_robot_deployment.md)，
+平台无关 contract、数据/控制流与执行器模板见
+[docs/real_robot_framework.md](docs/real_robot_framework.md)。独立 Qwen2.5-VL 推理服务器
+及 VLN 客户端配置见 [docs/lvlm_server_deployment.md](docs/lvlm_server_deployment.md)。
 
 常用入口：
 
@@ -803,8 +806,8 @@ SUDO_STDIN_PASSWORD=1 ./docker_en.sh smoke
 当前实物链路原则：
 
 ```text
-STRIVE 不直接发布 /cmd_vel。
-STRIVE 对底层控制器的正常输出是 MotionGoal -> RosWaypointController -> /way_point。
+VLN 不直接发布 /cmd_vel。
+VLN 对底层控制器的正常输出是 MotionGoal -> RosWaypointController -> /way_point。
 dry_run=true 或 lower_controller_enabled=false 时，不向真实 /way_point 交接。
 FinalInstructionVerifier 只在 NavigationStatus.REACHED 后消费 ViewEvidence。
 ```

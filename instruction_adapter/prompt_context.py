@@ -6,11 +6,11 @@ from .contracts import InstructionPlan, StriveInstructionSpec
 
 
 def render_instruction_context(spec: StriveInstructionSpec | InstructionPlan) -> str:
-    """Render structured task facts for STRIVE's existing VLM prompts.
+    """Render structured task facts for VLN's existing VLM prompts.
 
     The text is intentionally compact and factual.  It does not tell the VLM
     which room/viewpoint to choose; it only exposes target and context fields
-    that STRIVE's Room/Viewpoint/Object representation can reason over.
+    that VLN's Room/Viewpoint/Object representation can reason over.
     """
 
     if isinstance(spec, InstructionPlan):

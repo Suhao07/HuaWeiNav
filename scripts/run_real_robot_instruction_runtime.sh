@@ -94,7 +94,7 @@ source "${ROS_SETUP}"
 source "${OVERLAY_SETUP}"
 set -u
 
-# The ROS package lives inside real_robot/ros2_ws, while STRIVE contracts and
+# The ROS package lives inside real_robot/ros2_ws, while VLN contracts and
 # adapters live in the repository-level real_robot Python package.
 export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 

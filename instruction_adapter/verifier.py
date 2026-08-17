@@ -93,7 +93,7 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
 def candidate_uid_from_object(obj: Any, label: str = "") -> str:
     """Build a stable-enough instance key from geometry.
 
-    STRIVE's mapped ObjectNode does not expose a permanent object id.  We use a
+    VLN's mapped ObjectNode does not expose a permanent object id.  We use a
     quantized geometry signature so the same physical object is skipped after a
     hard verifier rejection, while another object of the same detector class can
     still be considered.

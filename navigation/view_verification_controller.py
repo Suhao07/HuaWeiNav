@@ -1,4 +1,4 @@
-"""View verification and check-again viewpoint control for STRIVE agent."""
+"""View verification and check-again viewpoint control for VLN agent."""
 
 from __future__ import annotations
 

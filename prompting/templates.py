@@ -1,4 +1,4 @@
-"""Central prompt templates for STRIVE LLM/VLM calls.
+"""Central prompt templates for VLN LLM/VLM calls.
 
 This module owns prompt text only. Runtime state, image packaging, caching, and
 model invocation stay in the caller modules so prompt changes remain isolated.

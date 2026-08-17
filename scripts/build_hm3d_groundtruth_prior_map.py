@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a STRIVE geometric prior map from HM3D Habitat ground truth."""
+"""Build a VLN geometric prior map from HM3D Habitat ground truth."""
 
 from __future__ import annotations
 

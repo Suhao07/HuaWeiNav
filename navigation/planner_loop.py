@@ -1,4 +1,4 @@
-"""Planner-loop helpers for STRIVE agent.
+"""Planner-loop helpers for VLN agent.
 
 This module owns the repeated "sense -> update map" prefix of one planning
 cycle. The high-level exploration/relocation state machine stays in the agent

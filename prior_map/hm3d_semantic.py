@@ -32,7 +32,7 @@ class HM3DSemanticPriorMapBuildResult:
 
 
 class HM3DSemanticTxtPriorMapBuilder:
-    """Convert HM3D semantic annotation txt files into STRIVE prior maps."""
+    """Convert HM3D semantic annotation txt files into VLN prior maps."""
 
     def build(
         self,

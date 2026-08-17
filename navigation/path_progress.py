@@ -1,4 +1,4 @@
-"""Path-following helpers for STRIVE step loop.
+"""Path-following helpers for VLN step loop.
 
 The functions here advance the current waypoint/path and trigger replanning
 when a path is exhausted. They do not run visual verification or decide final

@@ -1,4 +1,4 @@
-# STRIVE-CogNav Object Navigation 技术白皮书
+# VLN-CogNav Object Navigation 技术白皮书
 
 项目 pipeline 示意图：
 
@@ -27,7 +27,7 @@ Zhu et al. (2025) 的基本判断：VLM 不应替代导航系统，而应在结�
   -> final verifier 判断是否 STOP
 ```
 
-STRIVE 的关键贡献在于用 `Room / Viewpoint / Object` 三层结构压缩历史观测。
+VLN 的关键贡献在于用 `Room / Viewpoint / Object` 三层结构压缩历史观测。
 object node 保留目标定位与语义线索，viewpoint node 将连续空间离散成可探索的关键
 位置，room node 则为跨房间规划提供更稳定的推理单位。这样，VLM 面对的是经过组织的
 环境摘要，而不是未经筛选的长轨迹图像序列。SysNav 进一步强调系统分层：高层语义推理、
@@ -41,7 +41,7 @@ object node 保留目标定位与语义线索，viewpoint node 将连续空间�
 - benchmark object-goal 与自然语言 instruction mode 共享 final verifier
   和 view-control 闭环，但 benchmark 的结构化目标不会被复杂自然语言语义污染。
 
-因此，本文中的“STRIVE-CogNav”不是对原论文的简单工程复现。它保留了 STRIVE 的
+因此，本文中的“VLN-CogNav”不是对原论文的简单工程复现。它保留了 VLN 的
 多层场景表示和两阶段导航思想，同时加入面向自然语言任务的指令编译、运行时概念
 grounding、动态语义关系边和实物 ROS 适配层。设计目标是让语义能力扩展到更复杂的
 指令，同时不破坏原方法中“结构化表示约束 VLM 使用范围”的核心原则。
@@ -393,7 +393,7 @@ vocabulary 和 role 共同作用下的显式 grounding 产物。
 ## 5. 建图模块
 
 建图模块的目标不是追求完整的几何重建，而是维护一个对导航决策足够紧凑、可解释且
-可持续更新的状态表示。STRIVE 论文的核心观察是：VLM 对局部图像和语义关联较强，
+可持续更新的状态表示。相关方法论文的核心观察是：VLM 对局部图像和语义关联较强，
 但对连续三维路径、历史轨迹和长程空间一致性的把握并不稳定。因此，地图层需要先把
 原始 RGB-D 或点云观测组织成结构化证据，再交给 VLM 做高层判断。
 
@@ -540,7 +540,7 @@ instruction mode 中还会利用 instance ledger 避免被明确拒绝的实例�
 
 ### 5.6 Room segmentation
 
-房间分割遵循 STRIVE/SysNav 的结构化思想：墙体或障碍区域将可通行空间分割为
+房间分割遵循 VLN/SysNav 的结构化思想：墙体或障碍区域将可通行空间分割为
 连通区域，每个区域形成 `room node`。实际实现中由
 `mapping/room_segmenter.py` 承接主要逻辑，并在失败时回退为单房间模式，避免
 room segmentation 异常破坏导航主循环。
@@ -672,7 +672,7 @@ Output:
 
 ### 6.1 两阶段策略
 
-STRIVE 的导航策略可以概括为两阶段。第一阶段在房间层面调用 VLM，利用目标语义、
+VLN 的导航策略可以概括为两阶段。第一阶段在房间层面调用 VLM，利用目标语义、
 房间对象、探索状态和行程代价选择下一片搜索区域；第二阶段在房间内部采用传统
 frontier/viewpoint 探索，并只在需要早停或确认目标时调用 VLM。这样既利用了 VLM 的
 常识推理能力，又避免让它在每个低层候选点上承担三维路径评估。
@@ -724,7 +724,7 @@ $$
 - `\tilde{d}`：考虑已走步数和回溯惩罚的路径代价。
 - `B(r_i)`：已失败或低价值房间的惩罚项。
 
-论文中的 STRIVE 让 VLM 综合语义相关性与 travel cost，而不是逐个评估所有
+相关方法让 VLM 综合语义相关性与 travel cost，而不是逐个评估所有
 viewpoint。这个设计有两个直接收益：其一，房间摘要比单帧图像更接近人类进行室内
 搜索时使用的上下文；其二，room-level 决策显著降低了 VLM 调用频率和 token 消耗。
 SysNav 进一步强调将 VLM 限制在 room-level，以避免其进行细粒度 3D 路径判断。
@@ -776,7 +776,7 @@ anchor 不参与 stop。若某个 anchor 附近搜索失败，只记录该 ancho
 ### 6.6 Final verifier 与 view-control
 
 最终停止不是单一 detector 判断，而是统一的 instruction satisfaction verifier。
-STRIVE 论文中的 VLM-based target verification 包含两个关键思想：先利用目标周围
+相关方法中的 VLM-based target verification 包含两个关键思想：先利用目标周围
 上下文降低检测误报，再在更合适的视角上进行一次复核。本项目将这一路径推广到
 自然语言指令：最终 verifier 不只判断“检测框里是什么”，还要判断当前视角是否足以
 支持原始任务、关系约束和停止决策。
@@ -828,7 +828,7 @@ $$
 `within_final_stop_distance`。它不是对象类别规则；若该约束未满足，除非 verifier
 明确给出不可执行或不适用的结构化解释，否则 `accept` 会被转为 `need_better_view`。
 
-视角优化继承了 STRIVE 中 Viewpoint-Optimized Re-Verification 的思想：目标第一次被
+视角优化继承了 VLN 中 Viewpoint-Optimized Re-Verification 的思想：目标第一次被
 检测到时，当前视角往往可能存在距离远、遮挡或目标贴边等问题；更好的停止证据应来自
 沿着可达路径采样得到的目标中心化视角，而不是从原地反复询问 VLM。抽象地说，给定
 已确认的目标实例 `o`、当前位姿 `p_t` 和候选视角集合 `\mathcal{V}_o`，系统选择：
@@ -1097,7 +1097,7 @@ logs/<save_dir>/episode-0/lvlm_calls/*.json
 ## 8. 实物部署模块设计
 
 实物部分已经形成第一版 SysNav-backed runtime。其核心不是把 Habitat action loop
-搬到机器人上，而是让 STRIVE 只保留高层语义能力：任务编译、concept grounding、
+搬到机器人上，而是让 VLN 只保留高层语义能力：任务编译、concept grounding、
 anchor/terminal 角色隔离、动态关系验证、最终证据确认和 waypoint 级意图输出。
 检测、对象融合、房间节点维护和底层运动执行优先复用 SysNav 的 ROS 链路。
 
@@ -1158,14 +1158,14 @@ flowchart TB
 | --- | --- | --- |
 | `real_robot/contracts.py` | 定义平台无关数据结构 | 不 import ROS、Habitat、OpenCV 或 detector 实现 |
 | `real_robot/detector_vocabulary.py` | 读取 SysNav `objects.yaml` 并保留 label provenance | 只记录 detector 词表，不做语义 alias 判断 |
-| `real_robot/sysnav_ros_adapters.py` | ROS message 与 STRIVE contract 互转 | 只做字段适配，不修改 SysNav map 状态 |
+| `real_robot/sysnav_ros_adapters.py` | ROS message 与 VLN contract 互转 | 只做字段适配，不修改 SysNav map 状态 |
 | `real_robot/sysnav_runtime.py` | 组装 snapshot、intent、waypoint 与 evidence loop | 不拥有 detector/mapping model |
 | `real_robot/ros2_ws/src/semantic_mapping` | 迁移 SysNav detector 与 semantic mapping | 发布 SysNav-compatible object/room topics |
 | `real_robot/ros2_ws/src/strive_sysnav_bringup` | 启动检测与建图链路 | 不包含高层语义规划逻辑 |
 
 #### 8.1.1 模块分层与运行职责
 
-实物模式采用“SysNav 管底层闭环，STRIVE 管语义决策”的分层。该分层不是简单的
+实物模式采用“SysNav 管底层闭环，VLN 管语义决策”的分层。该分层不是简单的
 ROS topic 转发，而是将对象身份、检测词表、运动状态和证据采集拆成可替换的
 contract。这样做的直接好处是：更换相机、检测器或底盘控制器时，不需要改
 instruction parser、concept grounding 和 final verifier。
@@ -1186,7 +1186,7 @@ instruction parser、concept grounding 和 final verifier。
 ```text
 Robot sensor topics
   -> SysNav detection_node
-     # 检测器在 SysNav ROS 链路内运行，STRIVE 第一版不直接接管 detector。
+     # 检测器在 SysNav ROS 链路内运行，VLN 第一版不直接接管 detector。
 
 SysNav /detection_result
   -> RosDetectionResultAdapter
@@ -1196,12 +1196,12 @@ SysNav /detection_result
 SysNav /object_nodes_list, /room_nodes_list
   -> RosObjectNodeAdapter / RosRoomNodeAdapter
   -> ObjectNodeSnapshot / RoomSnapshot
-     # object uid 进入 STRIVE ledger/cache；room label 不在 adapter 层硬编码。
+     # object uid 进入 VLN ledger/cache；room label 不在 adapter 层硬编码。
 
 ObjectNodeSnapshot + RoomSnapshot + robot pose
   -> build_semantic_map_snapshot()
   -> SemanticMapSnapshot
-     # 这是 STRIVE 高层策略看到的只读世界状态。
+     # 这是 VLN 高层策略看到的只读世界状态。
 
 SemanticMapSnapshot + instruction
   -> high_level_policy.decide()
@@ -1229,12 +1229,12 @@ ViewpointGoal
 “shelf anchor”。这种判断必须由 `ConceptQuery + DetectorVocabulary + 视觉证据`
 共同进入 grounding/verifier。类似地，`RosRoomNodeAdapter` 不把 room node 写成
 bedroom 或 living room；SysNav 的 room 几何节点只作为空间区域，语义房间名由
-STRIVE 的 room policy 或 VLM 推断。
+VLN 的 room policy 或 VLM 推断。
 
 #### 8.1.2 对象身份、缓存与检测词表
 
 实物系统中 detector track id、分割 mask 和对象融合结果都会随时间变化。因此
-STRIVE 不应直接用 bbox 或 label 作为长期身份。当前实现采用如下优先级：
+VLN 不应直接用 bbox 或 label 作为长期身份。当前实现采用如下优先级：
 
 ```text
 Object identity key:
@@ -1320,16 +1320,16 @@ ViewEvidence:
 ### 8.2 SysNav 复用链路
 
 第一版实物部署采用 topic 级复用，而不是将 SysNav detector/mapping 代码揉进
-STRIVE 主流程。SysNav 继续拥有 detector、tracking、SAM2 segmentation、对象图
-生命周期和房间节点；STRIVE 订阅只读 snapshot，做语义决策后发布 `/way_point`。
+VLN 主流程。SysNav 继续拥有 detector、tracking、SAM2 segmentation、对象图
+生命周期和房间节点；VLN 订阅只读 snapshot，做语义决策后发布 `/way_point`。
 
 ```mermaid
 sequenceDiagram
   participant Sensor as Robot Sensors
   participant Det as SysNav detection_node
   participant Map as SysNav semantic_mapping_node
-  participant Bridge as STRIVE SysNavSemanticMapBridge
-  participant Policy as STRIVE Instruction Policy
+  participant Bridge as VLN SysNavSemanticMapBridge
+  participant Policy as VLN Instruction Policy
   participant Ctrl as RosWaypointController
   participant Base as SysNav / Local Planner
 
@@ -1344,14 +1344,14 @@ sequenceDiagram
   Ctrl-->>Policy: reached / blocked / timeout
 ```
 
-这一边界保留了 SysNav 的真实机器人适配经验，同时让 STRIVE 的 prompt-first
+这一边界保留了 SysNav 的真实机器人适配经验，同时让 VLN 的 prompt-first
 指令模块和 final verifier 可以无缝复用。检测词表差异通过
 `DetectorVocabularyAdapter` 显式进入 grounding prompt，而不是在 adapter 中写
 隐藏同义词规则。
 
 ### 8.3 硬件与传感器
 
-STRIVE 论文中的真实平台配置为麦克纳姆轮底盘、Ricoh Theta Z1 全景相机和
+原论文中的真实平台配置为麦克纳姆轮底盘、Ricoh Theta Z1 全景相机和
 Livox Mid-360 LiDAR。当前接口同时保留 RealSense 的 pinhole RGB-D 接入能力，
 但上层只依赖 `CameraModel`：
 
@@ -1452,7 +1452,7 @@ classDiagram
   ViewpointGoal --> ViewEvidence
 ```
 
-`NavigationIntent` 是 STRIVE planner 的语义输出；`MotionGoal` 是 bridge 可执行的
+`NavigationIntent` 是 VLN planner 的语义输出；`MotionGoal` 是 bridge 可执行的
 运动请求；`ViewpointGoal` 是证据采集子任务。三者分开后，系统不会把
 “我要验证目标”误写成底盘速度控制，也不会把“底层 waypoint 到达”误当成
 “任务语义已经满足”。
@@ -1546,12 +1546,12 @@ unknown，而不是插值为虚假表面。
 
 ### 8.6 Viewpoint evidence 闭环
 
-仿真中 STRIVE 可以通过 Habitat action 快速旋转、靠近和 stop；真实机器人则是
+仿真中 VLN 可以通过 Habitat action 快速旋转、靠近和 stop；真实机器人则是
 异步执行。`ViewpointEvidenceLoop` 将这一过程显式拆成四步：
 
 ```mermaid
 sequenceDiagram
-  participant Policy as STRIVE Policy
+  participant Policy as VLN Policy
   participant Loop as ViewpointEvidenceLoop
   participant Ctrl as MotionController
   participant Base as SysNav / Local Planner
@@ -1568,7 +1568,7 @@ sequenceDiagram
   VLM-->>Policy: accept / need_better_view / reject
 ```
 
-这一闭环保持了 STRIVE 与 SysNav 的职责分离：
+这一闭环保持了 VLN 与 SysNav 的职责分离：
 
 - `MotionController` 只回答 waypoint 是否到达、是否 blocked、是否 timeout。
 - `EvidenceProvider` 只采集当前图像、crop、bbox 与相机模型。
@@ -1590,7 +1590,7 @@ $$
 
 ### 8.7 单镜像部署框架
 
-当前实物部署采用单一 ROS2 Humble 镜像承载 SysNav detector/mapping 与 STRIVE
+当前实物部署采用单一 ROS2 Humble 镜像承载 SysNav detector/mapping 与 VLN
 Python runtime，避免实车部署时同时维护两个容器的网络、TF 和 topic 命名。
 
 轻量构建命令：
@@ -1665,7 +1665,7 @@ Evidence boundary:
   ViewpointGoal -> current RGB/crop/pose -> ViewEvidence -> final verifier
 ```
 
-后续迁移到具体机器人时，需要补齐或替换的不是 STRIVE 高层策略，而是：
+后续迁移到具体机器人时，需要补齐或替换的不是 VLN 高层策略，而是：
 
 - 真实 `NavigationStatus` provider：从 SysNav/Nav2/local planner 的反馈计算
   `REACHED / BLOCKED / TIMEOUT`。
@@ -1677,7 +1677,7 @@ Evidence boundary:
 - detector vocabulary 配置：将不同检测器的 prompt/label space 显式传入
   concept grounding，而不是在 adapter 层写类别规则。
 
-这一设计使 STRIVE 的 instruction adapter、concept matcher、dynamic semantic
+这一设计使 VLN 的 instruction adapter、concept matcher、dynamic semantic
 edge verifier 和 final verifier 能够跨仿真与真实机器人复用；SysNav 或其他底层
 导航器只需实现等价的 mapping topics、waypoint 执行和 status feedback。
 

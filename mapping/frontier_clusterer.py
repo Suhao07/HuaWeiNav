@@ -1,4 +1,4 @@
-"""Frontier-cluster analysis for STRIVE mapper.
+"""Frontier-cluster analysis for VLN mapper.
 
 This module converts DBSCAN clusters around the current visible navigable
 region into candidate viewpoint centers. It uses mapper-provided geometry

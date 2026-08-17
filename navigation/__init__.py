@@ -1,1 +1,1 @@
-"""Navigation controllers extracted from the STRIVE agent runtime."""
+"""Navigation controllers extracted from the VLN agent runtime."""

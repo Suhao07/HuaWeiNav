@@ -1,5 +1,36 @@
 # Instruction Adapter Changelog
 
+## 2026-08-17
+
+### Added
+
+- 新增 `deployment/lvlm_server`：基于指定 ms-swift revision 部署
+  Qwen2.5-VL-7B/3B 的 OpenAI-compatible 服务，提供模型 shard/processor preflight、
+  可选 SHA256 迁移清单和跨主机多模态 API smoke。
+- 新增 `deployment/lvlm_server/schema_smoke.py`：使用生产 prompt、schema 和 trace
+  label 一次验收 instruction parser、concept grounding、batch concept matcher、
+  relation verifier 与 final verifier，并输出版本化 raw/parsed/latency 回执。
+- 新增 `deployment/lvlm_server/accept_deployment.py`：将 clean ms-swift revision、模型
+  shard/SHA256、CUDA 依赖、API discovery 和生产 schema 合并为
+  `strive.lvlm_deployment_acceptance/v1` 正式上线回执。
+- 新增 `SelfHostedOpenAICompatibleClient` 和共享 structured-output 工具，使现有
+  instruction parser、concept grounding、relation/final verifier 在不改变调用合同的
+  情况下接入自托管服务。
+- 新增 `docs/real_robot_framework.md`，定义平台无关 observation、semantic snapshot、
+  navigation intent、motion goal/status、view evidence、异步控制流和执行器扩展模板。
+
+### Changed
+
+- 实物 Docker 启动链统一按 `STRIVE_VLM > STRIVE_LLM_CLIENT > LLM_PROVIDER > cognav`
+  选择模型 provider，并透传自托管 LVLM 地址、模型名、认证和重试配置。
+- `MotionControllerProtocol` 补齐 `cancel()` 与 `hold()`，使 Action、SysNav waypoint 和
+  厂商 SDK adapter 使用相同的目标生命周期与安全边界。
+
+### Tests
+
+- 新增自托管结构化解析、模型快照和五类生产 schema 回执测试；完整 Python 测试与
+  实物离线验收均通过。
+
 ## 2026-08-12
 
 ### Fixed
@@ -55,11 +86,11 @@
   全局 BEV。
 - 房间边界从连通导航栅格的外轮廓提取；外轮廓无法闭合时才使用确定性的
   AABB fallback，并在 metadata 中标记 boundary method。
-- 明确 HM3D 不包含 FloorPlan-VLN 使用的 Matterport `*.house` 输入；STRIVE
+- 明确 HM3D 不包含 FloorPlan-VLN 使用的 Matterport `*.house` 输入；VLN
   复用的是 room-level 输出格式，而不是伪造 `.house` 数据。
 - 统一 HM3D scene-directory 与 existing-simulator 的加载边界，避免两个入口使用
   不同的资产、NavMesh 或坐标约定；补充 region/floor `height_range`。
-- `PriorMapLoader` 对 STRIVE 自生成的 `floorplan_metric` 显式执行一次
+- `PriorMapLoader` 对 VLN 自生成的 `floorplan_metric` 显式执行一次
   `(x,-z)->(x,z)` 归一化，避免 FloorPlan 交换坐标和 runtime query 坐标发生镜像。
 
 ### Tests
@@ -71,11 +102,11 @@
 
 ### Added
 
-- 新增 `real_robot/contracts.py`，作为 STRIVE 实物模式的第一层平台无关接口：
+- 新增 `real_robot/contracts.py`，作为 VLN 实物模式的第一层平台无关接口：
   - `RealObservation` / `CameraFrame` 描述真实 RGB、深度引用、点云引用和位姿；
   - `DetectionFrame` 统一 detector bbox、label、confidence、track id 和 mask 引用；
   - `ObjectNodeSnapshot`、`RoomSnapshot`、`SemanticMapSnapshot` 提供高层 planner 的只读地图视图；
-  - `NavigationIntent`、`MotionGoal`、`ViewpointGoal`、`NavigationStatus` 明确 STRIVE 高层与下层运动控制的异步边界；
+  - `NavigationIntent`、`MotionGoal`、`ViewpointGoal`、`NavigationStatus` 明确 VLN 高层与下层运动控制的异步边界；
   - `ViewEvidence` 和 `RuntimeDecision` 为 final verifier、relation verifier 和实物运行复盘提供结构化记录。
 - 新增 `real_robot/__init__.py`，集中导出实物 contract，后续 ROS/SysNav/bag replay adapter 都应依赖该包。
 - 新增 `real_robot/detector_vocabulary.py`，用于彻底复用 SysNav detector 词表配置：
@@ -94,7 +125,7 @@
   - `RosObjectNodeAdapter` 将 `/object_nodes_list` 转为 `ObjectNodeSnapshot`；
   - `RosRoomNodeAdapter` 将 `/room_nodes_list` 转为 `RoomSnapshot`；
   - `RosWaypointController` 将 `MotionGoal` 发布为 SysNav `/way_point`；
-  - `build_semantic_map_snapshot()` 将 SysNav object/room list 组装为 STRIVE 高层 planner 可消费的只读地图快照。
+  - `build_semantic_map_snapshot()` 将 SysNav object/room list 组装为 VLN 高层 planner 可消费的只读地图快照。
 - 新增 `real_robot/sysnav_runtime.py`，实现第一版 SysNav-backed 实物运行闭环：
   - `SysNavSemanticMapBridge` 缓存 `/object_nodes_list` 与 `/room_nodes_list`，并构建 `SemanticMapSnapshot`；
   - `SysNavInstructionRuntime` 将 `SemanticMapSnapshot` 交给高层策略，得到 `NavigationIntent` 后通过 motion controller 发布 waypoint；
@@ -104,14 +135,14 @@
   - 明确 contract 层只保存 JSON-friendly metadata、image/path reference 和几何状态；
   - 明确 VLM/verifier、mapper/planner、motion controller 和 runtime 的职责划分；
   - 将初始 runtime skeleton 更新为异步 `MotionGoal -> NavigationStatus -> ViewEvidence` 形式。
-  - 补充第一版 SysNav 复用链路：`/camera/image -> detection_node -> /detection_result -> semantic_mapping_node -> /object_nodes_list -> STRIVE instruction_adapter`。
+  - 补充第一版 SysNav 复用链路：`/camera/image -> detection_node -> /detection_result -> semantic_mapping_node -> /object_nodes_list -> VLN instruction_adapter`。
   - 补充 `SysNavSemanticMapBridge`、`SysNavInstructionRuntime` 和 `ViewpointEvidenceLoop` 的最小闭环伪代码。
   - 补充 detector vocabulary / label provenance 边界，明确词表差异由 concept grounding / verifier 处理。
 - 新增构建/运行脚本：
   - `scripts/build_real_robot_ros_ws.sh` 构建 `real_robot/ros2_ws` overlay；
   - `scripts/run_sysnav_detection_mapping.sh` source overlay 并启动 `strive_sysnav_bringup`。
 - 更新 `docker/Dockerfile.real_robot` 和 `docker/build_real_robot.sh`：
-  - 实物镜像改为复制完整 STRIVE workspace，而不是只复制 ROS overlay；
+  - 实物镜像改为复制完整 VLN workspace，而不是只复制 ROS overlay；
   - 设置 `PYTHONPATH=/workspace/STRIVE`，保证 real_robot、instruction_adapter、llm_utils 可在同一容器内导入；
   - 新增 `INSTALL_LLM_DEPS` 构建开关，默认安装 Pydantic v2 与 OpenAI-compatible client；
   - 保留 `INSTALL_ML_DEPS` 开关，区分轻量 ROS 验证镜像和完整 detector/mapping runtime 镜像；
@@ -119,7 +150,7 @@
 - 更新 `docker/run_real_robot_sysnav_stack.sh`：
   - 自动只读挂载 `SYSNAV_DETECTOR_MODEL_PATH` 和 `SYSNAV_SAM2_CHECKPOINT` 所在目录；
   - 透传 MAP/LLM/Ark/Gemini/CogNav 运行时环境变量；
-  - 保证真机部署时一个 `strive-real-robot:*` 容器即可承载 ROS detector/mapping 与 STRIVE 上层策略。
+  - 保证真机部署时一个 `strive-real-robot:*` 容器即可承载 ROS detector/mapping 与 VLN 上层策略。
 
 ### Tests
 
@@ -179,7 +210,7 @@
   - 当 benchmark object-goal 或自然语言 `InstructionPlan` 已安装时，Habitat `STOP`
     只能由 `FinalInstructionVerifier` 的 `decision=accept` 触发；
   - legacy `final_check()` 的 ray/voxel 可见性不再能单独结束 episode，只保留给无 plan
-    的原始 STRIVE 路径；
+    的原始 VLN 路径；
   - 若 verifier 返回 `need_better_view` 或其它非 accept 决策，agent 会阻断 stop action，
     继续执行 view-control 或采集新的当前视角证据。
 - view-control 增加 stable visual reference：
@@ -268,7 +299,7 @@
   - 说明 provider 边界、HM3D-OVON split 选择、success distance 对齐和
     Gibson custom wrapper 的迁移边界。
 - 新增 `docs/real_robot_deployment.md`：
-  - 整理 STRIVE 实物部署接口设计；
+  - 整理 VLN 实物部署接口设计；
   - 对照 SysNav ROS2 传感器、语义地图、VLM、exploration planner、
     local planner 和 path follower；
   - 明确 RealObservation、DetectionFrame、SemanticMapSnapshot、
@@ -554,14 +585,14 @@
   - 优先复用 CogNav episode metadata。
   - metadata 不足时调用 LLM 输出结构化 plan。
   - `tv_monitor -> tv` 等类别差异移到 grounding 层处理。
-- adapter 开启时，STRIVE 不再用 `ask_gpt_similar_objects()` 扩展目标同义词。
+- adapter 开启时，VLN 不再用 `ask_gpt_similar_objects()` 扩展目标同义词。
   - 目标检测词来自 `StriveInstructionSpec.target_detector_prompts`。
   - 新 grounding 层仅在精确匹配不足时可复用 legacy LLM similarity fallback。
 - `mapper.object_found_no_gpt()` 从裸 `tag == target` 改为 normalized target alias 匹配。
 - `mapper.object_found_no_gpt()` 会跳过已被 final verifier hard-rejected 的同一对象实例，但不会屏蔽同类别其它对象。
 - `objnav_agent_with_process_obs.py` 在几何 `final_check()` 通过后新增原始指令满足度验证；只有 `decision=accept` 才允许最终 stop。
-- final verifier 改为可插拔 `auto` 模式：普通 benchmark 没有 `InstructionPlan/InstructionSpec` 时直接旁路，不改变 STRIVE 原始停止逻辑。
-- mapper 中增加 `instruction_plan` / `instruction_spec` / `target_aliases` 字段，但不改变 STRIVE 的 room/viewpoint/path planner。
+- final verifier 改为可插拔 `auto` 模式：普通 benchmark 没有 `InstructionPlan/InstructionSpec` 时直接旁路，不改变 VLN 原始停止逻辑。
+- mapper 中增加 `instruction_plan` / `instruction_spec` / `target_aliases` 字段，但不改变 VLN 的 room/viewpoint/path planner。
 - 启用 instruction adapter 时，`mapper.object_found_no_gpt()` 在 sequence 模式只暴露 active target，防止后续子目标提前触发 stop。
 - `objnav_agent_with_process_obs.py` 在 final verifier 前调用 `ConstraintEvaluator`：
   - attribute/room 作为原始指令 verifier 的显式证据；
@@ -619,8 +650,8 @@
   - `batch_llm_calls` 是实际批量请求次数；
   - `batch_items_requested` 是批量请求覆盖的候选 object 数量；
   - `cache_hits` 和 `exact_matches` 用于区分“模型没被调用”和“模型被调用但批量处理”。
-- CogNav / Gemini / OpenAI compatible `parse()` 统一经过 trace wrapper，未显式标注的调用会退化为 `parse`，STRIVE 关键调用已补充语义化 `trace_label`。
-- `semantic_edges` 几何预筛改为使用 STRIVE 点云 z 轴作为垂直方向，并优先使用点云边界判断 `on / inside / under`。
+- CogNav / Gemini / OpenAI compatible `parse()` 统一经过 trace wrapper，未显式标注的调用会退化为 `parse`，VLN 关键调用已补充语义化 `trace_label`。
+- `semantic_edges` 几何预筛改为使用 VLN 点云 z 轴作为垂直方向，并优先使用点云边界判断 `on / inside / under`。
 - CogNav episode metadata compiler 增强为 best-effort 读取 `complex_constraints` 中的 relations / attributes / room constraints。
 
 ### Boundary

@@ -1,7 +1,7 @@
-# STRIVE Real-Robot ROS2 Overlay
+# VLN Real-Robot ROS2 Overlay
 
 This workspace vendors the first SysNav detector and semantic mapping stack
-needed by STRIVE real-robot deployment.
+needed by VLN real-robot deployment.
 
 ## Packages
 
@@ -19,8 +19,8 @@ src/semantic_mapping
 
 src/strive_sysnav_bringup
   Launch and high-level runtime package. It starts detection_node,
-  semantic_mapping_node, and the optional STRIVE instruction runtime node
-  inside the STRIVE overlay.
+  semantic_mapping_node, and the optional VLN instruction runtime node
+  inside the VLN overlay.
 
 src/terrain_analysis, src/local_planner
   Migrated SysNav lower navigation stack. `localPlanner` consumes the
@@ -110,7 +110,7 @@ bash scripts/run_sysnav_detection_mapping.sh \
   use_sim_time:=false
 ```
 
-`run_sysnav_detection_mapping.sh` does not start the STRIVE instruction runtime
+`run_sysnav_detection_mapping.sh` does not start the VLN instruction runtime
 unless explicitly requested:
 
 ```bash
@@ -128,7 +128,7 @@ bash scripts/run_sysnav_detection_mapping.sh \
 ```
 
 On the current Orin/Mid-360 robot, Point-LIO publishes the registered cloud
-and odometry under its native topic names. Start the STRIVE overlay with
+and odometry under its native topic names. Start the VLN overlay with
 explicit remaps:
 
 ```bash
@@ -140,7 +140,7 @@ bash scripts/run_sysnav_detection_mapping.sh \
 ```
 
 If no camera driver is already publishing `/camera/image`, the bringup launch
-can start `usb_cam` from the USB camera device and remap it into STRIVE:
+can start `usb_cam` from the USB camera device and remap it into VLN:
 
 ```bash
 bash docker/run_real_robot_sysnav_stack.sh \
@@ -178,7 +178,7 @@ Motion:
   /local_planner/cancel
 ```
 
-STRIVE consumes `/object_nodes_list` and `/room_nodes_list` through
+VLN consumes `/object_nodes_list` and `/room_nodes_list` through
 `real_robot.sysnav_runtime.SysNavSemanticMapBridge`, then publishes waypoint
 goals with `real_robot.sysnav_ros_adapters.RosWaypointController`.
 
@@ -236,7 +236,7 @@ must still be run on the robot.
 The high-level runtime node subscribes `/object_nodes_list`,
 `/room_nodes_list`, `/aft_mapped_to_init`, `/camera/image`, and
 `/detection_result`. The wrapper script sources ROS and the overlay, then adds
-the repository root to `PYTHONPATH` for the shared STRIVE `real_robot` package.
+the repository root to `PYTHONPATH` for the shared VLN `real_robot` package.
 
 Run tests in this order. Do not skip directly to `dry_run:=false`.
 
@@ -365,7 +365,7 @@ dry_run still prevents /way_point publication
 
 Run this only after `/path`, `/aft_mapped_to_init`, and the local planner are
 healthy, and only when the robot safety boundary is already handled outside
-STRIVE. This publishes `/way_point`; STRIVE still never publishes `/cmd_vel`.
+STRIVE. This publishes `/way_point`; VLN still never publishes `/cmd_vel`.
 The launch will reject this mode unless `lower_controller_enabled:=true` is
 set, or unless `waypoint_topic` is changed to the configured test topic.
 
@@ -481,13 +481,13 @@ USB camera device:
 ```
 
 The robot did not have `/registered_scan`, `/state_estimation`, `/camera/image`,
-`/way_point`, or `/cmd_vel` active during the first smoke pass, so STRIVE bringup
+`/way_point`, or `/cmd_vel` active during the first smoke pass, so VLN bringup
 must either use the launch remaps above or start the missing camera/local-planner
 nodes before running the full stack.
 
 Point-LIO's installed `mapping_mid360_orin.launch.py` loads
 `publish.scan_publish_en: false` from its config, so `/cloud_registered` can
-exist in the ROS graph without emitting live `PointCloud2` samples. For STRIVE,
+exist in the ROS graph without emitting live `PointCloud2` samples. For VLN,
 start the Livox/LIO tmux session through the HuaWeiNav host helper, which keeps
 the external repositories unchanged and applies runtime parameter overrides:
 
@@ -502,7 +502,7 @@ The helper starts `livox_ros_driver2` and runs `point_lio` with:
 publish.scan_publish_en:=true
 ```
 
-`/cloud_registered_body` is optional for STRIVE and is disabled by default to
+`/cloud_registered_body` is optional for VLN and is disabled by default to
 reduce Point-LIO load. Enable it only when debugging body-frame clouds:
 
 ```bash
@@ -642,10 +642,10 @@ files, runtime output, caches, and `real_robot/ros2_ws/{build,install,log}`.
 
 ## Motion Interface
 
-STRIVE should stay above the low-level controller boundary:
+VLN should stay above the low-level controller boundary:
 
 ```text
-STRIVE NavigationIntent / MotionGoal
+VLN NavigationIntent / MotionGoal
   -> RosWaypointController
   -> /way_point
   -> existing local planner / path follower / PD controller
@@ -693,7 +693,7 @@ The native SysNav waypoint topic has no goal identity or result contract. The
 overlay therefore provides an optional task-level action server:
 
 ```text
-STRIVE RosActionMotionController
+VLN RosActionMotionController
   -> /strive/execute_waypoint [strive_motion_msgs/ExecuteWaypoint]
   -> SysNavMotionServer
   -> /way_point [geometry_msgs/PointStamped]
@@ -716,7 +716,7 @@ ros2 launch strive_sysnav_motion sysnav_motion_server.launch.py \
 The Action result is the authoritative motion-attempt outcome. It distinguishes
 `REACHED`, `BLOCKED`, `TIMEOUT`, `PREEMPTED`, `SAFETY_STOP`, manual takeover and
 localization loss. It does not declare the natural-language task successful;
-STRIVE's evidence loop and final verifier retain that authority.
+VLN's evidence loop and final verifier retain that authority.
 
 The lower stack also exposes an explicit planner status topic:
 

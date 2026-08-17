@@ -2,7 +2,7 @@
 
 The contract is deliberately independent of ROS.  It records which external
 controller owns the waypoint and velocity interfaces, which safety limits have
-been reviewed, and whether STRIVE is authorized to submit live goals.
+been reviewed, and whether VLN is authorized to submit live goals.
 """
 
 from __future__ import annotations
@@ -100,7 +100,7 @@ def validate_controller_contract(
 
     Args:
         contract: Parsed robot-specific contract.
-        waypoint_topic: Topic the STRIVE/SysNav motion server will own.
+        waypoint_topic: Topic the VLN/SysNav motion server will own.
         world_frame: Frame expected by the lower planner.
         action_name: Task-level action used by the high-level runtime.
         require_approved: Require explicit approval for live handoff.

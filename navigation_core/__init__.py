@@ -1,2 +1,2 @@
-"""Core navigation utilities shared by STRIVE runtime modules."""
+"""Core navigation utilities shared by VLN runtime modules."""
 

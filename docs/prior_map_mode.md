@@ -1,8 +1,8 @@
-# STRIVE 先验地图模式技术文档
+# VLN 先验地图模式技术文档
 
-本文档定义 STRIVE 的先验地图模式。目标是在 Habitat/HM3D 仿真和真实机器人模式中
+本文档定义 VLN 的先验地图模式。目标是在 Habitat/HM3D 仿真和真实机器人模式中
 复用同一套语义先验地图 contract，让预先构建的房间、拓扑和区域信息作为搜索先验
-进入 STRIVE，而不是把 Habitat 的 NavMesh 真值带入真实机器人流程。
+进入 VLN，而不是把 Habitat 的 NavMesh 真值带入真实机器人流程。
 
 核心原则：
 
@@ -23,7 +23,7 @@ Final verifier owns task success.
 
 FloorPlan-VLN 的原始房间布局来自 Matterport3D `*.house` 房屋分割数据和
 Matterport connectivity graph；HM3D v0.2 发布的是 `basis.glb`、`semantic.glb`、
-`semantic.txt`、`basis.navmesh`，不包含同构的 `.house` 文件。因此 STRIVE 不应
+`semantic.txt`、`basis.navmesh`，不包含同构的 `.house` 文件。因此 VLN 不应
 伪造 HM3D `.house`，而是从 HM3D NavMesh 与语义场景生成同构的 room-only
 `floorplan.json`。
 
@@ -94,7 +94,7 @@ artifact 列表。
 正式 bundle 只包含上述语义文件。Habitat `PathFinder` 只在构建阶段用于恢复房间的
 几何范围，不能作为仿真先验输入，也不能进入 LVLM prompt 或实物导航接口。
 
-STRIVE 生成的布局被 `PriorMapLoader` 读取时会识别
+VLN 生成的布局被 `PriorMapLoader` 读取时会识别
 `frame_id=floorplan_metric` 与 `floorplan_axes=["x", "-z"]`，将第二个平面轴反射回
 canonical Habitat `(x,z)`；未带该显式标记的第三方 FloorPlan 文件不会被静默改写。
 
@@ -181,7 +181,7 @@ prior_map/vlm_reconstructor/
   从户型图图片重建 PriorMapData
 ```
 
-这些模块的思想可复用，但不应直接照搬旧仓库中的 Episode mixin。STRIVE 当前已经有
+这些模块的思想可复用，但不应直接照搬旧仓库中的 Episode mixin。VLN 当前已经有
 `instruction_adapter`、`planning`、`real_robot/contracts.py` 和 final verifier 边界，
 先验地图必须按这些边界重新封装。
 
@@ -541,7 +541,7 @@ class SearchPriorResult:
     diagnostics: dict[str, Any] = field(default_factory=dict)
 ```
 
-这是先验地图对 STRIVE 策略层的唯一输出。任何 policy 只能读取它做排序或解释，
+这是先验地图对 VLN 策略层的唯一输出。任何 policy 只能读取它做排序或解释，
 不能把其中某个 prior point 直接当成最终 goal。
 
 ## 6. Query 语义
@@ -588,7 +588,7 @@ score =
 这些分数是 soft ranking，不是 hard filter。除非未来某个 benchmark 明确定义先验地图
 是 ground truth，否则先验地图不能 hard reject 当前 live observation。
 
-## 7. 与现有 STRIVE 的接入点
+## 7. 与现有 VLN 的接入点
 
 ### 7.1 instruction_adapter
 

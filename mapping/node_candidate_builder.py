@@ -23,7 +23,7 @@ def add_nodes_from_candidates(
     """Create graph nodes for traversable frontier candidates.
 
     Each new node stores the local point-cloud slice that faces the candidate
-    direction. This preserves STRIVE's legacy debug and view scoring behavior
+    direction. This preserves VLN's legacy debug and view scoring behavior
     while keeping angular slicing out of ``mapper.get_nodes``.
     """
 

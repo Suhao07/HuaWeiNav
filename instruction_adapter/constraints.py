@@ -221,7 +221,7 @@ class ConstraintEvaluator:
                 failed.extend(relation_eval.failed_constraints)
                 satisfied.extend(relation_eval.satisfied_constraints)
             elif ctype == "room":
-                # 当前 STRIVE 房间没有自然语言标签；room 约束作为证据交给
+                # 当前 VLN 房间没有自然语言标签；room 约束作为证据交给
                 # final verifier，只有在未来接入 room caption 后才 hard reject。
                 evidence.setdefault("declared_room_constraints", []).append(constraint.as_dict())
                 satisfied.append("room constraint queued for final verifier")

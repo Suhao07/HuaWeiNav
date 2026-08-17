@@ -1,4 +1,4 @@
-"""Frontier extraction helpers for STRIVE mapper.
+"""Frontier extraction helpers for VLN mapper.
 
 The full ``get_nodes()`` pipeline still lives in the mapper because it touches
 many runtime caches and debug artifacts. This module extracts pure frontier

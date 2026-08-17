@@ -1,4 +1,4 @@
-"""ROS2 HIL lower-layer simulator for the STRIVE motion action contract.
+"""ROS2 HIL lower-layer simulator for the VLN motion action contract.
 
 This node deliberately simulates only SysNav's observable lower-layer topics.
 It does not publish ``/cmd_vel`` and therefore cannot move a real chassis.

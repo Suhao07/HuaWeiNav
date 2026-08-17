@@ -49,7 +49,7 @@ def build_check_again_viewpoints(
         success_distance=success_distance,
         stop_criterion=stop_criterion,
     )
-    # STRIVE historically evaluates candidates from target-near to current-near.
+    # VLN historically evaluates candidates from target-near to current-near.
     interpolated_path = interpolated_path[::-1]
 
     final_pos = np.asarray(object_node.position[:2], dtype=float)

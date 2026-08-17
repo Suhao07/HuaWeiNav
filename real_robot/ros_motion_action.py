@@ -1,4 +1,4 @@
-"""ROS-independent helpers for the STRIVE motion action boundary.
+"""ROS-independent helpers for the VLN motion action boundary.
 
 The ROS node uses these helpers to convert an action goal into the existing
 platform-neutral ``MotionGoal`` contract.  Keeping conversion here makes the
@@ -32,7 +32,7 @@ def pose3d_from_pose_stamped(msg: Any, default_frame: str = "map") -> Pose3D:
 
 
 def motion_goal_from_action_goal(goal_msg: Any, default_frame: str = "map") -> MotionGoal:
-    """Convert ``ExecuteWaypoint.Goal`` into a STRIVE ``MotionGoal``."""
+    """Convert ``ExecuteWaypoint.Goal`` into a VLN ``MotionGoal``."""
 
     target_pose = pose3d_from_pose_stamped(getattr(goal_msg, "target_pose"), default_frame)
     look_at = None

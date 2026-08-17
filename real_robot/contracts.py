@@ -1,6 +1,6 @@
-"""Platform-neutral contracts for STRIVE real-robot execution.
+"""Platform-neutral contracts for VLN real-robot execution.
 
-This module defines value objects exchanged between high-level STRIVE semantic
+This module defines value objects exchanged between high-level VLN semantic
 planning and platform-specific robot adapters. It intentionally avoids ROS,
 Habitat, numpy, OpenCV, or detector imports so the same contracts can be used
 by live robots, bag replay, simulation bridges, and unit tests.
@@ -129,7 +129,7 @@ class CameraFrame:
 
 @dataclass(frozen=True)
 class RealObservation:
-    """Synchronized sensor snapshot delivered to STRIVE real-robot runtime."""
+    """Synchronized sensor snapshot delivered to VLN real-robot runtime."""
 
     # 核心：一次 observation 必须绑定同一个 robot_pose，避免 RGB/LiDAR/odom 时序漂移。
     timestamp: float

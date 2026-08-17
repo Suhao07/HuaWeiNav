@@ -1,4 +1,4 @@
-"""Habitat action-control helpers for STRIVE agent."""
+"""Habitat action-control helpers for VLN agent."""
 
 from __future__ import annotations
 

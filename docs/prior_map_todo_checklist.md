@@ -1,4 +1,4 @@
-# STRIVE 先验地图模式待做 Checklist
+# VLN 先验地图模式待做 Checklist
 
 本文档跟踪先验地图模式的实现工作。先验地图只能提供 context、ranking 和 evidence
 summary，不能直接发布导航目标或绕过 final verifier。

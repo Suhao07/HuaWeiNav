@@ -50,7 +50,7 @@ class ConceptQuery:
 class TargetQuery:
     """One object concept extracted from an instruction.
 
-    role controls how STRIVE uses the object. Only terminal=True targets may
+    role controls how VLN uses the object. Only terminal=True targets may
     satisfy stop conditions; anchors/support objects are search or relation
     context.
     """
@@ -144,7 +144,7 @@ class InstructionPlan:
     """Prompt-first, planner-agnostic instruction contract.
 
     This is the canonical contract. StriveInstructionSpec below is kept as a
-    compatibility view for the existing STRIVE benchmark/mapper integration.
+    compatibility view for the existing VLN benchmark/mapper integration.
     """
 
     raw_instruction: str
@@ -230,7 +230,7 @@ class StriveInstructionSpec:
     """Normalized instruction contract consumed by STRIVE.
 
     The adapter is intentionally planner-agnostic: it only separates executable
-    target terms from room/search context.  STRIVE remains responsible for
+    target terms from room/search context.  VLN remains responsible for
     Room/Viewpoint/Object navigation after this contract is produced.
     """
 
@@ -255,7 +255,7 @@ class StriveInstructionSpec:
         """Terms that are allowed to satisfy the goal.
 
         Support objects are deliberately excluded.  For example, couch may help
-        STRIVE choose a living room for "watch a movie", but it must never be a
+        VLN choose a living room for "watch a movie", but it must never be a
         terminal target for that task.
         """
 

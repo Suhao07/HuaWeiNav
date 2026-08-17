@@ -48,7 +48,7 @@ bash docker/build.sh
 COGNAV_BASE_IMAGE=cognav-vln:1.0 IMAGE_TAG=strive-hm3d:local bash docker/build.sh
 ```
 
-Dockerfile 会在 CogNav 基础环境上补齐 STRIVE HM3D baseline 需要的依赖：
+Dockerfile 会在 CogNav 基础环境上补齐 VLN HM3D baseline 需要的依赖：
 
 - `mmengine`
 - `mmcv`
@@ -104,7 +104,7 @@ SAM_CHECKPOINT=/path/to/sam_vit_h_4b8939.pth bash docker/run_hm3d_baseline.sh
 
 ### 3.2 GroundingDINO
 
-STRIVE 当前 mmdet 配置使用 Swin-L 权重：
+VLN 当前 mmdet 配置使用 Swin-L 权重：
 
 ```text
 grounding_dino_swin-l_pretrain_obj365_goldg-34dcdc53.pth
@@ -294,7 +294,7 @@ logs/<save_dir>/episode-*/instruction_adapter/spec.json
 
 ### 5.5 CogNav 指令模式自治 Benchmark
 
-CogNav 已生成的 instruction benchmark 是 Habitat-compatible ObjectNav split，episode 仍由 Habitat 驱动，指令语义在 `episode.info` 中。STRIVE 运行时打开 `--enable_instruction_adapter` 后，会优先从 `episode.info` 编译 `InstructionPlan`，再交给 mapper/agent 自治导航。
+CogNav 已生成的 instruction benchmark 是 Habitat-compatible ObjectNav split，episode 仍由 Habitat 驱动，指令语义在 `episode.info` 中。VLN 运行时打开 `--enable_instruction_adapter` 后，会优先从 `episode.info` 编译 `InstructionPlan`，再交给 mapper/agent 自治导航。
 
 运行前建议先导出真实 LLM 配置。metadata 足够时解析不需要调用 LLM，但导航过程中的 room/viewpoint 选择仍可能使用 CogNav LLM client：
 

@@ -1,8 +1,8 @@
-"""File loaders for STRIVE prior-map contracts.
+"""File loaders for VLN prior-map contracts.
 
 This module converts supported static map file formats into ``PriorMapData``.
 It performs only schema-level normalization, including the explicit reflection
-marker used by STRIVE-generated FloorPlan layouts. Coordinate alignment,
+marker used by VLN-generated FloorPlan layouts. Coordinate alignment,
 runtime observation fusion, ranking, and navigation decisions belong to later
 prior-map modules.
 """
@@ -955,9 +955,9 @@ def _normalize_floorplan_coordinates(
     frame_id: str,
     metadata: Dict[str, Any],
 ) -> tuple[Sequence[PriorRoom], str, Dict[str, Any]]:
-    """Normalize STRIVE-generated ``(x,-z)`` room geometry for runtime use.
+    """Normalize VLN-generated ``(x,-z)`` room geometry for runtime use.
 
-    FloorPlan-VLN stores its 2-D layout in an ``(x, -z)`` convention. STRIVE's
+    FloorPlan-VLN stores its 2-D layout in an ``(x, -z)`` convention. VLN's
     canonical prior-map query layer uses Habitat ``(x,z)`` projection, so the
     generated interchange format carries an explicit marker and is reflected
     exactly once at load time:

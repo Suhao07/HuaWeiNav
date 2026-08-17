@@ -36,7 +36,7 @@ class HabitatPriorMapBuildResult:
 
 
 class HabitatObjectNavPriorMapBuilder:
-    """Convert Habitat ObjectNav datasets into STRIVE prior maps.
+    """Convert Habitat ObjectNav datasets into VLN prior maps.
 
     Args:
         default_room_label: Label used for the coarse scene-level room when the

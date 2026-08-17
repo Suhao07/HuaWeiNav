@@ -1,10 +1,10 @@
-# STRIVE HM3D Baseline 框架文档
+# VLN HM3D Baseline 框架文档
 
 本文档面向代码维护和二次开发，说明本项目 HM3D ObjectNav baseline 的主要模块、输入输出、数据流、核心模型和关键公式。
 
 ## 1. 总体目标
 
-STRIVE HM3D baseline 解决的是 Habitat HM3D ObjectNav 任务：
+VLN HM3D baseline 解决的是 Habitat HM3D ObjectNav 任务：
 
 ```text
 给定目标类别，例如 toilet，智能体在未知室内环境中通过 RGB-D 观测、目标检测、分割、三维建图、前沿探索和 LLM 决策，导航到目标附近并执行 stop。
@@ -68,7 +68,7 @@ docker/run_hm3d_baseline.sh
 
 - 查找或下载 SAM/GroundingDINO 权重。
 - 校验 CogNav HM3D 数据。
-- 挂载 STRIVE 仓库、CogNav 仓库、HuggingFace cache、权重文件。
+- 挂载 VLN 仓库、CogNav 仓库、HuggingFace cache、权重文件。
 - 透传 LLM、AMap、Habitat 和权重环境变量。
 - 在容器内启动 `objnav_benchmark_with_process_obs.py`。
 
@@ -76,7 +76,7 @@ docker/run_hm3d_baseline.sh
 
 ```text
 docker/
-  Dockerfile                         # 在 CogNav 基础镜像上补 STRIVE 依赖
+  Dockerfile                         # 在 CogNav 基础镜像上补 VLN 依赖
   build.sh                           # 构建 strive-hm3d:local
   run_hm3d_baseline.sh               # 运行 benchmark
   preflight.py / preflight.sh        # 运行前检查
@@ -178,7 +178,7 @@ mapper.object_found_no_gpt()
   -> stop 或继续探索
 ```
 
-普通 HM3D benchmark 不启用 `InstructionPlan` 时，这条链路完全旁路，保持原始 STRIVE 行为。
+普通 HM3D benchmark 不启用 `InstructionPlan` 时，这条链路完全旁路，保持原始 VLN 行为。
 
 ## 5. 核心输入输出
 
@@ -285,7 +285,7 @@ STRIVE_LLM_FALLBACK=1
 
 ```text
 instruction_adapter/plan.json          # canonical InstructionPlan
-instruction_adapter/spec.json          # STRIVE legacy spec
+instruction_adapter/spec.json          # VLN legacy spec
 instruction_adapter/runtime_state_*.json
 final_verifier/evidence_*.json
 final_verifier/result_*.json
@@ -391,7 +391,7 @@ max_episode_steps = 500
 
 ## 7. LLM 决策接口
 
-STRIVE 原始代码使用 OpenAI 风格：
+VLN 原始代码使用 OpenAI 风格：
 
 ```python
 client.beta.chat.completions.parse(...)
@@ -473,7 +473,7 @@ bbox crop 的类别复核结果，避免重复调用视觉模型。
 
 ## 10. 终止验证数据流
 
-STRIVE 的最终停止现在由三层共同决定：
+VLN 的最终停止现在由三层共同决定：
 
 ```text
 候选目标实例
@@ -516,7 +516,7 @@ check_again/current bbox image
 ```text
 accept: 可以 stop
 reject_candidate: 当前实例不是目标，写入 VerificationLedger 并继续探索
-need_better_view: 语义可满足但当前证据视角不足，复用 STRIVE 视角优化再验证一次
+need_better_view: 语义可满足但当前证据视角不足，复用 VLN 视角优化再验证一次
 need_relation_check: 预留给动态语义边 verifier
 uncertain: 不终止，按 soft rejection 继续
 ```
@@ -578,7 +578,7 @@ proposal 排序会优先选择能够满足或接近合同的可见视角，再�
 
 在安装 `InstructionPlan` 或 benchmark object-goal plan 后，`STOP` 权限只属于
 FinalInstructionVerifier。legacy `final_check()` 的 ray/voxel 可见性不再单独结束 episode；
-它只保留给无 plan 的原始 STRIVE 路径。若 final verifier 没有返回 accept，agent 会阻断
+它只保留给无 plan 的原始 VLN 路径。若 final verifier 没有返回 accept，agent 会阻断
 Habitat stop action，继续执行 view-control 或采集新的当前视角证据。
 
 better-view 子目标会 pin 已验证的 `DynamicSemanticEdge`。例如
@@ -617,7 +617,7 @@ VLM relation verifier 覆盖几何不确定性，并在缓存层绕过旧的 geo
 
 ### Concept Grounding And Anchor-First
 
-指令模式下，STRIVE 现在维护三类运行时状态：
+指令模式下，VLN 现在维护三类运行时状态：
 
 ```text
 ConceptQuery:

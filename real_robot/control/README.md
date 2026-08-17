@@ -1,6 +1,6 @@
 # Lower-controller contract gate
 
-STRIVE never publishes `/cmd_vel` directly.  Real movement is allowed only as a
+VLN never publishes `/cmd_vel` directly.  Real movement is allowed only as a
 hand-off to an externally owned waypoint/local-planner controller, after its
 topic, message type, frame, feedback, speed limits, e-stop and takeover
 procedure have been reviewed.

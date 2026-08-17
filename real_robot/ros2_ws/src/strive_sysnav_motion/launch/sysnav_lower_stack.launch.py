@@ -1,4 +1,4 @@
-"""Launch the migrated SysNav local planning stack behind STRIVE safety gates."""
+"""Launch the migrated SysNav local planning stack behind VLN safety gates."""
 
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument

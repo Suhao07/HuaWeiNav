@@ -1,7 +1,7 @@
-# STRIVE 重构后代码框架
+# VLN 重构后代码框架
 
 本文记录 2026-06-10 开始的 Phase0-6 重构边界。目标不是一次性重写
-STRIVE，而是在保持 HM3D benchmark 和 instruction mode 行为兼容的前提下，
+VLN，而是在保持 HM3D benchmark 和 instruction mode 行为兼容的前提下，
 把可复用的数学工具、策略接口和运行时状态逐步拆出来。
 
 ## Phase0：安全护栏
@@ -777,7 +777,7 @@ mapper_with_process_obs.py legacy room/object/relocate prompt import
 ```text
 没有 InstructionPlan / InstructionSpec:
   final verifier auto-bypass
-  object search 走原 STRIVE target tag 分支
+  object search 走原 VLN target tag 分支
   check_again 仍保留原 benchmark 复核路径
 
 有 InstructionPlan:

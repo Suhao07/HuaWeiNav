@@ -1,14 +1,14 @@
-# STRIVE 指令解析适配器
+# VLN 指令解析适配器
 
 ## 设计目标
 
-`instruction_adapter` 是 STRIVE 前面的任务编译层，职责是把自然语言或 CogNav episode metadata 编译成可执行的 `InstructionPlan`：
+`instruction_adapter` 是 VLN 前面的任务编译层，职责是把自然语言或 CogNav episode metadata 编译成可执行的 `InstructionPlan`：
 
 ```text
 instruction / episode.info
   -> InstructionPlan
   -> detector grounding
-  -> STRIVE legacy spec
+  -> VLN legacy spec
   -> mapper / agent
 ```
 
@@ -188,9 +188,9 @@ Does this observed object satisfy the shelf anchor concept for this instruction?
 这和 SysNav 的思想一致：语义解释按需发生在对象节点和指令概念之间，
 而不是提前写死同义词表。
 
-## STRIVE 接入
+## VLN 接入
 
-当前 STRIVE 主链仍消费 legacy `StriveInstructionSpec`，它由 `InstructionPlan.to_legacy_spec()` 生成：
+当前 VLN 主链仍消费 legacy `StriveInstructionSpec`，它由 `InstructionPlan.to_legacy_spec()` 生成：
 
 ```text
 objnav_benchmark_with_process_obs.py
@@ -209,7 +209,7 @@ logs/<save_dir>/episode-*/instruction_adapter/plan.json
 logs/<save_dir>/episode-*/instruction_adapter/spec.json
 ```
 
-`plan.json` 是新的 canonical 输出；`spec.json` 是兼容旧 STRIVE 代码的视图。
+`plan.json` 是新的 canonical 输出；`spec.json` 是兼容旧 VLN 代码的视图。
 
 ## 支持的可解子集
 
@@ -220,7 +220,7 @@ single target: 找到一个明确目标
 implicit/function target: 找能满足功能的目标，由 LLM parse + grounding 完成
 room constraint: 目标需要在指定房间或区域
 multi target any-success: 多个候选目标任一成功
-sequential target: 多目标顺序约束，当前 legacy STRIVE 只执行 active target
+sequential target: 多目标顺序约束，当前 legacy VLN 只执行 active target
 min count: 至少找到 N 个实例，作为 count constraint 声明
 ```
 
@@ -296,7 +296,7 @@ candidate object pair + relation + shared views
 \mathcal{V}_{i,j}=\{v_k^v|e_{k,i}^{v-o}\in\mathcal{R}\land e_{k,j}^{v-o}\in\mathcal{R}\}
 \]
 
-STRIVE 运行时只应对候选对象对调用关系验证器，而不是对所有物体对预计算。验证结果缓存为：
+VLN 运行时只应对候选对象对调用关系验证器，而不是对所有物体对预计算。验证结果缓存为：
 
 ```python
 SemanticEdge:
@@ -405,11 +405,11 @@ red chair 失败:
 检测模型生命周期
 ```
 
-这些都属于 STRIVE mapper/agent 或运行时 verifier，不属于 instruction parser。
+这些都属于 VLN mapper/agent 或运行时 verifier，不属于 instruction parser。
 
 ## Final Instruction Verifier
 
-STRIVE 原本已有两类确认：
+VLN 原本已有两类确认：
 
 ```text
 check_again: 从更好视角复核 bbox 内是否是目标类别
@@ -460,7 +460,7 @@ CandidateInstance:
     step: int
 ```
 
-当前 STRIVE `ObjectNode` 没有永久 object id，因此 `uid` 由类别、点云中心和点云尺寸的量化签名生成。这样可以解决：
+当前 VLN `ObjectNode` 没有永久 object id，因此 `uid` 由类别、点云中心和点云尺寸的量化签名生成。这样可以解决：
 
 ```text
 指令：find the red chair
@@ -481,7 +481,7 @@ instruction_hash + candidate_uid
 accepted: 可以终止
 rejected_hard: 明确不是目标实例，后续跳过该实例
 rejected_soft: 证据不足或暂时不满足，允许后续新证据再评估
-needs_better_view: 触发 STRIVE 现有视角优化复核
+needs_better_view: 触发 VLN 现有视角优化复核
 ```
 
 mapper 在候选选择阶段只跳过 `rejected_hard` 实例，不屏蔽同类其它实例。
@@ -651,7 +651,7 @@ view sufficiency。这样不会因为靠近后实例重分割而丢掉 51 步已
 
 在 benchmark object-goal 或 instruction plan 已安装时，Habitat `STOP` 只能由
 `FinalInstructionVerifier` 的 `decision=accept` 触发。legacy `final_check()` 的几何
-ray/voxel 可见性只服务于无 plan 的原始 STRIVE 路径；在统一 verifier 路径中，几何事实
+ray/voxel 可见性只服务于无 plan 的原始 VLN 路径；在统一 verifier 路径中，几何事实
 会进入 evidence，但不能单独结束 episode。若 verifier 返回 `need_better_view`、
 `uncertain` 或 `reject_candidate`，agent 会发出非 STOP 动作继续收集证据或恢复搜索。
 
@@ -716,7 +716,7 @@ book 不满足关系”导致所有 book 被屏蔽。
 ```bash
 export STRIVE_FINAL_VERIFIER=auto  # 默认：调用侧传入 plan 时启用 verifier
 export STRIVE_FINAL_VERIFIER=1     # 强制开启，要求调用侧传入 instruction plan
-export STRIVE_FINAL_VERIFIER=0     # 关闭后保持旧 STRIVE 行为
+export STRIVE_FINAL_VERIFIER=0     # 关闭后保持旧 VLN 行为
 export STRIVE_FINAL_STOP_DISTANCE_SCALE=1.0  # final-stop 距离门槛相对 success_distance 的倍率
 ```
 

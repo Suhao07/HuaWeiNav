@@ -1,4 +1,4 @@
-"""Frontier exploration policies for STRIVE navigation.
+"""Frontier exploration policies for VLN navigation.
 
 These helpers choose the next viewpoint node from the mapper graph. They do not
 perform perception, room segmentation, target verification, or Habitat actions.

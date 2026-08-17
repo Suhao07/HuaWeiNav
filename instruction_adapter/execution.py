@@ -70,7 +70,7 @@ class InstructionExecutionState:
     """State machine for executable instruction plans.
 
     Phase2 的 count / any-success / sequence 都在这里完成；普通 benchmark
-    不创建这个状态，因此不会改变原始 STRIVE 行为。
+    不创建这个状态，因此不会改变原始 VLN 行为。
     """
 
     def __init__(self, plan: InstructionPlan | None = None):

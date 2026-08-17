@@ -1867,7 +1867,7 @@ class HM3D_Objnav_Agent:
             self.found_goal = True
             return None
         # 任何复核失败都必须退出“已找到目标”状态。
-        # 否则 STRIVE 的 stop 分支会在后续 step 继续围绕同一候选触发，
+        # 否则 VLN 的 stop 分支会在后续 step 继续围绕同一候选触发，
         # 即使 final verifier 已经把该实例 hard-reject。
         if getattr(self.object_final, "_instruction_reference_role", "") == "anchor":
             self.mapper.anchor_search_ledger.mark(
