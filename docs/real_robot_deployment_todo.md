@@ -123,7 +123,7 @@ status adapter。
 - [ ] 在 Orin 工作区拉取共同基线，记录完整 commit，而不是只记录短哈希。
 - [x] 重建 `huawei-vln-realworld:orin-r36.5`；机器人 image ID 为 `5939ff884aa2`，7 个 ROS 包编译成功。
 - [x] 重新执行 D435i profile `check`、detector/GPU smoke、USB 相机只读 smoke 和 runtime WAIT smoke；结果写入当日终端/运行目录证据。
-- [ ] 运行至少 30 分钟资源监控，记录温度、CPU/GPU、内存、检测频率、点云频率和对象节点频率。
+- [x] 运行至少 30 分钟资源监控；`/aft_mapped_to_init` 约 100 Hz，`/cloud_registered_body` 无实际样本，Point-LIO 约 35% CPU，末段温度约 60--66°C、内存约 5.5 GB。原始产物保留在 `logs/diagnostics/resources/20260821T133641Z/`。
 
 验收出口：代码、镜像、模型和运行日志能对应到同一个 deployment manifest，且不会启动
 waypoint adapter 输出或任何真实运动节点。

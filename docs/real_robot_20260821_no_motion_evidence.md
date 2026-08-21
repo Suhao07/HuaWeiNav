@@ -17,6 +17,7 @@
 | Runtime | generic 与 D435i `runtime-smoke` | dry-run `WAIT`，缺少 `object_nodes`、pose、image |
 | Adapter | `run_real_robot_waypoint_adapter.sh`，15 s | `output_enabled=False`；没有控制 topic publisher |
 | Offline acceptance | `check_real_robot_acceptance.sh` | `113 passed` |
+| 30 min resource soak | `logs/diagnostics/resources/20260821T133641Z/` | `/aft_mapped_to_init` 约 100 Hz；`/cloud_registered_body` 无实际样本；Point-LIO 约 35% CPU；末段温度约 60--66°C、内存约 5.5 GB |
 
 ## LIO 诊断
 
@@ -51,7 +52,7 @@ RESOURCE_MONITOR_DURATION_S=1800 \
 输出目录：`logs/diagnostics/resources/20260821T133641Z/`
 
 该目录包含 `tegrastats.log`、`process.log`、`cloud_hz.log`、`odom_hz.log`、
-`core_pattern.txt` 和 `run.info`。最终结果应在监控进程退出后再判定。
+`core_pattern.txt` 和 `run.info`；监控进程已正常退出。
 
 ## 安全结论
 
