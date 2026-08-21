@@ -549,6 +549,8 @@ episode-*/prior_map/
 实物机器人模式的输入输出、数据流、控制流和可插拔接口见
 [docs/real_robot_framework.md](docs/real_robot_framework.md)。独立 LVLM 推理服务器
 及 VLN 客户端配置见 [docs/lvlm_server_deployment.md](docs/lvlm_server_deployment.md)。
+当前完成边界和现场执行顺序见
+[docs/real_robot_deployment_todo.md](docs/real_robot_deployment_todo.md)。
 
 常用入口：
 

@@ -7,6 +7,7 @@
 完整的数据流、控制流和平台适配边界见：
 
 - [`docs/real_robot_framework.md`](../../docs/real_robot_framework.md)
+- [`docs/real_robot_deployment_todo.md`](../../docs/real_robot_deployment_todo.md)
 - [`docs/lvlm_server_deployment.md`](../../docs/lvlm_server_deployment.md)
 
 实物模式采用单一 ROS2 运行环境和远程 LVLM 服务：
@@ -34,6 +35,11 @@ src/semantic_mapping/
   迁移的 SysNav detector_node 和 semantic_mapping_node。
   detector_node 订阅 RGB，发布 /detection_result；
   semantic_mapping_node 融合检测、点云和位姿，发布 /object_nodes_list。
+
+正式 instruction runtime 不使用对象中心或房间质心直接运动。SysNav 需要额外提供带
+pose 的 viewpoint 记录；VLN 通过 `SysNavGoalResolver` 消费这些记录。当前消息包中的
+`ObjectNode` 只包含最新 `viewpoint_id`，没有完整的 viewpoint pose 列表，因此在该
+数据尚未接通前，语义模式会返回 `WAIT`，而不是猜测一个 waypoint。
 
 src/strive_sysnav_bringup/
   VLN 实物模式 launch 和高层 runtime 节点。
@@ -141,6 +147,16 @@ VLN runtime 主要消费：
 当前迁移的 `semantic_mapping_node` 主要发布 `/object_nodes_list`；`/room_nodes_list`
 是 runtime adapter 支持的可选输入，不能假定每个 SysNav 版本都会发布。
 
+若指令包含 target 与 anchor，SysNav provider 使用两者的共视 viewpoint：
+
+```text
+V_target ∩ V_anchor -> SysNav selected viewpoint pose -> MotionGoal
+```
+
+Python runtime 不重新实现 SysNav 的可见性、碰撞、路径代价或 viewpoint 排序；这些
+能力必须由下层 viewpoint manager 提供。ROS bridge 后续只需补齐稳定 viewpoint UID、
+pose、可见对象列表和选择结果，不需要新增类别规则。
+
 ## 5. 启动感知建图
 
 ### 5.1 使用已存在的相机和定位节点
@@ -208,7 +224,7 @@ topic 名称必须以机器人 profile 和 launch 参数为准。启动前应使
 
 高层节点是 `strive_instruction_runtime`。它订阅 SysNav object/room snapshot、RGB、
 位姿和运动反馈，调用现有 instruction/concept/verifier 模块，输出
-`NavigationIntent -> MotionGoal`。
+`NavigationIntent -> SysNavGoalResolver -> MotionGoal`。
 
 ### 6.1 安全 WAIT smoke
 
@@ -252,7 +268,8 @@ bash scripts/run_real_robot_instruction_runtime.sh \
 
 该模式将输入编译为 `InstructionPlan`，通过
 `SemanticMapSnapshotIntentAdapter` 输出高层意图，但 dry-run 不会把目标发送到真实
-`/way_point`。
+`/way_point`。如果 snapshot 没有 SysNav viewpoint pose，runtime 会记录
+`viewpoint_provider_unavailable` 并保持 WAIT；dry-run 不会用对象中心替代 viewpoint。
 
 需要远程 LVLM 时，将 `instruction_plan_backend` 改为 `llm`，并按
 [`docs/lvlm_server_deployment.md`](../../docs/lvlm_server_deployment.md) 配置商业 API
@@ -285,6 +302,9 @@ REACHED
   -> final verifier
   -> accept 才能产生 stop intent
 ```
+
+`REACHED` 后如果最新 RGB、pose 或 detection 仍早于到达时间戳，runtime 进入
+`VERIFYING`，继续等待同一 goal 的新鲜证据，不重发 waypoint，也不调用高层策略。
 
 ### 6.4 测试 waypoint
 
@@ -399,6 +419,29 @@ ros2 launch strive_sysnav_motion sysnav_motion_server.launch.py \
 同一运行图中只能有一个 `/way_point` owner。Action server 返回的 `REACHED`、
 `BLOCKED`、`TIMEOUT`、`PREEMPTED`、`SAFETY_STOP`、人工接管和定位丢失，只描述运动
 尝试结果，不表示自然语言任务成功。
+
+### 8.3 外部机器人 waypoint adapter
+
+Orin-26 上观察到的外部控制器使用 `/waypoint` 的
+`std_msgs/Float32MultiArray`，与 VLN 的 world-frame `/way_point`
+`geometry_msgs/PointStamped` 不同。当前 adapter 只完成影子 topic 验证：
+
+```text
+/way_point
+  -> strive_waypoint_adapter
+  -> /strive/test_waypoint_array
+```
+
+配置入口为 `real_robot/control/waypoint_adapter_template.yaml`。输出默认关闭：
+
+```bash
+WAYPOINT_ADAPTER_CONFIG=/workspace/STRIVE/real_robot/control/<robot>_waypoint_adapter.yaml \
+  bash scripts/run_real_robot_waypoint_adapter.sh
+```
+
+只有外部控制器所有者确认 frame、数组语义、反馈、watchdog 和急停合同后，才允许把输出
+topic 改为真实 `/waypoint`。adapter 只做时间、frame 和格式转换，不发布 `/cmd_vel`。
+它与 SysNav 原生 `pathFollower` 是互斥下层路径，不能同时取得速度控制权。
 
 ## 9. 安全开关
 

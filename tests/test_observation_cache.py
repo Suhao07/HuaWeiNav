@@ -1,12 +1,14 @@
 from types import SimpleNamespace
 
 from real_robot.contracts import (
+    CameraFrame,
     CameraModel,
     DetectionFrame,
     NavigationStatus,
     NavigationStatusCode,
     ObjectNodeSnapshot,
     Pose3D,
+    RealObservation,
     SemanticMapSnapshot,
     ViewpointGoal,
 )
@@ -149,6 +151,57 @@ def test_object_crop_evidence_provider_supports_full_image_mode() -> None:
     assert evidence.bbox_xyxy is None
     assert evidence.camera_model == CameraModel.PINHOLE
     assert evidence.quality["evidence_mode"] == "full_image"
+
+
+def test_post_reach_evidence_does_not_mix_new_rgb_with_stale_object_bbox() -> None:
+    observation = RealObservation(
+        timestamp=3.0,
+        robot_pose=Pose3D(position=(1.0, 0.0, 0.0), stamp=3.0),
+        camera_frames=(
+            CameraFrame(
+                image_ref="ros:///camera/image/image/3.000000000",
+                camera_model=CameraModel.PINHOLE,
+            ),
+        ),
+    )
+    stale_detection = DetectionFrame(
+        timestamp=2.0,
+        image_ref="ros:///camera/image/image/2.000000000",
+        boxes_xyxy=((10.0, 10.0, 80.0, 80.0),),
+        labels=("book",),
+        confidences=(0.9,),
+        track_ids=("7",),
+    )
+    snapshot = SemanticMapSnapshot(
+        timestamp=2.0,
+        robot_pose=observation.robot_pose,
+        objects=(
+            ObjectNodeSnapshot(
+                uid="sysnav_object:7",
+                label="book",
+                bbox2d_xyxy=(100.0, 100.0, 200.0, 200.0),
+                track_ids=("7",),
+            ),
+        ),
+    )
+    provider = ObjectCropEvidenceProvider(
+        observation_provider=lambda: observation,
+        observation_after_provider=lambda _: observation,
+        object_provider=lambda: snapshot,
+        detection_provider=lambda: stale_detection,
+        detection_after_provider=lambda _: stale_detection,
+        mode="bbox_crop",
+    )
+
+    evidence = provider.capture_after(
+        ViewpointGoal(pose=observation.robot_pose, target_object_uid="sysnav_object:7"),
+        NavigationStatus(NavigationStatusCode.REACHED, stamp=2.5),
+    )
+
+    assert evidence is not None
+    assert evidence.image_ref == observation.primary_camera().image_ref
+    assert evidence.bbox_xyxy is None
+    assert evidence.verifier_payload["bbox_source"] is None
 
 
 class _FakeController:

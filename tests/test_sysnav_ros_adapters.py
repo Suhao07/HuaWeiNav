@@ -202,7 +202,7 @@ def test_build_semantic_map_snapshot_uses_sysnav_object_and_room_lists(tmp_path)
     assert snapshot.source == "sysnav_ros"
     assert snapshot.object_by_uid("sysnav_object:1").label == "chair"
     assert snapshot.room_by_uid("sysnav_room:9").centroid == (5.0, 0.0, 0.0)
-    assert snapshot.frontiers[0].room_id == "sysnav_room:9"
+    assert snapshot.frontiers == ()
     assert snapshot.metadata["detector_vocabulary"]["detector_name"] == "sysnav_test_detector"
 
 

@@ -281,6 +281,33 @@ class RosObservationCache:
             },
         )
 
+    def latest_observation_after(self, timestamp: float) -> Optional[RealObservation]:
+        """Return the latest observation whose RGB and pose follow ``timestamp``.
+
+        Args:
+            timestamp: Motion terminal timestamp used as the evidence barrier.
+
+        Returns:
+            A post-motion observation, or ``None`` until both RGB and pose are
+            newer than the barrier.
+        """
+
+        if self.latest_rgb is None or self.latest_pose is None:
+            return None
+        if self.latest_rgb.timestamp <= float(timestamp):
+            return None
+        if self.latest_pose.stamp is not None and self.latest_pose.stamp <= float(timestamp):
+            return None
+        return self.latest_observation()
+
+    def latest_detection_after(self, timestamp: float) -> Optional[DetectionFrame]:
+        """Return a detection frame newer than a motion terminal timestamp."""
+
+        frame = self.latest_detection_frame
+        if frame is None or frame.timestamp <= float(timestamp):
+            return None
+        return frame
+
     def _cache_image(self, msg: Any, topic: str, prefix: str) -> _CachedImageRecord:
         """Create a lightweight image record from a ROS-like image message."""
 
@@ -354,6 +381,8 @@ class ObjectCropEvidenceProvider:
         observation_provider: Callable[[], Optional[RealObservation]],
         object_provider: Callable[[], Optional[Any]],
         detection_provider: Optional[Callable[[], Optional[DetectionFrame]]] = None,
+        observation_after_provider: Optional[Callable[[float], Optional[RealObservation]]] = None,
+        detection_after_provider: Optional[Callable[[float], Optional[DetectionFrame]]] = None,
         mode: str = "auto",
         default_camera_model: CameraModel = CameraModel.UNKNOWN,
         now_fn: Callable[[], float] = time.time,
@@ -365,6 +394,8 @@ class ObjectCropEvidenceProvider:
             object_provider: Callable returning a `SemanticMapSnapshot`, object
                 iterable, or None.
             detection_provider: Callable returning the latest detection frame.
+            observation_after_provider: Optional post-motion observation lookup.
+            detection_after_provider: Optional post-motion detection lookup.
             mode: `auto`, `full_image`, or `bbox_crop`.
             default_camera_model: Camera model used when no camera frame exists.
             now_fn: Time source used if observation/status stamps are missing.
@@ -376,23 +407,69 @@ class ObjectCropEvidenceProvider:
         self.observation_provider = observation_provider
         self.object_provider = object_provider
         self.detection_provider = detection_provider
+        self.observation_after_provider = observation_after_provider
+        self.detection_after_provider = detection_after_provider
         self.mode = normalized
         self.default_camera_model = default_camera_model
         self.now_fn = now_fn
 
     def capture(self, goal: ViewpointGoal, status: NavigationStatus) -> ViewEvidence:
-        """Capture evidence for a reached viewpoint goal."""
+        """Capture the latest available evidence for a reached viewpoint goal."""
 
-        # 这里假设 caller 已确认 REACHED；provider 只负责把最新观测包装成 verifier evidence。
-        observation = self.observation_provider()
+        return self._capture(
+            goal,
+            status,
+            self.observation_provider(),
+            self.detection_provider() if self.detection_provider else None,
+            allow_object_bbox=True,
+        )
+
+    def capture_after(self, goal: ViewpointGoal, status: NavigationStatus) -> Optional[ViewEvidence]:
+        """Capture evidence only after the lower layer reports a timestamp."""
+
+        if status.stamp is None:
+            return self.capture(goal, status)
+        observation = (
+            self.observation_after_provider(float(status.stamp))
+            if self.observation_after_provider is not None
+            else self.observation_provider()
+        )
+        if observation is None or float(observation.timestamp) <= float(status.stamp):
+            return None
+        detection = (
+            self.detection_after_provider(float(status.stamp))
+            if self.detection_after_provider is not None
+            else self.detection_provider() if self.detection_provider is not None else None
+        )
+        if detection is not None and detection.timestamp <= float(status.stamp):
+            detection = None
+        # 中文核心边界：带 REACHED 时间屏障时，mapper 的历史 bbox 不能和新 RGB 混用；
+        # 没有同步 detection 就只提交当前整帧和对象 UID，让 verifier 自己判断证据是否足够。
+        allow_object_bbox = self.detection_provider is None and self.detection_after_provider is None
+        return self._capture(
+            goal,
+            status,
+            observation,
+            detection,
+            allow_object_bbox=allow_object_bbox,
+        )
+
+    def _capture(
+        self,
+        goal: ViewpointGoal,
+        status: NavigationStatus,
+        observation: Optional[RealObservation],
+        detection: Optional[DetectionFrame],
+        allow_object_bbox: bool,
+    ) -> ViewEvidence:
+        """Build evidence from the supplied observation transaction."""
+
         camera = observation.primary_camera() if observation is not None else None
         objects = _objects_from_provider(self.object_provider())
         target_uid = goal.target_object_uid or goal.anchor_object_uid
         # target uid 可以来自 terminal target，也可以来自 anchor-first 的 anchor 视点。
         target_object = _find_object(objects, target_uid)
-        detection = self.detection_provider() if self.detection_provider is not None else None
-
-        bbox, bbox_source = _select_bbox(target_object, detection)
+        bbox, bbox_source = _select_bbox(target_object, detection, allow_object_bbox=allow_object_bbox)
         image_ref, image_source = _select_image_ref(self.mode, camera, target_object, bbox)
         quality = _evidence_quality(
             bbox=bbox,
@@ -456,16 +533,16 @@ def _find_object(objects: Iterable[ObjectNodeSnapshot], uid: Optional[str]) -> O
 def _select_bbox(
     target_object: Optional[ObjectNodeSnapshot],
     detection: Optional[DetectionFrame],
+    *,
+    allow_object_bbox: bool = True,
 ) -> Tuple[Optional[BBox2D], Optional[str]]:
-    """Return the best bbox and its source."""
+    """Return the best bbox and its source.
+
+    Current detector evidence is preferred when available. Historical object
+    bboxes are used only when the caller explicitly permits them.
+    """
 
     if target_object is not None:
-        if target_object.bbox2d_xyxy is not None:
-            # object node 自带 bbox 时优先使用，因为它和 mapper uid 绑定最强。
-            return target_object.bbox2d_xyxy, "object_node"
-        metadata_bbox = target_object.metadata.get("bbox2d_xyxy") if isinstance(target_object.metadata, dict) else None
-        if metadata_bbox is not None:
-            return _bbox_tuple(metadata_bbox), "object_metadata"
         track_ids = set(str(track_id) for track_id in target_object.track_ids)
         if detection is not None and track_ids and detection.track_ids:
             for idx, track_id in enumerate(detection.track_ids):
@@ -477,6 +554,14 @@ def _select_bbox(
                 if label == target_object.label and idx < len(detection.boxes_xyxy):
                     # label fallback 只用于弱证据；多个同类物体时需要 verifier 再判断。
                     return detection.boxes_xyxy[idx], "detection_label"
+        if not allow_object_bbox:
+            return None, None
+        if target_object.bbox2d_xyxy is not None:
+            # object node 自带 bbox 时优先使用，因为它和 mapper uid 绑定最强。
+            return target_object.bbox2d_xyxy, "object_node"
+        metadata_bbox = target_object.metadata.get("bbox2d_xyxy") if isinstance(target_object.metadata, dict) else None
+        if metadata_bbox is not None:
+            return _bbox_tuple(metadata_bbox), "object_metadata"
     return None, None
 
 
@@ -488,11 +573,9 @@ def _select_image_ref(
 ) -> Tuple[Optional[str], str]:
     """Return image reference and source label for the evidence mode."""
 
-    if mode in {"auto", "bbox_crop"} and target_object is not None and target_object.image_ref:
-        # object image_ref 通常是对象裁剪或标注图，优先给 verifier 看目标局部。
-        return target_object.image_ref, "object_image_ref"
     if camera is not None:
-        # 没有对象图像时退回当前整帧 RGB，避免伪造 crop。
+        # 中文核心边界：运动完成后的当前 RGB 是主证据，mapper 历史 crop 只能
+        # 作为 reference，不能覆盖当前视角。
         return camera.image_ref, "camera_frame"
     if target_object is not None and target_object.image_ref:
         return target_object.image_ref, "object_image_ref"

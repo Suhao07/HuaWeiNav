@@ -12,12 +12,11 @@ import math
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Iterable, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Optional, Sequence, Tuple
 
 from real_robot.contracts import (
     BBox2D,
     DetectionFrame,
-    FrontierSnapshot,
     MotionGoal,
     MotionGoalMode,
     MotionReasonCode,
@@ -1083,7 +1082,8 @@ def build_semantic_map_snapshot(
         robot_pose=robot_pose,
         objects=objects,
         rooms=rooms,
-        frontiers=_frontiers_from_rooms(rooms),
+        # 房间语义不是可执行 frontier；真实 frontier 必须来自 SysNav planner。
+        frontiers=(),
         source="sysnav_ros",
         metadata={
             "object_count": len(objects),
@@ -1092,25 +1092,6 @@ def build_semantic_map_snapshot(
             "detector_vocabulary": vocabulary_context(getattr(object_adapter, "detector_vocabulary", None)),
         },
     )
-
-
-def _frontiers_from_rooms(rooms: Iterable[RoomSnapshot]) -> Tuple[FrontierSnapshot, ...]:
-    """Expose room centroids as coarse exploration references for the first bridge."""
-
-    frontiers = []
-    for room in rooms:
-        if room.centroid is None:
-            continue
-        # 第一版只把 room centroid 暴露为粗粒度参考点；真正 frontier 仍来自 SysNav planner。
-        frontiers.append(
-            FrontierSnapshot(
-                uid=f"{room.uid}:centroid",
-                position=room.centroid,
-                room_id=room.uid,
-                metadata={"source": "sysnav_room_centroid"},
-            )
-        )
-    return tuple(frontiers)
 
 
 def _boxes_from_parallel_arrays(

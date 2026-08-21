@@ -16,9 +16,11 @@ from real_robot.contracts import (
     Pose3D,
     RuntimeDecision,
     ViewpointGoal,
+    ViewpointSnapshot,
 )
 from real_robot.observation_cache import ObjectCropEvidenceProvider, RosObservationCache
 from real_robot.sysnav_ros_adapters import RosNavigationStatusProvider, RosWaypointController
+from real_robot.sysnav_goal_resolver import SysNavGoalResolver
 from real_robot.sysnav_runtime import (
     DryRunMotionController,
     RuntimeDecisionJsonlWriter,
@@ -202,10 +204,10 @@ def test_acceptance_dry_run_generates_navigation_intent_without_waypoint_publish
 
     decision = runtime.step("find a book")
 
-    assert decision.intent.mode == MotionGoalMode.GO_TO_OBJECT
-    assert decision.motion_goal.target_object_uid == "sysnav_object:11"
-    assert decision.navigation_status.metadata["dry_run"] is True
-    assert controller.goals == [decision.motion_goal]
+    assert decision.intent.mode == MotionGoalMode.WAIT
+    assert decision.reason == "no SysNav executable viewpoint available"
+    assert decision.lower_planner_state["viewpoint_provider_unavailable"] is True
+    assert controller.goals == []
 
 
 def test_acceptance_waypoint_smoke_reports_running_then_reached() -> None:
@@ -337,6 +339,7 @@ def test_acceptance_end_to_end_snapshot_to_waypoint_to_final_verifier() -> None:
             sleep_fn=lambda _: None,
         ),
         now_fn=lambda: 12.0,
+        goal_resolver=SysNavGoalResolver(_FixedViewpointProvider()),
     )
 
     first = runtime.step("find a book")
@@ -350,3 +353,19 @@ def test_acceptance_end_to_end_snapshot_to_waypoint_to_final_verifier() -> None:
     assert second.accepted_candidate_uid
     assert second.metadata["viewpoint_result"]["evidence"]["verifier_payload"]["target_object_uid"] == "sysnav_object:11"
     assert len(controller.goals) == 1
+
+
+class _FixedViewpointProvider:
+    """Small in-memory SysNav provider for the offline end-to-end smoke."""
+
+    def select_viewpoint(self, intent, snapshot, excluded_viewpoint_ids):
+        """Return one executable pose without deriving it from an object."""
+
+        del snapshot
+        if "sysnav_viewpoint:5" in excluded_viewpoint_ids:
+            return None
+        return ViewpointSnapshot(
+            uid="sysnav_viewpoint:5",
+            pose=Pose3D(position=(1.0, 2.0, 0.0), frame_id="map"),
+            visible_objects=(intent.target_object_uid or "",),
+        )

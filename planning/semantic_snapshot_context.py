@@ -349,10 +349,15 @@ class SnapshotTargetSelection:
 
     @property
     def selected_pose(self) -> Optional[Pose3D]:
-        """Return selected object pose in the snapshot frame.
+        """Return the observed object pose for diagnostics, never as a waypoint.
 
         Returns:
-            Pose for the selected object, or None when no object was selected.
+            Observed object pose, or None when the selection has no geometry.
+
+        Note:
+            The runtime must pass semantic intents through a SysNav viewpoint
+            resolver before motion. This property is retained for map/debug
+            consumers and is intentionally ignored by ``to_navigation_intent``.
         """
 
         obj = self.result.obj
@@ -401,8 +406,9 @@ class SnapshotTargetSelection:
         anchor semantics already came from `select_target_candidate()`.
 
         Returns:
-            `NavigationIntent` for the selected target/anchor, or WAIT when no
-            executable pose is available.
+        `NavigationIntent` for the selected target/anchor. The intent carries
+        semantic identity only; a SysNav viewpoint resolver supplies motion
+        geometry later.
         """
 
         if not self.result.found or self.result.obj is None:
@@ -411,18 +417,12 @@ class SnapshotTargetSelection:
                 reason=self.result.answer or "no instruction target candidate selected",
                 metadata=_selection_metadata(self, candidate=None),
             )
-        pose = self.selected_pose
-        if pose is None:
-            return NavigationIntent(
-                mode=MotionGoalMode.WAIT,
-                reason="selected semantic object has no executable pose",
-                metadata=_selection_metadata(self, candidate=None),
-            )
         candidate = self.candidate_instance
         mode = MotionGoalMode.GO_TO_ANCHOR if self.is_anchor_reference else MotionGoalMode.GO_TO_OBJECT
+        # 中文核心边界：这里输出语义身份，不把对象中心伪装成机器人 waypoint。
+        # 可执行位姿必须由 SysNav viewpoint resolver 提供。
         return NavigationIntent(
             mode=mode,
-            goal_pose=pose,
             target_object_uid=None if self.is_anchor_reference else self.selected_snapshot_uid,
             anchor_object_uid=self.selected_snapshot_uid if self.is_anchor_reference else None,
             reason=self.result.answer or f"selected {self.selected_snapshot_uid}",
@@ -667,14 +667,9 @@ def _prior_high_level_room_intent(
     if not selected_uid:
         return None
     room = snapshot.room_by_uid(selected_uid)
-    if room is not None and room.centroid is not None:
+    if room is not None:
         return NavigationIntent(
             mode=MotionGoalMode.GO_TO_FRONTIER,
-            goal_pose=Pose3D(
-                position=tuple(float(value) for value in room.centroid),
-                frame_id=snapshot.robot_pose.frame_id,
-                stamp=snapshot.timestamp,
-            ),
             reason="prior-map high-level room selection",
             metadata={
                 "policy": "prior_map_high_level_selection",
@@ -690,11 +685,6 @@ def _prior_high_level_room_intent(
     # 用先验图或 LVLM 输出的 UID 合成新的运动位姿。
     return NavigationIntent(
         mode=MotionGoalMode.GO_TO_FRONTIER,
-        goal_pose=Pose3D(
-            position=tuple(float(value) for value in frontier.position),
-            frame_id=snapshot.robot_pose.frame_id,
-            stamp=snapshot.timestamp,
-        ),
         reason="prior-map high-level frontier selection",
         metadata={
             "policy": "prior_map_high_level_selection",

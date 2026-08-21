@@ -157,7 +157,7 @@ def test_snapshot_intent_adapter_returns_target_navigation_intent() -> None:
 
     assert intent.mode == MotionGoalMode.GO_TO_OBJECT
     assert intent.target_object_uid == "book-1"
-    assert intent.goal_pose.position == (1.0, 2.0, 0.0)
+    assert intent.goal_pose is None
     assert intent.metadata["candidate_instance"].detector_label == "book"
 
 

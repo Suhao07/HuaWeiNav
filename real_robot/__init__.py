@@ -42,6 +42,13 @@ from real_robot.observation_cache import (
     ObjectCropEvidenceProvider,
     RosObservationCache,
 )
+from real_robot.sysnav_goal_resolver import (
+    GoalResolver,
+    PreResolvedGoalResolver,
+    SnapshotViewpointProvider,
+    SysNavGoalResolver,
+    ViewpointProvider,
+)
 from real_robot.sysnav_ros_adapters import (
     RosDetectionResultAdapter,
     RosNavigationStatusProvider,
@@ -105,6 +112,11 @@ __all__ = [
     "vocabulary_context",
     "ObjectCropEvidenceProvider",
     "RosObservationCache",
+    "GoalResolver",
+    "PreResolvedGoalResolver",
+    "SnapshotViewpointProvider",
+    "SysNavGoalResolver",
+    "ViewpointProvider",
     "RosDetectionResultAdapter",
     "RosNavigationStatusProvider",
     "RosObjectNodeAdapter",

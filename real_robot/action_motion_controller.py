@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+import time
 import uuid
 from typing import Any, Dict, Optional
 
@@ -44,6 +45,15 @@ class RosActionMotionController:
         self.server_wait_timeout_s = max(0.0, float(server_wait_timeout_s))
         self._lock = threading.RLock()
         self._records: Dict[str, Dict[str, Any]] = {}
+
+    def _now_seconds(self) -> float:
+        """Return the node clock time used to order motion and sensor events."""
+
+        clock = getattr(self.node, "get_clock", None)
+        if callable(clock):
+            now = clock().now()
+            return float(now.nanoseconds) / 1e9
+        return time.time()
 
     def send_goal(self, goal: MotionGoal) -> str:
         """Submit a goal asynchronously and return a local tracking id."""
@@ -151,6 +161,7 @@ class RosActionMotionController:
                 path_length_remaining=float(getattr(feedback, "path_length_remaining_m", 0.0)),
                 progress=float(getattr(feedback, "progress", 0.0)),
                 message="motion action feedback",
+                stamp=self._now_seconds(),
                 safety_state=str(getattr(feedback, "safety_state", "unknown")),
                 reason_code=reason,
                 metadata={
@@ -193,6 +204,7 @@ class RosActionMotionController:
                 status,
                 goal_id=goal_id,
                 current_pose=pose,
+                stamp=self._now_seconds(),
                 message=str(result.message),
                 reason_code=reason,
                 metadata={
