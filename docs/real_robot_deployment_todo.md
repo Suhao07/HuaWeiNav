@@ -1,7 +1,7 @@
 # VLN 实物部署状态与 TODO
 
 > 更新日期：2026-08-21
-> 代码基线：本地 `main` 已合并 `realworld` 的最新代码，当前为 `main=4e721b4`，`realworld=915586f`
+> 代码基线：本地 `main`/`realworld` 均为 `00c376a75f05e29b8d8a0b36a97857d53f270163`；机器人文件内容按该提交同步。机器人 Git HEAD 仍为 `7fdf2c8`，因为原工作区未提交改动已保留。
 > 目标平台：Orin-26、Intel RealSense D435i、Livox MID-360
 > 当前安全状态：感知与影子控制验证；真实运动未批准
 
@@ -110,7 +110,7 @@ status adapter。
 
 ### P0：统一代码与部署基线
 
-- [x] `main` 已合并 `realworld` 最新修改，当前本地基线为 `4e721b4`；`realworld` 分支基线为 `915586f`。
+- [x] `main` 已合并 `realworld` 最新修改，当前本地 `main`/`realworld` 基线为 `00c376a75f05e29b8d8a0b36a97857d53f270163`；机器人文件内容按该提交同步。
 - [x] 实物离线 acceptance 覆盖 contract、runtime、motion safety、SysNav adapter 和 viewpoint bridge，当前结果为 `113 passed`。
 - [x] waypoint adapter 的 Python、ROS node、launch 和单元测试进入仓库。
 - [x] 语义 runtime 已停止对象中心/房间质心执行回退；无可执行 SysNav viewpoint 时保持 `WAIT`。
@@ -121,12 +121,22 @@ status adapter。
 - [x] 在 ROS2 容器中完成 viewpoint bridge topic smoke 和 synthetic CDR rosbag2 replay；两者均验证精确时间戳、frame、pose 和 object ID。
 - [x] 在 ROS2 容器中完成现有 Motion HIL `reached` 场景；该测试不接管真实底盘。
 - [ ] 在 Orin 工作区拉取共同基线，记录完整 commit，而不是只记录短哈希。
-- [ ] 重建 `huawei-vln-realworld:orin-r36.5`，记录 image ID、基础镜像、资产 SHA256 和构建日志。
-- [ ] 重新执行 D435i profile `check`、detector smoke 和 runtime WAIT smoke，产物写入新的 run 目录。
+- [x] 重建 `huawei-vln-realworld:orin-r36.5`；机器人 image ID 为 `5939ff884aa2`，7 个 ROS 包编译成功。
+- [x] 重新执行 D435i profile `check`、detector/GPU smoke、USB 相机只读 smoke 和 runtime WAIT smoke；结果写入当日终端/运行目录证据。
 - [ ] 运行至少 30 分钟资源监控，记录温度、CPU/GPU、内存、检测频率、点云频率和对象节点频率。
 
 验收出口：代码、镜像、模型和运行日志能对应到同一个 deployment manifest，且不会启动
 waypoint adapter 输出或任何真实运动节点。
+
+### 2026-08-21 无运动实物执行记录
+
+- Profile check：`orin26_livox_mid360_generic_rgb` 与 `orin26_livox_mid360_d435i` 均通过；两者均保持 `START_SEMANTIC_MAPPING=false`、`dry_run=true`、真实运动关闭。
+- 镜像与软件：`huawei-vln-realworld:orin-r36.5`=`5939ff884aa2`；ROS workspace 7 包编译成功；离线 acceptance 为 `113 passed`。
+- GPU/模型 smoke：`torch cuda=True`，YOLOE detector init 成功；USB 相机只读 smoke 收到 `/camera/image` 和 `/camera_info`，分辨率 `1920x1080`、编码 `rgb8`、frame `default_cam`。
+- runtime shadow：D435i profile runtime smoke 和 live `semantic_snapshot` dry-run 均保持 `WAIT`，原因是实时 `object_nodes`、pose、image 尚未同时到达；未发布 `/way_point`、`/waypoint` 或 `/cmd_vel`。
+- waypoint adapter shadow：节点日志为 `output_enabled=False`；`/waypoint`、`/strive/test_waypoint_array`、`/way_point`、`/cmd_vel` 均未发现 publisher。
+- LIO 只读诊断：报告为 `logs/diagnostics/lio_dds_20260821T133422Z.md`；`/livox/lidar`、`/livox/imu`、`/cloud_registered`、`/aft_mapped_to_init` 均未收到实际 header。Point-LIO 参数显示 `publish.scan_publish_en=False`，因此 semantic mapping 继续关闭；未重启或修改外部 LIO。
+- 现场 bag 清单中暂未发现同时包含 `/viewpoint_rep_header` 与 `/object_nodes_list` 的 bag，因此 viewpoint replay 留待取得对应 bag 后执行。
 
 ### P1：完成 D435i--MID-360 标定
 

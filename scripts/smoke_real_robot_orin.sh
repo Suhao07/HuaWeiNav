@@ -483,7 +483,7 @@ setsid ros2 run usb_cam usb_cam_node_exe --ros-args \
 camera_pid=$!
 sleep 8
 echo "-- camera topics --"
-ros2 topic list | grep -E '^/camera/image$|^/camera_info$|^/camera/camera_info$' || true
+ros2 topic list | grep -E "^/camera/image$|^/camera_info$|^/camera/camera_info$" || true
 echo "-- image header --"
 timeout --kill-after=2s 4s ros2 topic echo --once /camera/image --field header || true
 echo "-- image dimensions/encoding --"
