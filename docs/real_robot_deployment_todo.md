@@ -46,7 +46,7 @@ VLN /way_point (PointStamped, world frame)
 | SysNav semantic mapping | 数据层影子验证 | 2026-08-19 实测对象节点约 0.5 Hz，坐标为米级，含 `chair`、`desk`、`cabinet` | 标定已批准、对象定位精度达标 |
 | LIO 输入 | 真机数据链已验证 | `/cloud_registered_body` 约 9.4--9.6 Hz，`/aft_mapped_to_init` 约 100 Hz | 长时定位无漂移 |
 | D435i--MID-360 标定 | 部分完成 | 内参、外参和历史 bag 已导入；已有只读评估脚本 | `calibration_status=calibrated` |
-| Instruction runtime | 软件闭环完成 | snapshot、active goal、REACHED 后取证和 verifier 生命周期有离线测试 | 已在 Orin 上运行真实自然语言任务 |
+| Instruction runtime | 软件闭环完成 | snapshot、SysNav viewpoint resolver、active goal、REACHED 后新鲜取证和 verifier 生命周期有离线测试 | 已在 Orin 上运行真实自然语言任务 |
 | 远程 LVLM | HTTP/schema 软件接口完成 | 商业 API、自部署 OpenAI-compatible 服务和 schema smoke 已实现 | 机器人网络上的 p95 延迟、超时恢复已验收 |
 | Waypoint adapter | 真机影子验证 | `PointStamped -> Float32MultiArray`、world-to-ego、过期丢弃在影子 topic 验证 | 外部 `/waypoint` 已接收或底盘已执行 |
 | SysNav 原生下层 | 代码迁移、离线/HIL 覆盖 | `localPlanner`、`pathFollower`、motion action、安全 mux 的软件链存在 | 它已成为 Orin 底盘的生产控制器 |
@@ -120,6 +120,7 @@ waypoint adapter 输出或任何真实运动节点。
 - [ ] 使用已批准标定从 profile 正常启动 semantic mapping，而不是绕过 profile 直接 launch。
 - [ ] 记录对象节点的位置误差、对象 UID 连续性、误检和重复簇；至少覆盖桌椅、柜体和小物体。
 - [ ] 在真实 `/object_nodes_list`、RGB 和 odom 上运行 `policy_mode=semantic_snapshot`、`dry_run=true`。
+- [ ] 接通带 pose 的 SysNav viewpoint provider；在此之前 semantic runtime 必须保持 WAIT，不能回退到对象中心或房间质心。
 - [ ] 验证远程 LVLM 的 instruction parse、concept grounding 和 final verifier，记录请求类型、p50/p95 延迟、超时和原始结构化响应。
 - [ ] 用模拟 `REACHED` 只验证证据闭环：目标 crop、原始指令、对象 UID 和 verifier 决策必须写入同一 run 目录。
 - [ ] 验证 LVLM 不可用、响应非法或超时时显式失败并保持 WAIT/HOLD；不得吞掉异常后继续发布目标。
@@ -153,6 +154,7 @@ waypoint adapter 输出或任何真实运动节点。
 
 - [ ] 先运行单目标显式指令，不启用 room prior 和复杂关系。
 - [ ] 验证 `MotionGoal` 到达后才采集 `ViewEvidence`；`REACHED` 不得直接等同于任务成功。
+- [ ] 验证 `REACHED` 后的 RGB、pose 和 detection 时间戳晚于到达事件；未满足时保持同一 goal 的 VERIFYING，不重发 waypoint。
 - [ ] 验证 final verifier 的 `accept / need_better_view / reject` 会产生对应的 STOP、视角调整或重新规划。
 - [ ] 再增加属性目标、anchor relation 和小目标搜索；每类至少保留成功和失败样例。
 - [ ] 最后接入实物语义先验地图，完成地图 frame alignment 后再启用 room-level guidance。

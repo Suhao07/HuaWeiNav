@@ -11,6 +11,7 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 "${PYTHON_BIN}" -m py_compile \
   real_robot/contracts.py \
   real_robot/sysnav_ros_adapters.py \
+  real_robot/sysnav_goal_resolver.py \
   real_robot/sysnav_runtime.py \
   real_robot/observation_cache.py \
   real_robot/waypoint_adapter.py \
@@ -32,6 +33,7 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 PYTHONPATH=. "${PYTHON_BIN}" -m pytest -q \
   tests/test_real_robot_acceptance.py \
   tests/test_sysnav_ros_adapters.py \
+  tests/test_sysnav_goal_resolver.py \
   tests/test_sysnav_runtime.py \
   tests/test_semantic_snapshot_context.py \
   tests/test_observation_cache.py \

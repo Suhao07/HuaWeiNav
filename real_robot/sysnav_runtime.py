@@ -36,6 +36,7 @@ from real_robot.sysnav_ros_adapters import (
     RosRoomNodeAdapter,
     build_semantic_map_snapshot,
 )
+from real_robot.sysnav_goal_resolver import GoalResolver, PreResolvedGoalResolver
 
 
 class MotionControllerProtocol(Protocol):
@@ -182,6 +183,35 @@ class RealInstructionRuntimeState:
     active_signature: Optional[tuple[Any, ...]] = None
     last_completed_signature: Optional[tuple[Any, ...]] = None
     last_terminal_status: Optional[NavigationStatus] = None
+    active_viewpoint_id: Optional[str] = None
+    pending_verification: Optional[ActiveGoalPoll] = None
+    attempted_viewpoint_ids: set[str] = field(default_factory=set)
+    attempt_context_signature: Optional[tuple[str, ...]] = None
+    halted_status: Optional[NavigationStatus] = None
+
+    def prepare_attempt_context(self, intent: NavigationIntent) -> None:
+        """Reset viewpoint attempts when the semantic candidate changes.
+
+        Args:
+            intent: New semantic intent produced by the VLN policy.
+        """
+
+        signature = (
+            str(intent.target_object_uid or ""),
+            str(intent.anchor_object_uid or ""),
+            str(intent.relation_edge_id or ""),
+            str(intent.metadata.get("candidate_uid", "") or ""),
+        )
+        if self.attempt_context_signature != signature:
+            self.attempt_context_signature = signature
+            self.attempted_viewpoint_ids.clear()
+
+    def record_viewpoint_attempt(self, motion_goal: MotionGoal) -> None:
+        """Record the resolved viewpoint used by one motion attempt."""
+
+        viewpoint_id = str(motion_goal.metadata.get("viewpoint_uid", "") or "").strip()
+        if viewpoint_id:
+            self.attempted_viewpoint_ids.add(viewpoint_id)
 
     def poll_active(self, motion_controller: MotionControllerProtocol) -> Optional[ActiveGoalPoll]:
         """Poll the active goal, if one exists.
@@ -229,6 +259,7 @@ class RealInstructionRuntimeState:
         self.active_motion_goal = motion_goal
         self.active_intent = intent
         self.active_signature = motion_goal_signature(motion_goal)
+        self.active_viewpoint_id = str(motion_goal.metadata.get("viewpoint_uid", "") or "") or None
 
     def should_suppress_completed(self, motion_goal: MotionGoal) -> bool:
         """Return whether a completed motion goal should not be re-dispatched.
@@ -252,6 +283,16 @@ class RealInstructionRuntimeState:
 
         self.last_completed_signature = None
         self.last_terminal_status = None
+
+    def hold(self, status: NavigationStatus) -> None:
+        """Persist a safety/manual/localization terminal state until reset."""
+
+        self.halted_status = status
+
+    def clear_halt(self) -> None:
+        """Clear a previously latched hold state."""
+
+        self.halted_status = None
 
 
 class DryRunMotionController:
@@ -520,7 +561,19 @@ class SysNavInstructionRuntime:
     now_fn: Callable[[], float] = time.time
     readiness_provider: Optional[Callable[[], RuntimeReadiness]] = None
     viewpoint_evidence_loop: Optional[Any] = None
+    goal_resolver: GoalResolver = field(default_factory=PreResolvedGoalResolver)
     state: RealInstructionRuntimeState = field(default_factory=RealInstructionRuntimeState)
+
+    def clear_hold(self) -> None:
+        """Resume high-level decisions after an external safety reset.
+
+        The runtime never clears HOLD from ordinary sensor updates. The safety
+        owner or an explicitly authorized operator must call this method after
+        the underlying stop condition has been resolved.
+        """
+
+        # 中文核心边界：安全恢复必须由安全所有者显式确认，VLN 不根据一帧正常观测自动复位。
+        self.state.clear_halt()
 
     def _verify_reached_goal(
         self,
@@ -536,6 +589,10 @@ class SysNavInstructionRuntime:
             active_goal.status,
             context=_verification_context_from_intent(active_goal.intent, active_goal.motion_goal),
         )
+        if bool((viewpoint_result.metadata or {}).get("evidence_pending")):
+            # 到达事件已经成立，但传感器尚未产生运动后的新证据；保持同一
+            # verification transaction，不能回到 policy 重新发布 waypoint。
+            return viewpoint_result, {}, None
         verifier_decision = dict((viewpoint_result.metadata or {}).get("verifier_decision") or {})
         if _policy_handles_viewpoint_result(self.high_level_policy, viewpoint_result, active_goal.intent):
             # policy adapter 写回 ledger/execution state 后，要清掉 completed suppression，让下一轮重新决策。
@@ -552,6 +609,7 @@ class SysNavInstructionRuntime:
                 "verifier_decision": verifier_decision,
                 "target_object_uid": active_goal.motion_goal.target_object_uid,
                 "anchor_object_uid": active_goal.motion_goal.anchor_object_uid,
+                "relation_edge_id": active_goal.motion_goal.relation_edge_id,
                 "candidate_uid": active_goal.intent.metadata.get("candidate_uid"),
             },
         )
@@ -590,10 +648,83 @@ class SysNavInstructionRuntime:
                 reason="waiting for SysNav semantic map",
             )
 
+        if self.state.halted_status is not None:
+            hold_intent = NavigationIntent(
+                mode=MotionGoalMode.WAIT,
+                reason="runtime is held by lower-level safety state",
+                metadata={"halted_status": runtime_decision_to_dict(
+                    RuntimeDecision(
+                        timestamp=snapshot.timestamp,
+                        intent=NavigationIntent(mode=MotionGoalMode.WAIT),
+                        navigation_status=self.state.halted_status,
+                    )
+                ).get("navigation_status")},
+            )
+            return RuntimeDecision(
+                timestamp=snapshot.timestamp,
+                intent=hold_intent,
+                navigation_status=self.state.halted_status,
+                lower_planner_state={"runtime_state": "HOLD"},
+                reason=hold_intent.reason,
+            )
+
+        if self.state.pending_verification is not None:
+            pending = self.state.pending_verification
+            viewpoint_result, verifier_decision, stop_intent = self._verify_reached_goal(pending)
+            if not bool((viewpoint_result.metadata if viewpoint_result else {}).get("evidence_pending")):
+                self.state.pending_verification = None
+            if stop_intent is not None:
+                return RuntimeDecision(
+                    timestamp=snapshot.timestamp,
+                    intent=stop_intent,
+                    navigation_status=pending.status,
+                    accepted_candidate_uid=str(
+                        pending.intent.metadata.get("candidate_uid")
+                        or pending.motion_goal.target_object_uid
+                        or pending.motion_goal.anchor_object_uid
+                        or ""
+                    ),
+                    accepted_relation_edge_id=pending.motion_goal.relation_edge_id,
+                    verifier_decision=verifier_decision,
+                    lower_planner_state={"runtime_state": "STOP", "goal_id": pending.status.goal_id},
+                    reason=stop_intent.reason,
+                    metadata={"viewpoint_result": runtime_viewpoint_result_to_dict(viewpoint_result)},
+                )
+            return RuntimeDecision(
+                timestamp=snapshot.timestamp,
+                intent=NavigationIntent(
+                    mode=MotionGoalMode.WAIT,
+                    reason="waiting for post-reach evidence",
+                    metadata={"runtime_state": "VERIFYING"},
+                ),
+                navigation_status=pending.status,
+                verifier_decision=verifier_decision,
+                lower_planner_state={"runtime_state": "VERIFYING", "goal_id": pending.status.goal_id},
+                reason="waiting for post-reach evidence",
+                metadata={"viewpoint_result": runtime_viewpoint_result_to_dict(viewpoint_result)},
+            )
+
         active_goal = self.state.poll_active(self.motion_controller)
         if active_goal is not None:
+            if active_goal.status.is_terminal():
+                self.state.record_viewpoint_attempt(active_goal.motion_goal)
+                if active_goal.status.status in {
+                    NavigationStatusCode.SAFETY_STOP,
+                    NavigationStatusCode.MANUAL_TAKEOVER,
+                    NavigationStatusCode.LOCALIZATION_LOST,
+                }:
+                    self.motion_controller.hold()
+                    self.state.hold(active_goal.status)
+                elif active_goal.status.succeeded() and self.viewpoint_evidence_loop is not None:
+                    self.state.pending_verification = active_goal
             # 有 active goal 时本轮只跟踪执行状态，不重复调用高层 policy 生成新 waypoint。
             viewpoint_result, verifier_decision, stop_intent = self._verify_reached_goal(active_goal)
+            if active_goal.status.succeeded() and self.viewpoint_evidence_loop is not None and bool(
+                (viewpoint_result.metadata if viewpoint_result else {}).get("evidence_pending")
+            ):
+                self.state.pending_verification = active_goal
+            else:
+                self.state.pending_verification = None
             if stop_intent is not None:
                 return RuntimeDecision(
                     timestamp=snapshot.timestamp,
@@ -606,6 +737,7 @@ class SysNavInstructionRuntime:
                         or active_goal.motion_goal.anchor_object_uid
                         or ""
                     ),
+                    accepted_relation_edge_id=active_goal.motion_goal.relation_edge_id,
                     verifier_decision=verifier_decision,
                     lower_planner_state={
                         "tracking_active_goal": False,
@@ -620,6 +752,23 @@ class SysNavInstructionRuntime:
                         if viewpoint_result is not None
                         else {},
                     },
+                )
+            if bool((viewpoint_result.metadata if viewpoint_result else {}).get("evidence_pending")):
+                return RuntimeDecision(
+                    timestamp=snapshot.timestamp,
+                    intent=NavigationIntent(
+                        mode=MotionGoalMode.WAIT,
+                        reason="waiting for post-reach evidence",
+                        metadata={"runtime_state": "VERIFYING"},
+                    ),
+                    navigation_status=active_goal.status,
+                    verifier_decision=verifier_decision,
+                    lower_planner_state={
+                        "runtime_state": "VERIFYING",
+                        "goal_id": active_goal.status.goal_id,
+                    },
+                    reason="waiting for post-reach evidence",
+                    metadata={"viewpoint_result": runtime_viewpoint_result_to_dict(viewpoint_result)},
                 )
             return RuntimeDecision(
                 timestamp=snapshot.timestamp,
@@ -643,7 +792,30 @@ class SysNavInstructionRuntime:
             )
 
         intent = self.high_level_policy.decide(snapshot, instruction)
-        motion_goal = intent.to_motion_goal()
+        self.state.prepare_attempt_context(intent)
+        motion_goal = self.goal_resolver.resolve(
+            intent,
+            snapshot,
+            set(self.state.attempted_viewpoint_ids),
+        )
+        if intent.mode not in {MotionGoalMode.WAIT, MotionGoalMode.STOP} and motion_goal is None:
+            wait_intent = NavigationIntent(
+                mode=MotionGoalMode.WAIT,
+                reason="no SysNav executable viewpoint available",
+                metadata={
+                    **dict(intent.metadata or {}),
+                    "runtime_state": "IDLE",
+                    "viewpoint_provider_unavailable": True,
+                },
+            )
+            return RuntimeDecision(
+                timestamp=snapshot.timestamp,
+                intent=wait_intent,
+                lower_planner_state={"runtime_state": "IDLE", "viewpoint_provider_unavailable": True},
+                reason=wait_intent.reason,
+            )
+        if motion_goal is None:
+            motion_goal = intent.to_motion_goal()
         if intent.mode == MotionGoalMode.WAIT:
             # WAIT 是高层语义等待状态，不进入 motion controller，避免生成无意义 goal_id。
             return RuntimeDecision(
@@ -685,6 +857,7 @@ class SysNavInstructionRuntime:
                 reason=wait_intent.reason,
             )
         goal_id = self.motion_controller.send_goal(motion_goal)
+        self.state.record_viewpoint_attempt(motion_goal)
         status = self.motion_controller.poll_status(goal_id)
         viewpoint_result: Optional[ViewpointResult] = None
         verifier_decision: Dict[str, Any] = {}
@@ -698,14 +871,27 @@ class SysNavInstructionRuntime:
             # 有些 fake/dry-run 或快速 planner 会第一次 poll 就 terminal，这条路径也要走 verifier。
             self.state.last_completed_signature = motion_goal_signature(motion_goal)
             self.state.last_terminal_status = status
-            viewpoint_result, verifier_decision, stop_intent = self._verify_reached_goal(
-                ActiveGoalPoll(
-                    status=status,
-                    motion_goal=motion_goal,
-                    intent=intent,
-                    tracking_active=False,
-                )
+            immediate_terminal = ActiveGoalPoll(
+                status=status,
+                motion_goal=motion_goal,
+                intent=intent,
+                tracking_active=False,
             )
+            self.state.record_viewpoint_attempt(motion_goal)
+            if status.status in {
+                NavigationStatusCode.SAFETY_STOP,
+                NavigationStatusCode.MANUAL_TAKEOVER,
+                NavigationStatusCode.LOCALIZATION_LOST,
+            }:
+                self.motion_controller.hold()
+                self.state.hold(status)
+            if status.succeeded() and self.viewpoint_evidence_loop is not None:
+                self.state.pending_verification = immediate_terminal
+            viewpoint_result, verifier_decision, stop_intent = self._verify_reached_goal(
+                immediate_terminal
+            )
+            if not bool((viewpoint_result.metadata if viewpoint_result else {}).get("evidence_pending")):
+                self.state.pending_verification = None
             if stop_intent is not None:
                 return RuntimeDecision(
                     timestamp=snapshot.timestamp,
@@ -718,6 +904,7 @@ class SysNavInstructionRuntime:
                         or motion_goal.anchor_object_uid
                         or ""
                     ),
+                    accepted_relation_edge_id=motion_goal.relation_edge_id,
                     verifier_decision=verifier_decision,
                     lower_planner_state={
                         "tracking_active_goal": False,
@@ -727,6 +914,24 @@ class SysNavInstructionRuntime:
                         "room_count": len(snapshot.rooms),
                     },
                     reason=stop_intent.reason,
+                    metadata={"viewpoint_result": runtime_viewpoint_result_to_dict(viewpoint_result)},
+                )
+            if bool((viewpoint_result.metadata if viewpoint_result else {}).get("evidence_pending")):
+                return RuntimeDecision(
+                    timestamp=snapshot.timestamp,
+                    intent=NavigationIntent(
+                        mode=MotionGoalMode.WAIT,
+                        reason="waiting for post-reach evidence",
+                        metadata={"runtime_state": "VERIFYING"},
+                    ),
+                    motion_goal=None,
+                    navigation_status=status,
+                    verifier_decision=verifier_decision,
+                    lower_planner_state={
+                        "runtime_state": "VERIFYING",
+                        "goal_id": status.goal_id,
+                    },
+                    reason="waiting for post-reach evidence",
                     metadata={"viewpoint_result": runtime_viewpoint_result_to_dict(viewpoint_result)},
                 )
 
@@ -824,7 +1029,19 @@ class ViewpointEvidenceLoop:
                 metadata={"goal_id": status.goal_id},
             )
 
-        evidence = self.evidence_provider.capture(goal, status)
+        capture_after = getattr(self.evidence_provider, "capture_after", None)
+        evidence = (
+            capture_after(goal, status)
+            if callable(capture_after)
+            else self.evidence_provider.capture(goal, status)
+        )
+        if evidence is None:
+            return ViewpointResult(
+                goal=goal,
+                status=status,
+                reason="waiting for post-reach evidence",
+                metadata={"goal_id": status.goal_id, "evidence_pending": True},
+            )
         verifier_decision: Dict[str, Any] = {}
         if self.final_verifier is not None:
             # VLM 只评估当前证据是否满足任务；物理到达状态来自 motion_controller。
@@ -889,6 +1106,15 @@ class LatestObservationEvidenceProvider:
                 **dict(crop_payload.get("metadata") or {}),
             },
         )
+
+    def capture_after(self, goal: ViewpointGoal, status: NavigationStatus) -> Optional[ViewEvidence]:
+        """Capture only when the latest observation is newer than the reach event."""
+
+        observation = self.observation_provider()
+        if status.stamp is not None:
+            if observation is None or float(getattr(observation, "timestamp", 0.0)) <= float(status.stamp):
+                return None
+        return self.capture(goal, status)
 
 
 class RuntimeDecisionJsonlWriter:

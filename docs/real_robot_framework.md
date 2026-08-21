@@ -246,8 +246,8 @@ SemanticMapSnapshot:
     robot_pose
     objects
     rooms
-    viewpoints
-    frontiers
+    viewpoints                  # SysNav 选出的可执行 viewpoint，必须包含 pose
+    frontiers                   # 仅接收 SysNav planner 提供的探索候选
     source
     metadata
 ```
@@ -293,8 +293,24 @@ ViewpointGoal:
 ```
 
 `NavigationIntent` 是高层语义决策，`MotionGoal` 是执行层请求，`ViewpointGoal` 是需要
-在到达后采集证据的运动目标。adapter 可以转换坐标系、容差和 ROS message，但不能
-改变 target/anchor UID、relation edge 或 `stop_allowed` 的语义。
+在到达后采集证据的运动目标。语义策略只填写 target/anchor/relation 和 evidence
+objective；在正式 instruction path 中，`goal_pose` 为空，由 `SysNavGoalResolver` 从
+SysNav viewpoint 记录取得可执行 pose。adapter 可以转换坐标系、容差和 ROS message，
+但不能改变 target/anchor UID、relation edge 或 `stop_allowed` 的语义。
+
+`SysNavGoalResolver` 不在 Python 层重新实现 viewpoint ranking、碰撞检查或路径规划。
+它只调用注入的 `ViewpointProvider`，检查已尝试的 viewpoint ID，并将 SysNav 选定的
+pose 包装为 `MotionGoal`。关系任务的几何候选集合为：
+
+\[
+\mathcal{V}_{target,anchor}
+  = \mathcal{V}_{target} \cap \mathcal{V}_{anchor},
+\]
+
+其中每个集合由 SysNav 的 object--viewpoint 可见关系提供。VLN 不根据 `book`、`shelf`
+或其他类别重新定义集合，也不把对象中心或房间质心伪装成执行位姿。当前迁移的 ROS
+消息尚未携带完整 viewpoint pose，因此正式 ROS 运行在没有可用 viewpoint 时显式
+返回 `WAIT`；这是一项待 SysNav bridge 补齐的数据合同，不用虚构 topic 或 pose。
 
 ### 4.3 执行状态与证据
 
@@ -361,7 +377,8 @@ sequenceDiagram
   Runtime->>Runtime: readiness gate
   Runtime->>Policy: SemanticMapSnapshot + instruction
   Policy-->>Runtime: NavigationIntent
-  Runtime->>Motion: MotionGoal
+  Runtime->>Runtime: SysNavGoalResolver
+  Runtime->>Motion: MotionGoal from SysNav viewpoint
   Motion->>Lower: Action goal 或 /way_point
 
   loop 每个 runtime timer tick
@@ -381,7 +398,7 @@ sequenceDiagram
   end
 ```
 
-对应当前 `SysNavInstructionRuntime.step()` 的最小伪代码如下：
+对应当前 `SysNavInstructionRuntime.step()` 的最小伪代码如下（`[PSEUDOCODE]`）：
 
 ```python
 def step(instruction):
@@ -393,12 +410,23 @@ def step(instruction):
     if snapshot is None:
         return WAIT  # 没有对象图时不把空地图交给导航策略
 
+    if state.halted_status is not None:
+        return HOLD  # 安全/人工接管/定位丢失由底层解除，不由 VLN 自主恢复
+
+    if state.pending_verification is not None:
+        evidence = evidence_loop.verify_reached(state.pending_verification)
+        if evidence.pending:
+            return VERIFYING  # 等待晚于 REACHED 的 RGB、pose 和 detection
+        return APPLY_VERIFIER_DECISION(evidence)
+
     active = state.poll_active(motion_controller)
     if active is not None:
         if not active.status.is_terminal():
             return TRACK_ACTIVE_GOAL  # active goal 未结束时禁止反复发布 waypoint
         if active.status.succeeded():
             evidence = evidence_loop.verify_reached(active.goal, active.status)
+            if evidence.pending:
+                return VERIFYING
             return APPLY_VERIFIER_DECISION(evidence)
         return HANDLE_MOTION_FAILURE(active.status)
 
@@ -406,15 +434,23 @@ def step(instruction):
     if intent.mode == WAIT:
         return WAIT
 
-    goal_id = motion_controller.send_goal(intent.to_motion_goal())
-    state.bind_active(goal_id, intent, intent.to_motion_goal())
+    motion_goal = goal_resolver.resolve(intent, snapshot, state.attempted_viewpoint_ids)
+    if motion_goal is None:
+        return WAIT  # SysNav 尚未返回可执行 viewpoint，不自行生成对象中心 pose
+
+    goal_id = motion_controller.send_goal(motion_goal)
+    state.record_viewpoint_attempt(motion_goal)
+    state.bind_active(goal_id, intent, motion_goal)
     return DISPATCHED(goal_id)
 ```
 
 这里的 `APPLY_VERIFIER_DECISION` 只允许 final verifier 在语义、关系和视觉证据满足时
-生成 `STOP`；`REACHED` 本身不能授权 STOP。若 VLM 返回 `need_better_view`，上层策略
-应保留 target/anchor/relation 上下文并生成下一个 `ViewpointGoal`，而不是把运动失败
-伪装成任务完成。
+生成 `STOP`；`REACHED` 本身不能授权 STOP。若 VLM 返回 `need_better_view`，当前
+viewpoint 只加入 `attempted_viewpoint_ids`，target/anchor/relation 身份仍由上层策略
+维护，下一轮由 SysNav provider 给出另一个 viewpoint。`BLOCKED` 或 `TIMEOUT` 只结束
+当前运动尝试，不自动否定对象；`SAFETY_STOP`、人工接管和定位丢失进入 HOLD。
+HOLD 只能由安全所有者在确认底层条件恢复后显式调用
+`SysNavInstructionRuntime.clear_hold()` 解除；VLN 不根据普通 RGB 或 odom 更新自动复位。
 
 ## 6. 输出接口与所有权
 
@@ -423,8 +459,9 @@ def step(instruction):
 | 输出 | 类型 | 下游 | 说明 |
 |---|---|---|---|
 | 语义意图 | `NavigationIntent` | runtime | 表达目标对象、anchor、关系和原因 |
-| 运动请求 | `MotionGoal` | motion controller | 表达可执行位姿和容差 |
+| 运动请求 | `MotionGoal` | motion controller | 表达 SysNav 已选的可执行位姿和容差 |
 | 视角请求 | `ViewpointGoal` | motion controller/evidence | 到达后需要采集视觉证据 |
+| viewpoint 解析 | `SysNavGoalResolver` | runtime | 将语义 UID 映射到 SysNav viewpoint pose |
 | 证据 | `ViewEvidence` | relation/final verifier | 绑定 pose、图像、bbox 和 UID |
 | 决策记录 | `RuntimeDecision` | JSONL artifact | 记录一次控制周期的输入摘要和输出 |
 

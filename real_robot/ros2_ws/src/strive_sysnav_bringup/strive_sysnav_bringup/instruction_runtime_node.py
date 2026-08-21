@@ -32,6 +32,11 @@ from real_robot.sysnav_ros_adapters import (
     normalize_ros_topic_name,
     validate_non_velocity_publish_topic,
 )
+from real_robot.sysnav_goal_resolver import (
+    PreResolvedGoalResolver,
+    SnapshotViewpointProvider,
+    SysNavGoalResolver,
+)
 from real_robot.sysnav_runtime import (
     DryRunMotionController,
     FinalInstructionVerifierAdapter,
@@ -140,6 +145,7 @@ class StriveInstructionRuntimeNode(Node):
         )
 
         self.high_level_policy = self._build_policy(self.policy_mode)
+        self.goal_resolver = self._build_goal_resolver(self.policy_mode)
         self.motion_controller = self._build_motion_controller()
         # evidence loop 只在 semantic_snapshot 模式下启用；wait/smoke 不需要 verifier 链路。
         self.viewpoint_evidence_loop = self._build_viewpoint_evidence_loop()
@@ -150,6 +156,7 @@ class StriveInstructionRuntimeNode(Node):
             viewpoint_evidence_loop=self.viewpoint_evidence_loop,
             readiness_provider=self._readiness,
             now_fn=self._now_seconds,
+            goal_resolver=self.goal_resolver,
         )
 
         queue_size = int(self.get_parameter("queue_size").value)
@@ -313,6 +320,20 @@ class StriveInstructionRuntimeNode(Node):
         self.get_logger().warning(f"unknown policy_mode={policy_mode}; falling back to WAIT")
         return WaitInstructionPolicy(f"unknown policy_mode={policy_mode}")
 
+    def _build_goal_resolver(self, policy_mode: str):
+        """Build the pose-resolution adapter for the selected policy.
+
+        Semantic instruction policies are resolved through SysNav viewpoint
+        records. Explicit-pose smoke policies retain the pass-through adapter
+        so that offline wiring tests do not pretend to have a SysNav planner.
+        """
+
+        normalized = policy_mode.strip().lower()
+        if normalized in {"semantic_snapshot", "semantic_map_snapshot", "instruction", "instruction_plan"}:
+            # 中文核心边界：语义策略只提交 target/anchor 身份；可执行位姿必须来自 SysNav viewpoint。
+            return SysNavGoalResolver(SnapshotViewpointProvider())
+        return PreResolvedGoalResolver()
+
     def _build_motion_controller(self):
         """Build either dry-run or waypoint-publishing motion controller."""
 
@@ -346,8 +367,10 @@ class StriveInstructionRuntimeNode(Node):
         # ObjectCropEvidenceProvider 复用 observation cache，不直接订阅 ROS topic。
         evidence_provider = ObjectCropEvidenceProvider(
             observation_provider=self.observation_cache.latest_observation,
+            observation_after_provider=self.observation_cache.latest_observation_after,
             object_provider=lambda: self.semantic_bridge.build_snapshot(timestamp=self._now_seconds()),
             detection_provider=lambda: self.observation_cache.latest_detection_frame,
+            detection_after_provider=self.observation_cache.latest_detection_after,
             mode=self.evidence_mode,
             now_fn=self._now_seconds,
         )

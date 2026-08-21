@@ -312,6 +312,47 @@ def test_instruction_runtime_verifies_immediate_reached_goal() -> None:
     assert len(controller.goals) == 1
 
 
+def test_runtime_keeps_reached_goal_pending_until_fresh_evidence_arrives() -> None:
+    bridge = SysNavSemanticMapBridge(robot_pose_provider=lambda: Pose3D(position=(0.0, 0.0, 0.0)))
+    bridge.update_object_nodes(_object_list_msg())
+    policy = FakePolicy()
+    controller = FakeMotionController(
+        [
+            NavigationStatus(NavigationStatusCode.RUNNING, goal_id="goal-1", message="accepted"),
+            NavigationStatus(
+                NavigationStatusCode.REACHED,
+                goal_id="goal-1",
+                current_pose=Pose3D(position=(1.0, 2.0, -0.8)),
+                stamp=5.0,
+                message="reached waypoint",
+            ),
+        ]
+    )
+    evidence_provider = PendingThenCurrentEvidenceProvider()
+    runtime = SysNavInstructionRuntime(
+        semantic_map_bridge=bridge,
+        high_level_policy=policy,
+        motion_controller=controller,
+        viewpoint_evidence_loop=ViewpointEvidenceLoop(
+            motion_controller=controller,
+            evidence_provider=evidence_provider,
+            final_verifier=FakeVerifier(),
+        ),
+        now_fn=lambda: 4.0,
+    )
+
+    runtime.step("find a book")
+    pending = runtime.step("find a book")
+    accepted = runtime.step("find a book")
+
+    assert pending.intent.mode == MotionGoalMode.WAIT
+    assert pending.lower_planner_state["runtime_state"] == "VERIFYING"
+    assert accepted.intent.mode == MotionGoalMode.STOP
+    assert len(controller.goals) == 1
+    assert len(policy.calls) == 1
+    assert evidence_provider.after_calls == 2
+
+
 def test_dry_run_motion_controller_records_goal_without_running_waypoint() -> None:
     controller = DryRunMotionController()
     goal = MotionGoal(
@@ -374,6 +415,22 @@ class FakeEvidenceProvider:
             target_object_uid=goal.target_object_uid,
             quality={"center_score": 0.8},
         )
+
+
+class PendingThenCurrentEvidenceProvider(FakeEvidenceProvider):
+    """Return no frame until one post-reach observation is available."""
+
+    def __init__(self):
+        super().__init__()
+        self.after_calls = 0
+
+    def capture_after(self, goal, status):
+        """Model a sensor cache that becomes fresh on the second query."""
+
+        self.after_calls += 1
+        if self.after_calls == 1:
+            return None
+        return self.capture(goal, status)
 
 
 class FakeVerifier:
