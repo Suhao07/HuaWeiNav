@@ -9,7 +9,7 @@ camera_projection:
   sensor_topics:
     rgb: /camera/d435i/d435i_camera/color/image_raw
     camera_info: /camera/d435i/d435i_camera/color/camera_info
-    lidar: /cloud_registered
+    lidar: /cloud_registered_body
     odom: /aft_mapped_to_init
   frame_ids:
     lidar: livox_frame
