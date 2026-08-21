@@ -1,0 +1,56 @@
+# D435i + Livox data-layer mapping profile.
+# This profile is intentionally not an approval to enable semantic fusion:
+# the projection asset remains extrinsics_only until RGB/LiDAR time offset and
+# reprojection validation are supplied.
+semantic_mapping_node:
+  ros__parameters:
+    platform: mecanum
+    detection_linear_state_time_bias: 0.0
+    detection_angular_state_time_bias: 0.0
+    visualize: false
+    vis_interval: 0.5
+    annotate_image: false
+    grounding_score_thresh: 0.35
+    target_object: refrigerator
+    object_file: src/semantic_mapping/semantic_mapping/config/objects.yaml
+    require_calibration: false
+    # Data-layer profile: consume Point-LIO's body-frame cloud output.  The
+    # projection file converts body -> LiDAR -> D435i camera explicitly.
+    cloud_input_frame: body
+    cloud_sync_before_s: 0.75
+    cloud_sync_after_s: 0.25
+    cloud_sync_max_gap_s: 1.25
+    allow_latest_odom: true
+    odom_max_age_s: 0.5
+    # Fail closed if Point-LIO ever diverges; this prevents million-metre
+    # object coordinates from entering the semantic map. Tune per robot.
+    pose_max_abs_m: 200.0
+    pose_max_linear_speed_mps: 5.0
+    pose_max_angular_speed_rps: 10.0
+    # Body cloud is sparse/accumulated at runtime; do not apply the legacy
+    # packet-order depth-jump heuristic during this data-layer acceptance.
+    filter_depth_jumps: false
+    # Keep detector masks intact for sparse Livox projections; tune per robot.
+    mask_erosion_iterations: 0
+    # Mapping consumes at most two body clouds per second; Point-LIO remains
+    # untouched and continues publishing its full-rate body cloud upstream.
+    cloud_processing_interval_s: 1.0
+    max_cloud_points: 10000
+    mapping_processing_interval_s: 2.0
+
+detection_node:
+  ros__parameters:
+    platform: mecanum
+    # Run detector at a bounded rate and reject stale camera frames so the
+    # detection timestamp remains close enough to Point-LIO for fusion.
+    max_input_age_s: 0.75
+    # One inference per second keeps the detector from starving the host LIO
+    # callback thread on Orin-26.  The RGB stream remains available at camera
+    # rate; stale frames are discarded at the callback boundary.
+    image_processing_interval: 2.0
+    visualize: false
+    vis_interval: 0.5
+    annotate_image: false
+    grounding_score_thresh: 0.35
+    target_object: refrigerator
+    object_file: src/semantic_mapping/semantic_mapping/config/objects.yaml

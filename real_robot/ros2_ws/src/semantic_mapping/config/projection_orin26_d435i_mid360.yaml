@@ -1,0 +1,59 @@
+# D435i + Livox Mid-360 profile.  This is a separate sensor chain from the
+# Generic USB camera profile.  The transform convention is
+# p_camera = R_lidar_to_camera @ p_lidar + t.
+camera_projection:
+  calibration_status: extrinsics_only
+  calibration_version: 1
+  sensor_model: intel_realsense_d435i
+  extrinsics_source: real_robot/calibration/orin26_d435i_mid360_targetless_v009_r009_extrinsics.json
+  sensor_topics:
+    rgb: /camera/d435i/d435i_camera/color/image_raw
+    camera_info: /camera/d435i/d435i_camera/color/camera_info
+    lidar: /cloud_registered_body
+    odom: /aft_mapped_to_init
+  frame_ids:
+    lidar: livox_frame
+    input_cloud: body
+    # Runtime RealSense driver frame. The imported calibration used the
+    # historical alias veocc_d435i_color_optical_frame for this same optical
+    # sensor; keep the alias below for auditability without publishing a fake TF.
+    camera_optical: d435i_color_optical_frame
+    calibration_camera_optical_alias: veocc_d435i_color_optical_frame
+    base: base
+  # Positive means RGB timestamp minus LiDAR timestamp.  The supplied JSON
+  # has no measured time offset; zero is an explicit, unvalidated assumption.
+  rgb_minus_lidar_time_offset_s: 0.0
+  time_offset_status: assumed_zero_unvalidated
+  time_offset_source: not_present_in_supplied_extrinsics
+  model: pinhole
+  image:
+    width: 1280
+    height: 720
+  intrinsics:
+    # Read-only live sample from /camera/d435i/color/camera_info at 1280x720.
+    fx: 909.4949951171875
+    fy: 909.1580200195312
+    cx: 626.6063842773438
+    cy: 370.9116516113281
+  distortion:
+    model: plumb_bob
+    coefficients: [0.0, 0.0, 0.0, 0.0, 0.0]
+  lidar_to_camera:
+    # Imported T_camera_from_lidar from the user-provided D435i calibration.
+    translation_m: [0.10970761, 0.67284314, 0.27480904]
+    rotation_rpy_rad: [-1.935569001, 0.007663065, -3.131491315]
+    rotation_convention: zyx_euler_roll_pitch_yaw
+  # Point-LIO's /cloud_registered_body publishes IMU/body-frame points.  Its
+  # configured R_imu_from_lidar is identity and t_imu_from_lidar is
+  # [-0.011, -0.02329, 0.04412] m, so this is the inverse translation used to
+  # convert body points back to the LiDAR frame before applying T_camera_from_lidar.
+  input_frame: body
+  input_to_lidar:
+    translation_m: [0.011, 0.02329, -0.04412]
+    rotation_rpy_rad: [0.0, 0.0, 0.0]
+    source: point_lio_T_imu_from_lidar_inverse
+  validation:
+    method: "read-only D435i CameraInfo sample plus imported D435i/MID-360 targetless extrinsics; time offset pending"
+    calibration_date_utc: "not_provided"
+    reprojection_rmse_px: null
+    sample_count: 1

@@ -9,6 +9,9 @@ OVERLAY_SETUP="${STRIVE_REAL_ROBOT_WS:-${REPO_ROOT}/real_robot/ros2_ws}/install/
 
 PLATFORM="${PLATFORM:-mecanum}"
 CLOUD_TOPIC="${CLOUD_TOPIC:-/cloud_registered}"
+STRIVE_POINTCLOUD_TOPIC="${STRIVE_POINTCLOUD_TOPIC:-${CLOUD_TOPIC}}"
+DETECTOR_DEVICE="${SYSNAV_DETECTOR_DEVICE:-cuda:0}"
+DETECTOR_IMGSZ="${SYSNAV_DETECTOR_IMGSZ:-640}"
 ODOM_TOPIC="${ODOM_TOPIC:-/aft_mapped_to_init}"
 CAMERA_TOPIC="${CAMERA_TOPIC:-/camera/image}"
 VIEWPOINT_TOPIC="${VIEWPOINT_TOPIC:-/viewpoint_rep_header}"
@@ -33,6 +36,7 @@ LIO_SAMPLE_TIMEOUT_S="${LIO_SAMPLE_TIMEOUT_S:-5}"
 WAIT_FOR_CAMERA="${WAIT_FOR_CAMERA:-0}"
 REQUIRE_NO_CMD_VEL_PUBLISHERS="${REQUIRE_NO_CMD_VEL_PUBLISHERS:-1}"
 START_SEMANTIC_MAPPING="${START_SEMANTIC_MAPPING:-false}"
+START_WAYPOINT_ADAPTER="${START_WAYPOINT_ADAPTER:-false}"
 MAPPING_CONFIG="${MAPPING_CONFIG:-}"
 PROJECTION_CONFIG="${PROJECTION_CONFIG:-}"
 DETECTION_TOPIC="${DETECTION_TOPIC:-/detection_result}"
@@ -134,6 +138,7 @@ preflight() {
   echo "start_semantic_mapping=${START_SEMANTIC_MAPPING}"
   echo "block_lower_controller=${BLOCK_LOWER_CONTROLLER}"
   echo "start_strive_runtime=${START_STRIVE_RUNTIME:-0}"
+  echo "start_waypoint_adapter=${START_WAYPOINT_ADAPTER}"
 
   if is_true "${WAIT_FOR_LIO}"; then
     wait_for_topic "${CLOUD_TOPIC}" "sensor_msgs/msg/PointCloud2" "${PREFLIGHT_TIMEOUT_S}"
@@ -232,7 +237,9 @@ main() {
   echo "Control output remains blocked unless explicitly enabled."
   local launch_args=(
     "platform:=${PLATFORM}"
-    "cloud_topic:=${CLOUD_TOPIC}"
+    "detector_device:=${DETECTOR_DEVICE}"
+    "detector_imgsz:=${DETECTOR_IMGSZ}"
+    "cloud_topic:=${STRIVE_POINTCLOUD_TOPIC}"
     "odom_topic:=${ODOM_TOPIC}"
     "camera_topic:=${CAMERA_TOPIC}"
     "start_semantic_mapping:=${START_SEMANTIC_MAPPING}"
@@ -245,8 +252,10 @@ main() {
     "usb_image_height:=${USB_IMAGE_HEIGHT}"
     "usb_pixel_format:=${USB_PIXEL_FORMAT}"
     "usb_framerate:=${USB_FRAMERATE}"
-    "usb_camera_info_url:=${USB_CAMERA_INFO_URL}"
   )
+  # Do not pass an empty ROS launch assignment (``name:=`` is malformed).
+  # The launch file already treats an omitted camera_info URL as unset.
+  append_launch_arg launch_args "usb_camera_info_url" "${USB_CAMERA_INFO_URL}"
   append_launch_arg launch_args "mapping_config" "${MAPPING_CONFIG}"
   append_launch_arg launch_args "projection_config" "${PROJECTION_CONFIG}"
   exec "${REPO_ROOT}/scripts/run_sysnav_detection_mapping.sh" "${launch_args[@]}" "$@"

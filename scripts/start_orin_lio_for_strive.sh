@@ -9,6 +9,23 @@ POINT_LIO_CONFIG="${POINT_LIO_CONFIG:-/home/orin26/code/point_lio_ws/install/poi
 ENABLE_CLOUD_PUBLISH="${ENABLE_CLOUD_PUBLISH:-1}"
 ENABLE_BODY_CLOUD_PUBLISH="${ENABLE_BODY_CLOUD_PUBLISH:-0}"
 RESTART_EXISTING="${RESTART_EXISTING:-1}"
+# Keep the robot-owned mapping_mid360_orin launch contract explicit when this
+# project starts an observation-only Point-LIO process.  These are parameter
+# overrides, not edits to the robot's Point-LIO workspace.
+LIO_USE_IMU_AS_INPUT="${LIO_USE_IMU_AS_INPUT:-1}"
+LIO_PROP_AT_FREQ_OF_IMU="${LIO_PROP_AT_FREQ_OF_IMU:-1}"
+LIO_CHECK_SATU="${LIO_CHECK_SATU:-1}"
+LIO_INIT_MAP_SIZE="${LIO_INIT_MAP_SIZE:-10}"
+LIO_POINT_FILTER_NUM="${LIO_POINT_FILTER_NUM:-6}"
+LIO_SPACE_DOWN_SAMPLE="${LIO_SPACE_DOWN_SAMPLE:-1}"
+LIO_FILTER_SIZE_SURF="${LIO_FILTER_SIZE_SURF:-0.5}"
+LIO_FILTER_SIZE_MAP="${LIO_FILTER_SIZE_MAP:-0.5}"
+LIO_CUBE_SIDE_LENGTH="${LIO_CUBE_SIDE_LENGTH:-1000.0}"
+LIO_RUNTIME_POS_LOG_ENABLE="${LIO_RUNTIME_POS_LOG_ENABLE:-0}"
+LIO_IVOX_NEARBY_TYPE="${LIO_IVOX_NEARBY_TYPE:-6}"
+LIO_LOCATION_MODE="${LIO_LOCATION_MODE:-0}"
+LIO_CON_FRAME="${LIO_CON_FRAME:-1}"
+LIO_CON_FRAME_NUM="${LIO_CON_FRAME_NUM:-10}"
 
 ros_bool() {
   case "${1,,}" in
@@ -36,6 +53,21 @@ if [[ ! -f "${POINT_LIO_CONFIG}" ]]; then
 fi
 
 point_lio_params=(
+  -p use_sim_time:=false
+  -p use_imu_as_input:="$(ros_bool "${LIO_USE_IMU_AS_INPUT}")"
+  -p prop_at_freq_of_imu:="$(ros_bool "${LIO_PROP_AT_FREQ_OF_IMU}")"
+  -p check_satu:="$(ros_bool "${LIO_CHECK_SATU}")"
+  -p init_map_size:="${LIO_INIT_MAP_SIZE}"
+  -p point_filter_num:="${LIO_POINT_FILTER_NUM}"
+  -p space_down_sample:="$(ros_bool "${LIO_SPACE_DOWN_SAMPLE}")"
+  -p filter_size_surf:="${LIO_FILTER_SIZE_SURF}"
+  -p filter_size_map:="${LIO_FILTER_SIZE_MAP}"
+  -p cube_side_length:="${LIO_CUBE_SIDE_LENGTH}"
+  -p runtime_pos_log_enable:="$(ros_bool "${LIO_RUNTIME_POS_LOG_ENABLE}")"
+  -p ivox_nearby_type:="${LIO_IVOX_NEARBY_TYPE}"
+  -p location_mode:="$(ros_bool "${LIO_LOCATION_MODE}")"
+  -p common.con_frame:="$(ros_bool "${LIO_CON_FRAME}")"
+  -p common.con_frame_num:="${LIO_CON_FRAME_NUM}"
   -p publish.scan_publish_en:="$(ros_bool "${ENABLE_CLOUD_PUBLISH}")"
   -p publish.scan_bodyframe_pub_en:="$(ros_bool "${ENABLE_BODY_CLOUD_PUBLISH}")"
 )
@@ -62,10 +94,19 @@ ros2 run tf2_ros static_transform_publisher \
   --frame-id aft_mapped --child-frame-id base \
   --ros-args -r __node:=tf_aft_mapped_to_base &
 TF_PID=\$!
-taskset -c 0-3 nice -n -10 ros2 run point_lio pointlio_mapping --ros-args \
+LIO_CMD=(ros2 run point_lio pointlio_mapping --ros-args \
   -r __node:=laserMapping \
   --params-file '${POINT_LIO_CONFIG}' \
-  ${point_lio_params[*]}
+  ${point_lio_params[*]})
+# Negative nice requires elevated scheduling privileges and previously caused
+# the ordinary orin26 tmux pane to exit before Point-LIO started.  Bind to the
+# first four CPUs when available, but never make deployment depend on it.
+if command -v taskset >/dev/null 2>&1 && taskset -c 0-3 true >/dev/null 2>&1; then
+  taskset -c 0-3 "\${LIO_CMD[@]}"
+else
+  echo '[odom] taskset unavailable; starting Point-LIO without CPU affinity'
+  "\${LIO_CMD[@]}"
+fi
 kill \$TF_PID 2>/dev/null || true
 exec /bin/zsh
 "

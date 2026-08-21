@@ -2,6 +2,8 @@
 set -euo pipefail
 
 IMAGE_TAG="${IMAGE_TAG:-huawei-vln-realworld:orin}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 ROS_SETUP="${ROS_SETUP:-/opt/ros/humble/setup.bash}"
 LIVOX_SETUP="${LIVOX_SETUP:-/home/orin26/code/ws_livox/install/setup.bash}"
 POINT_LIO_SETUP="${POINT_LIO_SETUP:-/home/orin26/code/point_lio_ws/install/setup.bash}"
@@ -10,6 +12,7 @@ USB_IMAGE_WIDTH="${USB_IMAGE_WIDTH:-1280}"
 USB_IMAGE_HEIGHT="${USB_IMAGE_HEIGHT:-720}"
 USB_PIXEL_FORMAT="${USB_PIXEL_FORMAT:-yuyv}"
 USB_FRAMERATE="${USB_FRAMERATE:-30.0}"
+USB_CAMERA_INFO_URL="${USB_CAMERA_INFO_URL:-}"
 CHECK_DETECTOR_INIT="${CHECK_DETECTOR_INIT:-0}"
 DETECTOR_INIT_TIMEOUT="${DETECTOR_INIT_TIMEOUT:-180}"
 REQUIRE_ML="${REQUIRE_ML:-0}"
@@ -437,12 +440,19 @@ if [[ "${CHECK_CAMERA}" == "1" && -e /dev/video0 ]]; then
   section "Container Camera Smoke"
   CAMERA_DEVICE_ARGS=(--device /dev/video0:/dev/video0)
   [[ -e /dev/video1 ]] && CAMERA_DEVICE_ARGS+=(--device /dev/video1:/dev/video1)
+  CAMERA_CALIBRATION_ARGS=()
+  CAMERA_CALIBRATION_HOST_DIR="${CAMERA_CALIBRATION_HOST_DIR:-${REPO_ROOT}/real_robot/calibration}"
+  if [[ -d "${CAMERA_CALIBRATION_HOST_DIR}" ]]; then
+    CAMERA_CALIBRATION_ARGS=(-v "${CAMERA_CALIBRATION_HOST_DIR}:/workspace/STRIVE/real_robot/calibration:ro")
+  fi
   run_maybe_sudo docker run --rm --network host --ipc=host "${DOCKER_GPU_ARGS[@]}" "${DOCKER_DDS_ARGS[@]}" \
     "${CAMERA_DEVICE_ARGS[@]}" \
+    "${CAMERA_CALIBRATION_ARGS[@]}" \
     -e "USB_IMAGE_WIDTH=${USB_IMAGE_WIDTH}" \
     -e "USB_IMAGE_HEIGHT=${USB_IMAGE_HEIGHT}" \
     -e "USB_PIXEL_FORMAT=${USB_PIXEL_FORMAT}" \
     -e "USB_FRAMERATE=${USB_FRAMERATE}" \
+    -e "USB_CAMERA_INFO_URL=${USB_CAMERA_INFO_URL}" \
     "${IMAGE_TAG}" bash -lc '
 set -eo pipefail
 v4l2-ctl --list-devices 2>&1 || true
@@ -468,9 +478,24 @@ setsid ros2 run usb_cam usb_cam_node_exe --ros-args \
   -p image_height:="${USB_IMAGE_HEIGHT}" \
   -p pixel_format:="${USB_PIXEL_FORMAT}" \
   -p framerate:="${USB_FRAMERATE}" \
+  ${USB_CAMERA_INFO_URL:+-p camera_info_url:="${USB_CAMERA_INFO_URL}"} \
   -r image_raw:=/camera/image &
 camera_pid=$!
 sleep 8
+echo "-- camera topics --"
+ros2 topic list | grep -E '^/camera/image$|^/camera_info$|^/camera/camera_info$' || true
+echo "-- image header --"
+timeout --kill-after=2s 4s ros2 topic echo --once /camera/image --field header || true
+echo "-- image dimensions/encoding --"
+for field in width height encoding; do
+  printf '%s=' "${field}"
+  timeout --kill-after=2s 4s ros2 topic echo --once /camera/image --field "${field}" || true
+done
+if [[ -n "${USB_CAMERA_INFO_URL}" ]]; then
+  echo "-- camera info header --"
+  timeout --kill-after=2s 4s ros2 topic echo --once /camera_info --field header || \
+    timeout --kill-after=2s 4s ros2 topic echo --once /camera/camera_info --field header || true
+fi
 cleanup_camera
 trap - EXIT INT TERM
 '

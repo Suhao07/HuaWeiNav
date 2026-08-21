@@ -1,0 +1,127 @@
+<mxfile host="app.diagrams.net" modified="2026-08-13T00:00:00.000Z" agent="Codex" version="24.7.17" type="device">
+  <diagram id="d435i-ros-graph" name="D435i ROS Graph">
+    <mxGraphModel dx="1600" dy="1000" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1800" pageHeight="1200" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+
+        <mxCell id="lane_cam" value="D435i 相机" style="swimlane;html=1;rounded=1;horizontal=0;startSize=32;fillColor=#eff6ff;strokeColor=#2563eb;fontStyle=1;fontColor=#1e3a8a;" vertex="1" parent="1">
+          <mxGeometry x="20" y="40" width="330" height="470" as="geometry"/>
+        </mxCell>
+        <mxCell id="lane_lio" value="Livox + Point-LIO" style="swimlane;html=1;rounded=1;horizontal=0;startSize=32;fillColor=#f0fdf4;strokeColor=#16a34a;fontStyle=1;fontColor=#14532d;" vertex="1" parent="1">
+          <mxGeometry x="390" y="40" width="390" height="650" as="geometry"/>
+        </mxCell>
+        <mxCell id="lane_vln" value="HuaweiVLN 感知与建图" style="swimlane;html=1;rounded=1;horizontal=0;startSize=32;fillColor=#fffbeb;strokeColor=#d97706;fontStyle=1;fontColor=#78350f;" vertex="1" parent="1">
+          <mxGeometry x="820" y="40" width="520" height="650" as="geometry"/>
+        </mxCell>
+        <mxCell id="lane_ctrl" value="控制流（当前关闭）" style="swimlane;html=1;rounded=1;horizontal=0;startSize=32;fillColor=#fef2f2;strokeColor=#dc2626;fontStyle=1;fontColor=#7f1d1d;" vertex="1" parent="1">
+          <mxGeometry x="20" y="740" width="1320" height="300" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="cam_node" value="/camera/d435i&lt;br&gt;realsense2_camera" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dbeafe;strokeColor=#2563eb;fontColor=#111827;" vertex="1" parent="lane_cam">
+          <mxGeometry x="40" y="55" width="240" height="55" as="geometry"/>
+        </mxCell>
+        <mxCell id="rgb" value="/camera/d435i/color/image_raw&lt;br&gt;sensor_msgs/Image" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#64748b;fontColor=#111827;" vertex="1" parent="lane_cam">
+          <mxGeometry x="40" y="145" width="240" height="60" as="geometry"/>
+        </mxCell>
+        <mxCell id="info" value="/camera/d435i/color/camera_info&lt;br&gt;sensor_msgs/CameraInfo&lt;br&gt;1280×720" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#64748b;fontColor=#111827;" vertex="1" parent="lane_cam">
+          <mxGeometry x="40" y="235" width="240" height="70" as="geometry"/>
+        </mxCell>
+        <mxCell id="depth" value="/camera/d435i/depth/image_rect_raw&lt;br&gt;sensor_msgs/Image" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#64748b;fontColor=#111827;" vertex="1" parent="lane_cam">
+          <mxGeometry x="40" y="335" width="240" height="60" as="geometry"/>
+        </mxCell>
+        <mxCell id="d435_tf" value="D435i optical frame&lt;br&gt;外参配置，不广播伪 TF" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fef3c7;strokeColor=#d97706;fontColor=#111827;dashed=1;" vertex="1" parent="lane_cam">
+          <mxGeometry x="40" y="425" width="240" height="60" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="livox_node" value="livox_ros_driver2" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dcfce7;strokeColor=#16a34a;fontColor=#111827;" vertex="1" parent="lane_lio">
+          <mxGeometry x="65" y="55" width="250" height="55" as="geometry"/>
+        </mxCell>
+        <mxCell id="lidar" value="/livox/lidar&lt;br&gt;livox_ros_driver2/msg/CustomMsg" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#64748b;fontColor=#111827;" vertex="1" parent="lane_lio">
+          <mxGeometry x="65" y="145" width="250" height="60" as="geometry"/>
+        </mxCell>
+        <mxCell id="imu" value="/livox/imu&lt;br&gt;sensor_msgs/Imu" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#64748b;fontColor=#111827;" vertex="1" parent="lane_lio">
+          <mxGeometry x="65" y="235" width="250" height="60" as="geometry"/>
+        </mxCell>
+        <mxCell id="lio" value="/laserMapping&lt;br&gt;Point-LIO" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dcfce7;strokeColor=#16a34a;fontColor=#111827;" vertex="1" parent="lane_lio">
+          <mxGeometry x="65" y="335" width="250" height="60" as="geometry"/>
+        </mxCell>
+        <mxCell id="cloud" value="/cloud_registered&lt;br&gt;sensor_msgs/PointCloud2&lt;br&gt;frame=camera_init" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#64748b;fontColor=#111827;" vertex="1" parent="lane_lio">
+          <mxGeometry x="35" y="435" width="165" height="75" as="geometry"/>
+        </mxCell>
+        <mxCell id="body" value="/cloud_registered_body&lt;br&gt;PointCloud2&lt;br&gt;frame=body" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#64748b;fontColor=#111827;" vertex="1" parent="lane_lio">
+          <mxGeometry x="220" y="435" width="165" height="75" as="geometry"/>
+        </mxCell>
+        <mxCell id="odom" value="/aft_mapped_to_init&lt;br&gt;nav_msgs/Odometry&lt;br&gt;camera_init → aft_mapped" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#64748b;fontColor=#111827;" vertex="1" parent="lane_lio">
+          <mxGeometry x="65" y="555" width="250" height="75" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="det" value="/detection_node&lt;br&gt;YOLOE detector&lt;br&gt;0.5 s interval / stale-frame gate" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fef3c7;strokeColor=#d97706;fontColor=#111827;" vertex="1" parent="lane_vln">
+          <mxGeometry x="50" y="65" width="300" height="70" as="geometry"/>
+        </mxCell>
+        <mxCell id="detres" value="/huawei_vln/d435i_detection_result&lt;br&gt;tare_planner/msg/DetectionResult" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#64748b;fontColor=#111827;" vertex="1" parent="lane_vln">
+          <mxGeometry x="50" y="180" width="300" height="65" as="geometry"/>
+        </mxCell>
+        <mxCell id="proj" value="D435i 投影配置&lt;br&gt;内参 + LiDAR→相机外参&lt;br&gt;状态：extrinsics_only" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fef3c7;strokeColor=#d97706;fontColor=#111827;dashed=1;" vertex="1" parent="lane_vln">
+          <mxGeometry x="50" y="290" width="300" height="70" as="geometry"/>
+        </mxCell>
+        <mxCell id="sem" value="/d435i_body_semantic_mapping&lt;br&gt;语义建图节点&lt;br&gt;body cloud + time sync" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dcfce7;strokeColor=#16a34a;fontColor=#111827;" vertex="1" parent="lane_vln">
+          <mxGeometry x="50" y="405" width="300" height="70" as="geometry"/>
+        </mxCell>
+        <mxCell id="obj" value="/huawei_vln/d435i_body_object_nodes_list&lt;br&gt;tare_planner/msg/ObjectNodeList&lt;br&gt;对象 + PointCloud2" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#64748b;fontColor=#111827;" vertex="1" parent="lane_vln">
+          <mxGeometry x="50" y="520" width="300" height="75" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="strive" value="STRIVE 高层规划&lt;br&gt;当前未启动" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fee2e2;strokeColor=#dc2626;fontColor=#7f1d1d;" vertex="1" parent="lane_ctrl">
+          <mxGeometry x="60" y="75" width="210" height="60" as="geometry"/>
+        </mxCell>
+        <mxCell id="wayin" value="/way_point&lt;br&gt;geometry_msgs/PointStamped&lt;br&gt;无 publisher" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fee2e2;strokeColor=#dc2626;fontColor=#7f1d1d;" vertex="1" parent="lane_ctrl">
+          <mxGeometry x="340" y="75" width="230" height="60" as="geometry"/>
+        </mxCell>
+        <mxCell id="adapter" value="Waypoint Adapter&lt;br&gt;output_enabled=false" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fee2e2;strokeColor=#dc2626;fontColor=#7f1d1d;" vertex="1" parent="lane_ctrl">
+          <mxGeometry x="640" y="75" width="230" height="60" as="geometry"/>
+        </mxCell>
+        <mxCell id="wayout" value="/waypoint&lt;br&gt;std_msgs/Float32MultiArray&lt;br&gt;无 publisher" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fee2e2;strokeColor=#dc2626;fontColor=#7f1d1d;" vertex="1" parent="lane_ctrl">
+          <mxGeometry x="940" y="75" width="230" height="60" as="geometry"/>
+        </mxCell>
+        <mxCell id="cmd" value="/cmd_vel&lt;br&gt;禁止直接发布" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fee2e2;strokeColor=#dc2626;fontColor=#7f1d1d;" vertex="1" parent="lane_ctrl">
+          <mxGeometry x="640" y="180" width="230" height="60" as="geometry"/>
+        </mxCell>
+        <mxCell id="base" value="底盘控制器&lt;br&gt;所有权/急停/反馈待批准" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fee2e2;strokeColor=#dc2626;fontColor=#7f1d1d;" vertex="1" parent="lane_ctrl">
+          <mxGeometry x="940" y="180" width="230" height="60" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="e_cam_rgb" edge="1" parent="lane_cam" source="cam_node" target="rgb" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;strokeColor=#2563eb;"/>
+        <mxCell id="e_cam_info" edge="1" parent="lane_cam" source="cam_node" target="info" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;strokeColor=#2563eb;"/>
+        <mxCell id="e_cam_depth" edge="1" parent="lane_cam" source="cam_node" target="depth" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;strokeColor=#2563eb;"/>
+        <mxCell id="e_livox_lidar" edge="1" parent="lane_lio" source="livox_node" target="lidar" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;strokeColor=#16a34a;"/>
+        <mxCell id="e_livox_imu" edge="1" parent="lane_lio" source="livox_node" target="imu" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;strokeColor=#16a34a;"/>
+        <mxCell id="e_lidar_lio" edge="1" parent="lane_lio" source="lidar" target="lio" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;strokeColor=#16a34a;"/>
+        <mxCell id="e_imu_lio" edge="1" parent="lane_lio" source="imu" target="lio" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;strokeColor=#16a34a;"/>
+        <mxCell id="e_lio_cloud" edge="1" parent="lane_lio" source="lio" target="cloud" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;strokeColor=#16a34a;"/>
+        <mxCell id="e_lio_body" edge="1" parent="lane_lio" source="lio" target="body" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;strokeColor=#16a34a;"/>
+        <mxCell id="e_lio_odom" edge="1" parent="lane_lio" source="lio" target="odom" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;strokeColor=#16a34a;"/>
+
+        <mxCell id="e_rgb_det" edge="1" parent="1" source="rgb" target="det" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;strokeColor=#d97706;"/>
+        <mxCell id="e_det_res" edge="1" parent="lane_vln" source="det" target="detres" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;strokeColor=#d97706;"/>
+        <mxCell id="e_body_sem" edge="1" parent="1" source="body" target="sem" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;strokeColor=#16a34a;"/>
+        <mxCell id="e_odom_sem" edge="1" parent="1" source="odom" target="sem" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;strokeColor=#16a34a;"/>
+        <mxCell id="e_det_sem" edge="1" parent="lane_vln" source="detres" target="sem" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;strokeColor=#d97706;"/>
+        <mxCell id="e_info_proj" edge="1" parent="1" source="info" target="proj" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=open;dashed=1;strokeColor=#d97706;"/>
+        <mxCell id="e_proj_sem" edge="1" parent="lane_vln" source="proj" target="sem" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=open;dashed=1;strokeColor=#d97706;"/>
+        <mxCell id="e_sem_obj" edge="1" parent="lane_vln" source="sem" target="obj" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;strokeColor=#16a34a;"/>
+
+        <mxCell id="e_obj_strive" edge="1" parent="1" source="obj" target="strive" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=open;dashed=1;strokeColor=#dc2626;"/>
+        <mxCell id="e_strive_wayin" edge="1" parent="lane_ctrl" source="strive" target="wayin" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=open;dashed=1;strokeColor=#dc2626;"/>
+        <mxCell id="e_wayin_adapter" edge="1" parent="lane_ctrl" source="wayin" target="adapter" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=open;dashed=1;strokeColor=#dc2626;"/>
+        <mxCell id="e_adapter_wayout" edge="1" parent="lane_ctrl" source="adapter" target="wayout" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=open;dashed=1;strokeColor=#dc2626;"/>
+        <mxCell id="e_wayout_base" edge="1" parent="lane_ctrl" source="wayout" target="base" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=open;dashed=1;strokeColor=#dc2626;"/>
+        <mxCell id="e_strive_cmd" edge="1" parent="lane_ctrl" source="strive" target="cmd" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=open;dashed=1;strokeColor=#dc2626;"/>
+
+        <mxCell id="legend" value="实线：已验证数据流&lt;br&gt;虚线：标定关系或未启用控制流&lt;br&gt;红色：禁止/未批准控制路径" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8fafc;strokeColor=#94a3b8;fontColor=#334155;" vertex="1" parent="1">
+          <mxGeometry x="20" y="1070" width="1320" height="60" as="geometry"/>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

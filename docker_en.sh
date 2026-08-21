@@ -11,6 +11,7 @@ ASSET_DIR="${SYSNAV_ASSET_DIR:-${REPO_ROOT}/real_robot/ros2_ws/src/semantic_mapp
 
 PLATFORM="${PLATFORM:-mecanum}"
 CLOUD_TOPIC="${CLOUD_TOPIC:-/cloud_registered}"
+STRIVE_POINTCLOUD_TOPIC="${STRIVE_POINTCLOUD_TOPIC:-${CLOUD_TOPIC}}"
 ODOM_TOPIC="${ODOM_TOPIC:-/aft_mapped_to_init}"
 CAMERA_TOPIC="${CAMERA_TOPIC:-/camera/image}"
 START_USB_CAM="${START_USB_CAM:-false}"
@@ -48,6 +49,8 @@ fi
 
 SYSNAV_DETECTOR_MODEL_TYPE="${SYSNAV_DETECTOR_MODEL_TYPE:-yoloe}"
 SYSNAV_DETECTOR_MODEL_PATH="${SYSNAV_DETECTOR_MODEL_PATH:-${ASSET_DIR}/yoloe-11s-seg.pt}"
+SYSNAV_DETECTOR_DEVICE="${SYSNAV_DETECTOR_DEVICE:-cuda:0}"
+SYSNAV_DETECTOR_IMGSZ="${SYSNAV_DETECTOR_IMGSZ:-640}"
 SYSNAV_SAM2_CHECKPOINT="${SYSNAV_SAM2_CHECKPOINT:-${ASSET_DIR}/sam2/checkpoints/sam2.1_hiera_base_plus.pt}"
 SYSNAV_MOBILECLIP_BLT_PATH="${SYSNAV_MOBILECLIP_BLT_PATH:-${ASSET_DIR}/mobileclip_blt.pt}"
 SYSNAV_MOBILECLIP_BLT_TS_PATH="${SYSNAV_MOBILECLIP_BLT_TS_PATH:-${ASSET_DIR}/mobileclip_blt.ts}"
@@ -60,6 +63,12 @@ STRIVE_INSTRUCTION_PLAN_BACKEND="${STRIVE_INSTRUCTION_PLAN_BACKEND:-rules}"
 STRIVE_DRY_RUN="${STRIVE_DRY_RUN:-true}"
 STRIVE_RUN_DIRECTORY="${STRIVE_RUN_DIRECTORY:-/tmp/strive_real_robot_runtime}"
 STRIVE_LOWER_CONTROLLER_ENABLED="${STRIVE_LOWER_CONTROLLER_ENABLED:-false}"
+START_WAYPOINT_ADAPTER="${START_WAYPOINT_ADAPTER:-false}"
+WAYPOINT_ADAPTER_CONFIG="${WAYPOINT_ADAPTER_CONFIG:-}"
+WAYPOINT_ADAPTER_INPUT_TOPIC="${WAYPOINT_ADAPTER_INPUT_TOPIC:-/way_point}"
+WAYPOINT_ADAPTER_OUTPUT_TOPIC="${WAYPOINT_ADAPTER_OUTPUT_TOPIC:-/waypoint}"
+WAYPOINT_ADAPTER_ODOM_TOPIC="${WAYPOINT_ADAPTER_ODOM_TOPIC:-/aft_mapped_to_init}"
+WAYPOINT_ADAPTER_OUTPUT_ENABLED="${WAYPOINT_ADAPTER_OUTPUT_ENABLED:-false}"
 
 usage() {
   cat <<EOF
@@ -193,6 +202,19 @@ append_unique_dir_mount() {
   fi
 }
 
+append_workspace_file_mount() {
+  local -n args_ref=$1
+  local container_path="$2"
+  [[ -n "${container_path}" ]] || return 0
+  [[ "${container_path}" == /workspace/STRIVE/* ]] || return 0
+  local host_path="${REPO_ROOT}/${container_path#/workspace/STRIVE/}"
+  if [[ -f "${host_path}" ]]; then
+    args_ref+=(-v "${host_path}:${container_path}:ro")
+  else
+    echo "Configured workspace file is missing; not mounting: ${host_path}" >&2
+  fi
+}
+
 docker_args() {
   case "${RESTART_POLICY}" in
     no|always|unless-stopped|on-failure|on-failure:*) ;;
@@ -225,6 +247,8 @@ docker_args() {
     -e "USB_CAMERA_INFO_URL=${USB_CAMERA_INFO_URL}"
     -e "SYSNAV_DETECTOR_MODEL_TYPE=${SYSNAV_DETECTOR_MODEL_TYPE}"
     -e "SYSNAV_DETECTOR_MODEL_PATH=${SYSNAV_DETECTOR_MODEL_PATH}"
+    -e "SYSNAV_DETECTOR_DEVICE=${SYSNAV_DETECTOR_DEVICE}"
+    -e "SYSNAV_DETECTOR_IMGSZ=${SYSNAV_DETECTOR_IMGSZ}"
     -e "SYSNAV_SAM2_CHECKPOINT=${SYSNAV_SAM2_CHECKPOINT}"
     -e "SYSNAV_MOBILECLIP_BLT_PATH=${SYSNAV_MOBILECLIP_BLT_PATH}"
     -e "SYSNAV_MOBILECLIP_BLT_TS_PATH=${SYSNAV_MOBILECLIP_BLT_TS_PATH}"
@@ -245,6 +269,12 @@ docker_args() {
     -e "STRIVE_DRY_RUN=${STRIVE_DRY_RUN}"
     -e "STRIVE_RUN_DIRECTORY=${STRIVE_RUN_DIRECTORY}"
     -e "STRIVE_LOWER_CONTROLLER_ENABLED=${STRIVE_LOWER_CONTROLLER_ENABLED}"
+    -e "START_WAYPOINT_ADAPTER=${START_WAYPOINT_ADAPTER}"
+    -e "WAYPOINT_ADAPTER_CONFIG=${WAYPOINT_ADAPTER_CONFIG}"
+    -e "WAYPOINT_ADAPTER_INPUT_TOPIC=${WAYPOINT_ADAPTER_INPUT_TOPIC}"
+    -e "WAYPOINT_ADAPTER_OUTPUT_TOPIC=${WAYPOINT_ADAPTER_OUTPUT_TOPIC}"
+    -e "WAYPOINT_ADAPTER_ODOM_TOPIC=${WAYPOINT_ADAPTER_ODOM_TOPIC}"
+    -e "WAYPOINT_ADAPTER_OUTPUT_ENABLED=${WAYPOINT_ADAPTER_OUTPUT_ENABLED}"
     -e "START_SEMANTIC_MAPPING=${START_SEMANTIC_MAPPING}"
     -e "MAPPING_CONFIG=${MAPPING_CONFIG}"
     -e "PROJECTION_CONFIG=${PROJECTION_CONFIG}"
@@ -299,6 +329,12 @@ docker_args() {
     DOCKER_RUN_ARGS+=(-v "${control_contract_dir}:/workspace/STRIVE/real_robot/control:ro")
   fi
 
+  # The image may predate a newly-added robot profile.  Mount only the selected
+  # mapping/projection YAML files read-only so a profile update does not require
+  # rebuilding the image and cannot alter another workspace.
+  append_workspace_file_mount DOCKER_RUN_ARGS "${MAPPING_CONFIG}"
+  append_workspace_file_mount DOCKER_RUN_ARGS "${PROJECTION_CONFIG}"
+
   declare -A mounted_dirs=()
   append_unique_dir_mount DOCKER_RUN_ARGS mounted_dirs "${SYSNAV_DETECTOR_MODEL_PATH}"
   append_unique_dir_mount DOCKER_RUN_ARGS mounted_dirs "${SYSNAV_SAM2_CHECKPOINT}"
@@ -321,6 +357,7 @@ docker_args() {
     STRIVE_OBJECT_TOPIC STRIVE_ROOM_TOPIC STRIVE_ODOM_TOPIC STRIVE_PATH_TOPIC \
     STRIVE_PLANNER_STATUS_TOPIC STRIVE_IMAGE_TOPIC STRIVE_DETECTION_TOPIC \
     STRIVE_DEPTH_TOPIC STRIVE_POINTCLOUD_TOPIC \
+    SYSNAV_DETECTOR_DEVICE SYSNAV_DETECTOR_IMGSZ \
     STRIVE_PERSIST_OBSERVATION_IMAGES STRIVE_OBSERVATION_IMAGE_DIRECTORY \
     STRIVE_DECISION_PERIOD_S STRIVE_USE_SIM_TIME; do
     if [[ -n "${!name:-}" ]]; then
@@ -332,7 +369,7 @@ docker_args() {
 launch_args() {
   LAUNCH_ARGS=(
     "platform:=${PLATFORM}"
-    "cloud_topic:=${CLOUD_TOPIC}"
+    "cloud_topic:=${STRIVE_POINTCLOUD_TOPIC}"
     "odom_topic:=${ODOM_TOPIC}"
     "start_usb_cam:=${START_USB_CAM}"
     "usb_video_device:=${USB_VIDEO_DEVICE}"
@@ -432,6 +469,7 @@ smoke() {
   USB_IMAGE_HEIGHT="${USB_IMAGE_HEIGHT}" \
   USB_PIXEL_FORMAT="${USB_PIXEL_FORMAT}" \
   USB_FRAMERATE="${USB_FRAMERATE}" \
+  USB_CAMERA_INFO_URL="${USB_CAMERA_INFO_URL:-}" \
   CHECK_DETECTOR_INIT="${CHECK_DETECTOR_INIT:-0}" \
   SUDO_STDIN_PASSWORD="${SUDO_STDIN_PASSWORD:-}" \
   bash "${REPO_ROOT}/scripts/smoke_real_robot_orin.sh"

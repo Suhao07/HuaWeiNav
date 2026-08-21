@@ -1,5 +1,7 @@
-# Do not mark this profile as calibrated until a board/target-based LiDAR-RGB
-# calibration has been recorded and its reprojection error is documented.
+# USB-camera profile.  Do not copy the D435i extrinsic into this file: the
+# Generic USB camera is a different sensor and has no validated LiDAR-RGB
+# transform yet.  Do not mark this profile as calibrated until a
+# USB-camera-specific calibration has been recorded.
 # The transform convention is p_camera = R_lidar_to_camera @ p_lidar + t.
 camera_projection:
   calibration_status: uncalibrated
@@ -11,35 +13,44 @@ camera_projection:
     lidar: /cloud_registered
     odom: /aft_mapped_to_init
   frame_ids:
-    # Replace these after checking actual message headers / TF.
+    # The usb_cam node currently publishes frame_id=default_cam.  Keep the
+    # live source explicit; this is not the D435i optical frame.
     lidar: livox_frame
-    camera_optical: camera_color_optical_frame
-  # Positive means the RGB timestamp is later than the LiDAR timestamp.
+    camera_optical: default_cam
+    camera_sensor: camera_x001_usb
+  # Positive means the RGB timestamp is later than the LiDAR timestamp.  No
+  # RGB-LiDAR measurement was included with camera_x001, so zero is only an
+  # initial assumption and must not be treated as calibrated.
   rgb_minus_lidar_time_offset_s: 0.0
+  time_offset_status: assumed_zero_unvalidated
+  time_offset_source: not_provided_for_usb_camera
   model: pinhole
   image:
-    width: 1280
-    height: 720
+    width: 1920
+    height: 1080
   intrinsics:
-    # Replace all four placeholders with the calibrated Generic USB RGB camera values.
-    fx: 0.0
-    fy: 0.0
-    cx: 0.0
-    cy: 0.0
+    # Temporary user-provided camera_x001 intrinsics.  The profile remains
+    # uncalibrated until the LiDAR-to-camera/time-offset validation is complete.
+    fx: 749.2058
+    fy: 749.2058
+    cx: 1003.1
+    cy: 526.5258
   # Keep the distortion record together with the pinhole values.  The current
   # projection path expects rectified RGB; rectify upstream if coefficients are
   # non-zero, rather than silently applying an unsupported distortion model.
   distortion:
     model: plumb_bob
-    coefficients: []
+    coefficients: [1.5847e-5, -1.3585e-7, 0.0, 0.0, 4.7386e-11]
   lidar_to_camera:
-    # Replace with the measured MID-360 -> RGB optical-frame transform.
+    # USB-camera transform is intentionally empty.  The matrix in
+    # orin26_d435i_mid360_targetless_v009_r009_extrinsics.json belongs to the
+    # D435i sensor and is stored in the separate D435i profile.
     translation_m: [0.0, 0.0, 0.0]
     rotation_rpy_rad: [0.0, 0.0, 0.0]
   min_depth_m: 0.05
   validation:
     # Fill these from the calibration report before changing status above.
-    method: ""
+    method: "user-provided camera_x001 intrinsics; USB-camera LiDAR extrinsics pending"
     calibration_date_utc: ""
-    reprojection_rmse_px: null
+    reprojection_rmse_px: 0.69
     sample_count: 0
