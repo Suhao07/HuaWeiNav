@@ -1,6 +1,6 @@
 # D435i--MID-360 标定数据采集
 
-这套流程只采集数据，不启动 semantic mapping、waypoint adapter、局部规划器或底盘控制。默认假设 Livox、Point-LIO 和 D435i 驱动已经由机器人原有工作流启动；脚本只读取 topic 并调用 `ros2 bag record`。
+这套流程会启动或复用 Livox、Point-LIO 和 D435i 驱动，然后采集数据；不会启动 semantic mapping、waypoint adapter、局部规划器或底盘控制。启动使用机器人上已有的 `/home/orin26/code/start_livox_odom.sh` 和 RealSense launch 参数，不修改这些外部项目。
 
 ## 1. 采集前检查
 
@@ -27,7 +27,14 @@ ros2 topic list -t | grep -E \
 
 ## 2. 启动和录制
 
-只使用机器人已有传感器进程时：
+默认命令会自动执行以下动作：
+
+1. 复用已有 `livox_odom` tmux session；不存在时调用 `/home/orin26/code/start_livox_odom.sh start`，启动 Livox MID-360 和 Point-LIO；
+2. 复用已有 `d435i_camera` tmux session；不存在时启动 RealSense D435i，使用 `1280x720@30`、`align_depth.enable:=true`、`enable_sync:=true`；
+3. 检查实际消息后开始录 bag；
+4. 采集完成只停止本次脚本新建的 tmux session，复用的已有 session 不会停止。
+
+直接录制：
 
 ```bash
 bash scripts/capture_d435i_mid360_calibration.sh \
@@ -35,11 +42,18 @@ bash scripts/capture_d435i_mid360_calibration.sh \
   --phase-duration 8
 ```
 
-如果需要由本项目启动 Point-LIO，必须显式提供启动命令，并设置 `RESTART_EXISTING=0`，避免脚本杀掉机器人原有 session：
+如果只想复用已经启动的传感器、不由脚本启动：
+
+```bash
+bash scripts/capture_d435i_mid360_calibration.sh \
+  --no-start-lio --no-start-d435i
+```
+
+如果机器人使用不同的 Point-LIO 启动脚本，可以显式覆盖默认命令：
 
 ```bash
 START_LIO=1 \
-LIO_START_CMD='RESTART_EXISTING=0 ENABLE_CLOUD_PUBLISH=1 ENABLE_BODY_CLOUD_PUBLISH=1 bash scripts/start_orin_lio_for_strive.sh' \
+LIO_START_CMD='<机器人现有 Point-LIO 启动命令>' \
 bash scripts/capture_d435i_mid360_calibration.sh --start-lio
 ```
 
@@ -47,8 +61,17 @@ D435i 驱动的 launch 参数和命名空间属于机器人现有项目，脚本
 
 ```bash
 START_D435I=1 \
-D435I_START_CMD='<机器人现有 D435i launch 命令，需包含 aligned depth>' \
+D435I_START_CMD='<机器人现有 D435i launch 命令，需包含 align_depth.enable:=true>' \
 bash scripts/capture_d435i_mid360_calibration.sh --start-d435i
+```
+
+如果更换机器人或 D435i 序列号，覆盖以下参数：
+
+```bash
+D435I_SERIAL_NO=_<serial> \
+D435I_CAMERA_NAMESPACE=camera/d435i \
+D435I_CAMERA_NAME=d435i_camera \
+bash scripts/capture_d435i_mid360_calibration.sh
 ```
 
 如当前深度 topic 名称不是 `aligned_depth_to_color`，且已由操作者确认驱动配置：

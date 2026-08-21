@@ -3,7 +3,8 @@ set -Eeuo pipefail
 
 # Record-only D435i + MID-360 calibration data.  This script never publishes a
 # waypoint or velocity command.  Existing host-owned sensor processes are
-# observed by default; optional driver startup requires an explicit command.
+# reused when present; otherwise the robot's known sensor startup helpers are
+# launched in dedicated tmux sessions and cleaned up only if this script created them.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -16,10 +17,16 @@ output_root="${CALIBRATION_OUTPUT_ROOT:-${REPO_ROOT}/real_robot/calibration/raw_
 output_dir=""
 bag_name=""
 allow_nonaligned_depth="${ALLOW_NONALIGNED_DEPTH:-0}"
-start_lio="${START_LIO:-0}"
-start_d435i="${START_D435I:-0}"
+start_lio="${START_LIO:-1}"
+start_d435i="${START_D435I:-1}"
+lio_session="${LIO_TMUX_SESSION:-livox_odom}"
+d435i_session="${D435I_TMUX_SESSION:-d435i_camera}"
+lio_start_script="${LIO_START_SCRIPT:-/home/orin26/code/start_livox_odom.sh}"
 lio_start_cmd="${LIO_START_CMD:-}"
 d435i_start_cmd="${D435I_START_CMD:-}"
+d435i_camera_namespace="${D435I_CAMERA_NAMESPACE:-camera/d435i}"
+d435i_camera_name="${D435I_CAMERA_NAME:-d435i_camera}"
+d435i_serial_no="${D435I_SERIAL_NO:-_233522079589}"
 sample_timeout_s="${CALIBRATION_SAMPLE_TIMEOUT_S:-8}"
 non_interactive="${CALIBRATION_NON_INTERACTIVE:-0}"
 
@@ -28,8 +35,10 @@ usage() {
 Usage: scripts/capture_d435i_mid360_calibration.sh [options]
 
 Record a synchronized RGB-D + CameraInfo + Livox + IMU + odometry bag for
-D435i--MID-360 calibration.  The default is observe-only: it does not start
-drivers, semantic mapping, a waypoint adapter, a planner, or any controller.
+D435i--MID-360 calibration.  By default it starts the robot's existing Livox +
+Point-LIO helper and D435i RealSense driver in dedicated tmux sessions.  It
+does not start semantic mapping, a waypoint adapter, a planner, or any
+controller.
 
 Options:
   --duration SEC              Total capture duration (default: 144)
@@ -39,8 +48,10 @@ Options:
   --allow-nonaligned-depth    Explicitly allow a depth topic whose name is not
                               aligned_depth_to_color; the manifest records this
                               as operator-declared and it remains a calibration risk.
-  --start-lio                 Run LIO_START_CMD before recording
-  --start-d435i               Run D435I_START_CMD before recording
+  --start-lio                 Explicitly enable LIO startup (default)
+  --no-start-lio              Reuse an already running LIO stack only
+  --start-d435i               Explicitly enable D435i startup (default)
+  --no-start-d435i            Reuse an already running D435i stack only
   --non-interactive           Do not wait for operator confirmation between phases
   -h, --help                  Show this help
 
@@ -48,9 +59,15 @@ Topic overrides are environment variables:
   RGB_TOPIC, DEPTH_TOPIC, CAMERA_INFO_TOPIC, LIDAR_TOPIC, IMU_TOPIC,
   CLOUD_TOPIC, ODOM_TOPIC, TF_TOPIC, TF_STATIC_TOPIC.
 
-Optional startup commands (never inferred):
-  LIO_START_CMD='RESTART_EXISTING=0 ENABLE_CLOUD_PUBLISH=1 ENABLE_BODY_CLOUD_PUBLISH=1 bash scripts/start_orin_lio_for_strive.sh'
-  D435I_START_CMD='ros2 launch realsense2_camera rs_launch.py ...'
+Default robot-owned startup:
+  LIO_START_SCRIPT=/home/orin26/code/start_livox_odom.sh
+  D435I_SERIAL_NO=_233522079589
+  D435I_CAMERA_NAMESPACE=camera/d435i
+  D435I_CAMERA_NAME=d435i_camera
+
+Optional startup overrides:
+  LIO_START_CMD='<foreground or robot startup command>'
+  D435I_START_CMD='<foreground or robot RealSense startup command>'
 
 The 18 phases cover 3 distances x 3 target orientations x 2 target poses.
 The operator moves/holds the calibration target; this script only sleeps while
@@ -88,8 +105,12 @@ while (($#)); do
       allow_nonaligned_depth=1; shift ;;
     --start-lio)
       start_lio=1; shift ;;
+    --no-start-lio)
+      start_lio=0; shift ;;
     --start-d435i)
       start_d435i=1; shift ;;
+    --no-start-d435i)
+      start_d435i=0; shift ;;
     --non-interactive)
       non_interactive=1; shift ;;
     -h|--help)
@@ -176,11 +197,11 @@ choose_depth_topic() {
   die "no D435i depth image topic found; set DEPTH_TOPIC explicitly"
 }
 
-if is_true "${start_lio}"; then
-  [[ -n "${lio_start_cmd}" ]] || die "--start-lio requires LIO_START_CMD; no LIO command is inferred"
+if (is_true "${start_lio}" || is_true "${start_d435i}") && ! command -v tmux >/dev/null 2>&1; then
+  die "tmux is required for the default robot sensor startup sessions"
 fi
-if is_true "${start_d435i}"; then
-  [[ -n "${d435i_start_cmd}" ]] || die "--start-d435i requires D435I_START_CMD; no camera command is inferred"
+if is_true "${start_lio}" && [[ -z "${lio_start_cmd}" && ! -f "${lio_start_script}" ]]; then
+  die "LIO startup script is missing: ${lio_start_script}; set LIO_START_CMD or --no-start-lio"
 fi
 
 timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -197,6 +218,57 @@ bag_dir="${output_dir}/${bag_name}"
 lio_pid=""
 d435i_pid=""
 bag_pid=""
+lio_started_by_us=0
+d435i_started_by_us=0
+
+tmux_session_exists() {
+  tmux has-session -t "$1" 2>/dev/null
+}
+
+start_lio_sensor_stack() {
+  if tmux_session_exists "${lio_session}"; then
+    echo "[calibration-capture] reusing existing LIO session: ${lio_session}"
+    return 0
+  fi
+  if [[ -n "${lio_start_cmd}" ]]; then
+    echo "[calibration-capture] starting supplied LIO command"
+    bash -lc "${lio_start_cmd}" >"${output_dir}/lio_start.log" 2>&1 &
+    lio_pid=$!
+  else
+    echo "[calibration-capture] starting robot LIO helper: ${lio_start_script} start"
+    bash "${lio_start_script}" start >"${output_dir}/lio_start.log" 2>&1
+  fi
+  lio_started_by_us=1
+  sleep 3
+}
+
+start_d435i_sensor() {
+  if tmux_session_exists "${d435i_session}"; then
+    echo "[calibration-capture] reusing existing D435i session: ${d435i_session}"
+    return 0
+  fi
+  if [[ -n "${d435i_start_cmd}" ]]; then
+    echo "[calibration-capture] starting supplied D435i command"
+    bash -lc "${d435i_start_cmd}" >"${output_dir}/d435i_start.log" 2>&1 &
+    d435i_pid=$!
+  else
+    echo "[calibration-capture] starting robot D435i RealSense session: ${d435i_session}"
+    tmux new-session -d -s "${d435i_session}" -n camera /bin/bash -lc \
+      "source '${ROS_SETUP}'; exec ros2 launch realsense2_camera rs_launch.py \
+        camera_namespace:=${d435i_camera_namespace} \
+        camera_name:=${d435i_camera_name} \
+        serial_no:=${d435i_serial_no} \
+        enable_color:=true enable_depth:=true \
+        rgb_camera.color_profile:=1280,720,30 \
+        depth_module.depth_profile:=1280,720,30 \
+        align_depth.enable:=true enable_sync:=true publish_tf:=true \
+        >'${output_dir}/d435i_driver.log' 2>&1" \
+      >"${output_dir}/d435i_start.log" 2>&1
+  fi
+  d435i_started_by_us=1
+  sleep 3
+}
+
 cleanup() {
   set +e
   if [[ -n "${bag_pid}" ]] && kill -0 "${bag_pid}" 2>/dev/null; then
@@ -209,22 +281,22 @@ cleanup() {
       wait "${pid}" 2>/dev/null || true
     fi
   done
+  if [[ "${d435i_started_by_us}" == "1" ]] && tmux_session_exists "${d435i_session}"; then
+    tmux kill-session -t "${d435i_session}" 2>/dev/null || true
+  fi
+  if [[ "${lio_started_by_us}" == "1" ]] && tmux_session_exists "${lio_session}"; then
+    tmux kill-session -t "${lio_session}" 2>/dev/null || true
+  fi
 }
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
 if is_true "${start_lio}"; then
-  echo "[calibration-capture] starting explicitly supplied LIO command"
-  bash -lc "${lio_start_cmd}" >"${output_dir}/lio_start.log" 2>&1 &
-  lio_pid=$!
-  sleep 3
+  start_lio_sensor_stack
 fi
 if is_true "${start_d435i}"; then
-  echo "[calibration-capture] starting explicitly supplied D435i command"
-  bash -lc "${d435i_start_cmd}" >"${output_dir}/d435i_start.log" 2>&1 &
-  d435i_pid=$!
-  sleep 3
+  start_d435i_sensor
 fi
 
 choose_depth_topic
@@ -264,6 +336,15 @@ if [[ -n "$(topic_line /cmd_vel)" ]]; then
   echo "[calibration-capture] warning: /cmd_vel is advertised; this script will not publish it" >&2
 fi
 
+lio_start_status="disabled"
+d435i_start_status="disabled"
+if is_true "${start_lio}"; then
+  [[ "${lio_started_by_us}" == "1" ]] && lio_start_status="started_by_script" || lio_start_status="reused_existing"
+fi
+if is_true "${start_d435i}"; then
+  [[ "${d435i_started_by_us}" == "1" ]] && d435i_start_status="started_by_script" || d435i_start_status="reused_existing"
+fi
+
 mapfile -t record_topics <<EOF
 ${RGB_TOPIC}
 ${DEPTH_TOPIC}
@@ -285,6 +366,9 @@ capture:
   coverage_grid: 3_distances_x_3_orientations_x_2_poses
   depth_alignment: ${depth_alignment}
   bag_path: ${bag_dir}
+startup:
+  lio: ${lio_start_status}
+  d435i: ${d435i_start_status}
 topics:
   rgb: ${RGB_TOPIC}
   depth: ${DEPTH_TOPIC}
