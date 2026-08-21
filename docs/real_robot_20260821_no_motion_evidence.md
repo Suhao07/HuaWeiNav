@@ -11,7 +11,7 @@
 | Generic RGB profile | `run_real_robot_profile.sh orin26_livox_mid360_generic_rgb check` | PASS；`START_SEMANTIC_MAPPING=false`、`dry_run=true`、lower controller=false |
 | D435i profile | `run_real_robot_profile.sh orin26_livox_mid360_d435i check` | PASS；使用 `/cloud_registered_body`，mapping gate 仍关闭 |
 | ROS workspace | 机器人端 `build_real_robot_ros_ws.sh` | 7 packages finished |
-| Docker image | `huawei-vln-realworld:orin-r36.5` | image ID `5939ff884aa2` |
+| Docker image | `huawei-vln-realworld:orin-r36.5` | final image ID `25048b859e0d` |
 | GPU/ML | detector init smoke | `torch cuda=True`，YOLOE init PASS |
 | USB camera | bounded camera smoke | `/camera/image` 与 `/camera_info` 收到；`1920x1080`、`rgb8`、`default_cam` |
 | Runtime | generic 与 D435i `runtime-smoke` | dry-run `WAIT`，缺少 `object_nodes`、pose、image |

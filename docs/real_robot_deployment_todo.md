@@ -121,7 +121,7 @@ status adapter。
 - [x] 在 ROS2 容器中完成 viewpoint bridge topic smoke 和 synthetic CDR rosbag2 replay；两者均验证精确时间戳、frame、pose 和 object ID。
 - [x] 在 ROS2 容器中完成现有 Motion HIL `reached` 场景；该测试不接管真实底盘。
 - [ ] 在 Orin 工作区拉取共同基线，记录完整 commit，而不是只记录短哈希。
-- [x] 重建 `huawei-vln-realworld:orin-r36.5`；机器人 image ID 为 `5939ff884aa2`，7 个 ROS 包编译成功。
+- [x] 重建 `huawei-vln-realworld:orin-r36.5`；机器人最终 image ID 为 `25048b859e0d`，7 个 ROS 包编译成功。
 - [x] 重新执行 D435i profile `check`、detector/GPU smoke、USB 相机只读 smoke 和 runtime WAIT smoke；结果写入当日终端/运行目录证据。
 - [x] 运行至少 30 分钟资源监控；`/aft_mapped_to_init` 约 100 Hz，`/cloud_registered_body` 无实际样本，Point-LIO 约 35% CPU，末段温度约 60--66°C、内存约 5.5 GB。原始产物保留在 `logs/diagnostics/resources/20260821T133641Z/`。
 
@@ -131,7 +131,7 @@ waypoint adapter 输出或任何真实运动节点。
 ### 2026-08-21 无运动实物执行记录
 
 - Profile check：`orin26_livox_mid360_generic_rgb` 与 `orin26_livox_mid360_d435i` 均通过；两者均保持 `START_SEMANTIC_MAPPING=false`、`dry_run=true`、真实运动关闭。
-- 镜像与软件：`huawei-vln-realworld:orin-r36.5`=`5939ff884aa2`；ROS workspace 7 包编译成功；离线 acceptance 为 `113 passed`。
+- 镜像与软件：`huawei-vln-realworld:orin-r36.5`=`25048b859e0d`；ROS workspace 7 包编译成功；离线 acceptance 为 `113 passed`。
 - GPU/模型 smoke：`torch cuda=True`，YOLOE detector init 成功；USB 相机只读 smoke 收到 `/camera/image` 和 `/camera_info`，分辨率 `1920x1080`、编码 `rgb8`、frame `default_cam`。
 - runtime shadow：D435i profile runtime smoke 和 live `semantic_snapshot` dry-run 均保持 `WAIT`，原因是实时 `object_nodes`、pose、image 尚未同时到达；未发布 `/way_point`、`/waypoint` 或 `/cmd_vel`。
 - waypoint adapter shadow：节点日志为 `output_enabled=False`；`/waypoint`、`/strive/test_waypoint_array`、`/way_point`、`/cmd_vel` 均未发现 publisher。
