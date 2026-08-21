@@ -18,7 +18,6 @@ import bisect
 import json
 from pathlib import Path
 
-import cv2
 import numpy as np
 
 
@@ -70,7 +69,14 @@ def interp_pose(times, poses, t):
     return out
 
 
-def read_bag(path, sample_every=8, points_per_packet=100):
+def read_bag(
+    path,
+    depth_topic="/camera/veocc_d435i/aligned_depth_to_color/image_raw",
+    lidar_topic="/livox/lidar",
+    odom_topic="/base_odom",
+    sample_every=8,
+    points_per_packet=100,
+):
     import rosbag2_py
     from livox_ros_driver2.msg import CustomMsg
     from nav_msgs.msg import Odometry
@@ -86,7 +92,7 @@ def read_bag(path, sample_every=8, points_per_packet=100):
     camera_i = 0
     while reader.has_next():
         topic, data, bag_ns = reader.read_next()
-        if topic == "/camera/veocc_d435i/aligned_depth_to_color/image_raw":
+        if topic == depth_topic:
             camera_i += 1
             if camera_i % sample_every:
                 continue
@@ -97,7 +103,7 @@ def read_bag(path, sample_every=8, points_per_packet=100):
             dtype = np.uint16 if msg.encoding.lower() in ("16uc1", "mono16") else np.float32
             arr = np.frombuffer(msg.data, dtype=dtype).reshape(msg.height, msg.step // np.dtype(dtype).itemsize)
             cameras.append((t, arr[:, : msg.width].copy(), msg.encoding))
-        elif topic == "/livox/lidar":
+        elif topic == lidar_topic:
             msg = deserialize_message(data, CustomMsg)
             t = stamp(msg)
             if t is None or not msg.points:
@@ -107,7 +113,7 @@ def read_bag(path, sample_every=8, points_per_packet=100):
             good = np.isfinite(xyz).all(axis=1) & (np.linalg.norm(xyz, axis=1) > 0.25)
             if np.any(good):
                 lidars.append((t, xyz[good]))
-        elif topic == "/base_odom":
+        elif topic == odom_topic:
             msg = deserialize_message(data, Odometry)
             t = stamp(msg)
             if t is not None:
@@ -206,6 +212,13 @@ def main():
     p.add_argument("--bag", required=True)
     p.add_argument("--extrinsics", required=True)
     p.add_argument("--output", required=True)
+    p.add_argument(
+        "--depth-topic",
+        default="/camera/veocc_d435i/aligned_depth_to_color/image_raw",
+        help="Aligned depth image topic recorded in the bag",
+    )
+    p.add_argument("--lidar-topic", default="/livox/lidar")
+    p.add_argument("--odom-topic", default="/base_odom")
     p.add_argument("--fx", type=float, required=True)
     p.add_argument("--fy", type=float, required=True)
     p.add_argument("--cx", type=float, required=True)
@@ -223,7 +236,12 @@ def main():
     t_cam_lidar = np.asarray(ext["T_camera_from_lidar"], dtype=float)
     t_base_lidar = np.asarray(ext["T_base_from_lidar"], dtype=float)
     t_base_camera = np.asarray(ext["T_base_from_camera"], dtype=float)
-    cameras, lidars, odoms = read_bag(args.bag)
+    cameras, lidars, odoms = read_bag(
+        args.bag,
+        depth_topic=args.depth_topic,
+        lidar_topic=args.lidar_topic,
+        odom_topic=args.odom_topic,
+    )
     odom_times = [x[0] for x in odoms]
     odom_poses = [x[1] for x in odoms]
     k = np.array([[args.fx, 0, args.cx], [0, args.fy, args.cy], [0, 0, 1]], dtype=float)
@@ -232,6 +250,11 @@ def main():
     best = choose_best(scores)
     result = {
         "bag": str(Path(args.bag)),
+        "topics": {
+            "depth": args.depth_topic,
+            "lidar": args.lidar_topic,
+            "odom": args.odom_topic,
+        },
         "timestamp_basis": "sensor message header stamps; candidate delta=t_rgb-t_lidar",
         "input_counts": {"camera_depth_samples": len(cameras), "lidar_packets": len(lidars), "odom_samples": len(odoms)},
         "scan": scores,
