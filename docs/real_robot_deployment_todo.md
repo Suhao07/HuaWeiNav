@@ -133,6 +133,7 @@ waypoint adapter 输出或任何真实运动节点。
 - Profile check：`orin26_livox_mid360_generic_rgb` 与 `orin26_livox_mid360_d435i` 均通过；两者均保持 `START_SEMANTIC_MAPPING=false`、`dry_run=true`、真实运动关闭。
 - 镜像与软件：`huawei-vln-realworld:orin-r36.5`=`25048b859e0d`；ROS workspace 7 包编译成功；离线 acceptance 为 `113 passed`。
 - GPU/模型 smoke：`torch cuda=True`，YOLOE detector init 成功；USB 相机只读 smoke 收到 `/camera/image` 和 `/camera_info`，分辨率 `1920x1080`、编码 `rgb8`、frame `default_cam`。
+- LVLM/schema/verifier 影子测试：在 `--network none` 的最终镜像中运行结构化输出、非法 JSON 重试、保守 fallback、final verifier 和 deployment receipt 测试，`16 passed`；未进行真实远程 LVLM 延迟验收。
 - runtime shadow：D435i profile runtime smoke 和 live `semantic_snapshot` dry-run 均保持 `WAIT`，原因是实时 `object_nodes`、pose、image 尚未同时到达；未发布 `/way_point`、`/waypoint` 或 `/cmd_vel`。
 - waypoint adapter shadow：节点日志为 `output_enabled=False`；`/waypoint`、`/strive/test_waypoint_array`、`/way_point`、`/cmd_vel` 均未发现 publisher。
 - LIO 只读诊断：报告为 `logs/diagnostics/lio_dds_20260821T133422Z.md`；`/livox/lidar`、`/livox/imu`、`/cloud_registered`、`/aft_mapped_to_init` 均未收到实际 header。Point-LIO 参数显示 `publish.scan_publish_en=False`，因此 semantic mapping 继续关闭；未重启或修改外部 LIO。

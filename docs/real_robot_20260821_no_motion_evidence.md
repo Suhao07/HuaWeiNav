@@ -13,6 +13,7 @@
 | ROS workspace | 机器人端 `build_real_robot_ros_ws.sh` | 7 packages finished |
 | Docker image | `huawei-vln-realworld:orin-r36.5` | final image ID `25048b859e0d` |
 | GPU/ML | detector init smoke | `torch cuda=True`，YOLOE init PASS |
+| LVLM/schema/verifier | final image, `--network none` | 16 tests passed；覆盖 schema injection、非法 JSON 重试、conservative fallback、final verifier；未测真实远程服务延迟 |
 | USB camera | bounded camera smoke | `/camera/image` 与 `/camera_info` 收到；`1920x1080`、`rgb8`、`default_cam` |
 | Runtime | generic 与 D435i `runtime-smoke` | dry-run `WAIT`，缺少 `object_nodes`、pose、image |
 | Adapter | `run_real_robot_waypoint_adapter.sh`，15 s | `output_enabled=False`；没有控制 topic publisher |
