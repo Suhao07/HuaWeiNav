@@ -16,6 +16,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/RoomNodeList.msg"
   "msg/RoomType.msg"
   "msg/ViewpointRep.msg"
+  "msg/ViewpointPose.msg"
   "msg/DetectionResult.msg"
   "msg/RoomEarlyStop1.msg"
   "msg/VlmAnswer.msg"

@@ -39,11 +39,19 @@ workspace 的实际代码为准，描述传感器输入、SysNav 感知建图、
 当前已经有平台无关 Python contract 和 SysNav adapter；真实传感器、目标底盘和急停链
 仍需要在对应设备上验收。代码 smoke、ROS bag replay 和 HIL 不能代替实物运动验收。
 
-截至 2026-08-21，Orin-26 上已经验证 D435i、MID-360/Point-LIO、detector、semantic
+截至 2026-08-21，当前软件基线为 `main=4e721b4`。Orin-26 上已经验证 D435i、MID-360/Point-LIO、detector、semantic
 mapping 到真实对象节点的数据链，以及 `/way_point` 到影子 `Float32MultiArray` topic 的
 waypoint 格式转换。当前投影配置仍为 `extrinsics_only`，controller contract 仍为
 `unapproved`，因此这些结果属于数据层和影子控制验证，不是完整实物导航验收。唯一执行
 清单见 [`real_robot_deployment_todo.md`](real_robot_deployment_todo.md)。
+
+本轮软件闭环已经补齐以下边界：语义 intent 不再直接携带对象中心或房间质心作为执行
+位姿；`SysNavGoalResolver` 从下层 viewpoint provider 获取目标或 target--anchor 共视
+viewpoint；活动 goal 在运动完成前保持；`REACHED` 之后必须等待时间戳更新的新鲜观测，
+再进入证据和 verifier 生命周期。若 snapshot 没有带 pose 的可执行 viewpoint，runtime
+显式返回 `WAIT`，不生成猜测 waypoint。上述路径由
+`scripts/check_real_robot_acceptance.sh` 的 `113 passed` 离线验收覆盖，但尚未替代
+真实 SysNav viewpoint topic 的频率/时序验收、底盘反馈或急停验收。
 
 ## 2. 总体架构
 
@@ -308,9 +316,23 @@ pose 包装为 `MotionGoal`。关系任务的几何候选集合为：
 \]
 
 其中每个集合由 SysNav 的 object--viewpoint 可见关系提供。VLN 不根据 `book`、`shelf`
-或其他类别重新定义集合，也不把对象中心或房间质心伪装成执行位姿。当前迁移的 ROS
-消息尚未携带完整 viewpoint pose，因此正式 ROS 运行在没有可用 viewpoint 时显式
-返回 `WAIT`；这是一项待 SysNav bridge 补齐的数据合同，不用虚构 topic 或 pose。
+或其他类别重新定义集合，也不把对象中心或房间质心伪装成执行位姿。原始
+`/viewpoint_rep_header` 只携带 viewpoint ID 和时间戳；仓库内的
+`sysnav_viewpoint_bridge` 将它与同时间的 odometry 组合为
+`/strive/sysnav/viewpoint_pose`，并累计 `ObjectNode.viewpoint_id` 形成直接观测关系。
+只有 bridge 输出了带 pose 的 viewpoint，正式 ROS runtime 才能生成 `MotionGoal`；在
+数据尚未对齐、frame 不一致或 viewpoint 尚未到达时仍显式返回 `WAIT`，不虚构 pose。
+当前 `SnapshotViewpointProvider` 消费的是 SysNav 已发布并缓存的 viewpoint 记录，不
+生成尚未发布的候选视角；SysNav 若后续提供独立的候选查询接口，只需替换 provider，
+不需要修改语义 runtime 或 `SysNavGoalResolver`。
+
+对于已有 ROS2 bag，`scripts/replay_sysnav_viewpoint_bag.py` 可以在不发布任何 ROS
+消息的条件下复现同一时间对齐逻辑，并将 `ViewpointPose` 等价记录导出为 JSONL。
+这使得 viewpoint ID、pose、frame 和直接观测到的 SysNav object ID 可以先在离线
+bag 上验收，再启动在线 bridge 节点。SysNav 当前没有独立的 viewpoint-pose 查询
+service，因此该 topic bridge 是当前真实接口的最小适配，不额外虚构 service 合同。
+bridge 内部保留 viewpoint header 的整数纳秒时间戳，ROS 输出和 JSONL replay 都复用该
+精确值，避免通过浮点秒重构消息时引入边界舍入误差。
 
 ### 4.3 执行状态与证据
 

@@ -26,6 +26,7 @@ from real_robot.contracts import (
     Pose3D,
     RoomSnapshot,
     SemanticMapSnapshot,
+    ViewpointSnapshot,
 )
 from real_robot.detector_vocabulary import (
     DetectorVocabulary,
@@ -42,6 +43,8 @@ class SysNavTopicConfig:
     detection_result: str = "/detection_result"
     object_nodes_list: str = "/object_nodes_list"
     room_nodes_list: str = "/room_nodes_list"
+    viewpoint_rep: str = "/viewpoint_rep_header"
+    viewpoint_pose: str = "/strive/sysnav/viewpoint_pose"
     waypoint: str = "/way_point"
     odometry: str = "/aft_mapped_to_init"
     path: str = "/path"
@@ -159,6 +162,62 @@ class RosObjectNodeAdapter:
         """Return all object snapshots in one SysNav object list message."""
 
         return tuple(self.from_msg(node) for node in _as_sequence(getattr(msg, "nodes", ())))
+
+
+class RosViewpointPoseAdapter:
+    """Convert the VLN viewpoint bridge message into a viewpoint snapshot.
+
+    The migrated SysNav ``ViewpointRep`` message contains only an ID and a
+    timestamp.  ``ViewpointPose`` is the explicit bridge contract produced by
+    pairing that record with the odometry pose at the same timestamp.
+    """
+
+    def __init__(self, topic: str = SysNavTopicConfig.viewpoint_pose) -> None:
+        """Create an adapter for the bridge output topic.
+
+        Args:
+            topic: ROS topic carrying ``tare_planner/ViewpointPose`` messages.
+        """
+
+        self.topic = topic
+
+    def from_msg(self, msg: Any) -> ViewpointSnapshot:
+        """Return one platform-neutral viewpoint snapshot.
+
+        Args:
+            msg: ROS-like ``ViewpointPose`` message.
+
+        Returns:
+            A viewpoint with the SysNav-selected pose and directly observed
+            object UIDs.
+
+        Raises:
+            ValueError: If the message has no stable viewpoint ID or pose
+                frame.
+        """
+
+        viewpoint_id = int(getattr(msg, "viewpoint_id", -1))
+        if viewpoint_id < 0:
+            raise ValueError("SysNav viewpoint pose must have a non-negative viewpoint_id")
+        pose = _pose3d_from_pose_msg(
+            getattr(msg, "pose", None),
+            getattr(msg, "header", None),
+            SysNavTopicConfig.world_frame,
+        )
+        if not pose.frame_id:
+            raise ValueError(f"SysNav viewpoint {viewpoint_id} has no pose frame")
+        object_ids = tuple(int(value) for value in _as_sequence(getattr(msg, "observed_object_ids", ())))
+        visible_objects = tuple(f"sysnav_object:{value}" for value in object_ids)
+        return ViewpointSnapshot(
+            uid=str(viewpoint_id),
+            pose=pose,
+            visible_objects=visible_objects,
+            metadata={
+                "ros_topic": self.topic,
+                "viewpoint_source": "sysnav_viewpoint_rep_plus_odom",
+                "observed_object_ids": list(object_ids),
+            },
+        )
 
 
 class RosRoomNodeAdapter:

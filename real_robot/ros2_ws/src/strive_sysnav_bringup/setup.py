@@ -24,6 +24,7 @@ setup(
     entry_points={
         "console_scripts": [
             "strive_instruction_runtime = strive_sysnav_bringup.instruction_runtime_node:main",
+            "strive_sysnav_viewpoint_bridge = strive_sysnav_bringup.viewpoint_bridge_node:main",
             "strive_waypoint_adapter = strive_sysnav_bringup.waypoint_adapter_node:main",
         ],
     },

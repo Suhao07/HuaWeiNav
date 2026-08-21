@@ -23,6 +23,22 @@
   机器人 VLN runtime
 ```
 
+## 当前实现状态
+
+当前软件基线为 `main=4e721b4`。已完成并通过离线测试的部分包括：
+
+- SysNav object/room snapshot 到平台无关 `NavigationIntent` 的转换；
+- `SysNavGoalResolver` 消费下层 viewpoint pose，并在缺少 viewpoint 数据时显式返回 `WAIT`；
+- 活动 motion goal 保持、`REACHED` 后的新鲜证据等待以及 `VERIFYING/HOLD` 生命周期；
+- viewpoint bridge、waypoint adapter、运动安全合同和 ROS 适配器的离线 acceptance，当前结果为 `113 passed`。
+- ROS2 Humble 容器中的 workspace build、viewpoint topic smoke、synthetic rosbag2 replay 和 Motion HIL 均已有可重复入口。
+
+尚未完成的部分是现场合同和硬件验收：原始 `ViewpointRep` 消息只包含 ID 和时间戳，仓库
+内的 `strive_sysnav_viewpoint_bridge` 负责和同时间 odometry 组合出 `ViewpointPose`，但
+尚未在真实 Orin/ROS bag 上验收时间偏移、frame 和频率。真实外部 `/waypoint` 控制器尚未
+批准，底盘反馈、速度限制、急停和人工接管尚未验收。因此正式语义模式在没有可执行
+viewpoint 时保持 `WAIT`，不会用对象中心或房间质心生成运动目标。
+
 ## 1. Workspace 结构
 
 ```text
@@ -36,10 +52,11 @@ src/semantic_mapping/
   detector_node 订阅 RGB，发布 /detection_result；
   semantic_mapping_node 融合检测、点云和位姿，发布 /object_nodes_list。
 
-正式 instruction runtime 不使用对象中心或房间质心直接运动。SysNav 需要额外提供带
-pose 的 viewpoint 记录；VLN 通过 `SysNavGoalResolver` 消费这些记录。当前消息包中的
-`ObjectNode` 只包含最新 `viewpoint_id`，没有完整的 viewpoint pose 列表，因此在该
-数据尚未接通前，语义模式会返回 `WAIT`，而不是猜测一个 waypoint。
+正式 instruction runtime 不使用对象中心或房间质心直接运动。原始 SysNav 消息中的
+`ObjectNode` 只包含最新 `viewpoint_id`，`ViewpointRep` 只包含 viewpoint ID；仓库内的
+`strive_sysnav_viewpoint_bridge` 将 viewpoint header、odom 和 object update 适配为
+`/strive/sysnav/viewpoint_pose`，VLN 再通过 `SysNavGoalResolver` 消费这些记录。bridge
+数据尚未对齐时，语义模式会返回 `WAIT`，而不是猜测一个 waypoint。
 
 src/strive_sysnav_bringup/
   VLN 实物模式 launch 和高层 runtime 节点。
@@ -130,6 +147,9 @@ semantic mapping 的输入由 launch 参数映射：
 注册点云：  /cloud_registered 或 /registered_scan
 位姿：      /aft_mapped_to_init 或 /state_estimation
 视角：      /viewpoint_rep_header，可选
+
+viewpoint bridge 输出：
+  /strive/sysnav/viewpoint_pose   tare_planner/ViewpointPose
 ```
 
 VLN runtime 主要消费：
@@ -154,8 +174,8 @@ V_target ∩ V_anchor -> SysNav selected viewpoint pose -> MotionGoal
 ```
 
 Python runtime 不重新实现 SysNav 的可见性、碰撞、路径代价或 viewpoint 排序；这些
-能力必须由下层 viewpoint manager 提供。ROS bridge 后续只需补齐稳定 viewpoint UID、
-pose、可见对象列表和选择结果，不需要新增类别规则。
+能力必须由下层 viewpoint manager 提供。ROS bridge 只负责时间对齐、frame 合同和直接
+object-viewpoint 观测关联，不新增类别规则。
 
 ## 5. 启动感知建图
 
@@ -268,7 +288,7 @@ bash scripts/run_real_robot_instruction_runtime.sh \
 
 该模式将输入编译为 `InstructionPlan`，通过
 `SemanticMapSnapshotIntentAdapter` 输出高层意图，但 dry-run 不会把目标发送到真实
-`/way_point`。如果 snapshot 没有 SysNav viewpoint pose，runtime 会记录
+`/way_point`。如果 viewpoint bridge 尚未提供可用 pose，runtime 会记录
 `viewpoint_provider_unavailable` 并保持 WAIT；dry-run 不会用对象中心替代 viewpoint。
 
 需要远程 LVLM 时，将 `instruction_plan_backend` 改为 `llm`，并按
@@ -480,8 +500,22 @@ dry_run=false 且 lower_controller_enabled=false
 
 ## 10. Bag replay 与离线验收
 
-如果 rosbag 已经包含 `/object_nodes_list`、`/room_nodes_list`、`/aft_mapped_to_init`
-和 `/camera/image`，可以只回放这些 VLN-facing topic，不启动 detector/mapping：
+ROS2 容器验收入口：
+
+```bash
+ROS_HUMBLE_RUN_AS_ROOT=1 bash scripts/ros_humble_container.sh viewpoint-smoke
+ROS_HUMBLE_RUN_AS_ROOT=1 bash scripts/ros_humble_container.sh viewpoint-bag-smoke
+ROS_HUMBLE_RUN_AS_ROOT=1 bash scripts/ros_humble_container.sh hil
+```
+
+当前结果：workspace 的 7 个 ROS2 包编译通过；viewpoint topic smoke、真实 CDR
+synthetic rosbag2 replay 和 Motion HIL `reached` 均通过。synthetic 输入只验证消息
+序列化、topic 时序和软件合同，不代表真实相机、LiDAR、定位或底盘验收。
+
+如果 rosbag 已经包含 `/object_nodes_list`、`/room_nodes_list`、`/aft_mapped_to_init`、
+`/viewpoint_rep_header` 和 `/camera/image`，可以只回放这些 VLN-facing topic，不启动
+detector/mapping。`run_real_robot_bag_replay.sh` 默认同时启动只读 viewpoint bridge，
+不会启动底盘或 `/way_point`：
 
 ```bash
 bash scripts/run_real_robot_bag_replay.sh /path/to/recorded_bag \
@@ -492,6 +526,10 @@ bash scripts/run_real_robot_bag_replay.sh /path/to/recorded_bag \
   dry_run:=true \
   run_directory:=/tmp/vln_real_robot_bag_replay
 ```
+
+如果 bag 已经直接录制了 `/strive/sysnav/viewpoint_pose`，可以设置
+`BAG_START_VIEWPOINT_BRIDGE=0`，并将 `viewpoint_pose_topic` 指向该录制 topic。若 bag
+没有 raw viewpoint 事件，runtime 不会伪造 viewpoint pose，而会继续保持 `WAIT`。
 
 离线验收入口：
 
@@ -510,6 +548,62 @@ verifier accept -> stop intent
 ```
 
 这些测试不等于真实相机、LiDAR、局部规划器、底盘或急停验收。
+
+### 10.1 SysNav viewpoint bridge 的 bag 级验证
+
+SysNav 当前公开的 viewpoint 消息 `ViewpointRep` 只包含 `viewpoint_id` 和
+`header.stamp`。因此应使用同一份 bag 中的 odometry 恢复 viewpoint pose，而不能用
+对象中心或房间中心补一个近似位姿。仓库提供了不发布 ROS 消息的离线观察工具：
+
+```bash
+source /opt/ros/humble/setup.bash
+source real_robot/ros2_ws/install/setup.bash
+
+python3 scripts/replay_sysnav_viewpoint_bag.py /path/to/sysnav_bag \
+  --viewpoint-topic /viewpoint_rep_header \
+  --object-topic /object_nodes_list \
+  --odom-topic /aft_mapped_to_init \
+  --output /tmp/sysnav_viewpoint_records.jsonl
+```
+
+输出的每一行对应一个已经解析的 `ViewpointPose` 等价记录，至少包含：
+
+```text
+viewpoint_id
+timestamp
+timestamp_ns
+frame_id
+pose.position
+pose.orientation_xyzw
+observed_object_ids
+```
+
+同一 `viewpoint_id` 可能先产生一条没有对象 ID 的 pose，随后在延迟到达的
+`ObjectNodeList` 提供直接观测关系后产生更新记录；runtime 按 viewpoint ID 保留最新
+记录，对象历史则单调累积，不把这类更新误认为新的 viewpoint。
+
+如果 viewpoint 与 odometry 的时间差超过 `--max-time-offset-s`，或者两者 frame
+不一致，工具不会输出猜测 pose；应先修正 bag 中的时间同步或 TF 配置。若要验证
+ROS2 节点自身的 topic 链路，可以在一个终端启动：
+
+```bash
+ros2 launch strive_sysnav_bringup sysnav_viewpoint_bridge.launch.py \
+  viewpoint_topic:=/viewpoint_rep_header \
+  object_topic:=/object_nodes_list \
+  odom_topic:=/aft_mapped_to_init \
+  output_topic:=/strive/sysnav/viewpoint_pose
+```
+
+再在另一个终端回放输入并检查输出：
+
+```bash
+ros2 bag play /path/to/sysnav_bag --topics \
+  /viewpoint_rep_header /object_nodes_list /aft_mapped_to_init
+ros2 topic echo /strive/sysnav/viewpoint_pose
+```
+
+这一步只验证 SysNav viewpoint 数据格式和时序，不启动底盘，也不代表 waypoint
+控制器已经通过现场验收。
 
 ## 11. Orin / Jetson 运行入口
 

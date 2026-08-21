@@ -18,6 +18,8 @@ Commands:
   hil         Run action-level or native SysNav lower-stack HIL scenarios.
   launch-check Parse aggregate real-robot launch arguments without starting nodes.
   bag-smoke   Generate and replay a synthetic lower-planner rosbag2.
+  viewpoint-smoke  Run an in-process ROS2 SysNav viewpoint bridge smoke test.
+  viewpoint-bag-smoke  Generate and replay a synthetic SysNav viewpoint bag.
   clean       Remove the dev container if it exists.
 
 Notes:
@@ -115,6 +117,12 @@ case "${cmd}" in
     ;;
   bag-smoke)
     run_in_image 'cd /workspace/STRIVE_LIVE && set +u && source /opt/ros/humble/setup.bash && set -u && STRIVE_REAL_ROBOT_WS=/workspace/STRIVE_LIVE/real_robot/ros2_ws STRIVE_COLCON_BUILD_BASE=/tmp/strive_bag_smoke_build STRIVE_COLCON_INSTALL_BASE=/tmp/strive_bag_smoke_install STRIVE_COLCON_LOG_BASE=/tmp/strive_bag_smoke_log bash scripts/build_real_robot_ros_ws.sh --build-base /tmp/strive_bag_smoke_build --install-base /tmp/strive_bag_smoke_install --log-base /tmp/strive_bag_smoke_log && set +u && source /tmp/strive_bag_smoke_install/setup.bash && set -u && STRIVE_OVERLAY_SETUP=/tmp/strive_bag_smoke_install/setup.bash bash scripts/run_lower_planner_bag_smoke.sh'
+    ;;
+  viewpoint-smoke)
+    run_in_image 'cd /workspace/STRIVE_LIVE && set +u && source /opt/ros/humble/setup.bash && set -u && STRIVE_REAL_ROBOT_WS=/workspace/STRIVE_LIVE/real_robot/ros2_ws STRIVE_COLCON_BUILD_BASE=/tmp/strive_viewpoint_smoke_build STRIVE_COLCON_INSTALL_BASE=/tmp/strive_viewpoint_smoke_install STRIVE_COLCON_LOG_BASE=/tmp/strive_viewpoint_smoke_log bash scripts/build_real_robot_ros_ws.sh --build-base /tmp/strive_viewpoint_smoke_build --install-base /tmp/strive_viewpoint_smoke_install --log-base /tmp/strive_viewpoint_smoke_log && set +u && source /tmp/strive_viewpoint_smoke_install/setup.bash && set -u && python3 scripts/run_sysnav_viewpoint_ros_smoke.py --output /tmp/strive_sysnav_viewpoint_ros_smoke.json'
+    ;;
+  viewpoint-bag-smoke)
+    run_in_image 'cd /workspace/STRIVE_LIVE && set +u && source /opt/ros/humble/setup.bash && set -u && STRIVE_REAL_ROBOT_WS=/workspace/STRIVE_LIVE/real_robot/ros2_ws STRIVE_COLCON_BUILD_BASE=/tmp/strive_viewpoint_bag_build STRIVE_COLCON_INSTALL_BASE=/tmp/strive_viewpoint_bag_install STRIVE_COLCON_LOG_BASE=/tmp/strive_viewpoint_bag_log bash scripts/build_real_robot_ros_ws.sh --build-base /tmp/strive_viewpoint_bag_build --install-base /tmp/strive_viewpoint_bag_install --log-base /tmp/strive_viewpoint_bag_log && set +u && source /tmp/strive_viewpoint_bag_install/setup.bash && set -u && python3 scripts/generate_synthetic_sysnav_viewpoint_bag.py /tmp/strive_sysnav_viewpoint_bag && python3 scripts/replay_sysnav_viewpoint_bag.py /tmp/strive_sysnav_viewpoint_bag --output /tmp/strive_sysnav_viewpoint_bag_records.jsonl && cat /tmp/strive_sysnav_viewpoint_bag_records.jsonl'
     ;;
   clean)
     docker_cmd rm -f "${CONTAINER_NAME}" >/dev/null 2>&1 || true

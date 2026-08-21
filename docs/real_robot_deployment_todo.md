@@ -1,7 +1,7 @@
 # VLN 实物部署状态与 TODO
 
 > 更新日期：2026-08-21
-> 代码基线：`main` 与 `realworld` 已在 `24f9bb6` 汇合
+> 代码基线：本地 `main` 已合并 `realworld` 的最新代码，当前为 `main=4e721b4`，`realworld=915586f`
 > 目标平台：Orin-26、Intel RealSense D435i、Livox MID-360
 > 当前安全状态：感知与影子控制验证；真实运动未批准
 
@@ -37,6 +37,24 @@ VLN /way_point (PointStamped, world frame)
 2. 机器人下层控制器 contract 获得所有者确认并完成急停、反馈和限速测试；
 3. 在真实对象节点和真实 RGB 上完成 `InstructionPlan -> MotionGoal -> REACHED -> final verifier` 的受控闭环。
 
+本轮已经完成的**软件闭环**如下，但这些内容仍不等同于实物验收：
+
+```text
+SemanticMapSnapshot
+  -> NavigationIntent
+  -> SysNavGoalResolver
+  -> MotionGoal / WAIT
+  -> active goal tracking
+  -> REACHED 后的新鲜 RGB / detection
+  -> ViewEvidence / verifier 生命周期
+```
+
+其中 `SysNavGoalResolver` 只消费下层提供的 viewpoint pose，不再把对象中心或房间质心
+伪装成执行位姿；当前迁移的 ROS 消息还没有携带完整 viewpoint pose，因此正式语义路径
+在 bridge 尚未收到时间对齐的 viewpoint pose 时显式保持 `WAIT`。
+`scripts/check_real_robot_acceptance.sh` 当前离线结果为 `113 passed`，该结果只证明软件
+合同和状态生命周期，不代表真实控制器已接管底盘。
+
 ## 2. 已完成与证据边界
 
 | 模块 | 当前状态 | 可证明内容 | 不能据此声称 |
@@ -46,7 +64,8 @@ VLN /way_point (PointStamped, world frame)
 | SysNav semantic mapping | 数据层影子验证 | 2026-08-19 实测对象节点约 0.5 Hz，坐标为米级，含 `chair`、`desk`、`cabinet` | 标定已批准、对象定位精度达标 |
 | LIO 输入 | 真机数据链已验证 | `/cloud_registered_body` 约 9.4--9.6 Hz，`/aft_mapped_to_init` 约 100 Hz | 长时定位无漂移 |
 | D435i--MID-360 标定 | 部分完成 | 内参、外参和历史 bag 已导入；已有只读评估脚本 | `calibration_status=calibrated` |
-| Instruction runtime | 软件闭环完成 | snapshot、SysNav viewpoint resolver、active goal、REACHED 后新鲜取证和 verifier 生命周期有离线测试 | 已在 Orin 上运行真实自然语言任务 |
+| Instruction runtime | 软件闭环完成（离线） | snapshot、SysNav viewpoint resolver、active goal、REACHED 后新鲜取证和 verifier 生命周期有离线测试 | 已在 Orin 上运行真实自然语言任务 |
+| SysNav viewpoint bridge | 软件 bridge 已实现，真机数据待验收 | `/viewpoint_rep_header` + 同时刻 odom -> `/strive/sysnav/viewpoint_pose`；object-viewpoint 观测历史、共视交集和无效时间/frame 的 WAIT 已有代码和测试 | Orin 上已验证 viewpoint 频率、时间偏移和 frame |
 | 远程 LVLM | HTTP/schema 软件接口完成 | 商业 API、自部署 OpenAI-compatible 服务和 schema smoke 已实现 | 机器人网络上的 p95 延迟、超时恢复已验收 |
 | Waypoint adapter | 真机影子验证 | `PointStamped -> Float32MultiArray`、world-to-ego、过期丢弃在影子 topic 验证 | 外部 `/waypoint` 已接收或底盘已执行 |
 | SysNav 原生下层 | 代码迁移、离线/HIL 覆盖 | `localPlanner`、`pathFollower`、motion action、安全 mux 的软件链存在 | 它已成为 Orin 底盘的生产控制器 |
@@ -91,9 +110,16 @@ status adapter。
 
 ### P0：统一代码与部署基线
 
-- [x] `main` 与 `realworld` 汇合到共同提交 `24f9bb6`。
-- [x] 实物离线 acceptance 覆盖 contract、runtime、motion safety 和 SysNav adapter。
+- [x] `main` 已合并 `realworld` 最新修改，当前本地基线为 `4e721b4`；`realworld` 分支基线为 `915586f`。
+- [x] 实物离线 acceptance 覆盖 contract、runtime、motion safety、SysNav adapter 和 viewpoint bridge，当前结果为 `113 passed`。
 - [x] waypoint adapter 的 Python、ROS node、launch 和单元测试进入仓库。
+- [x] 语义 runtime 已停止对象中心/房间质心执行回退；无可执行 SysNav viewpoint 时保持 `WAIT`。
+- [x] `REACHED` 后的活动目标保持、同一 goal 的新鲜证据等待、`VERIFYING/HOLD` 生命周期已进入离线测试。
+- [x] 新增 `ViewpointPose` 消息、`sysnav_viewpoint_bridge` launch/node 和 `SysNavViewpointBridgeModel`，可在不改 SysNav 规划器的情况下导出带 pose 的 viewpoint。
+- [x] 新增 `scripts/replay_sysnav_viewpoint_bag.py`，可在 ROS2 环境读取真实 bag 并导出 viewpoint pose 对齐记录；该脚本不发布消息、不控制底盘。
+- [x] 在 `strive-ros-humble:local` 容器中使用全新 colcon 前缀编译当前 ROS2 workspace，7 个包通过。
+- [x] 在 ROS2 容器中完成 viewpoint bridge topic smoke 和 synthetic CDR rosbag2 replay；两者均验证精确时间戳、frame、pose 和 object ID。
+- [x] 在 ROS2 容器中完成现有 Motion HIL `reached` 场景；该测试不接管真实底盘。
 - [ ] 在 Orin 工作区拉取共同基线，记录完整 commit，而不是只记录短哈希。
 - [ ] 重建 `huawei-vln-realworld:orin-r36.5`，记录 image ID、基础镜像、资产 SHA256 和构建日志。
 - [ ] 重新执行 D435i profile `check`、detector smoke 和 runtime WAIT smoke，产物写入新的 run 目录。
@@ -117,10 +143,14 @@ waypoint adapter 输出或任何真实运动节点。
 
 ### P2：感知、指令与 LVLM 的无运动闭环
 
+- [x] 完成 `SemanticMapSnapshot -> NavigationIntent -> SysNavGoalResolver -> MotionGoal/WAIT` 的软件链路；该项由离线 fake provider 和 runtime 测试覆盖。
+- [x] 完成 `REACHED -> fresh evidence -> verifier` 的软件生命周期；旧 detection 不得与到达后的新 RGB 混合，证据不足时保持 `VERIFYING`。
+- [x] 完成 raw SysNav viewpoint topic 到带 pose `ViewpointPose` 的软件适配；时间错位或 frame 不一致时不发布猜测 pose。
 - [ ] 使用已批准标定从 profile 正常启动 semantic mapping，而不是绕过 profile 直接 launch。
 - [ ] 记录对象节点的位置误差、对象 UID 连续性、误检和重复簇；至少覆盖桌椅、柜体和小物体。
 - [ ] 在真实 `/object_nodes_list`、RGB 和 odom 上运行 `policy_mode=semantic_snapshot`、`dry_run=true`。
-- [ ] 接通带 pose 的 SysNav viewpoint provider；在此之前 semantic runtime 必须保持 WAIT，不能回退到对象中心或房间质心。
+- [ ] 在包含 `/viewpoint_rep_header`、`/object_nodes_list` 和 odom 的真实机器人 ROS2 bag 上运行 viewpoint replay，并核对时间偏移、frame、频率和 object-viewpoint 关联。synthetic bag smoke 不替代此项。
+- [ ] 在 Orin/ROS bag 上验收带 pose 的 SysNav viewpoint provider，记录 viewpoint 频率、时间偏移、frame 和 object-viewpoint 关联；在验收前 semantic runtime 必须保持 WAIT，不能回退到对象中心或房间质心。
 - [ ] 验证远程 LVLM 的 instruction parse、concept grounding 和 final verifier，记录请求类型、p50/p95 延迟、超时和原始结构化响应。
 - [ ] 用模拟 `REACHED` 只验证证据闭环：目标 crop、原始指令、对象 UID 和 verifier 决策必须写入同一 run 目录。
 - [ ] 验证 LVLM 不可用、响应非法或超时时显式失败并保持 WAIT/HOLD；不得吞掉异常后继续发布目标。
@@ -152,10 +182,19 @@ waypoint adapter 输出或任何真实运动节点。
 
 ### P5：完整实物 ObjectNav 闭环
 
+以下三项已经具备离线软件实现，但仍需在真实传感器、SysNav viewpoint provider 和底盘
+反馈上重新验收；因此不把它们作为实物完成项：
+
+- [x] 软件层实现 `MotionGoal` 到达后再进入 `ViewEvidence`，`REACHED` 不直接等同于任务成功。
+- [x] 软件层实现到达时间戳之后的新鲜 RGB、pose 和 detection 检查；不满足时保持同一 goal 的 `VERIFYING`，不重发 waypoint。
+- [x] 软件层保留 `accept / need_better_view / reject_candidate` 的 verifier 决策边界，具体视角重规划仍依赖实际 SysNav viewpoint provider。
+
+实物验收仍从以下条目开始：
+
 - [ ] 先运行单目标显式指令，不启用 room prior 和复杂关系。
-- [ ] 验证 `MotionGoal` 到达后才采集 `ViewEvidence`；`REACHED` 不得直接等同于任务成功。
-- [ ] 验证 `REACHED` 后的 RGB、pose 和 detection 时间戳晚于到达事件；未满足时保持同一 goal 的 VERIFYING，不重发 waypoint。
-- [ ] 验证 final verifier 的 `accept / need_better_view / reject` 会产生对应的 STOP、视角调整或重新规划。
+- [ ] 在真实底盘上验证 `MotionGoal` 到达后才采集 `ViewEvidence`；`REACHED` 不得直接等同于任务成功。
+- [ ] 在真实传感器上验证 `REACHED` 后的 RGB、pose 和 detection 时间戳晚于到达事件；未满足时保持同一 goal 的 VERIFYING，不重发 waypoint。
+- [ ] 在真实 SysNav viewpoint provider 和底盘反馈上验证 final verifier 的 `accept / need_better_view / reject` 会产生对应的 STOP、视角调整或重新规划。
 - [ ] 再增加属性目标、anchor relation 和小目标搜索；每类至少保留成功和失败样例。
 - [ ] 最后接入实物语义先验地图，完成地图 frame alignment 后再启用 room-level guidance。
 - [ ] 记录成功率、路径长度、耗时、LVLM 调用次数、人工接管次数和安全中断原因。

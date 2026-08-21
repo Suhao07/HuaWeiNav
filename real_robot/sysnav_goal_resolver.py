@@ -43,11 +43,13 @@ class ViewpointProvider(Protocol):
 
 
 class SnapshotViewpointProvider:
-    """Read SysNav-ordered viewpoints already present in a map snapshot.
+    """Read SysNav-emitted viewpoints already present in a map snapshot.
 
-    This provider performs only identity intersection. It does not score
-    distance, visibility, or collision. The snapshot order is treated as the
-    order supplied by the lower SysNav viewpoint manager.
+    This provider performs only identity intersection. It does not generate
+    future viewpoints, score distance, or run collision checks. The order of
+    the cached records is treated as the order in which SysNav exposed them;
+    a production provider may later replace this class when SysNav publishes a
+    dedicated candidate-query contract.
     """
 
     def select_viewpoint(
@@ -147,10 +149,10 @@ class PreResolvedGoalResolver:
 class SysNavGoalResolver:
     """Adapt a SysNav-selected viewpoint to a VLN ``MotionGoal``.
 
-    The provider is intentionally injected because the current migrated ROS
-    workspace does not yet expose SysNav viewpoint poses.  In deployment it
-    will be backed by a SysNav bridge; tests can provide an in-memory provider.
-    This class never ranks viewpoints or computes a path.
+    The provider is intentionally injected.  The current ROS integration uses
+    ``SysNavSemanticMapBridge`` records emitted by the viewpoint bridge; tests
+    can provide an in-memory provider.  This class never generates or ranks
+    viewpoints and never computes a path.
     """
 
     def __init__(self, provider: ViewpointProvider) -> None:

@@ -11,8 +11,12 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 "${PYTHON_BIN}" -m py_compile \
   real_robot/contracts.py \
   real_robot/sysnav_ros_adapters.py \
+  real_robot/sysnav_viewpoint_bridge.py \
   real_robot/sysnav_goal_resolver.py \
   real_robot/sysnav_runtime.py \
+  scripts/replay_sysnav_viewpoint_bag.py \
+  scripts/run_sysnav_viewpoint_ros_smoke.py \
+  scripts/generate_synthetic_sysnav_viewpoint_bag.py \
   real_robot/observation_cache.py \
   real_robot/waypoint_adapter.py \
   real_robot/motion_safety.py \
@@ -21,8 +25,10 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
   planning/semantic_snapshot_context.py \
   real_robot/ros2_ws/src/semantic_mapping/semantic_mapping/projection_config.py \
   real_robot/ros2_ws/src/strive_sysnav_bringup/strive_sysnav_bringup/instruction_runtime_node.py \
+  real_robot/ros2_ws/src/strive_sysnav_bringup/strive_sysnav_bringup/viewpoint_bridge_node.py \
   real_robot/ros2_ws/src/strive_sysnav_bringup/strive_sysnav_bringup/waypoint_adapter_node.py \
   real_robot/ros2_ws/src/strive_sysnav_bringup/launch/strive_instruction_runtime.launch.py \
+  real_robot/ros2_ws/src/strive_sysnav_bringup/launch/sysnav_viewpoint_bridge.launch.py \
   real_robot/ros2_ws/src/strive_sysnav_bringup/launch/sysnav_detection_mapping.launch.py \
   real_robot/ros2_ws/src/strive_sysnav_bringup/launch/waypoint_adapter.launch.py \
   real_robot/ros2_ws/src/strive_sysnav_motion/strive_sysnav_motion/motion_server.py \
@@ -34,6 +40,8 @@ PYTHONPATH=. "${PYTHON_BIN}" -m pytest -q \
   tests/test_real_robot_acceptance.py \
   tests/test_sysnav_ros_adapters.py \
   tests/test_sysnav_goal_resolver.py \
+  tests/test_sysnav_viewpoint_bridge.py \
+  tests/test_sysnav_viewpoint_bag_replay.py \
   tests/test_sysnav_runtime.py \
   tests/test_semantic_snapshot_context.py \
   tests/test_observation_cache.py \

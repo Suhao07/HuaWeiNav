@@ -10,7 +10,7 @@ from nav_msgs.msg import Odometry, Path as NavPath
 from rclpy.node import Node
 from sensor_msgs.msg import Image, PointCloud2
 from std_msgs.msg import String
-from tare_planner.msg import DetectionResult, ObjectNodeList, RoomNodeList
+from tare_planner.msg import DetectionResult, ObjectNodeList, RoomNodeList, ViewpointPose
 
 from instruction_adapter.compiler import compile_instruction_plan
 from planning.semantic_snapshot_context import (
@@ -172,6 +172,14 @@ class StriveInstructionRuntimeNode(Node):
             self.semantic_bridge.update_room_nodes,
             queue_size,
         )
+        viewpoint_pose_topic = str(self.get_parameter("viewpoint_pose_topic").value or "")
+        if viewpoint_pose_topic:
+            self.create_subscription(
+                ViewpointPose,
+                viewpoint_pose_topic,
+                self.semantic_bridge.update_viewpoint_pose,
+                queue_size,
+            )
         self.create_subscription(
             Odometry,
             str(self.get_parameter("odom_topic").value),
@@ -237,6 +245,7 @@ class StriveInstructionRuntimeNode(Node):
         self.declare_parameter("instruction", "")
         self.declare_parameter("object_topic", "/object_nodes_list")
         self.declare_parameter("room_topic", "/room_nodes_list")
+        self.declare_parameter("viewpoint_pose_topic", "/strive/sysnav/viewpoint_pose")
         self.declare_parameter("odom_topic", "/aft_mapped_to_init")
         self.declare_parameter("path_topic", "/path")
         self.declare_parameter("planner_status_topic", "/local_planner/status")

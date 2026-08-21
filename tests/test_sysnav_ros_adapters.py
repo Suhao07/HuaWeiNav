@@ -4,11 +4,13 @@ import pytest
 
 from real_robot.contracts import MotionGoal, MotionGoalMode, NavigationStatusCode, Pose3D
 from real_robot.detector_vocabulary import DetectorVocabularyAdapter
+from real_robot.sysnav_goal_resolver import SnapshotViewpointProvider, SysNavGoalResolver
 from real_robot.sysnav_ros_adapters import (
     RosDetectionResultAdapter,
     RosNavigationStatusProvider,
     RosObjectNodeAdapter,
     RosRoomNodeAdapter,
+    RosViewpointPoseAdapter,
     RosWaypointController,
     build_semantic_map_snapshot,
 )
@@ -204,6 +206,131 @@ def test_build_semantic_map_snapshot_uses_sysnav_object_and_room_lists(tmp_path)
     assert snapshot.room_by_uid("sysnav_room:9").centroid == (5.0, 0.0, 0.0)
     assert snapshot.frontiers == ()
     assert snapshot.metadata["detector_vocabulary"]["detector_name"] == "sysnav_test_detector"
+
+
+def test_viewpoint_pose_adapter_preserves_sysnav_pose_and_object_identity() -> None:
+    msg = SimpleNamespace(
+        header=_header(sec=4, nanosec=500_000_000),
+        viewpoint_id=7,
+        pose=SimpleNamespace(
+            position=_point(3.0, 4.0, 0.0),
+            orientation=_orientation(z=0.707, w=0.707),
+        ),
+        observed_object_ids=[42, 43],
+    )
+
+    viewpoint = RosViewpointPoseAdapter().from_msg(msg)
+
+    assert viewpoint.uid == "7"
+    assert viewpoint.pose.position == (3.0, 4.0, 0.0)
+    assert viewpoint.pose.frame_id == "map"
+    assert viewpoint.visible_objects == ("sysnav_object:42", "sysnav_object:43")
+
+
+def test_semantic_snapshot_bridge_accumulates_object_viewpoint_history() -> None:
+    from real_robot.sysnav_runtime import SysNavSemanticMapBridge
+
+    bridge = SysNavSemanticMapBridge(
+        robot_pose_provider=lambda: Pose3D(position=(0.0, 0.0, 0.0)),
+    )
+    bridge.update_viewpoint_pose(
+        SimpleNamespace(
+            header=_header(sec=4, nanosec=500_000_000),
+            viewpoint_id=7,
+            pose=SimpleNamespace(
+                position=_point(3.0, 4.0, 0.0),
+                orientation=_orientation(),
+            ),
+            observed_object_ids=[42],
+        )
+    )
+    bridge.update_object_nodes(
+        SimpleNamespace(
+            header=_header(sec=4),
+            nodes=[
+                SimpleNamespace(
+                    header=_header(sec=4),
+                    object_id=[42],
+                    label="book",
+                    position=_point(5.0, 6.0, 0.0),
+                    bbox3d=[],
+                    cloud=None,
+                    status=True,
+                    img_path="",
+                    is_asked_vlm=False,
+                    viewpoint_id=7,
+                )
+            ],
+        )
+    )
+
+    snapshot = bridge.build_snapshot(timestamp=5.0)
+
+    assert snapshot is not None
+    assert snapshot.viewpoints[0].uid == "7"
+    assert snapshot.viewpoints[0].visible_objects == ("sysnav_object:42",)
+    assert snapshot.object_by_uid("sysnav_object:42").visible_viewpoints == ("7",)
+
+
+def test_sysnav_viewpoint_bridge_reaches_goal_resolver() -> None:
+    """Verify the raw SysNav viewpoint path through the executable goal boundary."""
+
+    from real_robot.contracts import NavigationIntent, MotionGoalMode
+    from real_robot.sysnav_runtime import SysNavSemanticMapBridge
+    from real_robot.sysnav_viewpoint_bridge import SysNavViewpointBridgeModel
+
+    model = SysNavViewpointBridgeModel(max_time_offset_s=0.1)
+    records = model.update_odometry(_odom_msg(1.5, 2.5, 0.0, sec=7))
+    assert records == ()
+    records = model.update_viewpoint(
+        SimpleNamespace(header=_header(sec=7), viewpoint_id=12)
+    )
+    assert len(records) == 1
+
+    record = records[0]
+    bridge = SysNavSemanticMapBridge(
+        robot_pose_provider=lambda: Pose3D(position=(0.0, 0.0, 0.0))
+    )
+    bridge.update_viewpoint_pose(
+        SimpleNamespace(
+            header=_header(sec=7),
+            viewpoint_id=record.viewpoint_id,
+            pose=SimpleNamespace(
+                position=_point(*record.pose.position),
+                orientation=_orientation(*record.pose.orientation_xyzw[:3], w=record.pose.orientation_xyzw[3]),
+            ),
+            observed_object_ids=[],
+        )
+    )
+    bridge.update_object_nodes(
+        SimpleNamespace(
+            nodes=[
+                SimpleNamespace(
+                    header=_header(sec=7),
+                    object_id=[42],
+                    label="book",
+                    position=_point(6.0, 6.0, 0.0),
+                    bbox3d=[],
+                    cloud=None,
+                    status=True,
+                    img_path="",
+                    is_asked_vlm=False,
+                    viewpoint_id=12,
+                )
+            ]
+        )
+    )
+    snapshot = bridge.build_snapshot(timestamp=8.0)
+    intent = NavigationIntent(
+        mode=MotionGoalMode.GO_TO_OBJECT,
+        target_object_uid="sysnav_object:42",
+    )
+
+    goal = SysNavGoalResolver(SnapshotViewpointProvider()).resolve(intent, snapshot, set())
+
+    assert goal is not None
+    assert goal.goal_pose.position == (1.5, 2.5, 0.0)
+    assert goal.metadata["viewpoint_uid"] == "12"
 
 
 class FakePointStamped:

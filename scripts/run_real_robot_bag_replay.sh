@@ -12,9 +12,9 @@ usage() {
   cat <<EOF
 Usage: scripts/run_real_robot_bag_replay.sh BAG_PATH [runtime launch args...]
 
-Replays a rosbag and starts only the STRIVE high-level instruction runtime.
-It does not start SysNav detector/mapping, lower controllers, /way_point, or
-/cmd_vel publishers by default.
+Replays a rosbag and starts the STRIVE high-level instruction runtime plus the
+read-only SysNav viewpoint bridge.  It does not start SysNav detector/mapping,
+lower controllers, /way_point, or /cmd_vel publishers by default.
 
 Default runtime topic mapping:
   object_topic=${BAG_OBJECT_TOPIC:-/object_nodes_list}
@@ -23,6 +23,8 @@ Default runtime topic mapping:
   image_topic=${BAG_IMAGE_TOPIC:-/camera/image}
   detection_topic=${BAG_DETECTION_TOPIC:-/detection_result}
   path_topic=${BAG_PATH_TOPIC:-/path}
+  viewpoint_topic=${BAG_VIEWPOINT_TOPIC:-/viewpoint_rep_header}
+  viewpoint_pose_topic=${BAG_VIEWPOINT_POSE_TOPIC:-/strive/sysnav/viewpoint_pose}
 
 Useful environment variables:
   BAG_LOOP=1
@@ -30,11 +32,13 @@ Useful environment variables:
   BAG_REQUIRED_TOPICS=/object_nodes_list,/room_nodes_list,/aft_mapped_to_init,/camera/image
   BAG_REQUIRE_RUNTIME_DECISION=1
   BAG_RUNTIME_GRACE_S=2
+  BAG_STARTUP_GRACE_S=1
   STRIVE_INSTRUCTION="find a book"
   STRIVE_DATASET_TARGET=book
   STRIVE_POLICY_MODE=semantic_snapshot
   STRIVE_INSTRUCTION_PLAN_BACKEND=rules
   STRIVE_RUN_DIRECTORY=/tmp/strive_real_robot_bag_replay
+  BAG_START_VIEWPOINT_BRIDGE=1
 
 Any extra arguments are passed to strive_instruction_runtime.launch.py and can
 override the defaults above.
@@ -141,6 +145,7 @@ RUNTIME_ARGS=(
   "run_directory:=${RUN_DIRECTORY}"
   "object_topic:=${BAG_OBJECT_TOPIC:-/object_nodes_list}"
   "room_topic:=${BAG_ROOM_TOPIC:-/room_nodes_list}"
+  "viewpoint_pose_topic:=${BAG_VIEWPOINT_POSE_TOPIC:-/strive/sysnav/viewpoint_pose}"
   "odom_topic:=${BAG_ODOM_TOPIC:-/aft_mapped_to_init}"
   "image_topic:=${BAG_IMAGE_TOPIC:-/camera/image}"
   "detection_topic:=${BAG_DETECTION_TOPIC:-/detection_result}"
@@ -152,7 +157,7 @@ RUNTIME_ARGS=(
 )
 
 cleanup() {
-  for pid in "${RUNTIME_PID:-}" "${BAG_PID:-}"; do
+  for pid in "${BRIDGE_PID:-}" "${RUNTIME_PID:-}" "${BAG_PID:-}"; do
     [[ -n "${pid}" ]] || continue
     if kill -0 "${pid}" >/dev/null 2>&1; then
       kill "${pid}" >/dev/null 2>&1 || true
@@ -168,7 +173,18 @@ echo "== Start STRIVE instruction runtime =="
 ros2 launch strive_sysnav_bringup strive_instruction_runtime.launch.py "${RUNTIME_ARGS[@]}" "$@" &
 RUNTIME_PID=$!
 
-# 启动 runtime 后再播放 bag，避免短 bag 在 runtime 完成订阅前已经播放结束。
+if is_true "${BAG_START_VIEWPOINT_BRIDGE:-1}"; then
+  echo "== Start SysNav viewpoint bridge =="
+  ros2 launch strive_sysnav_bringup sysnav_viewpoint_bridge.launch.py \
+    "viewpoint_topic:=${BAG_VIEWPOINT_TOPIC:-/viewpoint_rep_header}" \
+    "object_topic:=${BAG_OBJECT_TOPIC:-/object_nodes_list}" \
+    "odom_topic:=${BAG_ODOM_TOPIC:-/aft_mapped_to_init}" \
+    "output_topic:=${BAG_VIEWPOINT_POSE_TOPIC:-/strive/sysnav/viewpoint_pose}" &
+  BRIDGE_PID=$!
+fi
+
+# 启动 runtime/bridge 后再播放 bag，避免短 bag 在订阅建立前已经播放结束。
+sleep "${BAG_STARTUP_GRACE_S:-1}"
 echo "== Start bag replay =="
 ros2 bag play "${BAG_PATH}" "${BAG_PLAY_ARGS[@]}" &
 BAG_PID=$!
@@ -183,6 +199,11 @@ while kill -0 "${BAG_PID}" >/dev/null 2>&1; do
     [[ "${status}" -ne 0 ]] || status=1
     cleanup
     exit "${status}"
+  fi
+  if is_true "${BAG_START_VIEWPOINT_BRIDGE:-1}" && ! kill -0 "${BRIDGE_PID}" >/dev/null 2>&1; then
+    echo "SysNav viewpoint bridge exited before rosbag replay completed." >&2
+    cleanup
+    exit 1
   fi
   sleep 0.2
 done

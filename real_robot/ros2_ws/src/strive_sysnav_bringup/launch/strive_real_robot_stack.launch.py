@@ -29,11 +29,13 @@ def generate_launch_description() -> LaunchDescription:
         "enable_lower_stack": "false",
         "platform": "mecanum",
         "start_semantic_mapping": "true",
+        "start_viewpoint_bridge": "true",
         "start_usb_cam": "false",
         "camera_topic": "/camera/image",
         "cloud_topic": "/cloud_registered",
         "odom_topic": "/aft_mapped_to_init",
         "viewpoint_topic": "/viewpoint_rep_header",
+        "viewpoint_pose_topic": "/strive/sysnav/viewpoint_pose",
         "detection_topic": "/detection_result",
         "object_nodes_topic": "/object_nodes_list",
         "object_topic": "/object_nodes_list",
@@ -189,6 +191,7 @@ def generate_launch_description() -> LaunchDescription:
         "instruction": LaunchConfiguration("instruction"),
         "object_topic": LaunchConfiguration("object_topic"),
         "room_topic": LaunchConfiguration("room_topic"),
+        "viewpoint_pose_topic": LaunchConfiguration("viewpoint_pose_topic"),
         "odom_topic": LaunchConfiguration("odom_topic"),
         "path_topic": LaunchConfiguration("path_topic"),
         "planner_status_topic": LaunchConfiguration("planner_status_topic"),
@@ -245,6 +248,20 @@ def generate_launch_description() -> LaunchDescription:
         ),
         launch_arguments=detection_arguments.items(),
     )
+    viewpoint_bridge_launch = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            PathJoinSubstitution(
+                [FindPackageShare("strive_sysnav_bringup"), "launch", "sysnav_viewpoint_bridge.launch.py"]
+            )
+        ),
+        launch_arguments={
+            "viewpoint_topic": LaunchConfiguration("viewpoint_topic"),
+            "object_topic": LaunchConfiguration("object_nodes_topic"),
+            "odom_topic": LaunchConfiguration("odom_topic"),
+            "output_topic": LaunchConfiguration("viewpoint_pose_topic"),
+        }.items(),
+        condition=IfCondition(LaunchConfiguration("start_viewpoint_bridge")),
+    )
     lower_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             PathJoinSubstitution(
@@ -265,4 +282,4 @@ def generate_launch_description() -> LaunchDescription:
 
     # 中文说明：lower stack 只有显式 enable 才存在；高层 runtime 始终运行，
     # 但默认 dry-run，避免“启动了感知”被误解为“已经获得底盘控制权”。
-    return LaunchDescription(declarations + [detection_launch, lower_launch, runtime_launch])
+    return LaunchDescription(declarations + [detection_launch, viewpoint_bridge_launch, lower_launch, runtime_launch])
