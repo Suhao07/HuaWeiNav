@@ -39,6 +39,12 @@ workspace 的实际代码为准，描述传感器输入、SysNav 感知建图、
 当前已经有平台无关 Python contract 和 SysNav adapter；真实传感器、目标底盘和急停链
 仍需要在对应设备上验收。代码 smoke、ROS bag replay 和 HIL 不能代替实物运动验收。
 
+截至 2026-08-21，Orin-26 上已经验证 D435i、MID-360/Point-LIO、detector、semantic
+mapping 到真实对象节点的数据链，以及 `/way_point` 到影子 `Float32MultiArray` topic 的
+waypoint 格式转换。当前投影配置仍为 `extrinsics_only`，controller contract 仍为
+`unapproved`，因此这些结果属于数据层和影子控制验证，不是完整实物导航验收。唯一执行
+清单见 [`real_robot_deployment_todo.md`](real_robot_deployment_todo.md)。
+
 ## 2. 总体架构
 
 ```mermaid
@@ -424,7 +430,7 @@ def step(instruction):
 
 ### 6.2 ROS 输出
 
-支持两种互斥的运动后端：
+VLN runtime 支持两种互斥的高层运动后端：
 
 ```text
 方式 A：Action backend
@@ -444,7 +450,7 @@ def step(instruction):
 result、cancel 和 safety reason；Waypoint backend 兼容现有 SysNav 原生 topic，但必须
 依赖 `RosNavigationStatusProvider` 从 odom、path、timeout 和 progress 推断状态。
 
-下层执行链为：
+`/way_point` 之后存在两条互斥的下层执行路径。SysNav 原生路径为：
 
 ```text
 /way_point
@@ -455,6 +461,20 @@ result、cancel 和 safety reason；Waypoint backend 兼容现有 SysNav 原生 
   -> SafetyVelocityMux
   -> /cmd_vel
 ```
+
+Orin-26 当前观察到的机器人自有路径为：
+
+```text
+/way_point (geometry_msgs/PointStamped, world frame)
+  -> WaypointFormatAdapter
+  -> /waypoint (std_msgs/Float32MultiArray, ego [x, y])
+  -> 外部局部规划器 / PD controller
+  -> 外部底盘 bridge / mux
+```
+
+第二条路径目前只完成影子 topic 验证，尚未连接真实 `/waypoint`。两条下层路径不能同时
+启动；在真实 controller contract 获批前，迁移的 SysNav `pathFollower` 和机器人外部
+controller 都不得取得生产 `/cmd_vel` 所有权。
 
 `/cmd_vel` 只能由底层安全 mux 发布。VLN、instruction runtime、LVLM 和 evidence
 provider 都不得直接发布 `/cmd_vel` 或其变体。
@@ -511,6 +531,10 @@ real_robot/sysnav_runtime.py
 real_robot/action_motion_controller.py
   ExecuteWaypoint Action client；通过 SysNavMotionServer 交接 waypoint。
 
+real_robot/waypoint_adapter.py
+  将 world-frame PointStamped 转换为机器人自有 controller 的 ego-frame 数组；只负责
+  frame、时间和格式转换，不发布速度。
+
 real_robot/motion_safety.py
   平台无关速度限制和安全决策模型。
 
@@ -529,7 +553,9 @@ real_robot/ros2_ws/src/strive_sysnav_bringup
   sysnav_detection_mapping.launch.py
   strive_instruction_runtime.launch.py
   strive_real_robot_stack.launch.py
+  waypoint_adapter.launch.py
   instruction_runtime_node.py
+  waypoint_adapter_node.py
 
 real_robot/ros2_ws/src/strive_motion_msgs
   ExecuteWaypoint.action
@@ -650,6 +676,8 @@ dry_run=false, lower_controller_enabled=true
 
 ## 10. 相关文档
 
+- [实物部署状态与 TODO](real_robot_deployment_todo.md)
+- [实物控制链原理与当前方案](real_robot_control_chain_design_zh.md)
 - [LVLM 接入与部署基础](lvlm_server_deployment.md)
 - [SysNav 真实机器人 ROS2 workspace](../real_robot/ros2_ws/README.md)
 - [技术白皮书](project_technical_whitepaper.md)

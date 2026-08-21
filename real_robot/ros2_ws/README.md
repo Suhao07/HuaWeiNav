@@ -7,6 +7,7 @@
 完整的数据流、控制流和平台适配边界见：
 
 - [`docs/real_robot_framework.md`](../../docs/real_robot_framework.md)
+- [`docs/real_robot_deployment_todo.md`](../../docs/real_robot_deployment_todo.md)
 - [`docs/lvlm_server_deployment.md`](../../docs/lvlm_server_deployment.md)
 
 实物模式采用单一 ROS2 运行环境和远程 LVLM 服务：
@@ -399,6 +400,29 @@ ros2 launch strive_sysnav_motion sysnav_motion_server.launch.py \
 同一运行图中只能有一个 `/way_point` owner。Action server 返回的 `REACHED`、
 `BLOCKED`、`TIMEOUT`、`PREEMPTED`、`SAFETY_STOP`、人工接管和定位丢失，只描述运动
 尝试结果，不表示自然语言任务成功。
+
+### 8.3 外部机器人 waypoint adapter
+
+Orin-26 上观察到的外部控制器使用 `/waypoint` 的
+`std_msgs/Float32MultiArray`，与 VLN 的 world-frame `/way_point`
+`geometry_msgs/PointStamped` 不同。当前 adapter 只完成影子 topic 验证：
+
+```text
+/way_point
+  -> strive_waypoint_adapter
+  -> /strive/test_waypoint_array
+```
+
+配置入口为 `real_robot/control/waypoint_adapter_template.yaml`。输出默认关闭：
+
+```bash
+WAYPOINT_ADAPTER_CONFIG=/workspace/STRIVE/real_robot/control/<robot>_waypoint_adapter.yaml \
+  bash scripts/run_real_robot_waypoint_adapter.sh
+```
+
+只有外部控制器所有者确认 frame、数组语义、反馈、watchdog 和急停合同后，才允许把输出
+topic 改为真实 `/waypoint`。adapter 只做时间、frame 和格式转换，不发布 `/cmd_vel`。
+它与 SysNav 原生 `pathFollower` 是互斥下层路径，不能同时取得速度控制权。
 
 ## 9. 安全开关
 

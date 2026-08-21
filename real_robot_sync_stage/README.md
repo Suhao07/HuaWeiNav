@@ -1,24 +1,9 @@
-# Workspace-local camera calibration
+# Realworld branch sync staging
 
-Put the RGB camera's calibrated `camera_info` YAML here, for example
-`orin26_generic_rgb.yaml`.  The real-robot container mounts this directory
-read-only at `/workspace/STRIVE/real_robot/calibration`.
+本目录曾用于在分支合并前暂存 Orin 部署记录。`main` 与 `realworld` 已形成共同基线，
+这里不再维护独立实现方案或进度状态。
 
-The Orin-26 deployment also has an imported, read-only extrinsics asset:
-`orin26_d435i_mid360_targetless_v009_r009_extrinsics.json`. It preserves the
-source project's 4x4 transforms and frame names. The asset is marked
-`extrinsics_only` because it does not contain RGB intrinsics, distortion,
-time-offset, or reprojection validation; it must not be treated as an
-approved semantic-fusion profile by itself.
+- 当前实物框架：[`docs/real_robot_framework.md`](../docs/real_robot_framework.md)
+- 当前部署 TODO：[`docs/real_robot_deployment_todo.md`](../docs/real_robot_deployment_todo.md)
 
-After the calibration file is present, set the selected robot profile to:
-
-```bash
-export USB_CAMERA_INFO_URL="file:///workspace/STRIVE/real_robot/calibration/orin26_generic_rgb.yaml"
-```
-
-Then run the normal profile check and detector-only camera validation.  Do not
-set this value until the file is present.  Calibration files are intentionally
-Git-ignored; retain the calibration report and values with the robot's
-deployment records. The imported extrinsics file records the source path and
-SHA-256 for auditability without modifying the source project.
+新的代码、配置和验收文档应直接进入其正式目录，不再先复制到本目录。
