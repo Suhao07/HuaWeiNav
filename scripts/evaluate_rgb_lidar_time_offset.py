@@ -253,6 +253,9 @@ def main():
     t_cam_lidar = np.asarray(ext["T_camera_from_lidar"], dtype=float)
     t_base_lidar = np.asarray(ext["T_base_from_lidar"], dtype=float)
     t_base_camera = np.asarray(ext["T_base_from_camera"], dtype=float)
+    if args.lidar_topic.endswith("_body"):
+        # Point-LIO already expresses this registered cloud in the base/body frame.
+        t_base_lidar = np.eye(4)
     cameras, lidars, odoms = read_bag(
         args.bag,
         depth_topic=args.depth_topic,
@@ -274,6 +277,7 @@ def main():
             "odom": args.odom_topic,
         },
         "timestamp_basis": "sensor message header stamps; candidate delta=t_rgb-t_lidar",
+        "lidar_frame_assumption": "base/body for *_body topic" if args.lidar_topic.endswith("_body") else "sensor lidar frame",
         "input_counts": {"camera_depth_samples": len(cameras), "lidar_packets": len(lidars), "odom_samples": len(odoms)},
         "scan": scores,
         "best": best,
