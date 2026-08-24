@@ -396,6 +396,14 @@ bag_pid=$!
 sleep 2
 kill -0 "${bag_pid}" 2>/dev/null || die "ros2 bag record exited before capture"
 
+cat <<'EOF'
+[calibration-capture] operator checklist
+  - Keep the robot stationary with wheels/brakes secured.
+  - Do not start mapping, detector, planner, waypoint adapter, or controller.
+  - Use one rigid target visible in RGB, aligned depth, and MID-360 points.
+  - For each phase, place the target first, then press Enter, then hold still.
+EOF
+
 phases=(
   "near/front/pose-A" "near/left/pose-A" "near/right/pose-A"
   "near/front/pose-B" "near/left/pose-B" "near/right/pose-B"
@@ -407,19 +415,42 @@ phases=(
 printf 'phase_index,phase_label,started_utc,duration_s\n' >"${output_dir}/phase_log.csv"
 for index in "${!phases[@]}"; do
   phase_label="${phases[$index]}"
-  printf '[calibration-capture] phase %02d/18: %s — position target, then hold it still\n' "$((index + 1))" "${phase_label}"
+  case "${phase_label}" in
+    near/*) distance_hint="NEAR: close working distance; keep the whole target in the shared RGB/LiDAR view" ;;
+    middle/*) distance_hint="MIDDLE: normal working distance; keep the target fully visible" ;;
+    far/*) distance_hint="FAR: longest useful distance; keep enough depth/LiDAR points on the target" ;;
+  esac
+  case "${phase_label}" in
+    */front/*) orientation_hint="FRONT: target plane faces the camera" ;;
+    */left/*) orientation_hint="LEFT: rotate target about 20-30 degrees to the left" ;;
+    */right/*) orientation_hint="RIGHT: rotate target about 20-30 degrees to the right" ;;
+  esac
+  case "${phase_label}" in
+    */pose-A) pose_hint="POSE-A: upright, approximately vertical" ;;
+    */pose-B) pose_hint="POSE-B: tilt target up/down about 10-20 degrees" ;;
+  esac
+  printf '\n[calibration-capture] phase %02d/18: %s\n' "$((index + 1))" "${phase_label}"
+  printf '  %s\n  %s\n  %s\n' "${distance_hint}" "${orientation_hint}" "${pose_hint}"
+  printf '  Check RGB + aligned depth + LiDAR visibility, then press Enter.\n'
   if ! is_true "${non_interactive}"; then
-    read -r -p "Press Enter to record this phase (${phase_duration_s}s)... " || true
+    read -r -p "[calibration-capture] Press Enter to record; hold target still for ${phase_duration_s}s: " || true
   fi
   phase_start="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   printf '%d,%s,%s,%s\n' "$((index + 1))" "${phase_label}" "${phase_start}" "${phase_duration_s}" >>"${output_dir}/phase_log.csv"
+  printf '[calibration-capture] recording phase %02d/18...\n' "$((index + 1))"
   sleep "${phase_duration_s}"
+  printf '[calibration-capture] phase %02d complete; reposition target for the next phase.\n' "$((index + 1))"
 done
 
 # If duration has deliberately been extended, preserve the requested total.
 minimum_s=$((phase_duration_s * 18))
 if ((duration_s > minimum_s)); then
-  sleep "$((duration_s - minimum_s))"
+  dynamic_s=$((duration_s - minimum_s))
+  printf '\n[calibration-capture] dynamic time-offset segment: %ss\n' "${dynamic_s}"
+  echo "  Slowly move the target left/right, up/down, and rotate it while keeping it visible in RGB, depth, and LiDAR."
+  echo "  Do not move the robot and do not let the target leave the shared field of view."
+  sleep "${dynamic_s}"
+  echo "[calibration-capture] dynamic segment complete"
 fi
 
 echo "[calibration-capture] stopping bag"
