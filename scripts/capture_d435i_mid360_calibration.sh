@@ -148,8 +148,11 @@ TF_STATIC_TOPIC="${TF_STATIC_TOPIC:-/tf_static}"
 if [[ -f "${ROS_SETUP}" ]]; then
   # ROS setup is idempotent and gives ros2 bag the message/type environment.
   # shellcheck disable=SC1090
+  set +u
   source "${ROS_SETUP}"
+  set -u
 fi
+set +u
 for setup_file in \
   /home/orin26/code/ws_livox/install/setup.bash \
   /home/orin26/code/point_lio_ws/install/setup.bash; do
@@ -158,6 +161,7 @@ for setup_file in \
     source "${setup_file}"
   fi
 done
+set -u
 command -v ros2 >/dev/null 2>&1 || die "ros2 is not available; run this on the ROS 2 robot environment"
 command -v timeout >/dev/null 2>&1 || die "timeout is required"
 
