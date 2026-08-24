@@ -76,6 +76,8 @@ def read_bag(
     odom_topic="/base_odom",
     sample_every=8,
     points_per_packet=100,
+    min_stamp=None,
+    max_stamp=None,
 ):
     import rosbag2_py
     from livox_ros_driver2.msg import CustomMsg
@@ -94,6 +96,10 @@ def read_bag(
     camera_i = 0
     while reader.has_next():
         topic, data, bag_ns = reader.read_next()
+        if min_stamp is not None and bag_ns * 1e-9 < min_stamp:
+            continue
+        if max_stamp is not None and bag_ns * 1e-9 > max_stamp:
+            continue
         if topic == depth_topic:
             camera_i += 1
             if camera_i % sample_every:
@@ -236,6 +242,10 @@ def main():
     p.add_argument("--odom-topic", default="/base_odom")
     p.add_argument("--sample-every", type=int, default=8,
                    help="Use every Nth depth frame to bound offline memory use.")
+    p.add_argument("--min-stamp", type=float, default=None,
+                   help="Ignore bag messages before this ROS timestamp (seconds).")
+    p.add_argument("--max-stamp", type=float, default=None,
+                   help="Ignore bag messages after this ROS timestamp (seconds).")
     p.add_argument("--fx", type=float, required=True)
     p.add_argument("--fy", type=float, required=True)
     p.add_argument("--cx", type=float, required=True)
@@ -262,6 +272,8 @@ def main():
         lidar_topic=args.lidar_topic,
         odom_topic=args.odom_topic,
         sample_every=max(1, args.sample_every),
+        min_stamp=args.min_stamp,
+        max_stamp=args.max_stamp,
     )
     odom_times = [x[0] for x in odoms]
     odom_poses = [x[1] for x in odoms]
