@@ -21,12 +21,14 @@ start_lio="${START_LIO:-1}"
 start_d435i="${START_D435I:-1}"
 lio_session="${LIO_TMUX_SESSION:-livox_odom}"
 d435i_session="${D435I_TMUX_SESSION:-d435i_camera}"
-lio_start_script="${LIO_START_SCRIPT:-/home/orin26/code/start_livox_odom.sh}"
+lio_start_script="${LIO_START_SCRIPT:-${REPO_ROOT}/scripts/start_orin_lio_for_strive.sh}"
 lio_start_cmd="${LIO_START_CMD:-}"
 d435i_start_cmd="${D435I_START_CMD:-}"
 d435i_camera_namespace="${D435I_CAMERA_NAMESPACE:-camera/d435i}"
 d435i_camera_name="${D435I_CAMERA_NAME:-d435i_camera}"
 d435i_serial_no="${D435I_SERIAL_NO:-_233522079589}"
+d435i_fps="${D435I_FPS:-15}"
+livox_publish_freq="${LIVOX_PUBLISH_FREQ:-10.0}"
 sample_timeout_s="${CALIBRATION_SAMPLE_TIMEOUT_S:-8}"
 non_interactive="${CALIBRATION_NON_INTERACTIVE:-0}"
 
@@ -64,6 +66,7 @@ Default robot-owned startup:
   D435I_SERIAL_NO=_233522079589
   D435I_CAMERA_NAMESPACE=camera/d435i
   D435I_CAMERA_NAME=d435i_camera
+  D435I_FPS=15
 
 Optional startup overrides:
   LIO_START_CMD='<foreground or robot startup command>'
@@ -147,6 +150,14 @@ if [[ -f "${ROS_SETUP}" ]]; then
   # shellcheck disable=SC1090
   source "${ROS_SETUP}"
 fi
+for setup_file in \
+  /home/orin26/code/ws_livox/install/setup.bash \
+  /home/orin26/code/point_lio_ws/install/setup.bash; do
+  if [[ -f "${setup_file}" ]]; then
+    # shellcheck disable=SC1090
+    source "${setup_file}"
+  fi
+done
 command -v ros2 >/dev/null 2>&1 || die "ros2 is not available; run this on the ROS 2 robot environment"
 command -v timeout >/dev/null 2>&1 || die "timeout is required"
 
@@ -228,18 +239,19 @@ tmux_session_exists() {
 start_lio_sensor_stack() {
   if tmux_session_exists "${lio_session}"; then
     echo "[calibration-capture] reusing existing LIO session: ${lio_session}"
-    return 0
-  fi
-  if [[ -n "${lio_start_cmd}" ]]; then
+  elif [[ -n "${lio_start_cmd}" ]]; then
     echo "[calibration-capture] starting supplied LIO command"
     bash -lc "${lio_start_cmd}" >"${output_dir}/lio_start.log" 2>&1 &
     lio_pid=$!
+    lio_started_by_us=1
   else
     echo "[calibration-capture] starting robot LIO helper: ${lio_start_script} start"
     bash "${lio_start_script}" start >"${output_dir}/lio_start.log" 2>&1
+    lio_started_by_us=1
   fi
-  lio_started_by_us=1
   sleep 3
+  ros2 param set /livox_lidar_publisher publish_freq "${livox_publish_freq}" \
+    >"${output_dir}/livox_runtime_params.log" 2>&1 || die "failed to set Livox publish_freq=${livox_publish_freq}"
 }
 
 start_d435i_sensor() {
@@ -259,8 +271,8 @@ start_d435i_sensor() {
         camera_name:=${d435i_camera_name} \
         serial_no:=${d435i_serial_no} \
         enable_color:=true enable_depth:=true \
-        rgb_camera.color_profile:=1280,720,30 \
-        depth_module.depth_profile:=1280,720,30 \
+        rgb_camera.color_profile:=1280,720,${d435i_fps} \
+        depth_module.depth_profile:=1280,720,${d435i_fps} \
         align_depth.enable:=true enable_sync:=true publish_tf:=true \
         >'${output_dir}/d435i_driver.log' 2>&1" \
       >"${output_dir}/d435i_start.log" 2>&1

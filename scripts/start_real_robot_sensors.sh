@@ -23,17 +23,21 @@ source "${PROFILE_FILE}"
 set +a
 
 ROS_SETUP="${ROS_SETUP_ZSH:-/opt/ros/humble/setup.zsh}"
-LIO_HELPER="${LIO_START_SCRIPT:-/home/orin26/code/start_livox_odom.sh}"
+LIO_HELPER="${LIO_START_SCRIPT:-${ROOT_DIR}/scripts/start_orin_lio_for_strive.sh}"
 LIO_SESSION="${LIO_TMUX_SESSION:-livox_odom}"
 CAMERA_SESSION="${D435I_TMUX_SESSION:-d435i_camera}"
+LIVOX_SETUP="${LIVOX_SETUP_ZSH:-/home/orin26/code/ws_livox/install/setup.zsh}"
+POINT_LIO_SETUP="${POINT_LIO_SETUP_ZSH:-/home/orin26/code/point_lio_ws/install/setup.zsh}"
 CAMERA_NAMESPACE="${D435I_CAMERA_NAMESPACE:-camera/d435i}"
 CAMERA_NAME="${D435I_CAMERA_NAME:-d435i_camera}"
 CAMERA_SERIAL="${D435I_SERIAL_NO:-_233522079589}"
+CAMERA_FPS="${D435I_FPS:-15}"
 RGB_TOPIC="${RGB_TOPIC:-/camera/d435i/d435i_camera/color/image_raw}"
 DEPTH_TOPIC="${DEPTH_TOPIC:-/camera/d435i/d435i_camera/aligned_depth_to_color/image_raw}"
 INFO_TOPIC="${CAMERA_INFO_TOPIC:-/camera/d435i/d435i_camera/color/camera_info}"
+LIVOX_PUBLISH_FREQ="${LIVOX_PUBLISH_FREQ:-10.0}"
 
-ros_cmd() { zsh -lc "source '${ROS_SETUP}'; $*"; }
+ros_cmd() { zsh -lc "source '${ROS_SETUP}'; source '${LIVOX_SETUP}'; source '${POINT_LIO_SETUP}'; $*"; }
 session_exists() { tmux has-session -t "$1" 2>/dev/null; }
 
 start_camera() {
@@ -41,12 +45,12 @@ start_camera() {
     echo "[sensors] reusing D435i tmux session: ${CAMERA_SESSION}"
     return
   fi
-  echo "[sensors] starting D435i ${CAMERA_SERIAL} at 1280x720@30 with aligned depth"
+  echo "[sensors] starting D435i ${CAMERA_SERIAL} at 1280x720@${CAMERA_FPS} with aligned depth"
   tmux new-session -d -s "${CAMERA_SESSION}" -n camera /bin/zsh -lc \
     "set -e; source '${ROS_SETUP}'; exec ros2 launch realsense2_camera rs_launch.py \
       camera_namespace:='${CAMERA_NAMESPACE}' camera_name:='${CAMERA_NAME}' \
       serial_no:='${CAMERA_SERIAL}' enable_color:=true enable_depth:=true \
-      rgb_camera.color_profile:=1280,720,30 depth_module.depth_profile:=1280,720,30 \
+      rgb_camera.color_profile:=1280,720,${CAMERA_FPS} depth_module.depth_profile:=1280,720,${CAMERA_FPS} \
       align_depth.enable:=true enable_sync:=true publish_tf:=true"
 }
 
@@ -58,6 +62,7 @@ start_lio() {
   echo "[sensors] starting robot-owned Livox + Point-LIO; runtime cloud/body-cloud overrides enabled"
   ENABLE_CLOUD_PUBLISH=1 ENABLE_BODY_CLOUD_PUBLISH=1 RESTART_EXISTING=0 \
     bash "${LIO_HELPER}" start
+  ros_cmd "ros2 param set /livox_lidar_publisher publish_freq ${LIVOX_PUBLISH_FREQ}"
 }
 
 check_topics() {
