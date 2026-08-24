@@ -14,6 +14,18 @@ bash scripts/run_real_robot_profile.sh orin26_livox_mid360_generic_rgb lio-diagn
 bash scripts/run_real_robot_profile.sh orin26_livox_mid360_generic_rgb runtime-smoke
 ```
 
+For the D435i/MID-360 calibration data path, start only the external sensor
+and Point-LIO processes with the project-owned entrypoint:
+
+```bash
+bash scripts/start_real_robot_sensors.sh orin26_livox_mid360_d435i start
+bash scripts/start_real_robot_sensors.sh orin26_livox_mid360_d435i status
+```
+
+The entrypoint performs actual-message checks for RGB, aligned depth,
+CameraInfo, Livox, IMU, registered cloud, and odometry. It never starts
+semantic mapping, detection, waypoint, `/cmd_vel`, or a lower controller.
+
 For a container-only dependency check while the shared LIO graph is unavailable,
 source the profile from **Bash** (or use the helper above), then run the smoke
 with the generic env file disabled:
