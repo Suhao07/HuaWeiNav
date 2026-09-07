@@ -6,3 +6,4 @@
 # them local/remote under the calibration mount unless a reviewed release
 # explicitly vendors one.
 *.json
+!orin26_d435i_mid360_candidate_20260826.json

@@ -131,3 +131,43 @@ held-out `pass=false`（median 超过当前 0.25 m 工作阈值），所以这�
 `0.0230 m/s`，pose-scale proxy `pass=true`。这证明 Point-LIO 修正后输入位姿
 已回到合理量级，但不等价于对象点云/投影误差验收；实际对象列表仍需在标定通过
 后再启用 semantic mapping 验证。
+
+## 2026-08-26 动态 bag 复核（仍未批准）
+
+本次使用机器人上已完成的动态记录
+`/home/orin26/HuaweiVLN/logs/calibration/d435i_mid360_dynamic_20260823T062132Z/dynamic_bag`
+进行只读复核。该 bag 包含 167.58 s、2507 帧 aligned depth、16723 个原始
+`/livox/lidar` packet 和 16731 个 `/aft_mapped_to_init` 样本；内参直接取 bag 内
+640x480 CameraInfo（`fx=606.330017`、`fy=606.105347`、`cx=311.070923`、
+`cy=247.274445`）。
+
+时间偏移扫描使用原始 `/livox/lidar`（不是 `/cloud_registered_body`），定义仍为
+`Delta t=t_RGB-t_LiDAR`。全量扫描的训练候选为 `+0.090 s`：
+
+| 指标 | 全量 | train（交替帧） | held-out（train offset） |
+|---|---:|---:|---:|
+| 有效对应数 | 2301 | 1148 | 1153 |
+| median absolute depth residual | 0.045 m | 0.043 m | 0.048 m |
+| RMSE | 0.256 m | 0.246 m | 0.266 m |
+| P90 absolute residual | 0.464 m | 0.416 m | 0.477 m |
+| depth inlier ratio | 0.996 | 0.997 | 0.994 |
+
+虽然阈值式 `pass` 字段为 true，但 held-out 自己的最低候选是 `-0.120 s`，并且
+扫描曲线在多个偏移处的 median 几乎相同；因此不满足“唯一、稳定、跨片段复现”的
+验收要求，`+0.090 s` 只能作为候选，不能写入 projection profile。
+
+同时对 VEOcc 已有的 8 个静态场景和同一只读外参做了 RGB-D 深度一致性复核（不是
+棋盘边缘像素误差）：184546 个有效对应的 aggregate RMSE 为 0.432 m、median
+absolute 为 0.063 m、P90 为 0.591 m、`|error|<0.20 m` inlier ratio 为 0.746。
+这些场景没有 LiDAR 点与棋盘边缘的一一对应关系，因此真正的 LiDAR-to-image
+像素 RMSE 仍为**未测量**；上述深度统计不能替代该指标。
+
+本轮生成的机器人端证据：
+
+```text
+/home/orin26/HuaweiVLN/logs/calibration_eval/dynamic_20260823T062132Z/time_offset_raw_lidar.json
+/home/orin26/HuaweiVLN/logs/calibration_eval/static_v009_r009_imported/depth_metrics.json
+```
+
+结论：外参和内参可继续作为只读运行候选，时间偏移与真正像素投影误差尚未通过，
+`calibration_status` 继续保持 `extrinsics_only`，semantic mapping 不因本次复核开启。

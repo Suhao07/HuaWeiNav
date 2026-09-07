@@ -1,6 +1,6 @@
 # VLN 实物部署状态与 TODO
 
-> 更新日期：2026-08-21
+> 更新日期：2026-09-07
 > 代码基线：本地 `main`/`realworld` 均为 `00c376a75f05e29b8d8a0b36a97857d53f270163`；机器人文件内容按该提交同步。机器人 Git HEAD 仍为 `7fdf2c8`，因为原工作区未提交改动已保留。
 > 目标平台：Orin-26、Intel RealSense D435i、Livox MID-360
 > 当前安全状态：感知与影子控制验证；真实运动未批准
@@ -13,6 +13,26 @@
 bag replay、HIL 和影子 topic 不能替代真实底盘验收。
 
 ## 1. 当前结论
+
+### 2026-09-07 状态刷新
+
+用户已批准将静态棋盘 RANSAC candidate 作为 provisional 标定配置使用。当前 profile
+已写入 `calibration_status: calibrated`，外参文件为
+`real_robot/calibration/orin26_d435i_mid360_candidate_20260826.json`；但该批准是工程
+试运行决定，不代表时间偏移和动态投影验收完成。
+
+最新 candidate 的证据摘要：
+
+- 静态有效阶段：12/18（近距 6 个阶段因棋盘超出画面不可用）；
+- 平面 P90：train 0.0105 m，held-out 0.0112 m；
+- 深度 P90：train 0.0684 m，held-out 0.0692 m；
+- held-out 深度内点率：79.11%；
+- 像素代理 P90：train 11.46 px，held-out 11.27 px；
+- 动态时间偏移：train -15 ms，held-out +20 ms，差异 35 ms，仍未验证。
+
+因此当前允许启动 semantic mapping 做静态/低速数据链试运行，但必须保留
+`time_offset_status: unvalidated`，并继续禁止真实 waypoint、`/cmd_vel` 和底盘运动。
+Point-LIO 动态 TF 仍需连续窗口测试；出现 `future extrapolation` 时不能称为稳定部署完成。
 
 当前已打通两条无运动链路：
 

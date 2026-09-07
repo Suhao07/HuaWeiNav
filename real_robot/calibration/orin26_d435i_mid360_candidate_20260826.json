@@ -1,0 +1,33 @@
+{
+  "schema": "huawei_vln.real_robot.extrinsics.v1",
+  "calibration_status": "calibrated",
+  "calibration_id": "d435i-mid360-candidate-20260826",
+  "source": {
+    "project": "HuaweiVLN",
+    "method": "OCC initial extrinsic refined with static-board RANSAC fusion",
+    "read_only_import": false
+  },
+  "camera_frame": "d435i_color_optical_frame",
+  "lidar_frame": "livox_frame",
+  "T_camera_from_lidar": [
+    [-0.998614690573, 0.027545515973, 0.044832402578, 0.169513011520],
+    [-0.032712694125, 0.342353863977, -0.939001443802, 0.636538843184],
+    [-0.041213825523, -0.939167224923, -0.340978509903, 0.262327046828],
+    [0.0, 0.0, 0.0, 1.0]
+  ],
+  "validation": {
+    "static_stages_usable": "12/18",
+    "plane_p90_m": {"train": 0.0105, "held_out": 0.0112},
+    "depth_p90_m": {"train": 0.0684, "held_out": 0.0692},
+    "depth_inlier_ratio_lt_0_05_m": {"train": null, "held_out": 0.7911},
+    "pixel_median_px": {"train": 6.03, "held_out": 5.58},
+    "pixel_p90_px": {"train": 11.46, "held_out": 11.27},
+    "pixel_rmse_px": {"train": 7.20, "held_out": 6.98},
+    "time_offset_s": 0.0,
+    "time_offset_status": "unvalidated",
+    "time_offset_train_ms": -15.0,
+    "time_offset_held_out_ms": 20.0,
+    "time_offset_train_held_out_delta_ms": 35.0,
+    "measurement_date_utc": "not_provided"
+  }
+}
