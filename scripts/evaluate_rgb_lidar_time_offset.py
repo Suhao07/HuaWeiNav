@@ -286,6 +286,15 @@ def main():
                 key=lambda x: abs(x["offset_s"] - train_best["offset_s"]),
             )
         heldout_best = choose_best(heldout_scores)
+        offset_disagreement_s = None
+        if train_best is not None and heldout_best is not None:
+            offset_disagreement_s = abs(
+                train_best["offset_s"] - heldout_best["offset_s"]
+            )
+        offset_stable_at_grid = bool(
+            offset_disagreement_s is not None
+            and offset_disagreement_s <= args.step
+        )
         result["held_out"] = {
             "split": "alternating_camera_samples",
             "train_camera_samples": len(train_cameras),
@@ -293,9 +302,12 @@ def main():
             "train_best": train_best,
             "heldout_at_train_offset": heldout_at_train,
             "heldout_best": heldout_best,
+            "offset_disagreement_s": offset_disagreement_s,
+            "offset_stable_at_grid": offset_stable_at_grid,
             "pass": bool(
                 train_best
                 and heldout_at_train
+                and offset_stable_at_grid
                 and heldout_at_train["correspondences"] >= 100
                 and heldout_at_train["depth_inlier_ratio"] >= 0.10
                 and heldout_at_train["score_median_abs_m"] < 0.25
@@ -304,7 +316,10 @@ def main():
     out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(result, indent=2), encoding="utf-8")
-    print(json.dumps({k: result[k] for k in ("input_counts", "best", "identifiable", "warning")}, indent=2))
+    summary = {k: result[k] for k in ("input_counts", "best", "identifiable", "warning")}
+    if "held_out" in result:
+        summary["held_out"] = result["held_out"]
+    print(json.dumps(summary, indent=2))
 
 
 if __name__ == "__main__":
