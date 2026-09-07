@@ -415,6 +415,7 @@ class MappingNode(Node):
                 if os.path.exists(maskpath):
                     os.remove(maskpath)
             elif flag == 1:
+                os.makedirs(os.path.dirname(imgpath), exist_ok=True)
                 np.save(imgpath, img)  # 也可以用 cv2.imwrite
                 np.save(maskpath, mask)
             
