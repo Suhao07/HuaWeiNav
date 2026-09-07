@@ -21,12 +21,14 @@ start_lio="${START_LIO:-1}"
 start_d435i="${START_D435I:-1}"
 lio_session="${LIO_TMUX_SESSION:-livox_odom}"
 d435i_session="${D435I_TMUX_SESSION:-d435i_camera}"
-lio_start_script="${LIO_START_SCRIPT:-/home/orin26/code/start_livox_odom.sh}"
+lio_start_script="${LIO_START_SCRIPT:-${REPO_ROOT}/scripts/start_orin_lio_for_strive.sh}"
 lio_start_cmd="${LIO_START_CMD:-}"
 d435i_start_cmd="${D435I_START_CMD:-}"
 d435i_camera_namespace="${D435I_CAMERA_NAMESPACE:-camera/d435i}"
 d435i_camera_name="${D435I_CAMERA_NAME:-d435i_camera}"
 d435i_serial_no="${D435I_SERIAL_NO:-_233522079589}"
+d435i_fps="${D435I_FPS:-15}"
+livox_publish_freq="${LIVOX_PUBLISH_FREQ:-10.0}"
 sample_timeout_s="${CALIBRATION_SAMPLE_TIMEOUT_S:-8}"
 non_interactive="${CALIBRATION_NON_INTERACTIVE:-0}"
 
@@ -64,6 +66,7 @@ Default robot-owned startup:
   D435I_SERIAL_NO=_233522079589
   D435I_CAMERA_NAMESPACE=camera/d435i
   D435I_CAMERA_NAME=d435i_camera
+  D435I_FPS=15
 
 Optional startup overrides:
   LIO_START_CMD='<foreground or robot startup command>'
@@ -145,8 +148,20 @@ TF_STATIC_TOPIC="${TF_STATIC_TOPIC:-/tf_static}"
 if [[ -f "${ROS_SETUP}" ]]; then
   # ROS setup is idempotent and gives ros2 bag the message/type environment.
   # shellcheck disable=SC1090
+  set +u
   source "${ROS_SETUP}"
+  set -u
 fi
+set +u
+for setup_file in \
+  /home/orin26/code/ws_livox/install/setup.bash \
+  /home/orin26/code/point_lio_ws/install/setup.bash; do
+  if [[ -f "${setup_file}" ]]; then
+    # shellcheck disable=SC1090
+    source "${setup_file}"
+  fi
+done
+set -u
 command -v ros2 >/dev/null 2>&1 || die "ros2 is not available; run this on the ROS 2 robot environment"
 command -v timeout >/dev/null 2>&1 || die "timeout is required"
 
@@ -228,18 +243,19 @@ tmux_session_exists() {
 start_lio_sensor_stack() {
   if tmux_session_exists "${lio_session}"; then
     echo "[calibration-capture] reusing existing LIO session: ${lio_session}"
-    return 0
-  fi
-  if [[ -n "${lio_start_cmd}" ]]; then
+  elif [[ -n "${lio_start_cmd}" ]]; then
     echo "[calibration-capture] starting supplied LIO command"
     bash -lc "${lio_start_cmd}" >"${output_dir}/lio_start.log" 2>&1 &
     lio_pid=$!
+    lio_started_by_us=1
   else
     echo "[calibration-capture] starting robot LIO helper: ${lio_start_script} start"
     bash "${lio_start_script}" start >"${output_dir}/lio_start.log" 2>&1
+    lio_started_by_us=1
   fi
-  lio_started_by_us=1
   sleep 3
+  ros2 param set /livox_lidar_publisher publish_freq "${livox_publish_freq}" \
+    >"${output_dir}/livox_runtime_params.log" 2>&1 || die "failed to set Livox publish_freq=${livox_publish_freq}"
 }
 
 start_d435i_sensor() {
@@ -259,8 +275,8 @@ start_d435i_sensor() {
         camera_name:=${d435i_camera_name} \
         serial_no:=${d435i_serial_no} \
         enable_color:=true enable_depth:=true \
-        rgb_camera.color_profile:=1280,720,30 \
-        depth_module.depth_profile:=1280,720,30 \
+        rgb_camera.color_profile:=1280,720,${d435i_fps} \
+        depth_module.depth_profile:=1280,720,${d435i_fps} \
         align_depth.enable:=true enable_sync:=true publish_tf:=true \
         >'${output_dir}/d435i_driver.log' 2>&1" \
       >"${output_dir}/d435i_start.log" 2>&1
@@ -396,6 +412,14 @@ bag_pid=$!
 sleep 2
 kill -0 "${bag_pid}" 2>/dev/null || die "ros2 bag record exited before capture"
 
+cat <<'EOF'
+[calibration-capture] operator checklist
+  - Keep the robot stationary with wheels/brakes secured.
+  - Do not start mapping, detector, planner, waypoint adapter, or controller.
+  - Use one rigid target visible in RGB, aligned depth, and MID-360 points.
+  - For each phase, place the target first, then press Enter, then hold still.
+EOF
+
 phases=(
   "near/front/pose-A" "near/left/pose-A" "near/right/pose-A"
   "near/front/pose-B" "near/left/pose-B" "near/right/pose-B"
@@ -407,19 +431,42 @@ phases=(
 printf 'phase_index,phase_label,started_utc,duration_s\n' >"${output_dir}/phase_log.csv"
 for index in "${!phases[@]}"; do
   phase_label="${phases[$index]}"
-  printf '[calibration-capture] phase %02d/18: %s — position target, then hold it still\n' "$((index + 1))" "${phase_label}"
+  case "${phase_label}" in
+    near/*) distance_hint="NEAR: close working distance; keep the whole target in the shared RGB/LiDAR view" ;;
+    middle/*) distance_hint="MIDDLE: normal working distance; keep the target fully visible" ;;
+    far/*) distance_hint="FAR: longest useful distance; keep enough depth/LiDAR points on the target" ;;
+  esac
+  case "${phase_label}" in
+    */front/*) orientation_hint="FRONT: target plane faces the camera" ;;
+    */left/*) orientation_hint="LEFT: rotate target about 20-30 degrees to the left" ;;
+    */right/*) orientation_hint="RIGHT: rotate target about 20-30 degrees to the right" ;;
+  esac
+  case "${phase_label}" in
+    */pose-A) pose_hint="POSE-A: upright, approximately vertical" ;;
+    */pose-B) pose_hint="POSE-B: tilt target up/down about 10-20 degrees" ;;
+  esac
+  printf '\n[calibration-capture] phase %02d/18: %s\n' "$((index + 1))" "${phase_label}"
+  printf '  %s\n  %s\n  %s\n' "${distance_hint}" "${orientation_hint}" "${pose_hint}"
+  printf '  Check RGB + aligned depth + LiDAR visibility, then press Enter.\n'
   if ! is_true "${non_interactive}"; then
-    read -r -p "Press Enter to record this phase (${phase_duration_s}s)... " || true
+    read -r -p "[calibration-capture] Press Enter to record; hold target still for ${phase_duration_s}s: " || true
   fi
   phase_start="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   printf '%d,%s,%s,%s\n' "$((index + 1))" "${phase_label}" "${phase_start}" "${phase_duration_s}" >>"${output_dir}/phase_log.csv"
+  printf '[calibration-capture] recording phase %02d/18...\n' "$((index + 1))"
   sleep "${phase_duration_s}"
+  printf '[calibration-capture] phase %02d complete; reposition target for the next phase.\n' "$((index + 1))"
 done
 
 # If duration has deliberately been extended, preserve the requested total.
 minimum_s=$((phase_duration_s * 18))
 if ((duration_s > minimum_s)); then
-  sleep "$((duration_s - minimum_s))"
+  dynamic_s=$((duration_s - minimum_s))
+  printf '\n[calibration-capture] dynamic time-offset segment: %ss\n' "${dynamic_s}"
+  echo "  Slowly move the target left/right, up/down, and rotate it while keeping it visible in RGB, depth, and LiDAR."
+  echo "  Do not move the robot and do not let the target leave the shared field of view."
+  sleep "${dynamic_s}"
+  echo "[calibration-capture] dynamic segment complete"
 fi
 
 echo "[calibration-capture] stopping bag"

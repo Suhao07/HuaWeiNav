@@ -76,9 +76,13 @@ def read_bag(
     odom_topic="/base_odom",
     sample_every=8,
     points_per_packet=100,
+    min_stamp=None,
+    max_stamp=None,
 ):
     import rosbag2_py
     from livox_ros_driver2.msg import CustomMsg
+    from sensor_msgs.msg import PointCloud2
+    from sensor_msgs_py import point_cloud2
     from nav_msgs.msg import Odometry
     from sensor_msgs.msg import Image
     from rclpy.serialization import deserialize_message
@@ -92,6 +96,10 @@ def read_bag(
     camera_i = 0
     while reader.has_next():
         topic, data, bag_ns = reader.read_next()
+        if min_stamp is not None and bag_ns * 1e-9 < min_stamp:
+            continue
+        if max_stamp is not None and bag_ns * 1e-9 > max_stamp:
+            continue
         if topic == depth_topic:
             camera_i += 1
             if camera_i % sample_every:
@@ -104,12 +112,25 @@ def read_bag(
             arr = np.frombuffer(msg.data, dtype=dtype).reshape(msg.height, msg.step // np.dtype(dtype).itemsize)
             cameras.append((t, arr[:, : msg.width].copy(), msg.encoding))
         elif topic == lidar_topic:
-            msg = deserialize_message(data, CustomMsg)
+            msg_type = PointCloud2 if lidar_topic.endswith("_body") else CustomMsg
+            msg = deserialize_message(data, msg_type)
             t = stamp(msg)
-            if t is None or not msg.points:
+            if t is None:
                 continue
-            stride = max(1, len(msg.points) // points_per_packet)
-            xyz = np.asarray([(p.x, p.y, p.z) for p in msg.points[::stride]], dtype=np.float64)
+            if msg_type is PointCloud2:
+                xyz = np.asarray(
+                    [tuple(p) for p in point_cloud2.read_points(
+                        msg, field_names=("x", "y", "z"), skip_nans=True
+                    )],
+                    dtype=np.float64,
+                )
+                if len(xyz) > points_per_packet:
+                    xyz = xyz[:: max(1, len(xyz) // points_per_packet)]
+            else:
+                if not msg.points:
+                    continue
+                stride = max(1, len(msg.points) // points_per_packet)
+                xyz = np.asarray([(p.x, p.y, p.z) for p in msg.points[::stride]], dtype=np.float64)
             good = np.isfinite(xyz).all(axis=1) & (np.linalg.norm(xyz, axis=1) > 0.25)
             if np.any(good):
                 lidars.append((t, xyz[good]))
@@ -219,6 +240,12 @@ def main():
     )
     p.add_argument("--lidar-topic", default="/livox/lidar")
     p.add_argument("--odom-topic", default="/base_odom")
+    p.add_argument("--sample-every", type=int, default=8,
+                   help="Use every Nth depth frame to bound offline memory use.")
+    p.add_argument("--min-stamp", type=float, default=None,
+                   help="Ignore bag messages before this ROS timestamp (seconds).")
+    p.add_argument("--max-stamp", type=float, default=None,
+                   help="Ignore bag messages after this ROS timestamp (seconds).")
     p.add_argument("--fx", type=float, required=True)
     p.add_argument("--fy", type=float, required=True)
     p.add_argument("--cx", type=float, required=True)
@@ -236,11 +263,17 @@ def main():
     t_cam_lidar = np.asarray(ext["T_camera_from_lidar"], dtype=float)
     t_base_lidar = np.asarray(ext["T_base_from_lidar"], dtype=float)
     t_base_camera = np.asarray(ext["T_base_from_camera"], dtype=float)
+    if args.lidar_topic.endswith("_body"):
+        # Point-LIO already expresses this registered cloud in the base/body frame.
+        t_base_lidar = np.eye(4)
     cameras, lidars, odoms = read_bag(
         args.bag,
         depth_topic=args.depth_topic,
         lidar_topic=args.lidar_topic,
         odom_topic=args.odom_topic,
+        sample_every=max(1, args.sample_every),
+        min_stamp=args.min_stamp,
+        max_stamp=args.max_stamp,
     )
     odom_times = [x[0] for x in odoms]
     odom_poses = [x[1] for x in odoms]
@@ -256,6 +289,7 @@ def main():
             "odom": args.odom_topic,
         },
         "timestamp_basis": "sensor message header stamps; candidate delta=t_rgb-t_lidar",
+        "lidar_frame_assumption": "base/body for *_body topic" if args.lidar_topic.endswith("_body") else "sensor lidar frame",
         "input_counts": {"camera_depth_samples": len(cameras), "lidar_packets": len(lidars), "odom_samples": len(odoms)},
         "scan": scores,
         "best": best,
