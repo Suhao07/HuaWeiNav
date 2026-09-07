@@ -147,10 +147,33 @@ def _strip_json_fence(text: str) -> str:
 
 
 def _json_candidates(text: str) -> list[str]:
-    """Return whole-response and first-object parse candidates."""
+    """Return whole-response and top-level object parse candidates.
+
+    Some instruct models echo the injected JSON schema before returning the
+    requested object.  Keep the last complete top-level object first so that
+    the actual answer is selected without weakening schema validation.
+    """
 
     normalized = _strip_json_fence(text)
     candidates = [normalized]
+    decoder = json.JSONDecoder()
+    top_level_objects: list[str] = []
+    cursor = 0
+    while cursor < len(normalized):
+        start = normalized.find("{", cursor)
+        if start < 0:
+            break
+        try:
+            parsed, end = decoder.raw_decode(normalized, start)
+        except json.JSONDecodeError:
+            cursor = start + 1
+            continue
+        if isinstance(parsed, dict):
+            top_level_objects.append(normalized[start:end])
+            cursor = end
+        else:
+            cursor = start + 1
+    candidates.extend(reversed(top_level_objects))
     start = normalized.find("{")
     end = normalized.rfind("}")
     if start >= 0 and end > start:

@@ -194,6 +194,7 @@ class _SelfHostedParsedChat:
             or "self_hosted_parse"
         )
         normalized = inject_json_schema(messages, response_format)
+        json_schema = _response_json_schema(response_format) if _guided_json_enabled() else None
         last_content = ""
         last_error: Optional[Exception] = None
 
@@ -201,10 +202,13 @@ class _SelfHostedParsedChat:
             request_messages = normalized if attempt == 0 else _repair_messages(normalized, last_content)
             started = time.perf_counter()
             try:
+                generation_kwargs = _generation_kwargs(kwargs)
+                if json_schema is not None:
+                    generation_kwargs["extra_body"] = {"guided_json": json_schema}
                 completion = self.client.chat.completions.create(
                     model=model,
                     messages=request_messages,
-                    **_generation_kwargs(kwargs),
+                    **generation_kwargs,
                 )
                 last_content = _message_text(completion)
                 record_call(
@@ -245,6 +249,31 @@ def _generation_kwargs(values: Mapping[str, Any]) -> dict[str, Any]:
         if value is not None:
             output[key] = value
     return output
+
+
+def _response_json_schema(response_format: Any) -> dict[str, Any]:
+    """Build the JSON schema sent to a guided-decoding provider."""
+
+    schema_builder = getattr(response_format, "model_json_schema", None)
+    if schema_builder is None:
+        schema_builder = getattr(response_format, "schema", None)
+    if schema_builder is None:
+        raise TypeError("response_format must be a Pydantic model class")
+    schema = schema_builder()
+    if not isinstance(schema, dict):
+        raise TypeError("response_format JSON schema must be a dictionary")
+    return schema
+
+
+def _guided_json_enabled() -> bool:
+    """Return whether the remote provider should enforce the JSON schema."""
+
+    return os.getenv("VLN_LVLM_GUIDED_JSON", "0").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 def _first_env(*names: str) -> str:
