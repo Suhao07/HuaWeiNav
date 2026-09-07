@@ -100,7 +100,7 @@ TF_PID=\$!
 LIO_CMD=(ros2 run point_lio pointlio_mapping --ros-args \
   -r '__node:=laserMapping' \
   --params-file '${POINT_LIO_CONFIG}' \
-  ${point_lio_params[@]@Q})
+  ${point_lio_params[*]})
 # Negative nice requires elevated scheduling privileges and previously caused
 # the ordinary orin26 tmux pane to exit before Point-LIO started.  Bind to the
 # first four CPUs when available, but never make deployment depend on it.
