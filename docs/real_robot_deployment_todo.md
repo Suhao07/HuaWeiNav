@@ -1,13 +1,34 @@
 # VLN 实物部署状态与 TODO
 
 > 更新日期：2026-09-07
-> 代码基线：本地 `main`/`realworld` 均为 `00c376a75f05e29b8d8a0b36a97857d53f270163`；机器人文件内容按该提交同步。机器人 Git HEAD 仍为 `7fdf2c8`，因为原工作区未提交改动已保留。
+> 代码基线：本地 `realworld`、GitHub `origin/realworld` 和新机器人工作区均为 `e27217c`（完整提交见 Git）；旧 `/home/orin26/HuaweiVLN` 保留为只读回滚工作区，未被覆盖。
 > 目标平台：Orin-26、Intel RealSense D435i、Livox MID-360
 > 当前安全状态：感知与影子控制验证；真实运动未批准
 
 本文是实物部署的单一进度清单。设计接口见
 [`real_robot_framework.md`](real_robot_framework.md)，实测证据保留在对应日期的
 `real_robot_*_evidence_*.md` 文档中。
+
+### 2026-09-08 清洁工作区部署记录
+
+- 新工作区：`/home/orin26/HuaweiVLN_deployments/realworld_2c0b783`；旧
+  `/home/orin26/HuaweiVLN` 未修改。
+- 旧工作区备份证据：`/home/orin26/HuaweiVLN_backups/HuaweiVLN_pre_clean_20260907T151320Z/`
+  （staged/unstaged patch、Git 状态和未跟踪清单）。
+- 迁移内容限定为共同 Git 基线、已确认的传感器/坐标/融合/控制 adapter 原理代码、候选
+  标定文件和五个现有模型资产；未复制旧 logs、outputs、build/install 或缓存。
+- 新镜像 `huawei-vln-realworld:orin-r36.5` 已重建，ROS overlay 的 7 个包编译成功。
+- 外部 Livox/Point-LIO 仍由 `/home/orin26/code` 所有；通过项目包装器以 ROS 参数开启
+  `publish.scan_publish_en` 和 `publish.scan_bodyframe_pub_en`，未编辑该工作区。
+- LIO-only 诊断报告：`logs/diagnostics/lio_dds_20260907T154932Z.md`；四个 topic
+  均收到真实消息。独立 60 秒测量约为 `/cloud_registered_body` 9.43 Hz、odom 99.5 Hz。
+- semantic mapping 已在新容器中启动，输入明确为 `/cloud_registered_body`；对象节点
+  `/huawei_vln/d435i_object_nodes_list` 约 0.4--0.5 Hz，样本 frame 为 `map`、坐标为米级，
+  融合日志持续出现有效投影点；对象图像已正常写入 `output/object_images/`。
+- shadow adapter 仅使用 `output_enabled=false`；合成 PointStamped 已完成 ego 转换日志，
+  未创建 `/waypoint` publisher，也未发布 `/cmd_vel`。
+- 本轮仍未批准真实底盘控制；当前实际配置的 controller contract 仍为
+  `approval_status: unapproved`。
 
 勾选规则：只有代码、命令输出或真机记录能够直接证明的事项才标记为完成。单元测试、
 bag replay、HIL 和影子 topic 不能替代真实底盘验收。
