@@ -5,6 +5,9 @@ TMUX_SESSION="${TMUX_SESSION:-livox_odom}"
 ROS_SETUP_ZSH="${ROS_SETUP_ZSH:-/opt/ros/humble/setup.zsh}"
 LIVOX_SETUP_ZSH="${LIVOX_SETUP_ZSH:-/home/orin26/code/ws_livox/install/setup.zsh}"
 POINT_LIO_SETUP_ZSH="${POINT_LIO_SETUP_ZSH:-/home/orin26/code/point_lio_ws/install/setup.zsh}"
+ROS_SETUP_BASH="${ROS_SETUP_BASH:-${ROS_SETUP_ZSH%.zsh}.bash}"
+LIVOX_SETUP_BASH="${LIVOX_SETUP_BASH:-${LIVOX_SETUP_ZSH%.zsh}.bash}"
+POINT_LIO_SETUP_BASH="${POINT_LIO_SETUP_BASH:-${POINT_LIO_SETUP_ZSH%.zsh}.bash}"
 POINT_LIO_CONFIG="${POINT_LIO_CONFIG:-/home/orin26/code/point_lio_ws/install/point_lio/share/point_lio/config/mid360_orin.yaml}"
 ENABLE_CLOUD_PUBLISH="${ENABLE_CLOUD_PUBLISH:-1}"
 ENABLE_BODY_CLOUD_PUBLISH="${ENABLE_BODY_CLOUD_PUBLISH:-0}"
@@ -43,8 +46,8 @@ if tmux has-session -t "${TMUX_SESSION}" 2>/dev/null; then
   exit 2
 fi
 
-if [[ ! -f "${ROS_SETUP_ZSH}" || ! -f "${LIVOX_SETUP_ZSH}" || ! -f "${POINT_LIO_SETUP_ZSH}" ]]; then
-  echo "[start-orin-lio] missing ROS/Livox/Point-LIO setup file" >&2
+if [[ ! -f "${ROS_SETUP_BASH}" || ! -f "${LIVOX_SETUP_BASH}" || ! -f "${POINT_LIO_SETUP_BASH}" ]]; then
+  echo "[start-orin-lio] missing ROS/Livox/Point-LIO bash setup file" >&2
   exit 3
 fi
 if [[ ! -f "${POINT_LIO_CONFIG}" ]]; then
@@ -72,20 +75,20 @@ point_lio_params=(
   -p publish.scan_bodyframe_pub_en:="$(ros_bool "${ENABLE_BODY_CLOUD_PUBLISH}")"
 )
 
-tmux new-session -d -s "${TMUX_SESSION}" -n livox /bin/zsh -lc "
+tmux new-session -d -s "${TMUX_SESSION}" -n livox /bin/bash -lc "
 set -e
-source '${ROS_SETUP_ZSH}'
-source '${LIVOX_SETUP_ZSH}'
+source '${ROS_SETUP_BASH}'
+source '${LIVOX_SETUP_BASH}'
 echo '[livox] ros2 launch livox_ros_driver2 msg_MID360_launch.py'
 ros2 launch livox_ros_driver2 msg_MID360_launch.py
-exec /bin/zsh
+exec /bin/bash
 "
 
-tmux split-window -t "${TMUX_SESSION}:0" -h /bin/zsh -lc "
+tmux split-window -t "${TMUX_SESSION}:0" -h /bin/bash -lc "
 set -e
-source '${ROS_SETUP_ZSH}'
-source '${LIVOX_SETUP_ZSH}'
-source '${POINT_LIO_SETUP_ZSH}'
+source '${ROS_SETUP_BASH}'
+source '${LIVOX_SETUP_BASH}'
+source '${POINT_LIO_SETUP_BASH}'
 sleep 2
 echo '[odom] ros2 run point_lio pointlio_mapping with STRIVE cloud publish settings'
 ros2 run tf2_ros static_transform_publisher \
@@ -108,7 +111,7 @@ else
   "\${LIO_CMD[@]}"
 fi
 kill \$TF_PID 2>/dev/null || true
-exec /bin/zsh
+exec /bin/bash
 "
 
 tmux list-panes -t "${TMUX_SESSION}" -F 'pane=#{pane_index} cmd=#{pane_current_command} pid=#{pane_pid} active=#{pane_active}'
