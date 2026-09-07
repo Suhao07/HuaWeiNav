@@ -285,7 +285,7 @@ void goalHandler(const geometry_msgs::msg::PointStamped::ConstSharedPtr goal)
 
 void cancelHandler(const std_msgs::msg::Empty::ConstSharedPtr)
 {
-  // 中文说明：取消不仅要让上层 action 结束，还必须清掉 localPlanner 的旧目标；
+  // 取消不仅要让上层 action 结束，还必须清掉 localPlanner 的旧目标；
   // 否则安全 hold 解除后，规划器可能重新发布已经取消的路径。
   cancelRequested = true;
 }

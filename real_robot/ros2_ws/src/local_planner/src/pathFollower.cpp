@@ -420,7 +420,7 @@ int main(int argc, char** argv)
           }
         }
 
-        // 中文说明：手动速度不能复用自治变量，否则 mux 无法证明当前命令
+        // 手动速度不能复用自治变量，否则 mux 无法证明当前命令
         // 的来源。manualMode 下自治通道明确归零，手动命令单独发布给 mux。
         if (manualMode) {
           cmd_vel.twist.linear.x = 0;
@@ -434,7 +434,7 @@ int main(int argc, char** argv)
       }
     }
 
-    // 中文说明：手动接管必须在没有有效自治路径时仍然可用，因此不能放在
+    // 手动接管必须在没有有效自治路径时仍然可用，因此不能放在
     // pathInit 分支内。manual topic 始终有新鲜的零/手动命令，mux 才能区分
     // “驾驶员要求停车”和“手动输入已经断流”。
     manual_cmd.header.stamp = nh->now();
