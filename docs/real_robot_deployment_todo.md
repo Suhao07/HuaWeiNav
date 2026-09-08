@@ -61,6 +61,8 @@
   9.202--9.677 Hz），`/aft_mapped_to_init` 平均 99.661 Hz（最低窗口
   80.992 Hz）；Point-LIO 进程 CPU 54.7--62.2%，RAM 4.98--7.29 GB，
   `tj` 温度 61.5--72.7°C。监控目录内没有 `future extrapolation`、崩溃或 traceback。
+  该监控的 `process.log` 以 Point-LIO 为跟踪对象，不能替代“修复后 detector + semantic
+  mapping + Point-LIO 连续 30 分钟”的专门整栈 soak；整栈长测仍需单独安排。
 - 语义合并索引修复已固化为镜像
   `huawei-vln-realworld:orin-r36.5-fix`（ID `27d904a21207`，7 个 ROS 包构建成功）；
   原 `huawei-vln-realworld:orin-r36.5` tag 保留未覆盖。临时检测/建图容器已停止，
