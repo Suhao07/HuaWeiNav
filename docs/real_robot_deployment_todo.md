@@ -52,8 +52,19 @@
   和 `/aft_mapped_to_init`；当前 `/viewpoint_rep_header` publisher 为 0，
   `/strive/sysnav/viewpoint_pose` 没有实际消息，因此真实 SysNav viewpoint 仍待外部
   SysNav 规划器启动后验收。
-- 30 分钟资源/温度监控仍在进行中；最终报告以
-  `logs/diagnostics/resources/20260908T034523Z/` 的完整文件为准，未提前标记为完成。
+- 30 分钟资源/温度监控已完成；最终报告保留在
+  `logs/diagnostics/resources/20260908T034523Z/`。
+
+### 2026-09-08 监控收尾
+
+- 30 分钟监控已完成：`/cloud_registered_body` 平均 9.441 Hz（窗口范围
+  9.202--9.677 Hz），`/aft_mapped_to_init` 平均 99.661 Hz（最低窗口
+  80.992 Hz）；Point-LIO 进程 CPU 54.7--62.2%，RAM 4.98--7.29 GB，
+  `tj` 温度 61.5--72.7°C。监控目录内没有 `future extrapolation`、崩溃或 traceback。
+- 语义合并索引修复已固化为镜像
+  `huawei-vln-realworld:orin-r36.5-fix`（ID `27d904a21207`，7 个 ROS 包构建成功）；
+  原 `huawei-vln-realworld:orin-r36.5` tag 保留未覆盖。临时检测/建图容器已停止，
+  Livox、Point-LIO 和 D435i 外部进程保持运行。
 
 勾选规则：只有代码、命令输出或真机记录能够直接证明的事项才标记为完成。单元测试、
 bag replay、HIL 和影子 topic 不能替代真实底盘验收。
