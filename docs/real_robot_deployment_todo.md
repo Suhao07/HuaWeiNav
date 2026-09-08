@@ -1,7 +1,7 @@
 # VLN 实物部署状态与 TODO
 
 > 更新日期：2026-09-08
-> 代码基线：本地 `realworld`、GitHub `origin/realworld` 和新机器人工作区均为 `82da4d5`（完整提交见 Git）；旧 `/home/orin26/HuaweiVLN` 保留为只读回滚工作区，未被覆盖。
+> 代码基线：本地 `realworld` 已包含 `3978b5c`（semantic mapping 合并索引修复）；`origin/realworld` 仍停在 `82da4d5`，未在本轮推送。新机器人工作区已同步该文件并用于临时容器重建，旧 `/home/orin26/HuaweiVLN` 保留为只读回滚工作区，未被覆盖。
 > 目标平台：Orin-26、Intel RealSense D435i、Livox MID-360
 > 当前安全状态：感知与影子控制验证；真实运动未批准
 
@@ -29,6 +29,31 @@
   未创建 `/waypoint` publisher，也未发布 `/cmd_vel`。
 - 本轮仍未批准真实底盘控制；当前实际配置的 controller contract 仍为
   `approval_status: unapproved`。
+
+### 2026-09-08 实时验收续测
+
+- Point-LIO/Livox：`/livox/lidar` 约 100 Hz、`/livox/imu` 约 200 Hz，
+  `/cloud_registered_body` 约 9.4 Hz，`/cloud_registered` 约 100 Hz，
+  `/aft_mapped_to_init` 约 100 Hz；60 秒 `tf2_echo camera_init -> base` 收到 57 个
+  连续样本，除启动前两次 frame 尚未出现外没有 `future extrapolation`。
+- D435i：RGB、aligned depth、CameraInfo 均有实时消息；RGB/Depth 约 15 Hz、
+  `1280x720`，编码分别为 `bgr8`/`16UC1`，CameraInfo frame 为
+  `d435i_camera_color_optical_frame`。该 frame 与 projection YAML 的历史别名不同，
+  当前仍通过显式 OCC 投影配置处理，未广播伪 TF。
+- Semantic mapping：发现对象合并索引缺陷并在 `3978b5c` 修复；容器内重建后连续运行
+  超过 2 分钟无 `IndexError`、`Traceback` 或 `future extrapolation`。真实对象节点
+  `/huawei_vln/d435i_object_nodes_list` 约 0.55 Hz，样本包含 `printer` 和合并后的
+  SysNav object ID，坐标为 `map` 米制。
+- `semantic_snapshot`：以自然语言 `Find the printer`（显式 `dataset_target=printer`）
+  运行 `dry_run=true`，已记录 `InstructionPlan`、目标 UID `sysnav_object:3` 和地图坐标；
+  因没有输入 `/viewpoint_rep_header`，`sysnav_viewpoint_bridge` 没有可发布的
+  `ViewpointPose`，runtime 持续 `WAIT`，未生成 waypoint 或速度命令。
+- Viewpoint bridge：节点已启动并订阅 `/viewpoint_rep_header`、`/huawei_vln/d435i_object_nodes_list`
+  和 `/aft_mapped_to_init`；当前 `/viewpoint_rep_header` publisher 为 0，
+  `/strive/sysnav/viewpoint_pose` 没有实际消息，因此真实 SysNav viewpoint 仍待外部
+  SysNav 规划器启动后验收。
+- 30 分钟资源/温度监控仍在进行中；最终报告以
+  `logs/diagnostics/resources/20260908T034523Z/` 的完整文件为准，未提前标记为完成。
 
 勾选规则：只有代码、命令输出或真机记录能够直接证明的事项才标记为完成。单元测试、
 bag replay、HIL 和影子 topic 不能替代真实底盘验收。
