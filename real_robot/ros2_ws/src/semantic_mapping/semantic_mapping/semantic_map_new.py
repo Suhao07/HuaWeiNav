@@ -481,7 +481,11 @@ class ObjMapper():
                         self.publish_deleted_object(target_obj_same, detection_stamp)
                         target_obj_same.cleanup_images(self.save_queue)
                         self.single_obj_list.remove(target_obj_same)
-                        i -= 1
+                        # Keep the scan index non-negative when the first
+                        # object absorbs another object; otherwise a second
+                        # merge can access a stale negative index after the
+                        # list shrinks.
+                        i = max(i - 1, 0)
                         del target_obj_same
                     
                 # # whether to perform cross-class merging (keep this)
