@@ -1,7 +1,7 @@
 # VLN 实物部署状态与 TODO
 
 > 更新日期：2026-09-08
-> 代码基线：本地 `realworld` 最新为 `88fe4fa`（包含 `3978b5c` 的 semantic mapping 合并索引修复）；`origin/realworld` 仍停在 `82da4d5`，未在本轮推送。新机器人工作区已用同一修复提交为 `0acbf3e` 并用于镜像重建，旧 `/home/orin26/HuaweiVLN` 保留为只读回滚工作区，未被覆盖。
+> 代码基线：本地 `realworld` 最新为 `ea37c38`（包含 `ad08c1a` 的低速 OCC 融合接受结论和 `3978b5c` 的 semantic mapping 合并索引修复）；`origin/realworld` 仍落后 6 个提交，未在本轮推送。新机器人工作区已用同一修复提交为 `0acbf3e` 并用于镜像重建，旧 `/home/orin26/HuaweiVLN` 保留为只读回滚工作区，未被覆盖。
 > 目标平台：Orin-26、Intel RealSense D435i、Livox MID-360
 > 当前安全状态：感知与影子控制验证；真实运动未批准
 
@@ -112,14 +112,17 @@ VLN /way_point (PointStamped, world frame)
 这些结果证明低速数据链和接口可运行；它们仍不能证明底盘能够安全执行 waypoint，
 也不能替代高动态时间偏移/像素精度增强验收。
 
-当前完整闭环仍缺三项硬条件：
+当前低速 VLN 仍缺三类硬条件：
 
-1. Point-LIO 动态 TF、viewpoint pose 和长时间资源窗口在真实运行中稳定通过验收；
-2. 机器人下层控制器 contract 获得所有者确认并完成急停、反馈和限速测试；
-3. 在真实对象节点和真实 RGB 上完成 `InstructionPlan -> MotionGoal -> REACHED -> final verifier` 的受控闭环。
+1. 在修复后的 detector + semantic mapping + Point-LIO 组合上完成专门的整栈长时间
+   soak，并把动态 TF、资源、掉帧和温度结果写入同一运行证据；
+2. 接入并验收真实 SysNav viewpoint provider，完成不发布 waypoint 的任务级语义闭环；
+3. 由底盘所有者批准 controller contract，完成 bench、低速和安全测试后，才能打开真实
+   waypoint/底盘输出。
 
 RGB--LiDAR 动态时间偏移和严格像素投影误差不再列为低速 VLN 的硬条件；若目标扩展到
-高速或高精度融合，再单独开启增强验收。
+高速或高精度融合，再单独开启增强验收。当前 `calibration_status: calibrated` 是经用户
+确认的 OCC 低速运行决定，不应在后续清单中反复作为 P0 阻塞项。
 
 本轮已经完成的**软件闭环**如下，但这些内容仍不等同于实物验收：
 
@@ -190,29 +193,37 @@ SysNav 参考实现的原生运动链为：
 “万能底盘接口”；等控制器所有者给出真实消息和反馈合同后，只实现一个明确的 Orin
 status adapter。
 
-## 4. 执行 TODO
+## 4. 当前待做清单
 
-### P0：统一代码与部署基线
+### P0：传感器、坐标与整栈运行稳定性
 
-- [x] `main` 已合并 `realworld` 最新修改，当前本地 `main`/`realworld` 基线为 `00c376a75f05e29b8d8a0b36a97857d53f270163`；机器人文件内容按该提交同步。
-- [x] 实物离线 acceptance 覆盖 contract、runtime、motion safety、SysNav adapter 和 viewpoint bridge，当前结果为 `113 passed`。
-- [x] waypoint adapter 的 Python、ROS node、launch 和单元测试进入仓库。
-- [x] 语义 runtime 已停止对象中心/房间质心执行回退；无可执行 SysNav viewpoint 时保持 `WAIT`。
-- [x] `REACHED` 后的活动目标保持、同一 goal 的新鲜证据等待、`VERIFYING/HOLD` 生命周期已进入离线测试。
-- [x] 新增 `ViewpointPose` 消息、`sysnav_viewpoint_bridge` launch/node 和 `SysNavViewpointBridgeModel`，可在不改 SysNav 规划器的情况下导出带 pose 的 viewpoint。
-- [x] 新增 `scripts/replay_sysnav_viewpoint_bag.py`，可在 ROS2 环境读取真实 bag 并导出 viewpoint pose 对齐记录；该脚本不发布消息、不控制底盘。
-- [x] 在 `strive-ros-humble:local` 容器中使用全新 colcon 前缀编译当前 ROS2 workspace，7 个包通过。
-- [x] 在 ROS2 容器中完成 viewpoint bridge topic smoke 和 synthetic CDR rosbag2 replay；两者均验证精确时间戳、frame、pose 和 object ID。
-- [x] 在 ROS2 容器中完成现有 Motion HIL `reached` 场景；该测试不接管真实底盘。
-- [ ] 在 Orin 工作区拉取共同基线，记录完整 commit，而不是只记录短哈希。
-- [x] 重建 `huawei-vln-realworld:orin-r36.5`；机器人最终 image ID 为 `25048b859e0d`，7 个 ROS 包编译成功。
-- [x] 重新执行 D435i profile `check`、detector/GPU smoke、USB 相机只读 smoke 和 runtime WAIT smoke；结果写入当日终端/运行目录证据。
-- [x] 运行至少 30 分钟资源监控；`/aft_mapped_to_init` 约 100 Hz，`/cloud_registered_body` 无实际样本，Point-LIO 约 35% CPU，末段温度约 60--66°C、内存约 5.5 GB。原始产物保留在 `logs/diagnostics/resources/20260821T133641Z/`。
+- [x] 新的机器人工作区和 `huawei-vln-realworld:orin-r36.5-fix` 镜像已建立；旧
+  `/home/orin26/HuaweiVLN` 未覆盖，外部 `/home/orin26/code` 未修改。
+- [x] Livox、Point-LIO、D435i 实时输入已恢复；当前 `/livox/lidar` 约 100 Hz、
+  `/livox/imu` 约 200 Hz、`/cloud_registered_body` 约 9.4 Hz、
+  `/aft_mapped_to_init` 约 100 Hz，且 Point-LIO 使用 `prop_at_freq_of_imu=false`。
+- [x] 完成独立 60 秒 LIO/TF 检查；`camera_init -> base` 有连续样本，检查窗口未出现
+  `future extrapolation` 或 `past extrapolation`。
+- [x] D435i RGB、aligned depth、CameraInfo 的实时分辨率、编码和内参已记录；detector
+  使用 BGR→RGB、CUDA、`imgsz=320`，与当前运行 profile 一致。
+- [x] OCC 外参已按当前安装状态作为低速融合标定值使用；不再把严格动态时间偏移或像素
+  误差作为低速 VLN 阻塞项。
+- [ ] 在修复后的 detector + semantic mapping + Point-LIO **同时运行**时完成一段专门的
+  30 分钟以上整栈 soak，记录各节点频率、掉帧、CPU/GPU、内存和温度。已有 30 分钟记录
+  主要跟踪 Point-LIO，不能替代这项。
+- [ ] 明确记录 `camera_init -> aft_mapped -> base` 的长时 TF 时间戳，以及下游若需要时
+  `camera_init -> d435i_camera_color_optical_frame` 的实际连接方式；当前映射使用显式 OCC
+  投影配置，禁止广播未经确认的伪 TF。
+- [ ] 将本地 `realworld` 的最新完整 SHA（当前 `ea37c38`）推送到 `origin/realworld`，
+  并让机器人部署 manifest 固定到同一完整 SHA；这属于可追溯性，不是传感器启动阻塞。
 
-验收出口：代码、镜像、模型和运行日志能对应到同一个 deployment manifest，且不会启动
-waypoint adapter 输出或任何真实运动节点。
+验收出口：整栈运行证据能对应到同一代码 SHA、镜像 ID 和 profile，且全程未发布真实
+`/waypoint`、`/way_point` 或 `/cmd_vel`。
 
-### 2026-08-21 无运动实物执行记录
+### 历史记录：2026-08-21 无运动实物执行记录
+
+> 以下条目保留作历史证据，不覆盖 2026-09-08 的当前状态；其中当时的 LIO 无消息和旧镜像
+> 结果已由后续清洁工作区部署和实时检查更新。
 
 - Profile check：`orin26_livox_mid360_generic_rgb` 与 `orin26_livox_mid360_d435i` 均通过；两者均保持 `START_SEMANTIC_MAPPING=false`、`dry_run=true`、真实运动关闭。
 - 镜像与软件：`huawei-vln-realworld:orin-r36.5`=`25048b859e0d`；ROS workspace 7 包编译成功；离线 acceptance 为 `113 passed`。
@@ -223,50 +234,69 @@ waypoint adapter 输出或任何真实运动节点。
 - LIO 只读诊断：报告为 `logs/diagnostics/lio_dds_20260821T133422Z.md`；`/livox/lidar`、`/livox/imu`、`/cloud_registered`、`/aft_mapped_to_init` 均未收到实际 header。Point-LIO 参数显示 `publish.scan_publish_en=False`，因此 semantic mapping 继续关闭；未重启或修改外部 LIO。
 - 现场 bag 清单中暂未发现同时包含 `/viewpoint_rep_header` 与 `/object_nodes_list` 的 bag，因此 viewpoint replay 留待取得对应 bag 后执行。
 
-### P1：标定增强（低速 VLN 非阻塞）
+### P1：真实对象图、viewpoint 与无运动任务闭环
 
-- [x] OCC D435i--MID-360 外参与当前安装状态一致，作为低速运行的空间融合参数。
-- [x] 当前 candidate 的 calibration id、日期、样本数和已有误差指标已写入 projection YAML。
-- [x] profile 使用 `calibration_status: calibrated` 启动过 semantic mapping 试运行。
-- [ ] （增强项）用独立片段估计 RGB--LiDAR 时间偏移，并在 held-out 片段复核唯一性和稳定性。
-- [ ] （增强项）计算严格 LiDAR 到图像边缘的像素误差和更严格的深度误差。
+- [x] 使用已批准 OCC candidate 从 profile 启动 semantic mapping，输入固定为
+  `/cloud_registered_body`；对象节点已有真实样本，坐标为 `map` 米制。
+- [x] semantic mapping 的对象合并索引缺陷已在 `3978b5c` 修复，并已重建到机器人镜像；
+  修复后运行未再出现该 `IndexError`。
+- [x] 完成 `SemanticMapSnapshot -> NavigationIntent -> SysNavGoalResolver ->
+  MotionGoal/WAIT` 软件链路和 `REACHED -> fresh evidence -> verifier` 生命周期的离线测试。
+- [x] `semantic_snapshot` 已在 Orin 上以 `dry_run=true` 读取真实对象节点；无可执行 viewpoint
+  时保持 `WAIT`，没有发布任何 waypoint 或速度命令。
+- [ ] 记录真实对象节点的位置稳定性、UID 连续性、误检和重复簇；至少覆盖桌椅、柜体和
+  小物体，并保留对应 RGB/点云证据。
+- [ ] 获取真实 SysNav viewpoint provider，使 `/viewpoint_rep_header` 有实际 publisher；
+  当前 bridge 节点虽已启动，但输入 publisher 为 0。
+- [ ] 在真实 viewpoint、object nodes、RGB 和 odom 同时存在时，完成不发布 waypoint 的
+  `policy_mode=semantic_snapshot` 任务验收，记录 viewpoint 的 frame、频率、时间偏移和
+  object-viewpoint 关联。
+- [ ] 对远程 LVLM 做网络侧 instruction parse、concept grounding 和 final verifier 测试，
+  记录 p50/p95 延迟、超时、服务不可用和非法 JSON 时的 `WAIT/HOLD` 行为；密钥不得写入
+  仓库或日志。
 
-增强项通过后可支持高速/高精度融合；未通过不阻塞当前低速 VLN 试运行。
-`mapping_orin26_d435i_mid360.yaml` 中的 `require_calibration: false` 仍只是诊断开关，
-正式启动必须使用 profile 中已记录的 candidate，而不是依赖该开关绕过配置。
+验收出口：一条真实自然语言指令能在无运动条件下产生可追踪的
+`InstructionPlan -> NavigationIntent -> ViewpointPose/WAIT -> ViewEvidence -> verifier`
+证据；没有 viewpoint 时必须明确保持 `WAIT`。
 
-### P2：感知、指令与 LVLM 的无运动闭环
+### P1-增强：高动态/高精度融合（低速 VLN 非阻塞）
 
-- [x] 完成 `SemanticMapSnapshot -> NavigationIntent -> SysNavGoalResolver -> MotionGoal/WAIT` 的软件链路；该项由离线 fake provider 和 runtime 测试覆盖。
-- [x] 完成 `REACHED -> fresh evidence -> verifier` 的软件生命周期；旧 detection 不得与到达后的新 RGB 混合，证据不足时保持 `VERIFYING`。
-- [x] 完成 raw SysNav viewpoint topic 到带 pose `ViewpointPose` 的软件适配；时间错位或 frame 不一致时不发布猜测 pose。
-- [x] 使用已批准标定从 profile 正常启动 semantic mapping；输入固定为 `/cloud_registered_body`。
-- [ ] 记录对象节点的位置误差、对象 UID 连续性、误检和重复簇；至少覆盖桌椅、柜体和小物体。
-- [ ] 在真实 `/object_nodes_list`、RGB 和 odom 上运行 `policy_mode=semantic_snapshot`、`dry_run=true`。
-- [ ] 在包含 `/viewpoint_rep_header`、`/object_nodes_list` 和 odom 的真实机器人 ROS2 bag 上运行 viewpoint replay，并核对时间偏移、frame、频率和 object-viewpoint 关联。synthetic bag smoke 不替代此项。
-- [ ] 在 Orin/ROS bag 上验收带 pose 的 SysNav viewpoint provider，记录 viewpoint 频率、时间偏移、frame 和 object-viewpoint 关联；在验收前 semantic runtime 必须保持 WAIT，不能回退到对象中心或房间质心。
-- [ ] 验证远程 LVLM 的 instruction parse、concept grounding 和 final verifier，记录请求类型、p50/p95 延迟、超时和原始结构化响应。
-- [ ] 用模拟 `REACHED` 只验证证据闭环：目标 crop、原始指令、对象 UID 和 verifier 决策必须写入同一 run 目录。
-- [ ] 验证 LVLM 不可用、响应非法或超时时显式失败并保持 WAIT/HOLD；不得吞掉异常后继续发布目标。
+- [x] OCC D435i--MID-360 外参与当前安装状态一致，`calibration_status: calibrated` 已按
+  低速 VLN 决定写入 profile。
+- [ ] 若以后扩展到高速或高精度场景，再用独立连续片段复核 RGB--LiDAR 时间偏移的 held-out
+  稳定性。
+- [ ] 若以后需要像素级精度，再计算严格 LiDAR→图像边缘误差和更严格深度误差。
 
-验收出口：在完全不发布真实 waypoint 的条件下，一条真实自然语言指令能够产生可追踪的
-`InstructionPlan -> NavigationIntent -> ViewEvidence -> verifier decision`。
+以上两项不阻塞当前低速 semantic mapping 或 VLN 试运行。`require_calibration: false` 仍是
+诊断开关，不能代替 profile 中已记录的 candidate。
 
-### P3：确定唯一的真实运动后端
+### P2：平台无关软件回归（已完成，持续维护）
+
+- [x] `SemanticMapSnapshot -> NavigationIntent -> SysNavGoalResolver -> MotionGoal/WAIT`、
+  `REACHED -> fresh evidence -> verifier`、`ViewpointPose` bridge 和 waypoint adapter 均有
+  离线测试；最近一次 acceptance 为 `113 passed`。
+- [x] waypoint adapter 当前保持 shadow：`output_enabled=false`，不创建生产 waypoint
+  publisher，不发布 `/cmd_vel`。
+- [ ] 每次修改 detector、mapping、viewpoint 或 runtime 后重新运行 acceptance，并把结果
+  和部署 SHA 写入新的 run 目录。
+
+### P3：确定并批准唯一的真实运动后端（当前最大阻塞）
 
 - [ ] 由底盘控制器所有者书面确认 `/waypoint` 的消息类型、数组语义、单位、轴向、frame 和目标有效期。
 - [ ] 确认 `/topoplan/reached_goal` 是否为生产反馈；补齐 blocked、timeout、cancel/preempt、heartbeat 和故障状态接口。
 - [ ] 确认最终 `/cmd_vel` owner、速度/加速度限制、watchdog、急停断言/复位和人工接管流程。
-- [ ] 完成机器人专属 controller contract，保持 `cmd_vel_direct_publish=false`。
+- [ ] 完成机器人专属 controller contract，保持 `cmd_vel_direct_publish=false`，并由底盘
+  所有者签字/现场确认后才允许改变。
 - [ ] 根据确认后的实际反馈，只实现一个 Orin status adapter；不为尚不存在的反馈类型预写兼容分支。
 - [ ] 明确生产后端是“外部 `/waypoint` 控制器”还是“SysNav 原生下层”，并在 launch 中保证互斥。
 
 验收出口：`approval_status=approved` 只能由真实合同和现场验收记录支持，不能由单元测试或
 历史源码推断产生。
 
-### P4：分阶段运动验收
+### P4：分阶段安全运动验收（P3 批准后）
 
-- [ ] Shadow：保持 adapter `output_enabled=false`，验证 frame、新鲜度、坐标变换和无 `/cmd_vel` 所有权冲突。
+- [x] Shadow：保持 adapter `output_enabled=false`，已验证 frame、新鲜度、坐标变换和无
+  `/cmd_vel` 所有权冲突；不得把 shadow 结果当作真实控制验收。
 - [ ] Bench：轮子离地或电机硬件禁用，连接真实 `/waypoint`，验证正常、过期、取消和错误 frame。
 - [ ] Low-speed：第二人持急停，在空场执行不超过 0.5 m 的前进、后退、转向、HOLD、blocked 和 timeout。
 - [ ] Safety：实测急停、人工接管、通信中断、odom 过期和 controller heartbeat 丢失。
@@ -321,6 +351,17 @@ AND safety_state_allows_stop
 
 ## 6. 下一次现场工作的最短路径
 
-下一次 Orin 工作只做 P0 和 P1：同步共同代码基线、重建镜像、采集标定 bag、运行 held-out
-评估。不要同时打开真实 waypoint。P1 通过后，再单独进行 P2 的真实对象图和远程 LVLM
-无运动闭环。这样每次失败都能定位在传感器、标定、语义或控制中的单一层级。
+按以下顺序推进，期间保持真实运动关闭：
+
+1. 用 `huawei-vln-realworld:orin-r36.5-fix` 重启一套干净进程，完成 detector + semantic
+   mapping + Point-LIO 的整栈 30 分钟 soak，保存频率、掉帧、资源、温度和 TF 证据。
+2. 启动真实 SysNav viewpoint provider，确认 `/viewpoint_rep_header` 有消息；再运行一条
+   `semantic_snapshot` 自然语言指令，完成对象 UID、viewpoint、RGB 和 verifier 的无运动
+   证据闭环。没有 viewpoint 时必须继续 `WAIT`。
+3. 由底盘所有者确认并批准 controller contract，补齐状态 adapter；在批准前绝不发布真实
+   `/waypoint` 或 `/cmd_vel`。
+4. 依次执行轮子离地 bench、有人持急停的低速短距离和通信/急停故障测试，完成后才进入
+   完整 ObjectNav。
+
+高动态时间偏移、严格像素误差和深度精度保留为非阻塞增强项；只有目标场景升级时才重新
+开启该验收线。
