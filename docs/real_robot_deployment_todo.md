@@ -1,7 +1,7 @@
 # VLN 实物部署状态与 TODO
 
-> 更新日期：2026-09-07
-> 代码基线：本地 `realworld`、GitHub `origin/realworld` 和新机器人工作区均为 `e27217c`（完整提交见 Git）；旧 `/home/orin26/HuaweiVLN` 保留为只读回滚工作区，未被覆盖。
+> 更新日期：2026-09-08
+> 代码基线：本地 `realworld`、GitHub `origin/realworld` 和新机器人工作区均为 `82da4d5`（完整提交见 Git）；旧 `/home/orin26/HuaweiVLN` 保留为只读回滚工作区，未被覆盖。
 > 目标平台：Orin-26、Intel RealSense D435i、Livox MID-360
 > 当前安全状态：感知与影子控制验证；真实运动未批准
 
@@ -37,10 +37,11 @@ bag replay、HIL 和影子 topic 不能替代真实底盘验收。
 
 ### 2026-09-07 状态刷新
 
-用户已批准将静态棋盘 RANSAC candidate 作为 provisional 标定配置使用。当前 profile
-已写入 `calibration_status: calibrated`，外参文件为
-`real_robot/calibration/orin26_d435i_mid360_candidate_20260826.json`；但该批准是工程
-试运行决定，不代表时间偏移和动态投影验收完成。
+用户已确认 OCC 项目的 D435i--MID-360 外参与当前安装状态一致，并批准当前 candidate
+用于低速 VLN 试运行。当前 profile 已写入 `calibration_status: calibrated`，外参文件为
+`real_robot/calibration/orin26_d435i_mid360_candidate_20260826.json`。因此，**低速场景的
+空间融合不再是部署阻塞项**。动态时间偏移和严格像素投影验收属于高动态/高精度增强项，
+不再阻塞当前低速 VLN 验收。
 
 最新 candidate 的证据摘要：
 
@@ -51,8 +52,9 @@ bag replay、HIL 和影子 topic 不能替代真实底盘验收。
 - 像素代理 P90：train 11.46 px，held-out 11.27 px；
 - 动态时间偏移：train -15 ms，held-out +20 ms，差异 35 ms，仍未验证。
 
-因此当前允许启动 semantic mapping 做静态/低速数据链试运行，但必须保留
-`time_offset_status: unvalidated`，并继续禁止真实 waypoint、`/cmd_vel` 和底盘运动。
+因此当前允许启动 semantic mapping 做静态/低速数据链试运行；
+`time_offset_status: unvalidated` 继续保留为事实记录，但不否定低速融合可用性。
+真实 waypoint、`/cmd_vel` 和底盘运动仍受独立控制安全门禁约束。
 Point-LIO 动态 TF 仍需连续窗口测试；出现 `future extrapolation` 时不能称为稳定部署完成。
 
 当前已打通两条无运动链路：
@@ -69,14 +71,17 @@ VLN /way_point (PointStamped, world frame)
 ```
 
 第一条链路已经产生真实对象节点，第二条链路已经在影子 topic 上完成坐标与消息转换。
-这些结果证明接口和数据流可运行，但不能证明 RGB--LiDAR 标定达到任务精度，也不能证明
-底盘能够安全执行 waypoint。
+这些结果证明低速数据链和接口可运行；它们仍不能证明底盘能够安全执行 waypoint，
+也不能替代高动态时间偏移/像素精度增强验收。
 
 当前完整闭环仍缺三项硬条件：
 
-1. RGB--LiDAR 时间偏移与 held-out 投影误差通过验收；
+1. Point-LIO 动态 TF、viewpoint pose 和长时间资源窗口在真实运行中稳定通过验收；
 2. 机器人下层控制器 contract 获得所有者确认并完成急停、反馈和限速测试；
 3. 在真实对象节点和真实 RGB 上完成 `InstructionPlan -> MotionGoal -> REACHED -> final verifier` 的受控闭环。
+
+RGB--LiDAR 动态时间偏移和严格像素投影误差不再列为低速 VLN 的硬条件；若目标扩展到
+高速或高精度融合，再单独开启增强验收。
 
 本轮已经完成的**软件闭环**如下，但这些内容仍不等同于实物验收：
 
@@ -102,9 +107,9 @@ SemanticMapSnapshot
 |---|---|---|---|
 | 平台无关 contract | 已完成 | `SemanticMapSnapshot`、`NavigationIntent`、`MotionGoal`、`NavigationStatus`、`ViewEvidence` 已实现并有单元测试 | 真车已运动 |
 | SysNav detector | 真机数据链已验证 | D435i 图像进入 YOLOE，检测 topic 有真实消息 | 所有目标类别均稳定检测 |
-| SysNav semantic mapping | 数据层影子验证 | 2026-08-19 实测对象节点约 0.5 Hz，坐标为米级，含 `chair`、`desk`、`cabinet` | 标定已批准、对象定位精度达标 |
-| LIO 输入 | 真机数据链已验证 | `/cloud_registered_body` 约 9.4--9.6 Hz，`/aft_mapped_to_init` 约 100 Hz | 长时定位无漂移 |
-| D435i--MID-360 标定 | 部分完成 | 内参、外参和历史 bag 已导入；已有只读评估脚本 | `calibration_status=calibrated` |
+| SysNav semantic mapping | 低速真机数据链已验证 | 2026-09-08 新工作区实测对象节点约 0.4--0.5 Hz，坐标为米级，含有效投影点 | 对象精度和长时间稳定性仍需任务级验收 |
+| LIO 输入 | 60 秒真机数据链已验证 | `/cloud_registered_body` 约 9.4 Hz，`/aft_mapped_to_init` 约 100 Hz | 长时 TF、漂移和资源稳定性 |
+| D435i--MID-360 标定 | 低速试运行已接受 | OCC 外参/current candidate 已导入，profile 为 `calibration_status=calibrated` | 高动态时间偏移和严格像素精度增强验收 |
 | Instruction runtime | 软件闭环完成（离线） | snapshot、SysNav viewpoint resolver、active goal、REACHED 后新鲜取证和 verifier 生命周期有离线测试 | 已在 Orin 上运行真实自然语言任务 |
 | SysNav viewpoint bridge | 软件 bridge 已实现，真机数据待验收 | `/viewpoint_rep_header` + 同时刻 odom -> `/strive/sysnav/viewpoint_pose`；object-viewpoint 观测历史、共视交集和无效时间/frame 的 WAIT 已有代码和测试 | Orin 上已验证 viewpoint 频率、时间偏移和 frame |
 | 远程 LVLM | HTTP/schema 软件接口完成 | 商业 API、自部署 OpenAI-compatible 服务和 schema smoke 已实现 | 机器人网络上的 p95 延迟、超时恢复已验收 |
@@ -180,25 +185,24 @@ waypoint adapter 输出或任何真实运动节点。
 - LIO 只读诊断：报告为 `logs/diagnostics/lio_dds_20260821T133422Z.md`；`/livox/lidar`、`/livox/imu`、`/cloud_registered`、`/aft_mapped_to_init` 均未收到实际 header。Point-LIO 参数显示 `publish.scan_publish_en=False`，因此 semantic mapping 继续关闭；未重启或修改外部 LIO。
 - 现场 bag 清单中暂未发现同时包含 `/viewpoint_rep_header` 与 `/object_nodes_list` 的 bag，因此 viewpoint replay 留待取得对应 bag 后执行。
 
-### P1：完成 D435i--MID-360 标定
+### P1：标定增强（低速 VLN 非阻塞）
 
-- [ ] 采集新的 RGB、aligned depth、CameraInfo、Livox、IMU 和 odom 同步 bag；数据覆盖至少 3 个距离、3 个方位和 2 个姿态。
-- [ ] 用独立片段估计 RGB--LiDAR 时间偏移，并在 held-out 片段复核唯一性和稳定性。
-- [ ] 定义并计算 LiDAR 到图像的投影误差，至少记录有效点数、median、p90、RMSE 和 inlier ratio。
-- [ ] 由项目负责人确定验收阈值；阈值必须先写入验收记录，再判断 pass/fail。
-- [ ] 通过后更新 `projection_orin26_d435i_mid360.yaml` 的 calibration id、日期、样本数、误差和时间偏移。
-- [ ] 只有全部指标通过后，将 `calibration_status` 从 `extrinsics_only` 改为 `calibrated`。
+- [x] OCC D435i--MID-360 外参与当前安装状态一致，作为低速运行的空间融合参数。
+- [x] 当前 candidate 的 calibration id、日期、样本数和已有误差指标已写入 projection YAML。
+- [x] profile 使用 `calibration_status: calibrated` 启动过 semantic mapping 试运行。
+- [ ] （增强项）用独立片段估计 RGB--LiDAR 时间偏移，并在 held-out 片段复核唯一性和稳定性。
+- [ ] （增强项）计算严格 LiDAR 到图像边缘的像素误差和更严格的深度误差。
 
-验收出口：profile 的正常启动门能够接受该标定文件；使用 held-out bag 复现同一结论。
-当前 `mapping_orin26_d435i_mid360.yaml` 中 `require_calibration: false` 仅用于数据链诊断，
-不能作为正式融合批准。
+增强项通过后可支持高速/高精度融合；未通过不阻塞当前低速 VLN 试运行。
+`mapping_orin26_d435i_mid360.yaml` 中的 `require_calibration: false` 仍只是诊断开关，
+正式启动必须使用 profile 中已记录的 candidate，而不是依赖该开关绕过配置。
 
 ### P2：感知、指令与 LVLM 的无运动闭环
 
 - [x] 完成 `SemanticMapSnapshot -> NavigationIntent -> SysNavGoalResolver -> MotionGoal/WAIT` 的软件链路；该项由离线 fake provider 和 runtime 测试覆盖。
 - [x] 完成 `REACHED -> fresh evidence -> verifier` 的软件生命周期；旧 detection 不得与到达后的新 RGB 混合，证据不足时保持 `VERIFYING`。
 - [x] 完成 raw SysNav viewpoint topic 到带 pose `ViewpointPose` 的软件适配；时间错位或 frame 不一致时不发布猜测 pose。
-- [ ] 使用已批准标定从 profile 正常启动 semantic mapping，而不是绕过 profile 直接 launch。
+- [x] 使用已批准标定从 profile 正常启动 semantic mapping；输入固定为 `/cloud_registered_body`。
 - [ ] 记录对象节点的位置误差、对象 UID 连续性、误检和重复簇；至少覆盖桌椅、柜体和小物体。
 - [ ] 在真实 `/object_nodes_list`、RGB 和 odom 上运行 `policy_mode=semantic_snapshot`、`dry_run=true`。
 - [ ] 在包含 `/viewpoint_rep_header`、`/object_nodes_list` 和 odom 的真实机器人 ROS2 bag 上运行 viewpoint replay，并核对时间偏移、frame、频率和 object-viewpoint 关联。synthetic bag smoke 不替代此项。
