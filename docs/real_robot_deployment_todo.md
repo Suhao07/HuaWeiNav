@@ -1,7 +1,7 @@
 # VLN 实物部署状态与 TODO
 
 > 更新日期：2026-09-08
-> 代码基线：本地 `realworld` 已包含 `3978b5c`（semantic mapping 合并索引修复）；`origin/realworld` 仍停在 `82da4d5`，未在本轮推送。新机器人工作区已同步该文件并用于临时容器重建，旧 `/home/orin26/HuaweiVLN` 保留为只读回滚工作区，未被覆盖。
+> 代码基线：本地 `realworld` 最新为 `88fe4fa`（包含 `3978b5c` 的 semantic mapping 合并索引修复）；`origin/realworld` 仍停在 `82da4d5`，未在本轮推送。新机器人工作区已用同一修复提交为 `0acbf3e` 并用于镜像重建，旧 `/home/orin26/HuaweiVLN` 保留为只读回滚工作区，未被覆盖。
 > 目标平台：Orin-26、Intel RealSense D435i、Livox MID-360
 > 当前安全状态：感知与影子控制验证；真实运动未批准
 
