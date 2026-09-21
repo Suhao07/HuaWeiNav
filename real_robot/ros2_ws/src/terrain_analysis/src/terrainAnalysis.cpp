@@ -60,6 +60,7 @@ double voxelTimeUpdateThre = 2.0;
 double minRelZ = -1.5;
 double maxRelZ = 0.2;
 double disRatioZ = 0.2;
+string terrainFrame = "map";
 
 // terrain voxel parameters
 float terrainVoxelSize = 1.0;
@@ -228,6 +229,7 @@ int main(int argc, char **argv) {
   nh->declare_parameter<double>("minRelZ", minRelZ);
   nh->declare_parameter<double>("maxRelZ", maxRelZ);
   nh->declare_parameter<double>("disRatioZ", disRatioZ);
+  nh->declare_parameter<string>("terrainFrame", terrainFrame);
 
   nh->get_parameter("scanVoxelSize", scanVoxelSize);
   nh->get_parameter("decayTime", decayTime);
@@ -255,6 +257,7 @@ int main(int argc, char **argv) {
   nh->get_parameter("minRelZ", minRelZ);
   nh->get_parameter("maxRelZ", maxRelZ);
   nh->get_parameter("disRatioZ", disRatioZ);
+  nh->get_parameter("terrainFrame", terrainFrame);
 
   auto subOdometry = nh->create_subscription<nav_msgs::msg::Odometry>("/state_estimation", 5, odometryHandler);
 
@@ -680,7 +683,8 @@ int main(int argc, char **argv) {
       sensor_msgs::msg::PointCloud2 terrainCloud2;
       pcl::toROSMsg(*terrainCloudElev, terrainCloud2);
       terrainCloud2.header.stamp = rclcpp::Time(static_cast<uint64_t>(laserCloudTime * 1e9));
-      terrainCloud2.header.frame_id = "map";
+      // 点云数值已经与 odometry 使用同一世界坐标；frame 由部署配置明确声明。
+      terrainCloud2.header.frame_id = terrainFrame;
       pubLaserCloud->publish(terrainCloud2);
     }
 

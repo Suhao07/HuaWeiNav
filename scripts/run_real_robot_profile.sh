@@ -73,6 +73,9 @@ check_profile() {
   printf 'camera_info_url=%s\n' "${USB_CAMERA_INFO_URL:-<unset>}"
   printf 'semantic_mapping=%s\ndry_run=%s\nlower_controller=%s\n' \
     "${START_SEMANTIC_MAPPING}" "${STRIVE_DRY_RUN}" "${STRIVE_LOWER_CONTROLLER_ENABLED}"
+  printf 'agilex_platform=%s\nremote_control=%s\nchassis_ready_required=%s\ncommand_timeout_s=%s\nrosbridge=%s\n' \
+    "${START_AGILEX_PLATFORM:-false}" "${AGILEX_REMOTE_CONTROL_ENABLED:-false}" \
+    "${REQUIRE_CHASSIS_READY:-false}" "${AGILEX_COMMAND_TIMEOUT_S:-1.0}" "${AGILEX_URI:-<unset>}"
 
   for path in \
     "${SYSNAV_DETECTOR_MODEL_PATH}" \

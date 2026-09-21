@@ -39,6 +39,9 @@ class SafetyVelocityMux(Node):
         self.declare_parameter("safety_state_topic", "/platform/safety_state")
         self.declare_parameter("odom_topic", "/aft_mapped_to_init")
         self.declare_parameter("pointcloud_topic", "/cloud_registered")
+        self.declare_parameter("chassis_ready_topic", "/platform/chassis_ready")
+        self.declare_parameter("require_chassis_ready", False)
+        self.declare_parameter("chassis_ready_timeout_s", 1.0)
         self.declare_parameter("require_sensor_freshness", True)
         self.declare_parameter("sensor_watchdog_timeout_s", 0.5)
         self.declare_parameter("output_rate_hz", 20.0)
@@ -71,6 +74,8 @@ class SafetyVelocityMux(Node):
         self._estop_active = False
         self._last_odom_received_at: Optional[float] = None
         self._last_pointcloud_received_at: Optional[float] = None
+        self._chassis_ready = not _as_bool(self.get_parameter("require_chassis_ready").value)
+        self._chassis_ready_received_at: Optional[float] = None
         self._latest_autonomy: Optional[TwistStamped] = None
         self._latest_manual: Optional[TwistStamped] = None
         self._latest_autonomy_received_at: Optional[float] = None
@@ -101,6 +106,12 @@ class SafetyVelocityMux(Node):
             PointCloud2,
             str(self.get_parameter("pointcloud_topic").value),
             self._update_pointcloud,
+            queue_size,
+        )
+        self.create_subscription(
+            Bool,
+            str(self.get_parameter("chassis_ready_topic").value),
+            self._update_chassis_ready,
             queue_size,
         )
         period = 1.0 / max(1.0, float(self.get_parameter("output_rate_hz").value))
@@ -196,12 +207,23 @@ class SafetyVelocityMux(Node):
     def _update_autonomy_enable(self, msg: Bool) -> None:
         """Enable or disable autonomous output after external approval."""
 
-        self._autonomy_enabled = bool(msg.data)
+        enabled = bool(msg.data)
+        if enabled and not self._autonomy_enabled:
+            # 自动授权上升沿建立新的候选周期，旧缓存不能跨人工接管或断链恢复。
+            self._latest_autonomy = None
+            self._latest_autonomy_received_at = None
+        if not enabled:
+            self._latest_autonomy = None
+            self._latest_autonomy_received_at = None
+        self._autonomy_enabled = enabled
 
     def _update_manual_takeover(self, msg: Bool) -> None:
         """Switch final command ownership to or from manual control."""
 
         self._manual_takeover = bool(msg.data)
+        if self._manual_takeover:
+            self._latest_autonomy = None
+            self._latest_autonomy_received_at = None
 
     def _update_estop(self, msg: Bool) -> None:
         """Latch an external emergency-stop assertion until explicit reset."""
@@ -224,6 +246,23 @@ class SafetyVelocityMux(Node):
         """Record fresh registered point-cloud input for the final command watchdog."""
 
         self._last_pointcloud_received_at = time.monotonic()
+
+    def _update_chassis_ready(self, msg: Bool) -> None:
+        """Record whether the remote chassis is ready for automatic input."""
+
+        self._chassis_ready = bool(msg.data)
+        self._chassis_ready_received_at = time.monotonic()
+
+    def _chassis_is_ready(self, now: float) -> bool:
+        """Return whether the readiness publisher has a current true value."""
+
+        # 新鲜度模型：fresh = (t_now - t_received <= timeout)。两个时间均使用本机 monotonic。
+        if not self._chassis_ready:
+            return False
+        if self._chassis_ready_received_at is None:
+            return False
+        timeout = float(self.get_parameter("chassis_ready_timeout_s").value)
+        return now - self._chassis_ready_received_at <= timeout
 
     def _sensors_are_fresh(self, now: float) -> bool:
         """Return whether required localization and obstacle inputs are current."""
@@ -251,6 +290,12 @@ class SafetyVelocityMux(Node):
             self._policy.set_state(SafetyState.ESTOP)
         elif self._manual_takeover:
             self._policy.set_state(SafetyState.MANUAL_TAKEOVER)
+        elif _as_bool(self.get_parameter("require_chassis_ready").value) and not self._chassis_is_ready(time.monotonic()):
+            # readiness 失效立即撤销自动授权，下一次授权必须重新经过远端选源。
+            self._autonomy_enabled = False
+            self._latest_autonomy = None
+            self._latest_autonomy_received_at = None
+            self._policy.set_state(SafetyState.CONTROLLER_FAULT)
         elif not self._autonomy_enabled:
             self._policy.set_state(SafetyState.HOLD)
         elif not self._sensors_are_fresh(time.monotonic()):

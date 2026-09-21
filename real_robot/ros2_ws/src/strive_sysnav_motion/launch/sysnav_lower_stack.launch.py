@@ -14,6 +14,10 @@ def generate_launch_description():
 
     args = {
         "cloud_topic": "/cloud_registered",
+        "terrain_frame": "map",
+        "chassis_ready_topic": "/platform/chassis_ready",
+        "require_chassis_ready": "false",
+        "chassis_ready_timeout_s": "1.0",
         "odom_topic": "/aft_mapped_to_init",
         "waypoint_topic": "/way_point",
         "path_topic": "/path",
@@ -66,6 +70,7 @@ def generate_launch_description():
         executable="terrainAnalysis",
         name="terrainAnalysis",
         output="screen",
+        parameters=[{"terrainFrame": LaunchConfiguration("terrain_frame")}],
         remappings=[
             ("/state_estimation", odom),
             ("/registered_scan", cloud),
@@ -164,6 +169,9 @@ def generate_launch_description():
             {"planner_status_topic": LaunchConfiguration("planner_status_topic")},
             {"odom_topic": odom},
             {"pointcloud_topic": cloud},
+            {"chassis_ready_topic": LaunchConfiguration("chassis_ready_topic")},
+            {"require_chassis_ready": LaunchConfiguration("require_chassis_ready")},
+            {"chassis_ready_timeout_s": LaunchConfiguration("chassis_ready_timeout_s")},
             {"require_sensor_freshness": True},
             {"sensor_watchdog_timeout_s": LaunchConfiguration("sensor_watchdog_timeout_s")},
             {"max_linear_speed_mps": LaunchConfiguration("max_speed")},

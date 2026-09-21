@@ -24,6 +24,7 @@ setup(
         "console_scripts": [
             "sysnav_motion_server = strive_sysnav_motion.motion_server:main",
             "safety_velocity_mux = strive_sysnav_motion.safety_velocity_mux:main",
+            "agilex_platform = strive_sysnav_motion.agilex_platform:main",
             "motion_hil = strive_sysnav_motion.motion_hil:main",
             "lower_bag_probe = strive_sysnav_motion.lower_bag_probe:main",
         ],

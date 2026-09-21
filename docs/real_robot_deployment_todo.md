@@ -9,6 +9,11 @@
 [`real_robot_framework.md`](real_robot_framework.md)，实测证据保留在对应日期的
 `real_robot_*_evidence_*.md` 文档中。
 
+2026-09-21：复用 FWTW 松灵 rosbridge 的具体接入工作见
+[`real_robot_agilex_execution_checklist.md`](real_robot_agilex_execution_checklist.md)。
+该清单按 SysNav 原生下层路线拆分类型适配、遥测、模式联动、合同及分阶段验收；
+仅为本地实现审计与执行计划，不改变本文既有实物验收状态。
+
 ### 2026-09-08 清洁工作区部署记录
 
 - 新工作区：`/home/orin26/HuaweiVLN_deployments/realworld_2c0b783`；旧

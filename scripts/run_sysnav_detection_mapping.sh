@@ -42,8 +42,12 @@ STRIVE_DRY_RUN=false and the safety parameters allow it.
 Complete guarded stack:
   START_LOWER_STACK=1 scripts/run_sysnav_detection_mapping.sh
   This starts the aggregate launch with localPlanner, pathFollower,
-  SysNavMotionServer, and SafetyVelocityMux.  Live motion still requires
-  STRIVE_DRY_RUN=false, STRIVE_LOWER_CONTROLLER_ENABLED=true, and an approved
+  SysNavMotionServer, and SafetyVelocityMux.  Shadow mode keeps
+  STRIVE_DRY_RUN=true, STRIVE_LOWER_CONTROLLER_ENABLED=false, and
+  AGILEX_REMOTE_CONTROL_ENABLED=false.  Live motion additionally requires
+  START_AGILEX_PLATFORM=true, STRIVE_DRY_RUN=false,
+  STRIVE_LOWER_CONTROLLER_ENABLED=true, ALLOW_REAL_MOTION=true,
+  ENABLE_LOWER_CONTROLLER=true, BLOCK_LOWER_CONTROLLER=false, and an approved
   CONTROL_CONTRACT_FILE.
 EOF
 }
@@ -169,13 +173,30 @@ cleanup() {
 mapping_args
 
 if is_true "${START_LOWER_STACK}"; then
-  if is_true "${STRIVE_DRY_RUN:-true}" || ! is_true "${STRIVE_LOWER_CONTROLLER_ENABLED:-false}"; then
-    echo "START_LOWER_STACK=1 requires STRIVE_DRY_RUN=false and STRIVE_LOWER_CONTROLLER_ENABLED=true." >&2
-    exit 4
-  fi
-  if [[ -z "${CONTROL_CONTRACT_FILE:-}" || ! -f "${CONTROL_CONTRACT_FILE}" ]]; then
-    echo "START_LOWER_STACK=1 requires an existing CONTROL_CONTRACT_FILE." >&2
-    exit 4
+  require_controller_contract="true"
+  if ! is_true "${AGILEX_REMOTE_CONTROL_ENABLED:-false}"; then
+    if ! is_true "${STRIVE_DRY_RUN:-true}" || is_true "${STRIVE_LOWER_CONTROLLER_ENABLED:-false}"; then
+      echo "Shadow lower stack requires STRIVE_DRY_RUN=true and STRIVE_LOWER_CONTROLLER_ENABLED=false." >&2
+      exit 4
+    fi
+    require_controller_contract="false"
+  else
+    if ! is_true "${START_AGILEX_PLATFORM:-false}"; then
+      echo "Physical lower stack requires START_AGILEX_PLATFORM=true." >&2
+      exit 4
+    fi
+    if is_true "${STRIVE_DRY_RUN:-true}" || ! is_true "${STRIVE_LOWER_CONTROLLER_ENABLED:-false}"; then
+      echo "Physical lower stack requires STRIVE_DRY_RUN=false and STRIVE_LOWER_CONTROLLER_ENABLED=true." >&2
+      exit 4
+    fi
+    if ! is_true "${ALLOW_REAL_MOTION:-false}" || ! is_true "${ENABLE_LOWER_CONTROLLER:-false}" || is_true "${BLOCK_LOWER_CONTROLLER:-true}"; then
+      echo "Physical lower stack requires ALLOW_REAL_MOTION=true, ENABLE_LOWER_CONTROLLER=true, and BLOCK_LOWER_CONTROLLER=false." >&2
+      exit 4
+    fi
+    if [[ -z "${CONTROL_CONTRACT_FILE:-}" || ! -f "${CONTROL_CONTRACT_FILE}" ]]; then
+      echo "Physical lower stack requires an existing CONTROL_CONTRACT_FILE." >&2
+      exit 4
+    fi
   fi
   # 聚合生产入口始终走 Action；若调用者显式提供其它 backend，拒绝静默
   # 回退到直接发布 /way_point，保持 MotionServer 是唯一 task-level owner。
@@ -190,10 +211,24 @@ if is_true "${START_LOWER_STACK}"; then
     "platform:=mecanum"
     "camera_topic:=${CAMERA_TOPIC:-/camera/image}"
     "cloud_topic:=${CLOUD_TOPIC:-/cloud_registered}"
+    "lower_cloud_topic:=${LOWER_CLOUD_TOPIC:-/cloud_registered}"
+    "terrain_frame:=${LOWER_TERRAIN_FRAME:-map}"
     "odom_topic:=${ODOM_TOPIC:-/aft_mapped_to_init}"
     "viewpoint_topic:=${VIEWPOINT_TOPIC:-/viewpoint_rep_header}"
     "start_semantic_mapping:=${START_SEMANTIC_MAPPING}"
     "start_usb_cam:=${START_USB_CAM:-false}"
+    "start_agilex_platform:=${START_AGILEX_PLATFORM:-false}"
+    "require_chassis_ready:=${REQUIRE_CHASSIS_READY:-false}"
+    "chassis_ready_timeout_s:=${CHASSIS_READY_TIMEOUT_S:-1.0}"
+    "agilex_uri:=${AGILEX_URI:-ws://192.168.1.102:9090}"
+    "agilex_interface:=${AGILEX_INTERFACE:-}"
+    "agilex_remote_control_enabled:=${AGILEX_REMOTE_CONTROL_ENABLED:-false}"
+    "agilex_auto_topic:=${AGILEX_AUTO_TOPIC:-/navflow_cmd_vel}"
+    "agilex_manual_topic:=${AGILEX_MANUAL_TOPIC:-/run_management/virtual_joy}"
+    "agilex_command_timeout_s:=${AGILEX_COMMAND_TIMEOUT_S:-1.0}"
+    "agilex_max_linear_mps:=${AGILEX_MAX_LINEAR_MPS:-0.5}"
+    "agilex_max_angular_rps:=${AGILEX_MAX_ANGULAR_RPS:-0.8}"
+    "require_controller_contract:=${require_controller_contract}"
     "${MODEL_ARGS[@]}"
     "${MAPPING_ARGS[@]}"
     "${RUNTIME_ARGS[@]}"

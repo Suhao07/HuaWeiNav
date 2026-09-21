@@ -27,12 +27,15 @@ def generate_launch_description() -> LaunchDescription:
     # control topics without editing any package source.
     defaults = {
         "enable_lower_stack": "false",
+        "start_agilex_platform": "false",
         "platform": "mecanum",
         "start_semantic_mapping": "true",
         "start_viewpoint_bridge": "true",
         "start_usb_cam": "false",
         "camera_topic": "/camera/image",
         "cloud_topic": "/cloud_registered",
+        "lower_cloud_topic": "/cloud_registered",
+        "terrain_frame": "map",
         "odom_topic": "/aft_mapped_to_init",
         "viewpoint_topic": "/viewpoint_rep_header",
         "viewpoint_pose_topic": "/strive/sysnav/viewpoint_pose",
@@ -81,6 +84,17 @@ def generate_launch_description() -> LaunchDescription:
         "require_pose": "true",
         "require_image": "true",
         "pointcloud_topic": "/cloud_registered",
+        "chassis_ready_topic": "/platform/chassis_ready",
+        "require_chassis_ready": "false",
+        "chassis_ready_timeout_s": "1.0",
+        "agilex_uri": "ws://192.168.1.102:9090",
+        "agilex_interface": "",
+        "agilex_remote_control_enabled": "false",
+        "agilex_auto_topic": "/navflow_cmd_vel",
+        "agilex_manual_topic": "/run_management/virtual_joy",
+        "agilex_command_timeout_s": "1.0",
+        "agilex_max_linear_mps": "0.5",
+        "agilex_max_angular_rps": "0.8",
         "depth_topic": "",
         "path_topic": "/path",
         "planner_status_topic": "/local_planner/status",
@@ -145,7 +159,8 @@ def generate_launch_description() -> LaunchDescription:
     }
 
     lower_arguments = {
-        "cloud_topic": LaunchConfiguration("cloud_topic"),
+        "cloud_topic": LaunchConfiguration("lower_cloud_topic"),
+        "terrain_frame": LaunchConfiguration("terrain_frame"),
         "odom_topic": LaunchConfiguration("odom_topic"),
         "waypoint_topic": LaunchConfiguration("waypoint_topic"),
         "path_topic": LaunchConfiguration("path_topic"),
@@ -161,6 +176,9 @@ def generate_launch_description() -> LaunchDescription:
         "cancel_topic": LaunchConfiguration("cancel_topic"),
         "planner_status_topic": LaunchConfiguration("planner_status_topic"),
         "safety_state_topic": LaunchConfiguration("safety_state_topic"),
+        "chassis_ready_topic": LaunchConfiguration("chassis_ready_topic"),
+        "require_chassis_ready": LaunchConfiguration("require_chassis_ready"),
+        "chassis_ready_timeout_s": LaunchConfiguration("chassis_ready_timeout_s"),
         "action_name": LaunchConfiguration("motion_action_name"),
         "allow_look_at": LaunchConfiguration("allow_look_at"),
         "alignment_action_name": LaunchConfiguration("alignment_action_name"),
@@ -271,6 +289,32 @@ def generate_launch_description() -> LaunchDescription:
         launch_arguments=lower_arguments.items(),
         condition=IfCondition(LaunchConfiguration("enable_lower_stack")),
     )
+    agilex_launch = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            PathJoinSubstitution(
+                [FindPackageShare("strive_sysnav_motion"), "launch", "agilex_platform.launch.py"]
+            )
+        ),
+        launch_arguments={
+            "input_cmd_topic": LaunchConfiguration("output_cmd_topic"),
+            "uri": LaunchConfiguration("agilex_uri"),
+            "interface": LaunchConfiguration("agilex_interface"),
+            "remote_control_enabled": LaunchConfiguration("agilex_remote_control_enabled"),
+            "controller_contract_file": LaunchConfiguration("controller_contract_file"),
+            "waypoint_topic": LaunchConfiguration("waypoint_topic"),
+            "world_frame": LaunchConfiguration("world_frame"),
+            "action_name": LaunchConfiguration("motion_action_name"),
+            "auto_topic": LaunchConfiguration("agilex_auto_topic"),
+            "manual_topic": LaunchConfiguration("agilex_manual_topic"),
+            "command_timeout_s": LaunchConfiguration("agilex_command_timeout_s"),
+            "autonomy_enable_topic": LaunchConfiguration("autonomy_enable_topic"),
+            "manual_takeover_topic": LaunchConfiguration("manual_takeover_topic"),
+            "chassis_ready_topic": LaunchConfiguration("chassis_ready_topic"),
+            "max_linear_mps": LaunchConfiguration("agilex_max_linear_mps"),
+            "max_angular_rps": LaunchConfiguration("agilex_max_angular_rps"),
+        }.items(),
+        condition=IfCondition(LaunchConfiguration("start_agilex_platform")),
+    )
     runtime_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             PathJoinSubstitution(
@@ -282,4 +326,4 @@ def generate_launch_description() -> LaunchDescription:
 
     # 中文说明：lower stack 只有显式 enable 才存在；高层 runtime 始终运行，
     # 但默认 dry-run，避免“启动了感知”被误解为“已经获得底盘控制权”。
-    return LaunchDescription(declarations + [detection_launch, viewpoint_bridge_launch, lower_launch, runtime_launch])
+    return LaunchDescription(declarations + [detection_launch, viewpoint_bridge_launch, lower_launch, agilex_launch, runtime_launch])

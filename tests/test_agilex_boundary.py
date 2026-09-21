@@ -1,0 +1,307 @@
+from pathlib import Path
+from collections import deque
+import importlib.util
+import json
+import struct
+import sys
+import threading
+import types
+
+
+MOTION_ROOT = Path("real_robot/ros2_ws/src/strive_sysnav_motion")
+
+
+class _Parameter:
+    def __init__(self, value):
+        self.value = value
+
+
+class _Logger:
+    def warning(self, message):
+        self.message = message
+
+
+class _FakeSocket:
+    def __init__(self, responses=()):
+        self.sent = []
+        self.responses = deque(responses)
+
+    def send(self, message):
+        self.sent.append(message)
+
+    def receive(self, _timeout):
+        response = self.responses.popleft()
+        if isinstance(response, bool):
+            request = self.sent[-1]
+            return {
+                "op": "service_response",
+                "id": request["id"],
+                "result": response,
+                "values": {},
+            }
+        return response
+
+
+def _load_bridge_module():
+    rclpy = types.ModuleType("rclpy")
+    rclpy.node = types.ModuleType("rclpy.node")
+    rclpy.node.Node = object
+    geometry = types.ModuleType("geometry_msgs.msg")
+    geometry.TwistStamped = type("TwistStamped", (), {})
+    std_msgs = types.ModuleType("std_msgs.msg")
+    std_msgs.Bool = type("Bool", (), {})
+    std_msgs.String = type("String", (), {})
+    std_srvs = types.ModuleType("std_srvs.srv")
+    std_srvs.SetBool = type("SetBool", (), {
+        "Request": type("Request", (), {}),
+        "Response": type("Response", (), {}),
+    })
+    contract = types.ModuleType("real_robot.control.controller_contract")
+    contract.ControllerContractError = type("ControllerContractError", (ValueError,), {})
+    contract.load_controller_contract = lambda _path: None
+    contract.validate_controller_contract = lambda *args, **kwargs: None
+    modules = {
+        "rclpy": rclpy,
+        "rclpy.node": rclpy.node,
+        "geometry_msgs": types.ModuleType("geometry_msgs"),
+        "geometry_msgs.msg": geometry,
+        "std_msgs": types.ModuleType("std_msgs"),
+        "std_msgs.msg": std_msgs,
+        "std_srvs": types.ModuleType("std_srvs"),
+        "std_srvs.srv": std_srvs,
+        "real_robot": types.ModuleType("real_robot"),
+        "real_robot.control": types.ModuleType("real_robot.control"),
+        "real_robot.control.controller_contract": contract,
+    }
+    previous = {name: sys.modules.get(name) for name in modules}
+    sys.modules.update(modules)
+    try:
+        path = MOTION_ROOT / "strive_sysnav_motion/agilex_platform.py"
+        spec = importlib.util.spec_from_file_location("agilex_platform_fake_test", path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        sys.modules.pop("agilex_platform_fake_test", None)
+        for name, old in previous.items():
+            if old is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = old
+
+
+def _fake_platform(module, remote_control_enabled=True):
+    platform = module.AgileXPlatform.__new__(module.AgileXPlatform)
+    values = {
+        "auto_topic": "/navflow_cmd_vel",
+        "manual_topic": "/run_management/virtual_joy",
+        "mode_request_timeout_s": 1.0,
+        "selected_topic": "/mux_vel/selected",
+        "telemetry_topics": ["/ranger_status", "/mux_vel/selected"],
+    }
+    platform.get_parameter = lambda name: _Parameter(values[name])
+    platform.get_logger = lambda: _Logger()
+    platform._mode_lock = threading.Lock()
+    platform._automatic = False
+    platform._selected = ""
+    platform._telemetry_publishers = {}
+    platform._stop_event = threading.Event()
+    platform._remote_control_enabled = remote_control_enabled
+    return platform
+
+
+def test_agilex_bridge_owns_the_twiststamped_to_twist_boundary() -> None:
+    source = (MOTION_ROOT / "strive_sysnav_motion/agilex_platform.py").read_text(encoding="utf-8")
+
+    assert "TwistStamped" in source
+    assert 'msg.twist.linear.x' in source
+    assert '"topic": str(self.get_parameter("auto_topic").value)' in source
+    assert '"type": "geometry_msgs/Twist"' in source
+    assert 'self.declare_parameter("remote_control_enabled", False)' in source
+    assert 'if not self._remote_control_enabled:' in source
+    assert "self._validate_controller_contract()" in source
+    assert "AgileX remote-control contract gate failed" in source
+    assert 'contract.get("final_cmd_topic", default="")' in source
+    assert "approved agilex_rosbridge" in source
+    assert "must be positive in physical mode" in source
+
+
+def test_agilex_mode_switch_selects_remote_source_before_local_enable() -> None:
+    source = (MOTION_ROOT / "strive_sysnav_motion/agilex_platform.py").read_text(encoding="utf-8")
+
+    select_call = source.index('"service": "/mux_vel/select"')
+    local_mode_update = source.index("self._automatic = request.automatic", select_call)
+    assert select_call < local_mode_update
+    assert '"service": "/mux_vel/add"' in source
+    assert '"service": "/mux_vel/select"' in source
+    assert "self._zero_command()" in source
+    assert "operation.cancelled = True" in source
+
+
+def test_real_robot_launch_exposes_agilex_and_separate_lower_cloud_topic() -> None:
+    launch = Path(
+        "real_robot/ros2_ws/src/strive_sysnav_bringup/launch/strive_real_robot_stack.launch.py"
+    ).read_text(encoding="utf-8")
+    runner = Path("scripts/run_sysnav_detection_mapping.sh").read_text(encoding="utf-8")
+    docker_entry = Path("docker_en.sh").read_text(encoding="utf-8")
+    lower_launch = Path(
+        "real_robot/ros2_ws/src/strive_sysnav_motion/launch/sysnav_lower_stack.launch.py"
+    ).read_text(encoding="utf-8")
+    terrain = Path(
+        "real_robot/ros2_ws/src/terrain_analysis/src/terrainAnalysis.cpp"
+    ).read_text(encoding="utf-8")
+
+    assert '"start_agilex_platform": "false"' in launch
+    assert "agilex_platform.launch.py" in launch
+    assert '"agilex_remote_control_enabled": "false"' in launch
+    assert '"controller_contract_file": LaunchConfiguration("controller_contract_file")' in launch
+    assert '"command_timeout_s": LaunchConfiguration("agilex_command_timeout_s")' in launch
+    assert '"cloud_topic": LaunchConfiguration("lower_cloud_topic")' in launch
+    assert '"terrain_frame": LaunchConfiguration("terrain_frame")' in launch
+    assert '"lower_cloud_topic:=${LOWER_CLOUD_TOPIC:-/cloud_registered}"' in runner
+    assert '"terrain_frame:=${LOWER_TERRAIN_FRAME:-map}"' in runner
+    assert '"agilex_command_timeout_s:=${AGILEX_COMMAND_TIMEOUT_S:-1.0}"' in runner
+    assert "Shadow lower stack requires STRIVE_DRY_RUN=true" in runner
+    assert "Physical lower stack requires ALLOW_REAL_MOTION=true" in runner
+    assert '"require_controller_contract:=${require_controller_contract}"' in runner
+    assert '"ALLOW_REAL_MOTION=${ALLOW_REAL_MOTION}"' in docker_entry
+    assert '"START_AGILEX_PLATFORM=${START_AGILEX_PLATFORM:-false}"' in docker_entry
+    assert '"AGILEX_COMMAND_TIMEOUT_S=${AGILEX_COMMAND_TIMEOUT_S:-1.0}"' in docker_entry
+    assert 'declare_parameter<string>("terrainFrame", terrainFrame)' in terrain
+    assert 'terrainCloud2.header.frame_id = terrainFrame' in terrain
+    assert '"chassis_ready_topic"' in lower_launch
+    assert '"require_chassis_ready"' in lower_launch
+    assert '"chassis_ready_timeout_s"' in lower_launch
+
+
+def test_safety_mux_starts_a_new_autonomy_candidate_cycle_after_reenable() -> None:
+    source = (
+        MOTION_ROOT / "strive_sysnav_motion/safety_velocity_mux.py"
+    ).read_text(encoding="utf-8")
+
+    enable_edge = source.index("if enabled and not self._autonomy_enabled:")
+    cache_clear = source.index("self._latest_autonomy = None", enable_edge)
+    manual_edge = source.index("if self._manual_takeover:")
+    manual_cache_clear = source.index("self._latest_autonomy = None", manual_edge)
+    chassis_fault = source.index("SafetyState.CONTROLLER_FAULT")
+    chassis_cache_clear = source.index("self._latest_autonomy = None", chassis_fault - 220)
+    assert enable_edge < cache_clear
+    assert manual_edge < manual_cache_clear
+    assert chassis_cache_clear < chassis_fault
+
+
+def test_fake_rosbridge_verifies_mode_order_and_subscriptions() -> None:
+    module = _load_bridge_module()
+    platform = _fake_platform(module)
+    socket = _FakeSocket(
+        responses=[True, True]
+    )
+    request = module.ModeRequest(True, threading.Event())
+    platform._apply_mode(socket, request)
+
+    assert request.result is True
+    assert platform._automatic is True
+    assert platform._selected == "/navflow_cmd_vel"
+    assert [message["op"] for message in socket.sent] == [
+        "advertise", "publish", "call_service", "call_service",
+    ]
+    assert socket.sent[2]["service"] == "/mux_vel/add"
+    assert socket.sent[3]["service"] == "/mux_vel/select"
+    assert socket.sent[3]["args"] == {"topic": "/navflow_cmd_vel"}
+
+    subscribe_socket = _FakeSocket()
+    platform._subscribe(subscribe_socket)
+    assert subscribe_socket.sent[0] == {
+        "op": "subscribe", "topic": "/mux_vel/selected", "type": "std_msgs/String"
+    }
+    assert {message["topic"] for message in subscribe_socket.sent} == {
+        "/mux_vel/selected", "/ranger_status",
+    }
+
+
+def test_mode_cleanup_selects_manual_and_telemetry_keeps_raw_message() -> None:
+    module = _load_bridge_module()
+    platform = _fake_platform(module)
+    socket = _FakeSocket(responses=[True])
+    platform._restore_manual_source(socket)
+
+    assert socket.sent[0]["op"] == "publish"
+    assert socket.sent[1]["service"] == "/mux_vel/select"
+    assert socket.sent[1]["args"] == {"topic": "/run_management/virtual_joy"}
+    assert platform._automatic is False
+    assert platform._selected == "/run_management/virtual_joy"
+
+    class Publisher:
+        def __init__(self):
+            self.messages = []
+
+        def publish(self, message):
+            self.messages.append(message)
+
+    publisher = Publisher()
+    platform._telemetry_publishers = {"/ranger_status": publisher}
+    raw = {"op": "publish", "topic": "/ranger_status", "msg": {"header": {"stamp": 3}}}
+    platform._consume_remote_message(raw)
+    stored = json.loads(publisher.messages[0].data)
+    assert stored["msg"] == raw["msg"]
+    assert stored["raw"] == raw
+
+
+def test_cancelled_auto_request_restores_manual_source() -> None:
+    module = _load_bridge_module()
+    platform = _fake_platform(module)
+    request = module.ModeRequest(True, threading.Event())
+
+    class CancelAfterSelect(_FakeSocket):
+        def receive(self, timeout):
+            if len(self.sent) == 4:
+                request.cancelled = True
+            return super().receive(timeout)
+
+    socket = CancelAfterSelect(responses=[True, True, True])
+    platform._apply_mode(socket, request)
+
+    assert request.result is False
+    assert socket.sent[-1]["service"] == "/mux_vel/select"
+    assert socket.sent[-1]["args"] == {"topic": "/run_management/virtual_joy"}
+    assert platform._automatic is False
+    assert platform._selected == "/run_management/virtual_joy"
+
+
+def test_fake_rosbridge_decodes_a_text_frame_and_emits_masked_json() -> None:
+    module = _load_bridge_module()
+
+    class RawSocket:
+        def __init__(self, incoming=b""):
+            self.incoming = incoming
+            self.outgoing = b""
+
+        def sendall(self, data):
+            self.outgoing += data
+
+        def settimeout(self, _timeout):
+            return None
+
+        def recv(self, size):
+            chunk, self.incoming = self.incoming[:size], self.incoming[size:]
+            return chunk
+
+    payload = json.dumps({"op": "publish", "topic": "/ranger_status"}).encode()
+    incoming = struct.pack("!BB", 0x81, len(payload)) + payload
+    raw = RawSocket(incoming)
+    receiver = module.RosbridgeSocket.__new__(module.RosbridgeSocket)
+    receiver._socket = raw
+    assert receiver.receive(0.1) == json.loads(payload)
+
+    ping_raw = RawSocket(struct.pack("!BB", 0x89, 1) + b"p" + incoming)
+    ping_receiver = module.RosbridgeSocket.__new__(module.RosbridgeSocket)
+    ping_receiver._socket = ping_raw
+    assert ping_receiver.receive(0.1) == json.loads(payload)
+    assert ping_raw.outgoing[0] == 0x8A
+
+    sender = module.RosbridgeSocket.__new__(module.RosbridgeSocket)
+    sender._socket = RawSocket()
+    sender.send({"op": "ping", "id": "test"})
+    assert sender._socket.outgoing[0] == 0x81
+    assert sender._socket.outgoing[1] & 0x80
