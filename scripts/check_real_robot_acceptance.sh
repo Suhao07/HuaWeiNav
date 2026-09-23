@@ -51,6 +51,7 @@ PYTHONPATH=. "${PYTHON_BIN}" -m pytest -q \
   tests/test_motion_safety_state.py \
   tests/test_controller_contract.py \
   tests/test_sysnav_migration_boundary.py \
+  tests/test_agilex_boundary.py \
   tests/test_real_robot_projection_config.py \
   tests/test_waypoint_adapter.py
 
