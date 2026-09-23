@@ -56,9 +56,9 @@ Safety defaults:
   BLOCK_LOWER_CONTROLLER=1
   ENABLE_LOWER_CONTROLLER=0
 
-This script does not start the chassis bridge, local planner, PD controller, or
-any /cmd_vel publisher unless ENABLE_LOWER_CONTROLLER=1 and LOWER_CONTROLLER_CMD
-are explicitly provided.
+START_LOWER_STACK=1 delegates native planner/controller startup to the aggregate
+launch. Physical control requires its explicit motion flags and approved contract.
+External controllers use ENABLE_LOWER_CONTROLLER=1 and LOWER_CONTROLLER_CMD.
 EOF
 }
 
@@ -178,6 +178,12 @@ maybe_start_lower_controller() {
   fi
 
   require_motion_contract
+
+  # 原生控制栈由下游聚合 launch 启动；外部命令只用于独立控制器路径。
+  if is_true "${START_LOWER_STACK:-0}"; then
+    echo "[control] native lower stack startup belongs to the aggregate launch."
+    return 0
+  fi
 
   if [[ -z "${LOWER_CONTROLLER_CMD}" ]]; then
     echo "ENABLE_LOWER_CONTROLLER=1 requires LOWER_CONTROLLER_CMD." >&2

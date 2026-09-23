@@ -41,9 +41,10 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# 中文说明：HIL 只启动任务级 MotionServer 和反馈模拟器，不启动
-# localPlanner/pathFollower/SafetyVelocityMux，也不会产生任何 /cmd_vel。
-ros2 run strive_sysnav_motion sysnav_motion_server \
+# 直接启动安装产物，使清理阶段持有节点 PID；ros2 run 的父进程退出后，
+# 子节点可能继续运行并影响下一场 HIL。native 场景会产生隔离域内的模拟速度。
+motion_prefix="$(ros2 pkg prefix strive_sysnav_motion)"
+"${motion_prefix}/lib/strive_sysnav_motion/sysnav_motion_server" \
   --ros-args \
   -p planner_status_topic:=/local_planner/status \
   -p safety_state_topic:=/platform/safety_state \
@@ -65,7 +66,7 @@ if [[ "${SCENARIO}" == "native_planner" || "${SCENARIO}" == "native_safety" ]]; 
   planner_prefix="$(ros2 pkg prefix local_planner)"
   # 中文说明：该场景启动迁移后的真实 localPlanner。HIL 只提供
   # odom/registered_scan，不伪造 /path 或 planner status。
-  ros2 run local_planner localPlanner \
+  "${planner_prefix}/lib/local_planner/localPlanner" \
     --ros-args \
     -p pathFolder:="${planner_prefix}/share/local_planner/paths" \
     -p useTerrainAnalysis:=false \
@@ -92,7 +93,7 @@ fi
 if [[ "${SCENARIO}" == "native_safety" ]]; then
   # 中文说明：此场景继续使用迁移后的 pathFollower，并将其候选速度
   # 交给唯一 SafetyVelocityMux；HIL 只观测最终命令，不拥有底盘输出。
-  ros2 run local_planner pathFollower \
+  "${planner_prefix}/lib/local_planner/pathFollower" \
     --ros-args \
     -p autonomyMode:=true \
     -p autonomySpeed:=0.3 \
@@ -103,7 +104,7 @@ if [[ "${SCENARIO}" == "native_safety" ]]; then
     -r /cmd_vel/autonomy:=/cmd_vel/autonomy \
     >/tmp/strive_motion_hil_follower.log 2>&1 &
   FOLLOWER_PID=$!
-  ros2 run strive_sysnav_motion safety_velocity_mux \
+  "${motion_prefix}/lib/strive_sysnav_motion/safety_velocity_mux" \
     --ros-args \
     -p require_controller_contract:=false \
     -p autonomy_cmd_topic:=/cmd_vel/autonomy \
