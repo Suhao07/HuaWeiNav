@@ -28,6 +28,9 @@ checkpoints/
 *.mcap
 *.pyc
 *.ply
+!real_robot/ros2_ws/src/local_planner/paths/startPaths.ply
+!real_robot/ros2_ws/src/local_planner/paths/paths.ply
+!real_robot/ros2_ws/src/local_planner/paths/pathList.ply
 *.mp4
 *.avi
 *.mov

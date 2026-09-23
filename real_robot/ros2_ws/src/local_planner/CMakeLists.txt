@@ -38,6 +38,13 @@ install(TARGETS
   pathFollower
   DESTINATION lib/${PROJECT_NAME})
 
+# 路径库属于运行资源；配置阶段检查完整性，使部署缺项在构建时可见。
+foreach(path_asset startPaths.ply paths.ply pathList.ply correspondences.txt)
+  if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/paths/${path_asset}")
+    message(FATAL_ERROR "Missing localPlanner asset: paths/${path_asset}. Run scripts/generate_local_planner_paths.py from the repository.")
+  endif()
+endforeach()
+
 install(
   DIRECTORY
   config
