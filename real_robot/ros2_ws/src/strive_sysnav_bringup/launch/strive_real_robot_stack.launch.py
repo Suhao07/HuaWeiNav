@@ -12,6 +12,7 @@ from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.substitutions import FindPackageShare
+from launch_ros.actions import Node
 
 
 def _arg(name: str, default: str) -> DeclareLaunchArgument:
@@ -31,6 +32,7 @@ def generate_launch_description() -> LaunchDescription:
         "platform": "mecanum",
         "start_semantic_mapping": "true",
         "start_viewpoint_bridge": "true",
+        "start_viewpoint_provider": "true",
         "start_usb_cam": "false",
         "camera_topic": "/camera/image",
         "cloud_topic": "/cloud_registered",
@@ -326,4 +328,18 @@ def generate_launch_description() -> LaunchDescription:
 
     # 中文说明：lower stack 只有显式 enable 才存在；高层 runtime 始终运行，
     # 但默认 dry-run，避免“启动了感知”被误解为“已经获得底盘控制权”。
-    return LaunchDescription(declarations + [detection_launch, viewpoint_bridge_launch, lower_launch, agilex_launch, runtime_launch])
+    viewpoint_provider = Node(
+        package="strive_sysnav_viewpoints",
+        executable="sysnav_viewpoint_provider",
+        output="screen",
+        parameters=[{
+            "world_frame": LaunchConfiguration("world_frame"),
+            "odom_topic": LaunchConfiguration("odom_topic"),
+            "cloud_topic": LaunchConfiguration("lower_cloud_topic"),
+            "object_topic": LaunchConfiguration("object_nodes_topic"),
+            "viewpoint_topic": LaunchConfiguration("viewpoint_topic"),
+            "use_sim_time": LaunchConfiguration("use_sim_time"),
+        }],
+        condition=IfCondition(LaunchConfiguration("start_viewpoint_provider")),
+    )
+    return LaunchDescription(declarations + [detection_launch, viewpoint_provider, viewpoint_bridge_launch, lower_launch, agilex_launch, runtime_launch])

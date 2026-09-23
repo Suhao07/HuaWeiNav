@@ -52,6 +52,18 @@ src/semantic_mapping/
   detector_node 订阅 RGB，发布 /detection_result；
   semantic_mapping_node 融合检测、点云和位姿，发布 /object_nodes_list。
 
+src/strive_sysnav_viewpoints/
+  原始 SysNav 占据栅格、代表点模型及观测节点。
+  sysnav_viewpoint_provider 消费世界坐标点云、里程计与对象更新，按覆盖变化或
+  对象可见性触发并执行原始 2 米去重，发布 /viewpoint_rep_header。
+  聚合 strive_real_robot_stack.launch.py 默认启动该节点；已有外部生产者时，
+  使用 start_viewpoint_provider:=false 保持该话题的单一归属。
+  参数沿用原代码默认值；实际 world_frame、相机高度和覆盖参数仍需现场确认。
+
+原生生产者到现有 viewpoint bridge 的合成数据验证入口：
+`scripts/run_sysnav_viewpoint_provider_smoke.py`。该脚本应在禁网容器或独立测试
+ROS domain 中执行；它发布合成传感器数据，验证实际生产者生成事件与对象关联。
+
 正式 instruction runtime 不使用对象中心或房间质心直接运动。原始 SysNav 消息中的
 `ObjectNode` 只包含最新 `viewpoint_id`，`ViewpointRep` 只包含 viewpoint ID；仓库内的
 `strive_sysnav_viewpoint_bridge` 将 viewpoint header、odom 和 object update 适配为

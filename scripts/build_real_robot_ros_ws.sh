@@ -56,6 +56,7 @@ source "${ROS_SETUP}"
 set -u
 
 cd "${WS_DIR}"
+echo "Building ROS source workspace: ${WS_DIR}"
 
 # 核心：消息、SysNav 局部规划、检测建图与任务级 motion overlay 分层构建。
 # local_planner/pathFollower 的最终输出是 /cmd_vel/autonomy，真实底盘仍由
@@ -63,5 +64,5 @@ cd "${WS_DIR}"
 colcon "${COLCON_GLOBAL_ARGS[@]}" build \
   --symlink-install \
   "${COLCON_BUILD_ARGS[@]}" \
-  --packages-up-to tare_planner terrain_analysis local_planner semantic_mapping strive_motion_msgs strive_sysnav_motion strive_sysnav_bringup \
+  --packages-up-to tare_planner terrain_analysis local_planner semantic_mapping strive_motion_msgs strive_sysnav_motion strive_sysnav_viewpoints strive_sysnav_bringup \
   "${REMAINING_ARGS[@]}"

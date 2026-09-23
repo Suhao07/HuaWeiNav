@@ -1,0 +1,22 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>strive_sysnav_viewpoints</name>
+  <version>0.1.0</version>
+  <description>Original SysNav observation models for the HuaweiNav viewpoint provider.</description>
+  <maintainer email="ricksiu7@gmail.com">HuaweiNav</maintainer>
+  <license>BSD-3-Clause</license>
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <depend>rclcpp</depend>
+  <depend>nav_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>visualization_msgs</depend>
+  <depend>tf2_ros</depend>
+  <depend>pcl_conversions</depend>
+  <depend>cv_bridge</depend>
+  <depend>message_filters</depend>
+  <depend>tare_planner</depend>
+  <depend>libpcl-all-dev</depend>
+  <depend>libopencv-dev</depend>
+  <export><build_type>ament_cmake</build_type></export>
+</package>

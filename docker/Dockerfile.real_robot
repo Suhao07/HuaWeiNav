@@ -33,6 +33,7 @@ RUN if [[ "${SKIP_BASE_DEPS}" != "1" ]]; then apt-get update \
       python3-opencv \
       python3-yaml \
       ros-humble-cv-bridge \
+      ros-humble-message-filters \
       ros-humble-pcl-conversions \
       ros-humble-pcl-ros \
       ros-humble-tf2-geometry-msgs \
@@ -77,11 +78,14 @@ COPY . ${STRIVE_WS}
 
 # 核心：实物镜像内同时包含 STRIVE 上层和 SysNav ROS overlay；
 # 权重仍通过 volume/env 挂载，避免把大模型文件固化进镜像。
-RUN source /opt/ros/humble/setup.bash \
+# 基础镜像可能包含旧版同项目产物；在镜像层内重建，确保安装目录来自本次 COPY。
+RUN rm -rf ${STRIVE_REAL_ROBOT_WS}/build ${STRIVE_REAL_ROBOT_WS}/install ${STRIVE_REAL_ROBOT_WS}/log \
+ && export PATH=/usr/bin:${PATH} CMAKE_BUILD_PARALLEL_LEVEL=2 \
+ && source /opt/ros/humble/setup.bash \
  && cd ${STRIVE_REAL_ROBOT_WS} \
- && colcon build --symlink-install --packages-up-to \
+ && colcon build --symlink-install --executor sequential --packages-up-to \
       tare_planner terrain_analysis local_planner semantic_mapping \
-      strive_motion_msgs strive_sysnav_motion strive_sysnav_bringup
+      strive_motion_msgs strive_sysnav_motion strive_sysnav_viewpoints strive_sysnav_bringup
 
 RUN chmod +x ${STRIVE_WS}/scripts/build_real_robot_ros_ws.sh \
              ${STRIVE_WS}/scripts/check_real_robot_acceptance.sh \
