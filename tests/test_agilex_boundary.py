@@ -49,8 +49,8 @@ def _load_bridge_module():
     geometry = types.ModuleType("geometry_msgs.msg")
     geometry.TwistStamped = type("TwistStamped", (), {})
     std_msgs = types.ModuleType("std_msgs.msg")
-    std_msgs.Bool = type("Bool", (), {})
-    std_msgs.String = type("String", (), {})
+    std_msgs.Bool = types.SimpleNamespace
+    std_msgs.String = types.SimpleNamespace
     std_srvs = types.ModuleType("std_srvs.srv")
     std_srvs.SetBool = type("SetBool", (), {
         "Request": type("Request", (), {}),
