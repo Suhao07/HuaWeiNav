@@ -224,6 +224,10 @@ class AgileXPlatform(Node):
 
         self._latest_command = TwistStamped()
         self._latest_command_at = 0.0
+        self._hardware_contract = None
+        self._hardware_state = None
+        self._hardware_received_at = 0.0
+        self._hardware_fault_epoch = 0
         self._remote_control_enabled = _as_bool(self.get_parameter("remote_control_enabled").value)
         self._validate_controller_contract()
         self._command_lock = threading.Lock()
@@ -285,6 +289,15 @@ class AgileXPlatform(Node):
                 world_frame=str(self.get_parameter("world_frame").value),
                 action_name=str(self.get_parameter("action_name").value),
             )
+            hardware = contract.get("agilex_rosbridge", "hardware_state")
+            if not hardware or any(not hardware.get(key) for key in (
+                "allowed_control_modes", "ready_base_states", "ready_fault_codes",
+            )) or not float(hardware.get("telemetry_timeout_s", 0.0)) > 0.0:
+                raise ControllerContractError(
+                    "agilex_rosbridge.hardware_state requires confirmed allowed_control_modes, "
+                    "ready_base_states, ready_fault_codes and positive telemetry_timeout_s"
+                )
+            self._hardware_contract = hardware
             runtime_input = _normalize_topic(str(self.get_parameter("input_cmd_topic").value))
             contract_input = _normalize_topic(str(contract.get("final_cmd_topic", default="")))
             if runtime_input != contract_input:
@@ -347,7 +360,7 @@ class AgileXPlatform(Node):
         return response
 
     def _publish_mode_state(self) -> None:
-        """Publish the local mode and software connection readiness."""
+        """Publish authorization and current software/hardware readiness."""
 
         with self._mode_lock:
             automatic = self._automatic
@@ -355,8 +368,40 @@ class AgileXPlatform(Node):
             selected = self._selected
         self._autonomy_publisher.publish(Bool(data=automatic))
         self._manual_publisher.publish(Bool(data=self._remote_control_enabled and not automatic))
-        self._ready_publisher.publish(Bool(data=connected and automatic and selected == str(self.get_parameter("auto_topic").value)))
+        self._ready_publisher.publish(Bool(data=connected and automatic and self._hardware_ready() and selected == str(self.get_parameter("auto_topic").value)))
         self._selected_publisher.publish(String(data=selected))
+
+    def _hardware_ready(self) -> bool:
+        """Evaluate confirmed robot_status values and monotonic receive age.
+
+        就绪条件为模式、基座状态、故障码属于本车合同的许可集合，且
+        0 <= t_now - t_receive <= T。合同记录实际枚举，代码保持消息原值；
+        selected 的事件发布频率与该周期遥测超时独立。
+        """
+
+        with self._mode_lock:
+            state = self._hardware_state
+            received_at = self._hardware_received_at
+        contract = self._hardware_contract
+        if contract is None or state is None:
+            return False
+        return (
+            state[0] in contract["allowed_control_modes"]
+            and state[1] in contract["ready_base_states"]
+            and state[2] in contract["ready_fault_codes"]
+            and 0.0 <= time.monotonic() - received_at <= float(contract["telemetry_timeout_s"])
+        )
+
+    def _check_hardware_authorization(self, socket_client: RosbridgeSocket) -> None:
+        """Withdraw active authorization and send zero after hardware invalidation."""
+
+        if self._automatic and not self._hardware_ready():
+            with self._mode_lock:
+                self._automatic = False
+            with self._command_lock:
+                self._latest_command_at = 0.0
+            socket_client.send(self._zero_command())
+            self.get_logger().error("AgileX hardware state invalid or stale; automatic authorization revoked")
 
     def _run_worker(self) -> None:
         """Run the sole owner of WebSocket operations and mode transitions."""
@@ -419,6 +464,7 @@ class AgileXPlatform(Node):
         last_ping = 0.0
         while not self._stop_event.is_set():
             now = time.monotonic()
+            self._check_hardware_authorization(socket_client)
             request = self._next_request()
             if request is not None:
                 self._apply_mode(socket_client, request)
@@ -449,6 +495,15 @@ class AgileXPlatform(Node):
                 request.result = False
                 request.message = "mode request expired before rosbridge became available"
                 return
+            if request.automatic and not self._hardware_ready():
+                request.result = False
+                request.message = "hardware state is invalid or stale"
+                return
+            hardware_epoch = self._hardware_fault_epoch
+            with self._mode_lock:
+                self._automatic = False
+            with self._command_lock:
+                self._latest_command_at = 0.0
             socket_client.send({
                 "op": "advertise",
                 "topic": str(self.get_parameter("auto_topic").value),
@@ -484,9 +539,16 @@ class AgileXPlatform(Node):
                 raise WebSocketError(f"/mux_vel/select rejected {target}: {response.get('values')}")
             if request.cancelled:
                 raise WebSocketError("mode request expired after selecting the remote source")
+            self._wait_for_selected(socket_client, target, request)
+            if request.automatic and (
+                not self._hardware_ready() or self._hardware_fault_epoch != hardware_epoch
+            ):
+                raise WebSocketError("hardware state changed during automatic selection")
+            # 新授权只接收切换完成后的速度；selected 始终保留底盘实际反馈。
+            with self._command_lock:
+                self._latest_command_at = 0.0
             with self._mode_lock:
                 self._automatic = request.automatic
-                self._selected = target
             request.result = True
             request.message = f"selected {target}"
         except (WebSocketError, OSError) as exc:
@@ -505,6 +567,10 @@ class AgileXPlatform(Node):
     def _restore_manual_source(self, socket_client: RosbridgeSocket) -> None:
         """Stop automatic input and confirm the remote manual source."""
 
+        with self._mode_lock:
+            self._automatic = False
+        with self._command_lock:
+            self._latest_command_at = 0.0
         socket_client.send(self._zero_command())
         target = str(self.get_parameter("manual_topic").value)
         request_id = f"select:{target}:{time.time():.6f}"
@@ -523,9 +589,33 @@ class AgileXPlatform(Node):
         )
         if not bool(response.get("result")):
             raise WebSocketError(f"/mux_vel/select rejected {target}: {response.get('values')}")
-        with self._mode_lock:
-            self._automatic = False
-            self._selected = target
+        self._wait_for_selected(socket_client, target, cleanup_request, respect_stop_event=False)
+
+    def _wait_for_selected(
+        self,
+        socket_client: RosbridgeSocket,
+        target: str,
+        request: ModeRequest,
+        *,
+        respect_stop_event: bool = True,
+    ) -> None:
+        """Confirm mux feedback while processing telemetry on the same connection.
+
+        selected 按选源事件更新；当前连接已有的同源反馈也有效，周期遥测的
+        新鲜度规则应单独处理。服务响应只确认调用结果，反馈确认实际选源。
+        """
+
+        deadline = time.monotonic() + float(self.get_parameter("mode_request_timeout_s").value)
+        while not request.cancelled and (not respect_stop_event or not self._stop_event.is_set()):
+            with self._mode_lock:
+                if self._selected == target:
+                    return
+            if time.monotonic() >= deadline:
+                break
+            message = socket_client.receive(0.02)
+            if message is not None:
+                self._consume_remote_message(message)
+        raise WebSocketError(f"timed out waiting for /mux_vel/selected={target}")
 
     def _wait_for_service_id(
         self,
@@ -558,6 +648,13 @@ class AgileXPlatform(Node):
             raise WebSocketError(f"rosbridge reported an error: {message.get('msg', message)}")
         topic = str(message.get("topic", ""))
         payload = message.get("msg")
+        if topic == "/robot_status":
+            # 真实消息定义：robot_status_core/RobotStatus，三个字段均为整数。
+            with self._mode_lock:
+                self._hardware_state = (payload["control_mode"], payload["base_state"], payload["fault_code"])
+                self._hardware_received_at = time.monotonic()
+            if not self._hardware_ready():
+                self._hardware_fault_epoch += 1
         publisher = self._telemetry_publishers.get(topic)
         if publisher is not None:
             publisher.publish(String(data=json.dumps({
@@ -621,6 +718,8 @@ class AgileXPlatform(Node):
             if not connected:
                 self._automatic = False
                 self._selected = ""
+                self._hardware_state = None
+                self._hardware_received_at = 0.0
 
     def _fail_pending_requests(self, message: str) -> None:
         """Complete queued mode requests with the connection failure."""

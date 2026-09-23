@@ -6,6 +6,9 @@ import struct
 import sys
 import threading
 import types
+from unittest.mock import patch
+
+import pytest
 
 
 MOTION_ROOT = Path("real_robot/ros2_ws/src/strive_sysnav_motion")
@@ -18,6 +21,9 @@ class _Parameter:
 
 class _Logger:
     def warning(self, message):
+        self.message = message
+
+    def error(self, message):
         self.message = message
 
 
@@ -103,12 +109,80 @@ def _fake_platform(module, remote_control_enabled=True):
     platform.get_parameter = lambda name: _Parameter(values[name])
     platform.get_logger = lambda: _Logger()
     platform._mode_lock = threading.Lock()
+    platform._command_lock = threading.Lock()
+    platform._latest_command_at = 123.0
     platform._automatic = False
     platform._selected = ""
     platform._telemetry_publishers = {}
     platform._stop_event = threading.Event()
     platform._remote_control_enabled = remote_control_enabled
+    # 合成许可值只验证配置语义，不代表本车硬件枚举。
+    platform._hardware_contract = {
+        "allowed_control_modes": [71], "ready_base_states": [72],
+        "ready_fault_codes": [0], "telemetry_timeout_s": 1.0,
+    }
+    platform._hardware_state = (71, 72, 0)
+    platform._hardware_received_at = module.time.monotonic()
+    platform._hardware_fault_epoch = 0
     return platform
+
+
+def test_hardware_fault_revokes_authorization_and_requires_explicit_reenable() -> None:
+    module = _load_bridge_module()
+    platform = _fake_platform(module)
+    platform._automatic = True
+    socket = _FakeSocket()
+    platform._consume_remote_message({"topic": "/robot_status", "msg": {
+        "control_mode": 71, "base_state": 72, "fault_code": 4,
+    }})
+    platform._check_hardware_authorization(socket)
+    assert platform._automatic is False
+    assert platform._latest_command_at == 0.0
+    assert socket.sent == [platform._zero_command()]
+    platform._consume_remote_message({"topic": "/robot_status", "msg": {
+        "control_mode": 71, "base_state": 72, "fault_code": 0,
+    }})
+    assert platform._hardware_ready()
+    assert platform._automatic is False
+
+
+def test_hardware_timeout_and_reconnect_require_fresh_status() -> None:
+    module = _load_bridge_module()
+    platform = _fake_platform(module)
+    platform._automatic = True
+    platform._hardware_received_at = module.time.monotonic() - 2.0
+    socket = _FakeSocket()
+    platform._check_hardware_authorization(socket)
+    assert platform._automatic is False
+    assert socket.sent == [platform._zero_command()]
+    platform._set_connected(False)
+    platform._set_connected(True)
+    assert platform._hardware_state is None
+    assert platform._hardware_ready() is False
+    request = module.ModeRequest(True, threading.Event())
+    platform._apply_mode(socket, request)
+    assert request.result is False
+    assert len(socket.sent) == 1
+
+
+def test_hardware_takeover_during_selection_cancels_even_after_recovery() -> None:
+    module = _load_bridge_module()
+    platform = _fake_platform(module)
+    fault = {"topic": "/robot_status", "msg": {
+        "control_mode": 73, "base_state": 72, "fault_code": 0,
+    }}
+    recovery = {"topic": "/robot_status", "msg": {
+        "control_mode": 71, "base_state": 72, "fault_code": 0,
+    }}
+    selected = {"topic": "/mux_vel/selected", "msg": {"data": "/navflow_cmd_vel"}}
+    manual = {"topic": "/mux_vel/selected", "msg": {"data": "/run_management/virtual_joy"}}
+    socket = _FakeSocket([True, fault, recovery, selected, True, True, manual])
+    request = module.ModeRequest(True, threading.Event())
+    platform._apply_mode(socket, request)
+    assert request.result is False
+    assert "hardware state changed" in request.message
+    assert platform._automatic is False
+    assert platform._selected == "/run_management/virtual_joy"
 
 
 def test_agilex_bridge_owns_the_twiststamped_to_twist_boundary() -> None:
@@ -195,7 +269,10 @@ def test_fake_rosbridge_verifies_mode_order_and_subscriptions() -> None:
     module = _load_bridge_module()
     platform = _fake_platform(module)
     socket = _FakeSocket(
-        responses=[True, True]
+        responses=[True, True, {
+            "op": "publish", "topic": "/mux_vel/selected",
+            "msg": {"data": "/navflow_cmd_vel"},
+        }]
     )
     request = module.ModeRequest(True, threading.Event())
     platform._apply_mode(socket, request)
@@ -203,6 +280,7 @@ def test_fake_rosbridge_verifies_mode_order_and_subscriptions() -> None:
     assert request.result is True
     assert platform._automatic is True
     assert platform._selected == "/navflow_cmd_vel"
+    assert platform._latest_command_at == 0.0
     assert [message["op"] for message in socket.sent] == [
         "advertise", "publish", "call_service", "call_service",
     ]
@@ -223,7 +301,10 @@ def test_fake_rosbridge_verifies_mode_order_and_subscriptions() -> None:
 def test_mode_cleanup_selects_manual_and_telemetry_keeps_raw_message() -> None:
     module = _load_bridge_module()
     platform = _fake_platform(module)
-    socket = _FakeSocket(responses=[True])
+    socket = _FakeSocket(responses=[True, {
+        "op": "publish", "topic": "/mux_vel/selected",
+        "msg": {"data": "/run_management/virtual_joy"},
+    }])
     platform._restore_manual_source(socket)
 
     assert socket.sent[0]["op"] == "publish"
@@ -259,7 +340,10 @@ def test_cancelled_auto_request_restores_manual_source() -> None:
                 request.cancelled = True
             return super().receive(timeout)
 
-    socket = CancelAfterSelect(responses=[True, True, True])
+    socket = CancelAfterSelect(responses=[True, True, True, {
+        "op": "publish", "topic": "/mux_vel/selected",
+        "msg": {"data": "/run_management/virtual_joy"},
+    }])
     platform._apply_mode(socket, request)
 
     assert request.result is False
@@ -267,6 +351,31 @@ def test_cancelled_auto_request_restores_manual_source() -> None:
     assert socket.sent[-1]["args"] == {"topic": "/run_management/virtual_joy"}
     assert platform._automatic is False
     assert platform._selected == "/run_management/virtual_joy"
+
+
+def test_selected_feedback_timeout_preserves_observation() -> None:
+    module = _load_bridge_module()
+    platform = _fake_platform(module)
+    platform._selected = "/run_management/virtual_joy"
+    request = module.ModeRequest(True, threading.Event())
+    with patch.object(module.time, "monotonic", side_effect=[0.0, 2.0]):
+        with pytest.raises(module.WebSocketError, match="waiting for /mux_vel/selected"):
+            platform._wait_for_selected(_FakeSocket(), "/navflow_cmd_vel", request)
+    assert platform._selected == "/run_management/virtual_joy"
+    assert platform._automatic is False
+
+
+def test_selected_feedback_before_service_response_and_repeated_selection() -> None:
+    module = _load_bridge_module()
+    platform = _fake_platform(module)
+    selected = {"op": "publish", "topic": "/mux_vel/selected",
+                "msg": {"data": "/navflow_cmd_vel"}}
+    for responses in ([True, selected, True], [True, True]):
+        socket = _FakeSocket(responses)
+        request = module.ModeRequest(True, threading.Event())
+        platform._apply_mode(socket, request)
+        assert request.result is True
+        assert platform._automatic is True
 
 
 def test_fake_rosbridge_decodes_a_text_frame_and_emits_masked_json() -> None:
