@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Iterable, Mapping, Optional
 
-from llm_utils.lvlm_call_tracker import record_call
+from llm_utils.lvlm_call_tracker import record_call, record_request
 from llm_utils.structured_output import (
     extract_json_object,
     fallback_payload,
@@ -205,6 +205,8 @@ class _SelfHostedParsedChat:
                 generation_kwargs = _generation_kwargs(kwargs)
                 if json_schema is not None:
                     generation_kwargs["extra_body"] = {"guided_json": json_schema}
+                request_id = record_request(trace_label, model=model, messages=request_messages,
+                                            response_format=response_format, parameters=generation_kwargs)
                 completion = self.client.chat.completions.create(
                     model=model,
                     messages=request_messages,
@@ -216,6 +218,7 @@ class _SelfHostedParsedChat:
                     raw_response=last_content,
                     metadata={
                         "client": "self_hosted_openai_compatible",
+                        "request_id": request_id,
                         "base_url": self.base_url,
                         "model": model,
                         "response_format": getattr(response_format, "__name__", str(response_format)),
@@ -334,7 +337,7 @@ def _parsed_completion(parsed: Any, content: str) -> Any:
 def _fallback_enabled() -> bool:
     """Return whether structured failures should yield conservative output."""
 
-    return os.getenv("STRIVE_LLM_PARSE_FALLBACK", "1").lower() not in {
+    return os.getenv("STRIVE_LLM_PARSE_FALLBACK", "0").lower() not in {
         "0",
         "false",
         "no",

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 import rclpy
@@ -94,6 +95,7 @@ class StriveInstructionRuntimeNode(Node):
         self._latest_image_stamp: Optional[float] = None
 
         run_directory = Path(str(self.get_parameter("run_directory").value or "/tmp/strive_real_robot_runtime"))
+        self.evidence_directory = str(run_directory / "evidence_blobs")
         self._decision_writer = RuntimeDecisionJsonlWriter(run_directory / "runtime_decisions.jsonl")
         self.prior_map_runtime = build_prior_map_real_robot_runtime(
             PriorMapRealRobotConfig(
@@ -149,6 +151,7 @@ class StriveInstructionRuntimeNode(Node):
         self.motion_controller = self._build_motion_controller()
         # evidence loop 只在 semantic_snapshot 模式下启用；wait/smoke 不需要 verifier 链路。
         self.viewpoint_evidence_loop = self._build_viewpoint_evidence_loop()
+        self.inference_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="strive-inference")
         self.runtime = SysNavInstructionRuntime(
             semantic_map_bridge=self.semantic_bridge,
             high_level_policy=self.high_level_policy,
@@ -157,6 +160,7 @@ class StriveInstructionRuntimeNode(Node):
             readiness_provider=self._readiness,
             now_fn=self._now_seconds,
             goal_resolver=self.goal_resolver,
+            inference_executor=self.inference_executor,
         )
 
         queue_size = int(self.get_parameter("queue_size").value)
@@ -383,7 +387,9 @@ class StriveInstructionRuntimeNode(Node):
             mode=self.evidence_mode,
             now_fn=self._now_seconds,
         )
-        final_verifier = FinalInstructionVerifierAdapter(vlm=self.vlm) if self.enable_final_verifier else None
+        final_verifier = FinalInstructionVerifierAdapter(
+            vlm=self.vlm, evidence_dir=self.evidence_directory,
+        ) if self.enable_final_verifier else None
         if final_verifier is None:
             # 可先跑 evidence loop dry-run，不给 STOP 权限；打开 verifier 前先确认证据可用。
             self.get_logger().warning(
@@ -598,6 +604,7 @@ def main(args: Optional[list[str]] = None) -> None:
     try:
         rclpy.spin(node)
     finally:
+        node.inference_executor.shutdown(wait=False, cancel_futures=True)
         node.destroy_node()
         rclpy.shutdown()
 

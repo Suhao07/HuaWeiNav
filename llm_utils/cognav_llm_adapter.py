@@ -4,7 +4,7 @@ import time
 from types import SimpleNamespace
 
 from constants import COGNAV_MODEL_NAME, DEFAULT_VLM, GEMINI_MODEL_NAME, require_gemini_key
-from llm_utils.lvlm_call_tracker import record_call
+from llm_utils.lvlm_call_tracker import record_call, record_request
 from llm_utils.structured_output import (
     extract_json_object as _extract_json_object,
     fallback_payload as _fallback_payload,
@@ -51,6 +51,11 @@ class _CogNavParsedChat:
         if self._client is None:
             raise RuntimeError("CogNav LLM client is unavailable; use LLM_OFFLINE=1 or --vlm ark/openai/gemini")
 
+        trace_label = kwargs.get("trace_label") or getattr(response_format, "__name__", None) or "parse"
+        request_id = record_request(str(trace_label), model=model, messages=normalized,
+                                    response_format=response_format,
+                                    parameters={"temperature": kwargs.get("temperature", 0.0),
+                                                "max_tokens": kwargs.get("max_tokens")})
         started = time.perf_counter()
         completion = self._client.chat_completion(
             messages=normalized,
@@ -65,6 +70,7 @@ class _CogNavParsedChat:
             raw_response=str(content or ""),
             metadata={
                 "model": model,
+                "request_id": request_id,
                 "response_format": getattr(response_format, "__name__", str(response_format)),
                 "latency_ms": (time.perf_counter() - started) * 1000.0,
             },
@@ -72,9 +78,9 @@ class _CogNavParsedChat:
         try:
             parsed_payload = _extract_json_object(content)
         except Exception:
-            # 生产运行中 VLM 偶发 JSON-like 格式错误不能中断整条导航链。
-            # 默认对 parse error 做保守 fallback；如需调试原始异常，可显式关闭。
-            if os.getenv("STRIVE_LLM_PARSE_FALLBACK", "1").lower() in ("0", "false", "no", "off"):
+            # 解析失败保留原始异常和对应请求记录。
+            # 默认传播解析错误；历史兼容实验可显式开启 fallback。
+            if os.getenv("STRIVE_LLM_PARSE_FALLBACK", "0").lower() in ("0", "false", "no", "off"):
                 raise
             print(
                 "[CogNavLLMAdapter] JSON parse failed; using conservative fallback. "
@@ -108,6 +114,10 @@ class _TracingParsedCompletions:
 
     def parse(self, *args, **kwargs):
         trace_label = kwargs.pop("trace_label", "parse")
+        request_id = record_request(str(trace_label), model=kwargs["model"],
+                                    messages=kwargs["messages"], response_format=kwargs["response_format"],
+                                    parameters={key: value for key, value in kwargs.items()
+                                                if key not in {"model", "messages", "response_format"}})
         started = time.perf_counter()
         completion = self._inner.parse(*args, **kwargs)
         try:
@@ -119,6 +129,7 @@ class _TracingParsedCompletions:
             raw_response=str(content or ""),
             metadata={
                 "client": "openai_compatible",
+                "request_id": request_id,
                 "latency_ms": (time.perf_counter() - started) * 1000.0,
             },
         )

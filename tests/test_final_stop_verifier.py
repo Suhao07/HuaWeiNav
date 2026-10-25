@@ -1,14 +1,66 @@
 import sys
 import types
+import pytest
 
 
 sys.modules.setdefault("cv2", types.SimpleNamespace())
 
 from instruction_adapter.verifier import (
+    CandidateInstance,
+    EvidenceStore,
+    VerificationResult,
     FinalInstructionVerifier,
     _planner_hard_constraint_infeasible,
     hard_stop_constraints_from_evidence,
 )
+
+
+@pytest.mark.parametrize("reason", ["disabled", "llm_offline", "pydantic_unavailable", "empty_response", "request_error"])
+def test_unavailable_verification_never_accepts(reason):
+    result = FinalInstructionVerifier()._fallback(reason)
+    ledger = EvidenceStore()
+    record = ledger.put("find a chair", "chair-1", result)
+    assert not result.accepted
+    assert result.decision == "uncertain"
+    assert result.diagnostics["verdict"] == "unknown"
+    assert record.status != "accepted"
+    assert not ledger.is_hard_rejected("find a chair", "chair-1")
+
+
+def test_disabled_verifier_returns_unknown(monkeypatch):
+    monkeypatch.setenv("STRIVE_FINAL_VERIFIER", "off")
+    result = FinalInstructionVerifier().verify("find a chair", {}, CandidateInstance("c1", "chair"), {})
+    assert not result.accepted
+    assert result.diagnostics["unavailable"] == "disabled"
+
+
+def test_verifier_request_error_preserves_original_exception(monkeypatch):
+    import instruction_adapter.verifier as module
+
+    failure = RuntimeError("provider unavailable")
+
+    def fail_client(vlm):
+        raise failure
+
+    monkeypatch.setenv("STRIVE_FINAL_VERIFIER", "on")
+    monkeypatch.setenv("LLM_OFFLINE", "0")
+    monkeypatch.setattr(module, "HAS_PYDANTIC", True)
+    monkeypatch.setattr(module, "get_client_and_model", fail_client)
+    with pytest.raises(RuntimeError) as raised:
+        FinalInstructionVerifier().verify("find a chair", {}, CandidateInstance("c1", "chair"), {})
+    assert raised.value is failure
+
+
+@pytest.mark.parametrize("payload", [
+    {"satisfied": False, "decision": "accept"},
+    {"satisfied": True, "decision": "uncertain"},
+    {"satisfied": True, "decision": "accept", "semantic_satisfied": False},
+    {"satisfied": True, "decision": "accept", "semantic_satisfied": True, "view_sufficient_for_stop": False},
+])
+def test_inconsistent_result_cannot_be_accepted(payload):
+    result = VerificationResult(**payload)
+    assert not result.accepted
+    assert EvidenceStore().put("chair", "c1", result).status != "accepted"
 
 
 def test_view_guidance_reports_distance_as_prompt_fact():

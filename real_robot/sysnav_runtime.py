@@ -8,12 +8,11 @@ goals through the motion bridge.
 
 from __future__ import annotations
 
-import json
 import time
-import uuid
-from dataclasses import asdict, dataclass, field, is_dataclass, replace
-from enum import Enum
-from pathlib import Path
+from concurrent.futures import Executor, Future
+from scene.dependencies import object_dependencies
+from verification.images import image_dependencies_valid
+from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Optional, Protocol
 
 from real_robot.contracts import (
@@ -31,13 +30,11 @@ from real_robot.contracts import (
     ViewpointGoal,
     ViewpointResult,
 )
-from real_robot.sysnav_ros_adapters import (
-    RosObjectNodeAdapter,
-    RosRoomNodeAdapter,
-    RosViewpointPoseAdapter,
-    build_semantic_map_snapshot,
-)
 from real_robot.sysnav_goal_resolver import GoalResolver, PreResolvedGoalResolver
+from motion.supervisor import MotionSupervisor, ActiveGoalPoll, motion_goal_signature
+from backends.ros.scene import SysNavSemanticMapBridge
+from backends.ros.smoke import DryRunMotionController, FirstObjectSmokePolicy
+from harness.trace import RuntimeDecisionJsonlWriter, runtime_decision_to_dict, runtime_viewpoint_result_to_dict
 
 
 class MotionControllerProtocol(Protocol):
@@ -76,22 +73,27 @@ class InstructionPolicyProtocol(Protocol):
     def decide(self, snapshot: SemanticMapSnapshot, instruction: Optional[str] = None) -> NavigationIntent:
         """Return the next semantic navigation intent."""
 
+    def task_complete(self) -> bool:
+        """Read completion from the domain task owner."""
+
 
 class FinalInstructionVerifierAdapter:
     """Thin adapter from `ViewEvidence` to existing `FinalInstructionVerifier`."""
 
-    def __init__(self, verifier: Optional[Any] = None, vlm: str = "cognav") -> None:
+    def __init__(self, verifier: Optional[Any] = None, vlm: str = "cognav",
+                 evidence_dir: str = "outputs/evidence") -> None:
         """Initialize the adapter.
 
         Args:
             verifier: Optional existing verifier instance.
             vlm: VLM provider used when constructing the default verifier.
+            evidence_dir: Run-owned directory retaining model image inputs.
         """
 
         if verifier is None:
             from instruction_adapter.verifier import FinalInstructionVerifier
 
-            verifier = FinalInstructionVerifier(vlm=vlm)
+            verifier = FinalInstructionVerifier(vlm=vlm, evidence_dir=evidence_dir)
         self.verifier = verifier
 
     def verify(self, evidence: ViewEvidence, context: Dict[str, Any]) -> Dict[str, Any]:
@@ -159,36 +161,16 @@ class RuntimeReadiness:
         }
 
 
-@dataclass(frozen=True)
-class ActiveGoalPoll:
-    """Status snapshot for the currently tracked lower-level goal."""
-
-    status: NavigationStatus
-    motion_goal: MotionGoal
-    intent: NavigationIntent
-    tracking_active: bool
-
-
 @dataclass
 class RealInstructionRuntimeState:
-    """Track active real-robot motion goals across timer ticks.
+    """Track observation attempts and pending verification between timer ticks.
 
-    The runtime timer may fire faster than the lower planner completes a
-    waypoint. This state prevents repeated publication of the same active goal
-    while keeping policy semantics outside `real_robot`.
+    Motion ownership and terminal feedback live in MotionSupervisor.
     """
 
-    active_goal_id: Optional[str] = None
-    active_motion_goal: Optional[MotionGoal] = None
-    active_intent: Optional[NavigationIntent] = None
-    active_signature: Optional[tuple[Any, ...]] = None
-    last_completed_signature: Optional[tuple[Any, ...]] = None
-    last_terminal_status: Optional[NavigationStatus] = None
-    active_viewpoint_id: Optional[str] = None
     pending_verification: Optional[ActiveGoalPoll] = None
     attempted_viewpoint_ids: set[str] = field(default_factory=set)
     attempt_context_signature: Optional[tuple[str, ...]] = None
-    halted_status: Optional[NavigationStatus] = None
 
     def prepare_attempt_context(self, intent: NavigationIntent) -> None:
         """Reset viewpoint attempts when the semantic candidate changes.
@@ -214,190 +196,6 @@ class RealInstructionRuntimeState:
         if viewpoint_id:
             self.attempted_viewpoint_ids.add(viewpoint_id)
 
-    def poll_active(self, motion_controller: MotionControllerProtocol) -> Optional[ActiveGoalPoll]:
-        """Poll the active goal, if one exists.
-
-        Args:
-            motion_controller: Motion controller used to query status.
-
-        Returns:
-            Current navigation status plus the active goal metadata, or None
-            when no goal is active.
-        """
-
-        if self.active_goal_id is None or self.active_motion_goal is None or self.active_intent is None:
-            return None
-        # 先复制 active goal 上下文，再 poll；terminal poll 会清空 active 状态但本轮仍需写 RuntimeDecision。
-        goal = self.active_motion_goal
-        intent = self.active_intent
-        status = motion_controller.poll_status(self.active_goal_id)
-        tracking_active = not status.is_terminal()
-        if status.is_terminal():
-            # terminal 只说明这次 motion attempt 结束；语义 STOP 仍由 verifier/上层状态决定。
-            self.last_completed_signature = self.active_signature
-            self.last_terminal_status = status
-            self.active_goal_id = None
-            self.active_motion_goal = None
-            self.active_intent = None
-            self.active_signature = None
-        return ActiveGoalPoll(
-            status=status,
-            motion_goal=goal,
-            intent=intent,
-            tracking_active=tracking_active,
-        )
-
-    def bind_active(self, goal_id: str, intent: NavigationIntent, motion_goal: MotionGoal) -> None:
-        """Record one active lower-level motion goal.
-
-        Args:
-            goal_id: Motion controller goal id.
-            intent: High-level intent that produced the motion goal.
-            motion_goal: Lower-level motion goal submitted to the controller.
-        """
-
-        self.active_goal_id = goal_id
-        self.active_motion_goal = motion_goal
-        self.active_intent = intent
-        self.active_signature = motion_goal_signature(motion_goal)
-        self.active_viewpoint_id = str(motion_goal.metadata.get("viewpoint_uid", "") or "") or None
-
-    def should_suppress_completed(self, motion_goal: MotionGoal) -> bool:
-        """Return whether a completed motion goal should not be re-dispatched.
-
-        Args:
-            motion_goal: Candidate motion goal from the high-level policy.
-
-        Returns:
-            True when the same motion goal already reached successfully and no
-            higher-level state update has changed the requested goal.
-        """
-
-        if not motion_goal.requires_motion():
-            return False
-        if self.last_completed_signature != motion_goal_signature(motion_goal):
-            return False
-        return bool(self.last_terminal_status and self.last_terminal_status.succeeded())
-
-    def clear_completed(self) -> None:
-        """Clear completed-goal memory after policy state has advanced."""
-
-        self.last_completed_signature = None
-        self.last_terminal_status = None
-
-    def hold(self, status: NavigationStatus) -> None:
-        """Persist a safety/manual/localization terminal state until reset."""
-
-        self.halted_status = status
-
-    def clear_halt(self) -> None:
-        """Clear a previously latched hold state."""
-
-        self.halted_status = None
-
-
-class DryRunMotionController:
-    """Motion controller that records goals without publishing robot commands.
-
-    This controller is used by live ROS dry-run and bag replay. It preserves the
-    `MotionGoal -> NavigationStatus` contract while guaranteeing that no
-    waypoint is sent to the lower planner.
-    """
-
-    def __init__(self, status_code: NavigationStatusCode = NavigationStatusCode.IDLE) -> None:
-        """Initialize the dry-run controller.
-
-        Args:
-            status_code: Status returned for motion-requiring goals. WAIT and
-                STOP keep their non-motion status semantics.
-        """
-
-        self.status_code = status_code
-        self.goals: list[MotionGoal] = []
-        self._statuses: Dict[str, NavigationStatus] = {}
-
-    def send_goal(self, goal: MotionGoal) -> str:
-        """Record one goal and return a dry-run goal id.
-
-        Args:
-            goal: Motion request produced by VLN high-level policy.
-
-        Returns:
-            Stable dry-run goal id for this recorded request.
-        """
-
-        goal_id = f"dry_run_goal:{uuid.uuid4().hex}"
-        # dry-run 记录完整 MotionGoal，方便 JSONL 复盘，但绝不触发 RosWaypointController。
-        self.goals.append(goal)
-        if goal.mode == MotionGoalMode.STOP:
-            status = NavigationStatusCode.REACHED
-        elif not goal.requires_motion():
-            status = NavigationStatusCode.IDLE
-        else:
-            status = self.status_code
-        self._statuses[goal_id] = NavigationStatus(
-            status=status,
-            goal_id=goal_id,
-            message=f"dry-run recorded {goal.mode.value}; no waypoint published",
-            metadata={
-                "dry_run": True,
-                "requires_motion": goal.requires_motion(),
-                "target_object_uid": goal.target_object_uid,
-                "anchor_object_uid": goal.anchor_object_uid,
-            },
-        )
-        return goal_id
-
-    def poll_status(self, goal_id: str) -> NavigationStatus:
-        """Return the dry-run status for a recorded goal id.
-
-        Args:
-            goal_id: Goal id returned by `send_goal`.
-
-        Returns:
-            Recorded `NavigationStatus`, or FAILED for unknown goal ids.
-        """
-
-        return self._statuses.get(
-            goal_id,
-            NavigationStatus(
-                NavigationStatusCode.FAILED,
-                goal_id=goal_id,
-                message="unknown dry-run goal id",
-                metadata={"dry_run": True},
-            ),
-        )
-
-    def cancel(self, goal_id: Optional[str] = None) -> None:
-        """Mark one recorded goal, or all recorded goals, as preempted.
-
-        Args:
-            goal_id: Optional dry-run goal id. ``None`` selects every record.
-        """
-
-        selected_ids = [goal_id] if goal_id is not None else list(self._statuses)
-        for selected_id in selected_ids:
-            if selected_id not in self._statuses:
-                continue
-            self._statuses[selected_id] = NavigationStatus(
-                NavigationStatusCode.PREEMPTED,
-                goal_id=selected_id,
-                message="dry-run goal cancelled",
-                metadata={"dry_run": True},
-            )
-
-    def hold(self) -> None:
-        """Place all non-terminal dry-run goals into a safe idle state."""
-
-        for goal_id, status in list(self._statuses.items()):
-            if status.is_terminal():
-                continue
-            self._statuses[goal_id] = NavigationStatus(
-                NavigationStatusCode.IDLE,
-                goal_id=goal_id,
-                message="dry-run safe hold requested",
-                metadata={"dry_run": True},
-            )
 
 
 class WaitInstructionPolicy:
@@ -411,6 +209,10 @@ class WaitInstructionPolicy:
         """
 
         self.reason = reason
+
+    def task_complete(self) -> bool:
+        """An unconfigured task remains pending."""
+        return False
 
     def decide(self, snapshot: SemanticMapSnapshot, instruction: Optional[str] = None) -> NavigationIntent:
         """Return a WAIT intent with snapshot diagnostics.
@@ -435,196 +237,6 @@ class WaitInstructionPolicy:
         )
 
 
-class FirstObjectSmokePolicy:
-    """Smoke-test policy that targets the first object with a 3-D position.
-
-    This policy is only for runtime wiring validation. It does not interpret
-    natural language and must not be used as the final semantic navigation
-    policy.
-    """
-
-    def decide(self, snapshot: SemanticMapSnapshot, instruction: Optional[str] = None) -> NavigationIntent:
-        """Return a GO_TO_OBJECT intent for the first positioned object.
-
-        Args:
-            snapshot: Current semantic map snapshot.
-            instruction: Optional raw instruction, recorded only for debug.
-
-        Returns:
-            `NavigationIntent` for a smoke-test object, or WAIT when no object
-            has a usable position.
-        """
-
-        for obj in snapshot.objects:
-            if obj.position is None:
-                continue
-            return NavigationIntent(
-                mode=MotionGoalMode.GO_TO_OBJECT,
-                goal_pose=Pose3D(
-                    position=obj.position,
-                    frame_id=snapshot.robot_pose.frame_id,
-                    stamp=snapshot.timestamp,
-                ),
-                target_object_uid=obj.uid,
-                reason=f"smoke policy selected first positioned object: {obj.label}",
-                metadata={
-                    "instruction": instruction or "",
-                    "policy": "first_object_smoke",
-                    "object_label": obj.label,
-                },
-            )
-        return NavigationIntent(
-            mode=MotionGoalMode.WAIT,
-            reason="no positioned object available for first_object_smoke policy",
-            metadata={
-                "instruction": instruction or "",
-                "policy": "first_object_smoke",
-                "object_count": len(snapshot.objects),
-            },
-        )
-
-
-@dataclass
-class SysNavSemanticMapBridge:
-    """Cache SysNav object, room, and viewpoint topics for VLN snapshots.
-
-    SysNav publishes object updates with the viewpoint ID at which an object
-    was observed.  The bridge keeps that relation monotonically and combines
-    it with the pose records emitted by the viewpoint bridge.  It does not
-    change labels, infer semantic relations, or rank viewpoints.
-    """
-
-    robot_pose_provider: Callable[[], Pose3D]
-    object_adapter: RosObjectNodeAdapter = field(default_factory=RosObjectNodeAdapter)
-    room_adapter: RosRoomNodeAdapter = field(default_factory=RosRoomNodeAdapter)
-    viewpoint_adapter: RosViewpointPoseAdapter = field(default_factory=RosViewpointPoseAdapter)
-    latest_object_list_msg: Optional[Any] = None
-    latest_room_list_msg: Optional[Any] = None
-    latest_viewpoints: Dict[str, Any] = field(default_factory=dict)
-    object_viewpoint_history: Dict[str, set[str]] = field(default_factory=dict)
-
-    def update_object_nodes(self, msg: Any) -> None:
-        """Store the latest SysNav ``/object_nodes_list`` message."""
-
-        # 核心：SysNav semantic_mapping_node 是对象图唯一写入方，VLN runtime 只缓存只读消息。
-        self.latest_object_list_msg = msg
-        for obj in self.object_adapter.from_list_msg(msg):
-            if not obj.visible_viewpoints:
-                continue
-            self.object_viewpoint_history.setdefault(obj.uid, set()).update(obj.visible_viewpoints)
-            for viewpoint_uid in obj.visible_viewpoints:
-                viewpoint = self.latest_viewpoints.get(viewpoint_uid)
-                if viewpoint is None or obj.uid in viewpoint.visible_objects:
-                    continue
-                # 中文核心约束：对象消息晚到时只补充同一 viewpoint 的观测集合，
-                # 不覆盖 viewpoint pose，也不改变 SysNav 分配的对象身份。
-                self.latest_viewpoints[viewpoint_uid] = replace(
-                    viewpoint,
-                    visible_objects=tuple(sorted(set(viewpoint.visible_objects) | {obj.uid})),
-                )
-
-    def update_room_nodes(self, msg: Any) -> None:
-        """Store the latest SysNav ``/room_nodes_list`` message."""
-
-        self.latest_room_list_msg = msg
-
-    def update_viewpoint_pose(self, msg: Any) -> None:
-        """Store one bridge-produced SysNav viewpoint pose record.
-
-        Args:
-            msg: ROS-like ``tare_planner/ViewpointPose`` message.
-
-        Raises:
-            ValueError: If the bridge message does not contain a stable ID or
-                a pose frame.
-        """
-
-        viewpoint = self.viewpoint_adapter.from_msg(msg)
-        self.latest_viewpoints[viewpoint.uid] = viewpoint
-        for object_uid in viewpoint.visible_objects:
-            self.object_viewpoint_history.setdefault(object_uid, set()).add(viewpoint.uid)
-
-    def has_object_snapshot(self) -> bool:
-        """Return whether at least one object list message has arrived."""
-
-        return self.latest_object_list_msg is not None
-
-    def build_snapshot(self, timestamp: Optional[float] = None) -> Optional[SemanticMapSnapshot]:
-        """Build a VLN semantic map snapshot from cached SysNav messages."""
-
-        if self.latest_object_list_msg is None:
-            return None
-        base_snapshot = build_semantic_map_snapshot(
-            object_list_msg=self.latest_object_list_msg,
-            room_list_msg=self.latest_room_list_msg,
-            robot_pose=self.robot_pose_provider(),
-            timestamp=timestamp,
-            object_adapter=self.object_adapter,
-            room_adapter=self.room_adapter,
-        )
-        # 中文核心约束：viewpoint 历史只补充“在哪个视角观察到对象”，不覆盖
-        # SysNav 当前对象位置、标签或身份；viewpoint pose 仍完全来自下层 bridge。
-        objects = tuple(
-            replace(
-                obj,
-                visible_viewpoints=tuple(
-                    sorted(
-                        set(obj.visible_viewpoints)
-                        | self.object_viewpoint_history.get(obj.uid, set())
-                    )
-                ),
-            )
-            for obj in base_snapshot.objects
-        )
-        return replace(
-            base_snapshot,
-            objects=objects,
-            viewpoints=tuple(self.latest_viewpoints.values()),
-            metadata={
-                **base_snapshot.metadata,
-                "viewpoint_count": len(self.latest_viewpoints),
-                "viewpoint_topic_connected": bool(self.latest_viewpoints),
-            },
-        )
-
-    def create_ros_subscriptions(
-        self,
-        node: Any,
-        object_node_list_type: Any,
-        room_node_list_type: Any,
-        viewpoint_pose_type: Optional[Any] = None,
-        object_topic: str = "/object_nodes_list",
-        room_topic: str = "/room_nodes_list",
-        viewpoint_pose_topic: str = "/strive/sysnav/viewpoint_pose",
-        queue_size: int = 10,
-    ) -> Dict[str, Any]:
-        """Register ROS subscriptions on a provided node and return handles."""
-
-        # ROS 类型由调用方注入，避免非 ROS 环境 import runtime 时失败。
-        subscriptions = {
-            "object_nodes": node.create_subscription(
-                object_node_list_type,
-                object_topic,
-                self.update_object_nodes,
-                queue_size,
-            ),
-            "room_nodes": node.create_subscription(
-                room_node_list_type,
-                room_topic,
-                self.update_room_nodes,
-                queue_size,
-            ),
-        }
-        if viewpoint_pose_type is not None and viewpoint_pose_topic:
-            subscriptions["viewpoint_pose"] = node.create_subscription(
-                viewpoint_pose_type,
-                viewpoint_pose_topic,
-                self.update_viewpoint_pose,
-                queue_size,
-            )
-        return subscriptions
-
-
 @dataclass
 class SysNavInstructionRuntime:
     """Dispatch VLN navigation intents to SysNav waypoint execution."""
@@ -637,6 +249,22 @@ class SysNavInstructionRuntime:
     viewpoint_evidence_loop: Optional[Any] = None
     goal_resolver: GoalResolver = field(default_factory=PreResolvedGoalResolver)
     state: RealInstructionRuntimeState = field(default_factory=RealInstructionRuntimeState)
+    motion: MotionSupervisor = field(init=False)
+    inference_executor: Optional[Executor] = None
+    _decision_future: Optional[Future] = field(default=None, init=False)
+    _verification_future: Optional[Future] = field(default=None, init=False)
+    _decision_scope: tuple = field(default=(), init=False)
+    _verification_scope: tuple = field(default=(), init=False)
+    _current_instruction: Optional[str] = field(default=None, init=False)
+    _input_revision: int = field(default=0, init=False)
+    _decision_snapshot: Optional[SemanticMapSnapshot] = field(default=None, init=False)
+    _verification_dependencies: dict[str, str] = field(default_factory=dict, init=False)
+
+    def __post_init__(self):
+        """Share one motion owner between runtime and viewpoint execution."""
+        self.motion = MotionSupervisor(self.motion_controller)
+        if self.viewpoint_evidence_loop is not None:
+            self.viewpoint_evidence_loop.motion = self.motion
 
     def clear_hold(self) -> None:
         """Resume high-level decisions after an external safety reset.
@@ -647,22 +275,76 @@ class SysNavInstructionRuntime:
         """
 
         # 中文核心边界：安全恢复必须由安全所有者显式确认，VLN 不根据一帧正常观测自动复位。
-        self.state.clear_halt()
+        self.motion.resume()
+
+    def _inference_scope(self) -> tuple:
+        """Bind slow proposals to the instruction and current control owner."""
+        return self._input_revision, self.motion.control_epoch
+
+    def _decide(self, snapshot, instruction):
+        """Poll background policy work; inline execution supports deterministic replay."""
+        if self.inference_executor is None:
+            return self.high_level_policy.decide(snapshot, instruction)
+        if self._decision_future is None:
+            self._decision_scope = self._inference_scope()
+            self._decision_snapshot = snapshot
+            self._decision_future = self.inference_executor.submit(
+                self.high_level_policy.decide, snapshot, instruction,
+            )
+        if not self._decision_future.done():
+            return None
+        future, self._decision_future = self._decision_future, None
+        intent = future.result()  # 保留模型/策略异常；由运行入口记录完整调用栈。
+        uids = (intent.target_object_uid, intent.anchor_object_uid)
+        observed = object_dependencies(self._decision_snapshot, *uids)
+        current = object_dependencies(snapshot, *uids)
+        if self._decision_scope == self._inference_scope() and observed == current:
+            return intent
+        return None
 
     def _verify_reached_goal(
         self,
         active_goal: ActiveGoalPoll,
+        snapshot: SemanticMapSnapshot,
     ) -> tuple[Optional[ViewpointResult], Dict[str, Any], Optional[NavigationIntent]]:
         """Run evidence/verifier hooks for a reached motion goal."""
 
         if not active_goal.status.succeeded() or self.viewpoint_evidence_loop is None:
             # 只有 lower planner 明确 REACHED 后才采集 evidence；blocked/timeout 不能伪造到达视角。
             return None, {}, None
-        viewpoint_result = self.viewpoint_evidence_loop.verify_reached(
-            _viewpoint_goal_from_motion_goal(active_goal.motion_goal),
-            active_goal.status,
-            context=_verification_context_from_intent(active_goal.intent, active_goal.motion_goal),
+        goal = _viewpoint_goal_from_motion_goal(active_goal.motion_goal)
+        context = _verification_context_from_intent(active_goal.intent, active_goal.motion_goal)
+        dependencies = object_dependencies(
+            snapshot, active_goal.motion_goal.target_object_uid, active_goal.motion_goal.anchor_object_uid,
         )
+        context["verifier_evidence"] = {"dependencies": dependencies}
+        if self.inference_executor is None:
+            viewpoint_result = self.viewpoint_evidence_loop.verify_reached(
+                goal, active_goal.status, context=context,
+            )
+        else:
+            if self._verification_future is None:
+                self._verification_scope = self._inference_scope()
+                self._verification_dependencies = dependencies
+                self._verification_future = self.inference_executor.submit(
+                    self.viewpoint_evidence_loop.verify_reached,
+                    goal, active_goal.status, context=context,
+                )
+            if not self._verification_future.done():
+                return ViewpointResult(
+                    goal=goal, status=active_goal.status,
+                    reason="verification inference pending",
+                    metadata={"evidence_pending": True, "inference_pending": True},
+                ), {}, None
+            future, self._verification_future = self._verification_future, None
+            viewpoint_result = future.result()
+            if (self._verification_scope != self._inference_scope()
+                    or self._verification_dependencies != dependencies):
+                return ViewpointResult(
+                    goal=goal, status=active_goal.status,
+                    reason="verification context or object geometry changed",
+                    metadata={"stale_inference": True},
+                ), {}, None
         if bool((viewpoint_result.metadata or {}).get("evidence_pending")):
             # 到达事件已经成立，但传感器尚未产生运动后的新证据；保持同一
             # verification transaction，不能回到 policy 重新发布 waypoint。
@@ -670,10 +352,12 @@ class SysNavInstructionRuntime:
         verifier_decision = dict((viewpoint_result.metadata or {}).get("verifier_decision") or {})
         if _policy_handles_viewpoint_result(self.high_level_policy, viewpoint_result, active_goal.intent):
             # policy adapter 写回 ledger/execution state 后，要清掉 completed suppression，让下一轮重新决策。
-            self.state.clear_completed()
+            self.motion.clear_completed()
         if not _verifier_accepts(verifier_decision):
             return viewpoint_result, verifier_decision, None
-        # STOP 权限只来自 verifier accept；到达 waypoint 本身不能直接 STOP。
+        if not self.high_level_policy.task_complete():
+            return viewpoint_result, verifier_decision, None
+        # 目标验证通过后，由任务 reducer 的数量与顺序规则授予 STOP。
         stop_intent = NavigationIntent(
             mode=MotionGoalMode.STOP,
             stop_allowed=True,
@@ -687,12 +371,15 @@ class SysNavInstructionRuntime:
                 "candidate_uid": active_goal.intent.metadata.get("candidate_uid"),
             },
         )
-        self.state.clear_completed()
+        self.motion.clear_completed()
         return viewpoint_result, verifier_decision, stop_intent
 
     def step(self, instruction: Optional[str] = None) -> RuntimeDecision:
         """Run one real-robot high-level decision step."""
 
+        if instruction != self._current_instruction:
+            self._input_revision += 1
+            self._current_instruction = instruction
         if self.readiness_provider is not None:
             readiness = self.readiness_provider()
             if not readiness.ready:
@@ -722,7 +409,7 @@ class SysNavInstructionRuntime:
                 reason="waiting for SysNav semantic map",
             )
 
-        if self.state.halted_status is not None:
+        if self.motion.held:
             hold_intent = NavigationIntent(
                 mode=MotionGoalMode.WAIT,
                 reason="runtime is held by lower-level safety state",
@@ -730,21 +417,21 @@ class SysNavInstructionRuntime:
                     RuntimeDecision(
                         timestamp=snapshot.timestamp,
                         intent=NavigationIntent(mode=MotionGoalMode.WAIT),
-                        navigation_status=self.state.halted_status,
+                        navigation_status=self.motion.halted_status,
                     )
                 ).get("navigation_status")},
             )
             return RuntimeDecision(
                 timestamp=snapshot.timestamp,
                 intent=hold_intent,
-                navigation_status=self.state.halted_status,
+                navigation_status=self.motion.halted_status,
                 lower_planner_state={"runtime_state": "HOLD"},
                 reason=hold_intent.reason,
             )
 
         if self.state.pending_verification is not None:
             pending = self.state.pending_verification
-            viewpoint_result, verifier_decision, stop_intent = self._verify_reached_goal(pending)
+            viewpoint_result, verifier_decision, stop_intent = self._verify_reached_goal(pending, snapshot)
             if not bool((viewpoint_result.metadata if viewpoint_result else {}).get("evidence_pending")):
                 self.state.pending_verification = None
             if stop_intent is not None:
@@ -764,21 +451,24 @@ class SysNavInstructionRuntime:
                     reason=stop_intent.reason,
                     metadata={"viewpoint_result": runtime_viewpoint_result_to_dict(viewpoint_result)},
                 )
+            verification_pending = self.state.pending_verification is not None
+            phase = "VERIFYING" if verification_pending else "IDLE"
+            reason = "waiting for post-reach evidence" if verification_pending else viewpoint_result.reason
             return RuntimeDecision(
                 timestamp=snapshot.timestamp,
                 intent=NavigationIntent(
                     mode=MotionGoalMode.WAIT,
-                    reason="waiting for post-reach evidence",
-                    metadata={"runtime_state": "VERIFYING"},
+                    reason=reason,
+                    metadata={"runtime_state": phase},
                 ),
                 navigation_status=pending.status,
                 verifier_decision=verifier_decision,
-                lower_planner_state={"runtime_state": "VERIFYING", "goal_id": pending.status.goal_id},
-                reason="waiting for post-reach evidence",
+                lower_planner_state={"runtime_state": phase, "goal_id": pending.status.goal_id},
+                reason=reason,
                 metadata={"viewpoint_result": runtime_viewpoint_result_to_dict(viewpoint_result)},
             )
 
-        active_goal = self.state.poll_active(self.motion_controller)
+        active_goal = self.motion.poll_active()
         if active_goal is not None:
             if active_goal.status.is_terminal():
                 self.state.record_viewpoint_attempt(active_goal.motion_goal)
@@ -787,12 +477,11 @@ class SysNavInstructionRuntime:
                     NavigationStatusCode.MANUAL_TAKEOVER,
                     NavigationStatusCode.LOCALIZATION_LOST,
                 }:
-                    self.motion_controller.hold()
-                    self.state.hold(active_goal.status)
+                    self.motion.hold(active_goal.status)
                 elif active_goal.status.succeeded() and self.viewpoint_evidence_loop is not None:
                     self.state.pending_verification = active_goal
             # 有 active goal 时本轮只跟踪执行状态，不重复调用高层 policy 生成新 waypoint。
-            viewpoint_result, verifier_decision, stop_intent = self._verify_reached_goal(active_goal)
+            viewpoint_result, verifier_decision, stop_intent = self._verify_reached_goal(active_goal, snapshot)
             if active_goal.status.succeeded() and self.viewpoint_evidence_loop is not None and bool(
                 (viewpoint_result.metadata if viewpoint_result else {}).get("evidence_pending")
             ):
@@ -865,7 +554,14 @@ class SysNavInstructionRuntime:
                 },
             )
 
-        intent = self.high_level_policy.decide(snapshot, instruction)
+        intent = self._decide(snapshot, instruction)
+        if intent is None:
+            return RuntimeDecision(
+                timestamp=snapshot.timestamp,
+                intent=NavigationIntent(mode=MotionGoalMode.WAIT, reason="policy inference pending"),
+                lower_planner_state={"runtime_state": "THINKING"},
+                reason="policy inference pending",
+            )
         self.state.prepare_attempt_context(intent)
         motion_goal = self.goal_resolver.resolve(
             intent,
@@ -903,18 +599,18 @@ class SysNavInstructionRuntime:
                 },
                 reason=intent.reason,
             )
-        if self.state.should_suppress_completed(motion_goal):
+        if self.motion.should_suppress_completed(motion_goal):
             # 同一目标已到达但 verifier/policy 尚未推进时，避免 timer tick 反复发布同一个 waypoint。
             wait_intent = NavigationIntent(
                 mode=MotionGoalMode.WAIT,
                 reason="motion goal already reached; waiting for verifier or policy state update",
                 metadata={
-                    "completed_goal_signature": self.state.last_completed_signature,
+                    "completed_goal_signature": self.motion.last_completed_signature,
                     "last_terminal_status": runtime_decision_to_dict(
                         RuntimeDecision(
                             timestamp=snapshot.timestamp,
                             intent=intent,
-                            navigation_status=self.state.last_terminal_status,
+                            navigation_status=self.motion.last_terminal_status,
                         )
                     ).get("navigation_status"),
                 },
@@ -930,9 +626,9 @@ class SysNavInstructionRuntime:
                 },
                 reason=wait_intent.reason,
             )
-        goal_id = self.motion_controller.send_goal(motion_goal)
+        goal_id = self.motion.submit(intent, motion_goal)
         self.state.record_viewpoint_attempt(motion_goal)
-        status = self.motion_controller.poll_status(goal_id)
+        status = self.motion.poll_active().status
         viewpoint_result: Optional[ViewpointResult] = None
         verifier_decision: Dict[str, Any] = {}
         if motion_goal.requires_motion() and status.status in {
@@ -940,11 +636,9 @@ class SysNavInstructionRuntime:
             NavigationStatusCode.RUNNING,
         }:
             # 异步执行目标进入 active state，后续 tick 只 poll status。
-            self.state.bind_active(goal_id, intent, motion_goal)
+            pass  # MotionSupervisor 已持有运行中的目标。
         elif motion_goal.requires_motion() and status.is_terminal():
             # 有些 fake/dry-run 或快速 planner 会第一次 poll 就 terminal，这条路径也要走 verifier。
-            self.state.last_completed_signature = motion_goal_signature(motion_goal)
-            self.state.last_terminal_status = status
             immediate_terminal = ActiveGoalPoll(
                 status=status,
                 motion_goal=motion_goal,
@@ -957,12 +651,11 @@ class SysNavInstructionRuntime:
                 NavigationStatusCode.MANUAL_TAKEOVER,
                 NavigationStatusCode.LOCALIZATION_LOST,
             }:
-                self.motion_controller.hold()
-                self.state.hold(status)
+                self.motion.hold(status)
             if status.succeeded() and self.viewpoint_evidence_loop is not None:
                 self.state.pending_verification = immediate_terminal
             viewpoint_result, verifier_decision, stop_intent = self._verify_reached_goal(
-                immediate_terminal
+                immediate_terminal, snapshot
             )
             if not bool((viewpoint_result.metadata if viewpoint_result else {}).get("evidence_pending")):
                 self.state.pending_verification = None
@@ -1038,19 +731,26 @@ class ViewpointEvidenceLoop:
     timeout_s: float = 30.0
     now_fn: Callable[[], float] = time.monotonic
     sleep_fn: Callable[[float], None] = time.sleep
+    motion: MotionSupervisor = field(init=False)
+
+    def __post_init__(self):
+        """Create an owner for standalone use; runtime supplies its shared owner."""
+        self.motion = MotionSupervisor(self.motion_controller)
 
     def run(self, goal: ViewpointGoal, context: Optional[Dict[str, Any]] = None) -> ViewpointResult:
         """Execute ``ViewpointGoal -> /way_point -> wait reached -> evidence -> verifier``."""
 
         started_at = self.now_fn()
         motion_goal = goal.as_motion_goal()
-        goal_id = self.motion_controller.send_goal(motion_goal)
-        status = self.motion_controller.poll_status(goal_id)
+        intent = NavigationIntent(mode=motion_goal.mode, goal_pose=motion_goal.goal_pose)
+        goal_id = self.motion.submit(intent, motion_goal)
+        status = self.motion.poll_active().status
         poll_count = 1
 
         while not status.is_terminal():
             elapsed = self.now_fn() - started_at
             if elapsed >= self.timeout_s:
+                self.motion.cancel()
                 status = NavigationStatus(
                     NavigationStatusCode.TIMEOUT,
                     goal_id=goal_id,
@@ -1059,7 +759,7 @@ class ViewpointEvidenceLoop:
                 )
                 break
             self.sleep_fn(self.poll_interval_s)
-            status = self.motion_controller.poll_status(goal_id)
+            status = self.motion.poll_active().status
             poll_count += 1
 
         result = self.verify_reached(goal, status, context=context)
@@ -1191,80 +891,6 @@ class LatestObservationEvidenceProvider:
         return self.capture(goal, status)
 
 
-class RuntimeDecisionJsonlWriter:
-    """Append real-robot runtime decisions to a JSONL log file."""
-
-    def __init__(self, path: str | Path) -> None:
-        """Initialize the writer and create parent directories.
-
-        Args:
-            path: Destination JSONL file path.
-        """
-
-        self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-
-    def write(self, decision: RuntimeDecision) -> Dict[str, Any]:
-        """Append one decision to disk.
-
-        Args:
-            decision: Runtime decision emitted by `SysNavInstructionRuntime`.
-
-        Returns:
-            JSON-friendly dictionary that was written.
-        """
-
-        payload = runtime_decision_to_dict(decision)
-        with self.path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
-        return payload
-
-
-def runtime_decision_to_dict(decision: RuntimeDecision) -> Dict[str, Any]:
-    """Return a JSON-friendly runtime decision dictionary.
-
-    Args:
-        decision: Runtime decision emitted by the real-robot loop.
-
-    Returns:
-        JSON-serializable dictionary.
-    """
-
-    return _json_ready(decision)
-
-
-def runtime_viewpoint_result_to_dict(result: Optional[ViewpointResult]) -> Dict[str, Any]:
-    """Return a JSON-friendly viewpoint result dictionary."""
-
-    if result is None:
-        return {}
-    return _json_ready(result)
-
-
-def motion_goal_signature(goal: MotionGoal) -> tuple[Any, ...]:
-    """Return a stable identity for suppressing repeated goal dispatches."""
-
-    pose = goal.goal_pose
-    position = None
-    orientation = None
-    frame_id = ""
-    if pose is not None:
-        position = tuple(round(float(value), 3) for value in pose.position)
-        orientation = tuple(round(float(value), 4) for value in pose.orientation_xyzw)
-        frame_id = pose.frame_id
-    tolerance = tuple(sorted((str(key), round(float(value), 3)) for key, value in goal.tolerance.items()))
-    return (
-        goal.mode.value,
-        position,
-        orientation,
-        frame_id,
-        goal.target_object_uid or "",
-        goal.anchor_object_uid or "",
-        goal.relation_edge_id or "",
-        tolerance,
-    )
-
-
 def _viewpoint_goal_from_motion_goal(goal: MotionGoal) -> ViewpointGoal:
     """Convert a reached motion goal into a verifier viewpoint goal."""
 
@@ -1313,27 +939,16 @@ def _policy_handles_viewpoint_result(policy: Any, result: ViewpointResult, inten
 
 
 def _verifier_accepts(payload: Dict[str, Any]) -> bool:
-    """Return whether a verifier decision grants STOP authority."""
+    """Read explicit semantic and stop-view confirmation from the verifier."""
 
     if not payload:
         return False
-    return bool(payload.get("satisfied")) or str(payload.get("decision", "")).lower() == "accept"
-
-
-def _json_ready(value: Any) -> Any:
-    """Convert dataclasses, enums, tuples, and paths into JSON-ready values."""
-
-    if is_dataclass(value):
-        return _json_ready(asdict(value))
-    if isinstance(value, Enum):
-        return value.value
-    if isinstance(value, dict):
-        return {str(key): _json_ready(val) for key, val in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_json_ready(item) for item in value]
-    if isinstance(value, Path):
-        return str(value)
-    return value
+    return (
+        payload.get("satisfied") is True and payload.get("decision") == "accept"
+        and payload.get("semantic_satisfied") is True
+        and payload.get("view_sufficient_for_stop") is True
+        and image_dependencies_valid(payload.get("dependencies", {}))
+    )
 
 
 def _viewpoint_goal_summary(goal: ViewpointGoal) -> Dict[str, Any]:

@@ -59,6 +59,9 @@ class ParsedInstruction(BaseModel):
     support_objects: list[str] = Field(default_factory=list)
     affordances: list[str] = Field(default_factory=list)
     requires_runtime_relation: bool = False
+    unresolved: list[str] = Field(default_factory=list)
+    ordered: bool = False
+    exhaustive: bool = False
 
 
 class GroundingResult(BaseModel):

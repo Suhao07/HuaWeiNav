@@ -99,7 +99,7 @@ def _log_and_pick_best_proposal(proposals: list[dict[str, Any]]) -> dict[str, An
 
 
 def _try_view_control_proposal(agent: Any, proposals: list[dict[str, Any]], current_candidate: Any) -> bool:
-    state = getattr(agent.mapper, "instruction_execution_state", None)
+    state = getattr(getattr(agent, "task", None), "progress", None)
     pending_pair_active = (
         getattr(state, "mode", "") == "better_view_for_verified_pair"
         and bool(getattr(state, "pending_verified_pair", {}) or {})

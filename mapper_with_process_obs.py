@@ -17,13 +17,7 @@ import os
 from mapping_utils.representation import *
 import cv2
 from cv_utils.image_perceiver import *
-from instruction_adapter.concept_matcher import AnchorSearchLedger, RuntimeConceptMatcher
-from instruction_adapter.constraints import ConstraintEvaluator
 from instruction_adapter.ontology import normalize_term
-from instruction_adapter.relation_verifier import DynamicRelationService
-from instruction_adapter.semantic_edges import RelationPairLedger
-from instruction_adapter.spatial_graph import InstructionSpatialGraph
-from instruction_adapter.verifier import VerificationLedger, candidate_from_object
 from llm_utils.cognav_llm_adapter import get_client_and_model
 from mapping.frontier_extractor import (
     adaptive_intersection_distance,
@@ -40,10 +34,7 @@ from planning.exploration_policy import (
     find_closest_nodes as policy_find_closest_nodes,
     find_closest_viewpoint_in_room,
 )
-from planning.mode_policy import is_ordered_execution
-from planning.object_search_policy import InstructionObjectSearchPolicy
 from planning.room_policy import select_nearest_frontier_room
-from planning.target_selection_policy import select_target_candidate
 from prompting.templates import OBJECT_PROMPT, RELOCATE_PROMPT, ROOM_PROMPT
 from prior_map.simulation import refresh_mapper_prior_map_query
 from mapping.room_segmenter import (
@@ -125,23 +116,6 @@ class Instruct_Mapper:
         self.perception_target_list = []
         self.target_aliases = []
 
-        # 指令模式的状态全部挂在 mapper 上，保证 benchmark 原始 ObjectNav
-        # 仍然可以只依赖 target/target_list 跑通，不被复杂指令解析耦合。
-        self.instruction_plan = None
-        self.instruction_spec = None
-        self.verification_ledger = VerificationLedger()
-        self.concept_matcher = RuntimeConceptMatcher(vlm=vlm)
-        self.anchor_search_ledger = AnchorSearchLedger()
-        self.relation_pair_ledger = RelationPairLedger()
-        self.instruction_execution_state = None
-        self.instruction_spatial_graph = InstructionSpatialGraph()
-        self.instruction_relation_service = DynamicRelationService(vlm=vlm)
-        self.instruction_object_search_policy = InstructionObjectSearchPolicy()
-        self.instruction_constraint_evaluator = ConstraintEvaluator(
-            spatial_graph=self.instruction_spatial_graph,
-            relation_service=self.instruction_relation_service,
-            save_dir=save_dir,
-        )
         self.prior_map_runtime = None
         self.prior_map_policy_adapter = None
         self.search_prior_result = None
@@ -231,15 +205,6 @@ class Instruct_Mapper:
 
         # 每个 episode 必须清空指令记忆，否则上一个指令拒绝的实例、
         # 已验证关系边或 anchor 搜索记录会污染当前 episode。
-        self.instruction_plan = None
-        self.instruction_spec = None
-        self.verification_ledger.reset()
-        self.concept_matcher.reset()
-        self.anchor_search_ledger.reset()
-        self.relation_pair_ledger.reset()
-        self.instruction_execution_state = None
-        self.instruction_spatial_graph.reset()
-        self.instruction_relation_service.reset()
 
         self.room_nodes = []
 
@@ -306,24 +271,6 @@ class Instruct_Mapper:
         terms = [self.target]
         terms.extend(list(self.target_list or []))
         terms.extend(list(self.target_aliases or []))
-        spec = getattr(self, "instruction_spec", None)
-        if spec is not None:
-            try:
-                terms.extend(list(spec.target_match_terms))
-            except Exception:
-                pass
-        plan = getattr(self, "instruction_plan", None)
-        if plan is not None:
-            try:
-                state = getattr(self, "instruction_execution_state", None)
-                if state is not None and is_ordered_execution(plan):
-                    active = state.active_target(plan)
-                    if active is not None:
-                        terms.extend(list(active.match_terms))
-                else:
-                    terms.extend(list(plan.target_match_terms))
-            except Exception:
-                pass
         return {normalize_term(x) for x in terms if str(x or "").strip()}
 
     def _is_target_tag(self, tag):
@@ -335,101 +282,6 @@ class Instruct_Mapper:
         """
 
         return normalize_term(tag) in self._target_match_terms()
-
-    def _raw_instruction_for_verifier(self):
-        """Return the original instruction used by runtime verifiers."""
-
-        plan = getattr(self, "instruction_plan", None)
-        if plan is not None:
-            return str(getattr(plan, "raw_instruction", "") or self.target)
-        spec = getattr(self, "instruction_spec", None)
-        if spec is not None:
-            return str(getattr(spec, "raw_instruction", "") or self.target)
-        return str(self.target or "")
-
-    def _is_verifier_rejected(self, obj, step=None):
-        """Check whether the final verifier has hard-rejected this object instance."""
-
-        candidate = candidate_from_object(obj, canonical_label=self.target, step=step)
-        return self.verification_ledger.is_hard_rejected(
-            self._raw_instruction_for_verifier(),
-            candidate.uid,
-        )
-
-    def _anchor_concepts_for_plan(self):
-        """Return non-terminal concepts that may guide anchor-first search."""
-        plan = getattr(self, "instruction_plan", None)
-        if plan is None:
-            return []
-        concepts = []
-        for target in getattr(plan, "anchor_targets", []):
-            concepts.append(target.concept_query())
-        for constraint in getattr(plan, "constraints", []) or []:
-            concept = getattr(constraint, "object_concept", None)
-            if concept is not None and not getattr(concept, "terminal", False):
-                concepts.append(concept)
-        seen = set()
-        out = []
-        for concept in concepts:
-            key = getattr(concept, "id", "") or normalize_term(getattr(concept, "name", ""))
-            if key and key not in seen:
-                seen.add(key)
-                out.append(concept)
-        return out
-
-    def _anchor_concepts_for_terminal_target(self, plan, target):
-        """Return relation anchors required by a terminal target.
-
-        显式空间关系中的 anchor 是硬约束证据。对于
-        `book on shelf`，如果当前地图里没有能匹配 shelf concept 的实例，
-        就不应该先追一个孤立 book 否则会卡在错误目标上。
-        """
-        target_terms = {normalize_term(x) for x in target.match_terms}
-        target_terms.add(normalize_term(target.id))
-        concepts = []
-        for constraint in getattr(plan, "constraints", []) or []:
-            ctype = normalize_term(getattr(constraint, "type", ""))
-            if ctype not in ("spatial", "relation", "object_relation", "co_occurrence"):
-                continue
-            subject = normalize_term(getattr(constraint, "subject", ""))
-            if subject and subject not in target_terms:
-                continue
-            concept = getattr(constraint, "object_concept", None)
-            if concept is not None and not getattr(concept, "terminal", False):
-                concepts.append(concept)
-        return concepts
-
-    def _has_unblocked_anchor_evidence(self, plan, target, candidate_obj, step=None, debug=None):
-        """Require usable anchor evidence before chasing a relation-constrained target."""
-
-        concepts = self._anchor_concepts_for_terminal_target(plan, target)
-        if not concepts:
-            return True
-        raw_instruction = self._raw_instruction_for_verifier()
-        for concept in concepts:
-            objs = [obj for obj in self.objects if obj is not candidate_obj]
-            records = self.concept_matcher.match_many(
-                raw_instruction=raw_instruction,
-                concept=concept,
-                objects=objs,
-                step=step,
-            )
-            by_uid = {record.object_uid: record for record in records}
-            for obj in objs:
-                if obj is candidate_obj:
-                    continue
-                anchor_uid = candidate_from_object(obj, canonical_label=concept.name, step=step).uid
-                record = by_uid.get(anchor_uid)
-                if record is None:
-                    continue
-                if debug is not None:
-                    debug.append(record.as_dict())
-                if not record.matches_concept:
-                    continue
-                if self.anchor_search_ledger.is_blocked(raw_instruction, concept.id, anchor_uid):
-                    continue
-                return True
-        return False
 
     def add_node(self, position, pcd=None, has_frontier=False, frontier_idxs=np.array([]), block_current=False):
         """Add a viewpoint node through the topology graph service."""
@@ -2067,12 +1919,12 @@ class Instruct_Mapper:
 
         return room_final
 
-    def get_candidate_room_fully_explored_by_distance(self, instruct_goal, idx=None, step=None):
+    def get_candidate_room_fully_explored_by_distance(self, instruct_goal, idx=None, step=None, plan=None):
         """Deterministic relocation policy used when LLM room selection is off."""
 
         refresh_mapper_prior_map_query(
             self,
-            plan=getattr(self, "instruction_plan", None),
+            plan=plan,
             step=step or 0,
             episode_idx=idx,
         )
@@ -2102,121 +1954,6 @@ class Instruct_Mapper:
             with open(f'{self.save_dir}/episode-{idx}/room_policy/failure_{step}.txt', 'w') as f:
                 f.write(f'Deterministic room policy selected an explored room\n')
         return room_final
-
-    def object_found(self, instruct_goal, idx=None, step=None):
-        """Legacy LLM object selector over the serialized map state."""
-
-        json_dict = self.to_json_wo_some_class()
-        # transfer this dict to string
-        json_str = json.dumps(json_dict)
-
-        prompt_info = instruct_goal + '\n' + json_str
-
-        os.makedirs(f'{self.save_dir}/episode-{idx}/gpt_obj', exist_ok=True)
-        with open(f'{self.save_dir}/episode-{idx}/gpt_obj/prompt_{step}.txt', 'w') as f:
-            f.write(f'Prompt_info: {prompt_info}\n')
-            f.write(f'\n')
-
-        class Step(BaseModel):
-            explanation: str
-            output: str
-
-        class Reasoning(BaseModel):
-            steps: list[Step]
-            flag: bool
-            final_object: int
-
-        if self.vlm in ('gemini', 'cognav'):
-            client, model_name = get_client_and_model(self.vlm)
-
-            completion = client.beta.chat.completions.parse(
-                model=model_name,
-                messages=[{
-                    "role": "system",
-                    "content": OBJECT_PROMPT
-                }, {
-                    "role": "user",
-                    "content": prompt_info
-                }],
-                response_format=Reasoning,
-                trace_label="object_found_planner",
-            )
-        if self.vlm == 'openai':
-            client, _ = get_client_and_model(self.vlm)
-
-            completion = client.beta.chat.completions.parse(
-                model="gpt-4o-2024-08-06",
-                messages=[{
-                    "role": "system",
-                    "content": OBJECT_PROMPT
-                }, {
-                    "role": "user",
-                    "content": prompt_info
-                }],
-                response_format=Reasoning,
-                trace_label="object_found_planner",
-            )
-
-        answer = completion.choices[0].message.parsed
-        # save the answer to a txt file
-        with open(f'{self.save_dir}/episode-{idx}/gpt_obj/answer_{step}.txt', 'w') as f:
-            f.write(f'Answer: {answer}\n')
-            f.write(f'\n')
-            f.write(f'\n')
-        with open(f'{self.save_dir}/episode-{idx}/gpt_obj/input_{step}.txt', 'a') as f:
-            f.write(f'Input: {instruct_goal}\n' + json_str)
-            f.write(f'\n')
-            f.write(f'\n')
-
-        logger.info(f'Answer: {answer}')
-
-        if not answer.flag:
-            obj_final = None
-        else:
-            obj_final = self.objects[answer.final_object]
-            rgb = obj_final.rgb
-            bbox = obj_final.bbox
-
-        return answer.flag, obj_final
-
-    def object_found_no_gpt(self, instruct_goal, idx=None, step=None):
-        """Select a candidate object without the legacy object-planning LLM call."""
-
-        plan = getattr(self, "instruction_plan", None)
-        refresh_mapper_prior_map_query(self, plan=plan, step=step or 0, episode_idx=idx)
-        json_dict = self.to_json_wo_some_class()
-        # transfer this dict to string
-        json_str = json.dumps(json_dict)
-        prompt_info = instruct_goal + '\n' + json_str
-
-        os.makedirs(f'{self.save_dir}/episode-{idx}/no_gpt_obj', exist_ok=True)
-        with open(f'{self.save_dir}/episode-{idx}/no_gpt_obj/prompt_{step}.txt', 'w') as f:
-            f.write(f'Prompt_info: {prompt_info}\n')
-            f.write(f'\n')
-        with open(f'{self.save_dir}/episode-{idx}/no_gpt_obj/input_{step}.txt', 'a') as f:
-            f.write(f'Input: {prompt_info}\n')
-            f.write(f'\n')
-            f.write(f'\n')
-
-        result = select_target_candidate(self, plan=plan, step=step)
-        with open(f'{self.save_dir}/episode-{idx}/no_gpt_obj/answer_{step}.txt', 'w') as f:
-            f.write(f'Input: {prompt_info}\n')
-            f.write(f'Answer: {result.answer}\n')
-            if result.anchor_record:
-                f.write(f'Anchor match: {json.dumps(result.anchor_record, ensure_ascii=False)}\n')
-            if result.skipped_objs:
-                f.write(f'Skipped by final verifier: {json.dumps(result.skipped_objs, ensure_ascii=False)}\n')
-            if result.concept_debug:
-                f.write(f'Concept matches: {json.dumps(result.concept_debug, ensure_ascii=False)}\n')
-            if getattr(self, "prior_map_prompt_context", None) is not None:
-                f.write(
-                    "Prior map prompt context: "
-                    f"{json.dumps(self.prior_map_prompt_context.to_dict(), ensure_ascii=False)}\n"
-                )
-            f.write(f'\n')
-            f.write(f'\n')
-
-        return result.found, result.obj
 
     def get_candidate_room_relocate(self, instruct_goal, idx=None, step=None):
         self.process_obs_pcd = o3d.t.geometry.PointCloud(self.pcd_device)

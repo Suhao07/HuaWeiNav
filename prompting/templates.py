@@ -23,6 +23,14 @@ not invent scene-specific facts. Extract what the user asks for:
 - Use soft constraints only for hints explicitly present in the instruction.
 - Do not encode common-sense priors such as "TV is in living room" unless the
   room or context is explicitly stated by the instruction.
+- Preserve explicit prohibitions and all quantity/order requirements. Never
+  turn a prohibition into a search preference. Use avoid_room for forbidden rooms.
+- Set min_count on each target for explicit instance counts. Set ordered for
+  required sequencing. A minimum count alone does not imply exhaustive search;
+  set exhaustive only for an explicit requirement to exhaust the target set.
+- Put unresolved references that change task meaning in unresolved; do not
+  silently choose one interpretation. Missing scene observations are not, by
+  themselves, an ambiguity in the user's intent.
 
 Examples:
 Instruction: "Find a cup on the table in the kitchen."

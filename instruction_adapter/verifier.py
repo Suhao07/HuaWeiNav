@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import base64
 import hashlib
 import json
 import os
-from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from verification.images import image_input
 from typing import Any
 
 import numpy as np
@@ -15,68 +15,8 @@ from prompting.schemas import HAS_PYDANTIC, ParsedVerification
 from prompting.templates import FINAL_VERIFIER_PROMPT
 
 from .ontology import normalize_term
-
-
-@dataclass
-class CandidateInstance:
-    """A concrete mapped object candidate.
-
-    The detector label is intentionally separate from uid.  For instructions
-    such as "find the red chair", rejecting one blue chair must not reject every
-    chair in the scene.
-    """
-
-    uid: str
-    detector_label: str
-    canonical_label: str = ""
-    centroid: list[float] = field(default_factory=list)
-    bbox_2d: list[float] = field(default_factory=list)
-    confidence: float = 0.0
-    step: int | None = None
-
-    def as_dict(self) -> dict[str, Any]:
-        return asdict(self)
-
-
-@dataclass
-class VerificationRecord:
-    instruction_hash: str
-    candidate_uid: str
-    status: str
-    confidence: float = 0.0
-    decision: str = ""
-    failed_constraints: list[str] = field(default_factory=list)
-    reason: str = ""
-    step: int | None = None
-    evidence_paths: list[str] = field(default_factory=list)
-
-    def as_dict(self) -> dict[str, Any]:
-        return asdict(self)
-
-
-@dataclass
-class VerificationResult:
-    satisfied: bool
-    decision: str
-    confidence: float = 0.0
-    semantic_satisfied: bool = False
-    view_sufficient_for_stop: bool = True
-    hard_constraints: dict[str, Any] = field(default_factory=dict)
-    satisfied_constraints: list[str] = field(default_factory=list)
-    failed_constraints: list[str] = field(default_factory=list)
-    view_feedback: str = ""
-    preferred_view_goal: str = ""
-    view_objective: dict[str, Any] = field(default_factory=dict)
-    reason: str = ""
-    diagnostics: dict[str, Any] = field(default_factory=dict)
-
-    def as_dict(self) -> dict[str, Any]:
-        return asdict(self)
-
-
-def instruction_hash(raw_instruction: str) -> str:
-    raw = str(raw_instruction or "").strip().lower()
-    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
+from verification.contracts import CandidateInstance, VerificationResult
+from verification.store import EvidenceStore, instruction_hash
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -99,7 +39,9 @@ def candidate_uid_from_object(obj: Any, label: str = "") -> str:
     still be considered.
     """
 
-    detector_label = normalize_term(label or getattr(obj, "tag", "object")) or "object"
+    if getattr(obj, "uid", None):
+        return str(obj.uid)
+    detector_label = normalize_term(label or getattr(obj, "tag", getattr(obj, "label", "object"))) or "object"
     center = np.array(getattr(obj, "position", [0.0, 0.0, 0.0]), dtype=float).reshape(-1)[:3]
     if center.size < 3:
         center = np.pad(center, (0, 3 - center.size))
@@ -123,10 +65,13 @@ def candidate_from_object(
     canonical_label: str = "",
     step: int | None = None,
 ) -> CandidateInstance:
-    label = normalize_term(getattr(obj, "tag", canonical_label)) or normalize_term(canonical_label)
+    label = normalize_term(getattr(obj, "label", getattr(obj, "tag", canonical_label))) or normalize_term(canonical_label)
     uid = candidate_uid_from_object(obj, label)
-    centroid = np.array(getattr(obj, "position", []), dtype=float).reshape(-1)[:3].tolist()
-    bbox = getattr(obj, "bbox", None)
+    position = getattr(obj, "position", None)
+    if position is None:
+        position = getattr(obj, "bbox3d_center", None)
+    centroid = np.array(position if position is not None else [], dtype=float).reshape(-1)[:3].tolist()
+    bbox = getattr(obj, "bbox2d_xyxy", getattr(obj, "bbox", None))
     try:
         bbox = np.array(bbox, dtype=float).reshape(-1).tolist()
     except Exception:
@@ -141,71 +86,6 @@ def candidate_from_object(
         step=step,
     )
 
-
-class VerificationLedger:
-    """Instruction-scoped verifier memory.
-
-    ledger 只屏蔽“某条指令下的某个对象实例”，不屏蔽 detector
-    类别。这样找红色椅子时，蓝色椅子被拒绝后不会反复回来，但其它 chair
-    实例仍然可以继续参与验证。
-    """
-
-    def __init__(self):
-        self.records: dict[tuple[str, str], VerificationRecord] = {}
-
-    def reset(self):
-        self.records.clear()
-
-    def get(self, raw_instruction: str, candidate_uid: str) -> VerificationRecord | None:
-        return self.records.get((instruction_hash(raw_instruction), candidate_uid))
-
-    def is_hard_rejected(self, raw_instruction: str, candidate_uid: str) -> bool:
-        record = self.get(raw_instruction, candidate_uid)
-        return bool(record and record.status == "rejected_hard")
-
-    def put(
-        self,
-        raw_instruction: str,
-        candidate_uid: str,
-        result: VerificationResult,
-        step: int | None = None,
-        evidence_paths: list[str] | None = None,
-    ) -> VerificationRecord:
-        if result.satisfied or result.decision == "accept":
-            status = "accepted"
-        elif result.decision == "reject_candidate":
-            status = "rejected_hard"
-        elif result.decision == "need_better_view":
-            status = "needs_better_view"
-        else:
-            status = "rejected_soft"
-        record = VerificationRecord(
-            instruction_hash=instruction_hash(raw_instruction),
-            candidate_uid=candidate_uid,
-            status=status,
-            confidence=float(result.confidence or 0.0),
-            decision=result.decision,
-            failed_constraints=list(result.failed_constraints or []),
-            reason=result.reason,
-            step=step,
-            evidence_paths=list(evidence_paths or []),
-        )
-        self.records[(record.instruction_hash, candidate_uid)] = record
-        return record
-
-    def as_dict(self) -> dict[str, Any]:
-        return {
-            f"{inst}:{uid}": record.as_dict()
-            for (inst, uid), record in self.records.items()
-        }
-
-
-def _image_block(path: str) -> dict[str, Any] | None:
-    if not path or not os.path.exists(path):
-        return None
-    with open(path, "rb") as f:
-        data = base64.b64encode(f.read()).decode("utf-8")
-    return {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{data}"}}
 
 
 def _nested_image_path(payload: dict[str, Any], *keys: str) -> str:
@@ -314,8 +194,9 @@ def _planner_hard_constraint_infeasible(hard_constraints: dict[str, Any]) -> tup
 class FinalInstructionVerifier:
     """VLM verifier for original-instruction stop decisions."""
 
-    def __init__(self, vlm: str = "cognav"):
+    def __init__(self, vlm: str = "cognav", evidence_dir: str = "outputs/evidence"):
         self.vlm = vlm
+        self.evidence_dir = Path(evidence_dir)
 
     @staticmethod
     def _view_guidance(evidence: dict[str, Any]) -> tuple[list[str], str]:
@@ -364,15 +245,15 @@ class FinalInstructionVerifier:
         return guidance, preferred
 
     def _fallback(self, reason: str) -> VerificationResult:
-        # When LLM is intentionally unavailable, preserve baseline behavior.
+        # Missing validation is unknown, never positive or negative evidence.
         return VerificationResult(
-            satisfied=True,
-            decision="accept",
+            satisfied=False,
+            decision="uncertain",
             confidence=0.0,
-            semantic_satisfied=True,
-            view_sufficient_for_stop=True,
-            reason=f"final verifier fallback accepted: {reason}",
-            diagnostics={"fallback": reason},
+            semantic_satisfied=False,
+            view_sufficient_for_stop=False,
+            reason=f"final verifier unavailable: {reason}",
+            diagnostics={"unavailable": reason, "verdict": "unknown"},
         )
 
     def verify(
@@ -405,14 +286,25 @@ class FinalInstructionVerifier:
             {"type": "text", "text": json.dumps(payload, ensure_ascii=False, indent=2)},
         ]
         seen_image_paths: set[str] = set()
+        image_refs = {}
+        image_dependencies = {}
+
+        def load_image(path):
+            if not path:
+                return None
+            block, reference, digest = image_input(path, self.evidence_dir)
+            image_refs[path] = reference
+            image_dependencies["image:" + reference] = digest
+            return block
+
         for key in ("current_rgb_with_bbox_path", "object_crop_path", "centered_view_path"):
-            block = _image_block(str(evidence.get(key) or ""))
+            block = load_image(str(evidence.get(key) or ""))
             if block is not None:
                 seen_image_paths.add(str(evidence.get(key) or ""))
                 content.append({"type": "text", "text": key})
                 content.append(block)
         for item in evidence.get("relation_evidence_paths", []) or []:
-            block = _image_block(str(item))
+            block = load_image(str(item))
             if block is not None:
                 seen_image_paths.add(str(item))
                 content.append({"type": "text", "text": "relation_evidence"})
@@ -426,7 +318,7 @@ class FinalInstructionVerifier:
             )
             if not image_path or image_path in seen_image_paths:
                 continue
-            block = _image_block(image_path)
+            block = load_image(image_path)
             if block is not None:
                 seen_image_paths.add(image_path)
                 content.append({
@@ -438,25 +330,25 @@ class FinalInstructionVerifier:
                 })
                 content.append(block)
 
-        try:
-            client, model = get_client_and_model(self.vlm)
-            completion = client.beta.chat.completions.parse(
-                model=model,
-                messages=[
-                    {"role": "system", "content": FINAL_VERIFIER_PROMPT},
-                    {"role": "user", "content": content},
-                ],
-                response_format=ParsedVerification,
-                trace_label=FINAL_VERIFY.trace_label,
-            )
-            parsed = completion.choices[0].message.parsed
-        except Exception as exc:
-            return self._fallback(f"vlm_failed: {exc}")
+        # 请求异常交由运行时记录和处置，保留原始异常及调用栈。
+        client, model = get_client_and_model(self.vlm)
+        completion = client.beta.chat.completions.parse(
+            model=model,
+            messages=[
+                {"role": "system", "content": FINAL_VERIFIER_PROMPT},
+                {"role": "user", "content": content},
+            ],
+            response_format=ParsedVerification,
+            trace_label=FINAL_VERIFY.trace_label,
+        )
+        parsed = completion.choices[0].message.parsed
+        if parsed is None:
+            raise ValueError("Final verifier response has no structured judgment")
 
         decision = normalize_term(getattr(parsed, "decision", "")).replace(" ", "_")
         allowed = {"accept", "reject_candidate", "need_better_view", "need_relation_check", "uncertain"}
         if decision not in allowed:
-            decision = "accept" if bool(getattr(parsed, "satisfied", False)) else "uncertain"
+            raise ValueError(f"Unsupported final verifier decision: {decision!r}")
         confidence = max(0.0, min(1.0, _safe_float(getattr(parsed, "confidence", 0.0))))
         semantic_satisfied = bool(getattr(parsed, "semantic_satisfied", False))
         view_sufficient = bool(getattr(parsed, "view_sufficient_for_stop", True))
@@ -526,6 +418,10 @@ class FinalInstructionVerifier:
                 view_feedback = "Hard final-stop constraints are not yet satisfied; continue the view/approach objective."
         return VerificationResult(
             satisfied=parsed_satisfied and decision == "accept" and view_sufficient,
+            target_uid=candidate.uid,
+            evidence_ids=sorted(set(image_refs.values())),
+            dependencies={**evidence.get("dependencies", {}), **image_dependencies},
+            task_revision=plan_dict.get("diagnostics", {}).get("task_spec", {}).get("revision", 1),
             decision=decision,
             confidence=confidence,
             semantic_satisfied=semantic_satisfied,
@@ -544,6 +440,7 @@ class FinalInstructionVerifier:
             reason=reason,
             diagnostics={
                 "source": "vlm",
+                "image_sources": image_refs,
                 "model_provider": self.vlm,
                 "view_guidance": {
                     "facts": view_guidance,

@@ -67,7 +67,7 @@ def collect_panoramic_observations(agent: Any, rotate_times: int = 12) -> tuple[
         temporary_rotations.append(agent.mapper.current_rotation)
         agent.angles.append(2 * np.arccos((q_identity.inverse() * agent.rotation).w))
 
-        agent.obs = agent.env.step(3)
+        agent.obs = agent.execution.step(3)
         agent.update_trajectory()
 
     return temporary_images, temporary_positions, temporary_rotations

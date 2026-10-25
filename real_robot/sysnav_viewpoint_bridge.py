@@ -6,7 +6,7 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 
-from real_robot.contracts import Pose3D
+from scene.contracts import Pose3D
 
 
 @dataclass(frozen=True)

@@ -1,327 +1,25 @@
-"""Adapter from real-robot semantic snapshots to existing planning policies.
+"""Intent adaptation over shared read-only scene queries.
 
-The classes here do not implement a second instruction policy. They expose a
-`SemanticMapSnapshot` through the minimal mapper-like protocol already consumed
-by `planning.target_selection_policy.select_target_candidate()`.
+Task services live in the persistent policy context. Native scene snapshots are
+never wrapped as mapper objects or modified to express a semantic match.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Iterable, Optional
+from typing import Any, Callable, Optional
 
-from instruction_adapter.concept_matcher import AnchorSearchLedger, RuntimeConceptMatcher
 from instruction_adapter.contracts import InstructionPlan
-from instruction_adapter.constraints import ConstraintEvaluator
-from instruction_adapter.ontology import normalize_term
-from instruction_adapter.relation_verifier import DynamicRelationService
-from instruction_adapter.semantic_edges import RelationPairLedger
-from instruction_adapter.spatial_graph import InstructionSpatialGraph
-from instruction_adapter.verifier import VerificationLedger, VerificationResult, candidate_from_object
-from planning.object_search_policy import InstructionObjectSearchPolicy
-from planning.target_selection_policy import TargetSelectionResult, select_target_candidate
+from instruction_adapter.verifier import VerificationResult, candidate_from_object
+from scene.query import TargetSelectionResult
+from harness.tools import query_scene
 from real_robot.contracts import MotionGoalMode, NavigationIntent, ObjectNodeSnapshot, Pose3D, SemanticMapSnapshot, ViewpointResult
 
 
-RELATION_CONSTRAINT_TYPES = {
-    "spatial",
-    "relation",
-    "object_relation",
-    "object relation",
-    "co_occurrence",
-    "co occurrence",
-}
-
-
-class SnapshotConfidence:
-    """Small confidence wrapper compatible with mapper object expectations.
-
-    The existing simulator policy sorts objects with
-    `obj.confidence.numpy().item()`. Real-robot snapshots carry plain floats, so
-    this wrapper preserves that narrow interface without changing the policy.
-    """
-
-    def __init__(self, value: float) -> None:
-        """Create a mapper-compatible confidence value.
-
-        Args:
-            value: Numeric confidence score.
-        """
-
-        self.value = float(value or 0.0)
-
-    def numpy(self) -> "SnapshotConfidence":
-        """Return self for `confidence.numpy().item()` compatibility.
-
-        Returns:
-            This object.
-        """
-
-        return self
-
-    def item(self) -> float:
-        """Return the scalar confidence value.
-
-        Returns:
-            Float confidence.
-        """
-
-        return self.value
-
-    def __float__(self) -> float:
-        """Return the confidence as a Python float."""
-
-        return self.value
-
-
-class SnapshotObjectAdapter:
-    """Mapper-like object wrapper around `ObjectNodeSnapshot`.
-
-    Args:
-        snapshot: Source object snapshot.
-    """
-
-    def __init__(self, snapshot: ObjectNodeSnapshot) -> None:
-        """Initialize the object adapter.
-
-        Args:
-            snapshot: Source object snapshot.
-        """
-
-        self.snapshot = snapshot
-        self.uid = snapshot.uid
-        self.tag = snapshot.label
-        self.position = list(snapshot.position or snapshot.bbox3d_center or (0.0, 0.0, 0.0))
-        self.confidence = SnapshotConfidence(snapshot.confidence)
-        self.conf_list: dict[str, SnapshotConfidence] = {snapshot.label: self.confidence}
-        self.bbox = list(snapshot.bbox2d_xyxy or ())
-        self.room_id = snapshot.room_id
-        self.image_ref = snapshot.image_ref
-        self.track_ids = tuple(snapshot.track_ids or ())
-        self.metadata = dict(snapshot.metadata or {})
-        self._instruction_reference_role = ""
-        self._instruction_anchor_concept_id = ""
-        self._instruction_anchor_concept_name = ""
-        self._instruction_anchor_candidate_uid = ""
-
-    def as_snapshot(self) -> ObjectNodeSnapshot:
-        """Return the underlying object snapshot.
-
-        Returns:
-            Source `ObjectNodeSnapshot`.
-        """
-
-        return self.snapshot
-
-
-@dataclass
-class SemanticMapSnapshotPolicyContext:
-    """Mapper-like context that lets snapshots reuse existing policies.
-
-    Args:
-        snapshot: Current real-robot semantic map snapshot.
-        plan: Parsed instruction plan.
-        concept_matcher: Optional existing matcher instance.
-        verification_ledger: Optional instruction-scoped verification ledger.
-        anchor_search_ledger: Optional anchor search ledger.
-        relation_pair_ledger: Optional relation pair ledger.
-        constraint_evaluator: Optional existing constraint evaluator.
-        instruction_object_search_policy: Optional existing object search policy.
-        prior_result: Optional `SearchPriorResult` used as ranking evidence.
-        prior_map_policy_adapter: Optional adapter for target annotations.
-        prior_map_prompt_context: Optional bounded prompt context bundle.
-        prior_map_high_level_selection: Optional room/frontier selection result.
-        prior_map_room_semantics: Optional evidence-versioned room labels.
-        prior_map_diagnostics: Optional conflict/alignment diagnostics.
-        vlm: VLM provider name used when constructing default matchers.
-    """
-
-    snapshot: SemanticMapSnapshot
-    plan: Any
-    concept_matcher: Optional[Any] = None
-    verification_ledger: Optional[VerificationLedger] = None
-    anchor_search_ledger: Optional[AnchorSearchLedger] = None
-    relation_pair_ledger: Optional[RelationPairLedger] = None
-    constraint_evaluator: Optional[ConstraintEvaluator] = None
-    instruction_object_search_policy: Optional[InstructionObjectSearchPolicy] = None
-    prior_result: Optional[Any] = None
-    prior_map_policy_adapter: Optional[Any] = None
-    prior_map_prompt_context: Optional[Any] = None
-    prior_map_high_level_selection: Optional[Any] = None
-    prior_map_room_semantics: Optional[dict[str, Any]] = None
-    prior_map_diagnostics: Optional[dict[str, Any]] = None
-    vlm: str = "cognav"
-
-    def __post_init__(self) -> None:
-        """Initialize the mapper-like fields expected by planning policies."""
-
-        self.instruction_plan = self.plan
-        self.instruction_spec = None
-        self.objects = [SnapshotObjectAdapter(obj) for obj in self.snapshot.objects]
-        self.current_position = list(self.snapshot.robot_pose.position)
-        self.current_node_idx = None
-        self.target = _active_target_name(self.plan)
-        self.target_list = list(getattr(self.plan, "target_detector_prompts", []) or [self.target])
-        self.target_aliases = list(getattr(self.plan, "target_match_terms", []) or [self.target])
-        self.search_prior_result = self.prior_result
-        self.prior_map_last_result = self.prior_result
-        self.prior_map_diagnostics = dict(self.prior_map_diagnostics or {})
-        self.concept_matcher = self.concept_matcher or RuntimeConceptMatcher(vlm=self.vlm)
-        self.verification_ledger = self.verification_ledger or VerificationLedger()
-        self.anchor_search_ledger = self.anchor_search_ledger or AnchorSearchLedger()
-        self.relation_pair_ledger = self.relation_pair_ledger or RelationPairLedger()
-        self.instruction_object_search_policy = self.instruction_object_search_policy or InstructionObjectSearchPolicy()
-        if self.constraint_evaluator is None and hasattr(self, "instruction_constraint_evaluator"):
-            pass
-        elif self.constraint_evaluator is None:
-            spatial_graph = InstructionSpatialGraph()
-            relation_service = DynamicRelationService(vlm=self.vlm)
-            self.instruction_constraint_evaluator = ConstraintEvaluator(
-                spatial_graph=spatial_graph,
-                relation_service=relation_service,
-            )
-        else:
-            self.instruction_constraint_evaluator = self.constraint_evaluator
-
-    def _target_match_terms(self) -> set[str]:
-        """Return normalized terminal target terms.
-
-        Returns:
-            Normalized terms accepted as terminal target labels.
-        """
-
-        terms = list(self.target_aliases or []) + list(self.target_list or []) + [self.target]
-        return {normalize_term(term) for term in terms if normalize_term(term)}
-
-    def _is_target_tag(self, tag: str) -> bool:
-        """Return whether a label may satisfy the active target.
-
-        Args:
-            tag: Candidate object label.
-
-        Returns:
-            True when the label matches active target terms.
-        """
-
-        return normalize_term(tag) in self._target_match_terms()
-
-    def _raw_instruction_for_verifier(self) -> str:
-        """Return the raw instruction used by verifier ledgers.
-
-        Returns:
-            Raw instruction string.
-        """
-
-        return str(getattr(self.plan, "raw_instruction", "") or self.target or "")
-
-    def _is_verifier_rejected(self, obj: Any, step: int | None = None) -> bool:
-        """Return whether final verifier hard-rejected this instance.
-
-        Args:
-            obj: Mapper-like object adapter.
-            step: Optional runtime step.
-
-        Returns:
-            True if the existing verification ledger marks the instance as hard
-            rejected for the active instruction.
-        """
-
-        candidate = candidate_from_object(obj, canonical_label=self.target, step=step)
-        return self.verification_ledger.is_hard_rejected(
-            self._raw_instruction_for_verifier(),
-            candidate.uid,
-        )
-
-    def _anchor_concepts_for_plan(self) -> list[Any]:
-        """Return non-terminal concepts used by anchor-first search.
-
-        Returns:
-            Deduplicated non-terminal anchor concepts.
-        """
-
-        concepts = []
-        for target in getattr(self.plan, "anchor_targets", []):
-            concepts.append(target.concept_query())
-        for constraint in getattr(self.plan, "constraints", []) or []:
-            concept = getattr(constraint, "object_concept", None)
-            if concept is not None and not getattr(concept, "terminal", False):
-                concepts.append(concept)
-        return _dedupe_concepts(concepts)
-
-    def _anchor_concepts_for_terminal_target(self, plan: Any, target: Any) -> list[Any]:
-        """Return relation anchors required before chasing a terminal target.
-
-        Args:
-            plan: Instruction plan.
-            target: Terminal target query.
-
-        Returns:
-            Non-terminal concepts required by hard relation constraints.
-        """
-
-        target_terms = {normalize_term(term) for term in getattr(target, "match_terms", [])}
-        target_terms.add(normalize_term(getattr(target, "id", "")))
-        concepts = []
-        for constraint in getattr(plan, "constraints", []) or []:
-            ctype = normalize_term(getattr(constraint, "type", ""))
-            if ctype not in RELATION_CONSTRAINT_TYPES:
-                continue
-            subject = normalize_term(getattr(constraint, "subject", ""))
-            if subject and subject not in target_terms:
-                continue
-            concept = getattr(constraint, "object_concept", None)
-            if concept is not None and not getattr(concept, "terminal", False):
-                concepts.append(concept)
-        return _dedupe_concepts(concepts)
-
-    def _has_unblocked_anchor_evidence(
-        self,
-        plan: Any,
-        target: Any,
-        candidate_obj: Any,
-        step: int | None = None,
-        debug: Optional[list[dict[str, Any]]] = None,
-    ) -> bool:
-        """Return whether relation-constrained target has an available anchor.
-
-        Args:
-            plan: Instruction plan.
-            target: Terminal target query.
-            candidate_obj: Candidate terminal object.
-            step: Optional runtime step.
-            debug: Optional list receiving concept-match diagnostics.
-
-        Returns:
-            True when no anchor is required or a matching unblocked anchor is
-            currently observed.
-        """
-
-        concepts = self._anchor_concepts_for_terminal_target(plan, target)
-        if not concepts:
-            return True
-        raw_instruction = self._raw_instruction_for_verifier()
-        for concept in concepts:
-            objects = [obj for obj in self.objects if obj is not candidate_obj]
-            records = self.concept_matcher.match_many(
-                raw_instruction=raw_instruction,
-                concept=concept,
-                objects=objects,
-                step=step,
-            )
-            records_by_uid = {record.object_uid: record for record in records}
-            for obj in objects:
-                anchor_uid = candidate_from_object(obj, canonical_label=concept.name, step=step).uid
-                record = records_by_uid.get(anchor_uid)
-                if record is None:
-                    continue
-                if debug is not None:
-                    debug.append(record.as_dict())
-                if not record.matches_concept:
-                    continue
-                if self.anchor_search_ledger.is_blocked(raw_instruction, concept.id, anchor_uid):
-                    continue
-                return True
-        return False
+# Import alias retained while callers migrate to the explicit task owner.
+from task.reducer import apply_verification
+from verification.images import image_dependencies_valid
+from task.session import TaskSession as SemanticMapSnapshotPolicyContext
 
 
 @dataclass(frozen=True)
@@ -330,7 +28,7 @@ class SnapshotTargetSelection:
 
     Args:
         context: Mapper-like context used by the existing policy.
-        result: Existing `TargetSelectionResult`.
+        result: Shared query result.
     """
 
     context: SemanticMapSnapshotPolicyContext
@@ -381,7 +79,7 @@ class SnapshotTargetSelection:
             True when existing policy selected an anchor, not a terminal target.
         """
 
-        return bool(getattr(self.result.obj, "_instruction_reference_role", "") == "anchor")
+        return self.result.selection_role == "anchor"
 
     @property
     def candidate_instance(self) -> Any | None:
@@ -396,14 +94,14 @@ class SnapshotTargetSelection:
             return None
         return candidate_from_object(
             self.result.obj,
-            canonical_label=str(getattr(self.result.obj, "tag", "") or self.context.target),
+            canonical_label=self.result.canonical_label,
         )
 
     def to_navigation_intent(self) -> NavigationIntent:
         """Convert the existing target selection result to a motion intent.
 
         This method is an adapter, not a second navigation policy: target and
-        anchor semantics already came from `select_target_candidate()`.
+        anchor semantics already came from the shared scene query.
 
         Returns:
         `NavigationIntent` for the selected target/anchor. The intent carries
@@ -460,8 +158,7 @@ class SemanticMapSnapshotIntentAdapter:
 
     The adapter implements the real-robot runtime policy protocol without
     owning terminal/anchor/relation semantics. Those semantics remain in
-    `InstructionObjectSearchPolicy`, `ConstraintEvaluator`, and verifier
-    ledgers.
+    the shared scene query and task-owned evidence services.
     """
 
     def __init__(
@@ -490,6 +187,10 @@ class SemanticMapSnapshotIntentAdapter:
         self.last_selection: Optional[SnapshotTargetSelection] = None
         self.last_viewpoint_result: Optional[ViewpointResult] = None
 
+    def task_complete(self) -> bool:
+        """Expose the reducer's task completion for runtime STOP admission."""
+        return self.context is not None and self.context.progress.completed
+
     def decide(self, snapshot: SemanticMapSnapshot, instruction: Optional[str] = None) -> NavigationIntent:
         """Return the next intent for a semantic snapshot.
 
@@ -515,7 +216,8 @@ class SemanticMapSnapshotIntentAdapter:
             )
 
         if self.context is not None:
-            state = getattr(self.context, "instruction_execution_state", None)
+            self.context.install_plan(plan)
+            state = getattr(self.context, "progress", None)
             if bool(getattr(state, "completed", False)):
                 return NavigationIntent(
                     mode=MotionGoalMode.STOP,
@@ -579,7 +281,13 @@ class SemanticMapSnapshotIntentAdapter:
         if not verifier_decision:
             return False
         verification_result = _verification_result_from_dict(verifier_decision)
-        raw_instruction = self.context._raw_instruction_for_verifier()
+        if verification_result.task_revision != self.context.spec.revision:
+            return False
+        if verification_result.target_uid != candidate_uid:
+            return False
+        if not image_dependencies_valid(verification_result.dependencies):
+            return False
+        raw_instruction = self.context.plan.raw_instruction
         self.context.verification_ledger.put(
             raw_instruction,
             candidate_uid,
@@ -588,16 +296,15 @@ class SemanticMapSnapshotIntentAdapter:
         )
 
         plan = self.context.plan
-        state = self.context.instruction_constraint_evaluator.ensure_state(self.context, plan)
-        target = self.context.instruction_constraint_evaluator.target_for_candidate(self.context, plan, candidate)
-        if verification_result.satisfied or verification_result.decision == "accept":
-            if target is not None:
-                state.mark_candidate_accepted(plan, target, candidate_uid)
-            return True
-        if verification_result.decision == "reject_candidate":
-            state.mark_candidate_rejected(target, candidate_uid)
-            return True
-        return verification_result.decision == "need_better_view"
+        state = self.context.progress
+        target = next((t for t in plan.terminal_targets if t.id == intent.metadata.get("target_id")), None)
+        if target is None:
+            return False
+        apply_verification(state, target, candidate, verification_result, {})
+        return verification_result.accepted or verification_result.decision in (
+            "reject_candidate", "need_better_view",
+        )
+
 
 
 def select_target_candidate_from_snapshot(
@@ -626,16 +333,25 @@ def select_target_candidate_from_snapshot(
         context = SemanticMapSnapshotPolicyContext(snapshot=snapshot, plan=plan, **context_kwargs)
     else:
         context.snapshot = snapshot
-        context.plan = plan
+        context.install_plan(plan)
         for key, value in context_kwargs.items():
             setattr(context, key, value)
-        context.__post_init__()
-    result = select_target_candidate(context, plan=plan, step=step)
+    candidates = query_scene(context, step=step)
+    selected = candidates.selected
+    result = TargetSelectionResult(
+        found=selected is not None, obj=selected.obj if selected else None,
+        answer=candidates.reason, skipped_objs=candidates.skipped_objs,
+        concept_debug=candidates.concept_debug,
+        anchor_record=selected.record if selected and selected.role == "anchor" else {},
+        target_id=selected.target_id if selected else "",
+        canonical_label=selected.canonical_label if selected else "",
+        selection_role=selected.role if selected else "",
+    )
     return SnapshotTargetSelection(context=context, result=result)
 
 
-def _active_target_name(plan: Any) -> str:
-    active = getattr(plan, "active_terminal_target", None)
+def _active_target_name(plan: Any, progress: Any = None) -> str:
+    active = progress.active_target() if progress is not None else getattr(plan, "active_terminal_target", None)
     if active is not None:
         return str(getattr(active, "name", "") or "")
     terminals = list(getattr(plan, "terminal_targets", []) or [])
@@ -704,6 +420,7 @@ def _selection_metadata(selection: SnapshotTargetSelection, candidate: Any | Non
         "instruction_plan": plan,
         "selected_snapshot_uid": selection.selected_snapshot_uid,
         "selection_role": role,
+        "target_id": selection.result.target_id,
         "selection_answer": selection.result.answer,
         "candidate_instance": candidate,
         "candidate_uid": str(getattr(candidate, "uid", "") if candidate is not None else ""),
@@ -747,11 +464,11 @@ def _prior_map_metadata(context: SemanticMapSnapshotPolicyContext) -> dict[str, 
 
 def _verification_result_from_dict(payload: dict[str, Any]) -> VerificationResult:
     return VerificationResult(
-        satisfied=bool(payload.get("satisfied", payload.get("decision") == "accept")),
+        satisfied=payload.get("satisfied") is True,
         decision=str(payload.get("decision", "")),
         confidence=float(payload.get("confidence", 0.0) or 0.0),
-        semantic_satisfied=bool(payload.get("semantic_satisfied", payload.get("satisfied", False))),
-        view_sufficient_for_stop=bool(payload.get("view_sufficient_for_stop", True)),
+        semantic_satisfied=payload.get("semantic_satisfied") is True,
+        view_sufficient_for_stop=payload.get("view_sufficient_for_stop") is True,
         hard_constraints=dict(payload.get("hard_constraints") or {}),
         satisfied_constraints=list(payload.get("satisfied_constraints") or []),
         failed_constraints=list(payload.get("failed_constraints") or []),
@@ -760,6 +477,12 @@ def _verification_result_from_dict(payload: dict[str, Any]) -> VerificationResul
         view_objective=dict(payload.get("view_objective") or {}),
         reason=str(payload.get("reason", "")),
         diagnostics=dict(payload.get("diagnostics") or {}),
+        task_revision=payload.get("task_revision"),
+        target_uid=str(payload.get("target_uid", "")),
+        predicate_id=str(payload.get("predicate_id", "final_stop")),
+        anchor_uid=str(payload.get("anchor_uid", "")),
+        evidence_ids=list(payload.get("evidence_ids", [])),
+        dependencies=dict(payload.get("dependencies", {})),
     )
 
 
@@ -774,15 +497,3 @@ def _evidence_paths(result: ViewpointResult) -> list[str]:
         if value:
             refs.append(str(value))
     return refs
-
-
-def _dedupe_concepts(concepts: Iterable[Any]) -> list[Any]:
-    seen: set[str] = set()
-    out: list[Any] = []
-    for concept in concepts:
-        key = str(getattr(concept, "id", "") or normalize_term(getattr(concept, "name", "")))
-        if not key or key in seen:
-            continue
-        seen.add(key)
-        out.append(concept)
-    return out

@@ -173,6 +173,10 @@ class _AcceptingVerifier:
         return {
             "satisfied": True,
             "decision": "accept",
+            "semantic_satisfied": True,
+            "view_sufficient_for_stop": True,
+            "task_revision": 1,
+            "target_uid": context["candidate_instance"].uid,
             "reason": "acceptance smoke verified target evidence",
             "diagnostics": {
                 "image_ref": evidence.image_ref,
@@ -276,7 +280,8 @@ def test_acceptance_evidence_smoke_generates_view_evidence_and_payload(tmp_path)
             goal_id="goal-1",
             current_pose=Pose3D(position=(1.0, 2.0, 0.0)),
         ),
-        context={"raw_instruction": "find a book"},
+        context={"raw_instruction": "find a book",
+                 "candidate_instance": SimpleNamespace(uid="sysnav_object:11")},
     )
     writer = RuntimeDecisionJsonlWriter(tmp_path / "runtime_decisions.jsonl")
     payload = writer.write(

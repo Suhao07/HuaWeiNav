@@ -131,6 +131,8 @@ def get_args():
     parser.add_argument("--relocate", default=False, action="store_true")
     parser.add_argument("--no_gpt_relocate", default=False, action="store_true")
     parser.add_argument("--vlm", type=str, default=DEFAULT_VLM)
+    parser.add_argument("--decision_owner", choices=("legacy", "agent"), default="legacy")
+    parser.add_argument("--agent_max_model_calls", type=int, default=100)
     parser.add_argument("--custom_instruction", type=str, default="")
     parser.add_argument("--enable_instruction_adapter", default=False, action="store_true")
     parser.add_argument("--instruction_adapter_backend", type=str, default="llm")
@@ -170,20 +172,36 @@ def _install_instruction_plan(
     user instruction or dataset metadata.
     """
 
-    instruction_plan = instruction_parser.parse_plan(
-        raw_instruction=raw_instruction,
-        dataset_target=dataset_target,
-        available_classes=habitat_mapper.object_perceiver.classes,
-        episode_info=episode_info,
-    )
+    if source == "benchmark_object_goal":
+        from backends.habitat.task_input import adapt_objectnav_task
+        from instruction_adapter.task_compat import runtime_plan
+        from perception.detector_adapter import ground_plan
+
+        task = adapt_objectnav_task(dataset_target)
+        instruction_plan = ground_plan(
+            runtime_plan(task),
+            available_classes=habitat_mapper.object_perceiver.classes,
+            vlm=instruction_parser.vlm,
+            strict_available_classes=instruction_parser.strict_available_classes,
+            use_legacy_similarity_fallback=False,
+        )
+    else:
+        instruction_plan = instruction_parser.parse_plan(
+            raw_instruction=raw_instruction,
+            dataset_target=dataset_target,
+            available_classes=habitat_mapper.object_perceiver.classes,
+            episode_info=episode_info,
+        )
     instruction_plan.diagnostics.setdefault("source", [])
     instruction_plan.diagnostics["runtime_source"] = source
     instruction_spec = instruction_plan.to_legacy_spec()
 
-    habitat_mapper.instruction_plan = instruction_plan
-    habitat_mapper.instruction_spec = instruction_spec
-    habitat_mapper.instruction_execution_state = None
-    habitat_mapper.instruction_constraint_evaluator.ensure_state(habitat_mapper, instruction_plan)
+    from backends.habitat.scene import snapshot_from_mapper
+    from task.session import TaskSession
+
+    snapshot, _ = snapshot_from_mapper(habitat_mapper)
+    habitat_agent.task = TaskSession(snapshot=snapshot, plan=instruction_plan,
+                                     vlm=instruction_parser.vlm, save_dir=habitat_agent.save_dir)
 
     # Perception can use both terminal detector terms and non-terminal concept
     # detector terms. Stop remains controlled by terminal target + verifier.
@@ -201,6 +219,9 @@ def _install_instruction_plan(
 
     instruction_dir = os.path.join(episode_dir, "instruction_adapter")
     os.makedirs(instruction_dir, exist_ok=True)
+    if "task_spec" in instruction_plan.diagnostics:
+        with open(os.path.join(instruction_dir, "task_spec.json"), "w", encoding="utf-8") as f:
+            json.dump(instruction_plan.diagnostics["task_spec"], f, ensure_ascii=False, indent=2)
     with open(os.path.join(instruction_dir, "plan.json"), "w", encoding="utf-8") as f:
         json.dump(instruction_plan.as_dict(), f, ensure_ascii=False, indent=2, sort_keys=True)
     with open(os.path.join(instruction_dir, "spec.json"), "w", encoding="utf-8") as f:
@@ -338,19 +359,23 @@ if __name__ == "__main__":
 
         logger.info(f"Target: {habitat_mapper.target}")
         logger.info(f"Target list: {habitat_mapper.target_list}")
-        if habitat_mapper.instruction_spec is not None:
-            logger.info(f"Instruction spec: {habitat_mapper.instruction_spec.as_dict()}")
+        if instruction_spec is not None:
+            logger.info(f"Instruction spec: {instruction_spec.as_dict()}")
 
         habitat_mapper.object_perceiver.sam.initialize(habitat_mapper.target)
 
-        if args.relocate:
-            habitat_agent.make_plan_mod_relocate(idx=i)
+        if args.decision_owner == "agent":
+            from backends.habitat.agent_runtime import run_agent_episode
+            run_agent_episode(habitat_agent, episode_idx=i, max_steps=args.max_steps,
+                              max_model_calls=args.agent_max_model_calls)
         else:
-            habitat_agent.make_plan_mod_no_relocate(idx=i)
-
-        flag = True
-        while flag and not habitat_env.episode_over and habitat_agent.episode_steps < args.max_steps:
-            flag = habitat_agent.step_mod(idx=i)
+            if args.relocate:
+                habitat_agent.make_plan_mod_relocate(idx=i)
+            else:
+                habitat_agent.make_plan_mod_no_relocate(idx=i)
+            flag = True
+            while flag and not habitat_env.episode_over and habitat_agent.episode_steps < args.max_steps:
+                flag = habitat_agent.step_mod(idx=i)
 
         habitat_agent.save_trajectory(f"./{args.save_dir}/episode-{i}/")
         prior_map_summary = (
@@ -393,7 +418,7 @@ if __name__ == "__main__":
             'lvml_call_count_by_type': counts_compact(),
             'End': 1,
             'object_goal': (
-                getattr(getattr(habitat_mapper, "instruction_plan", None), "raw_instruction", "")
+                getattr(getattr(habitat_agent.task, "plan", None), "raw_instruction", "")
                 or habitat_agent.instruct_goal
             ),
         })

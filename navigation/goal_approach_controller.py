@@ -45,7 +45,7 @@ def rotate_toward_object_for_recheck(agent: Any) -> bool:
 
     # 复核前只做最小必要转向，避免为了确认目标额外触发规划状态变化。
     for _ in range(num_turns):
-        agent.obs = agent.env.step(direction)
+        agent.obs = agent.execution.step(direction)
         agent.update_trajectory(agent.on_node_flag)
         if agent.env.episode_over:
             return False
