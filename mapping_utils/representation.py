@@ -2,6 +2,7 @@ import numpy as np
 from enum import IntEnum
 import heapq
 import json
+from uuid import uuid4
 
 
 class NodeState(IntEnum):
@@ -10,9 +11,13 @@ class NodeState(IntEnum):
 
 
 class ObjectNode:
+    """An associated map instance whose identity survives observation updates."""
 
     def __init__(self, pcd_all, pcd_filtered, tag, confidence, position, actual_num, rgb,
                  bbox):
+        # 实例身份与几何版本分离：融合观测保留 uid，几何哈希负责证据失效。
+        # mapper 关联成功后原位更新已有 ObjectNode，因此身份随该实例持续存在。
+        self.uid = "object:" + uuid4().hex
         self.pcd_all = pcd_all
         self.pcd = pcd_filtered
         self.tag = tag

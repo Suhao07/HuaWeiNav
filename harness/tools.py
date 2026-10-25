@@ -48,7 +48,7 @@ class NavigationTools:
         self.last_goal_id = None
 
     def observe(self):
-        """Project bounded scene facts and authoritative state into model input."""
+        """Project observed scene facts and authoritative state into model input."""
         from dataclasses import asdict
         snapshot = self.session.snapshot
         return {
@@ -56,8 +56,9 @@ class NavigationTools:
             "progress": self.session.progress.as_dict(),
             "timestamp": snapshot.timestamp,
             "robot_pose": snapshot.robot_pose.as_dict(),
-            "objects": [obj.concept_payload() for obj in snapshot.objects[:32]],
-            "frontiers": [asdict(item) for item in snapshot.frontiers[:32]],
+            # 地图按发现顺序追加对象；截取前缀会永久隐藏后来发现的目标。
+            "objects": [obj.concept_payload() for obj in snapshot.objects],
+            "frontiers": [asdict(item) for item in snapshot.frontiers],
             "motion": {"phase": self.motion.phase, "held": self.motion.held,
                        "control_epoch": self.motion.control_epoch},
         }

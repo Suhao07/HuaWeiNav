@@ -4,9 +4,9 @@ from __future__ import annotations
 import inspect
 import json
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Literal, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, create_model
 
 from harness.tools import NavigationTools
 from scene.dependencies import object_dependencies
@@ -14,27 +14,60 @@ from llm_utils.cognav_llm_adapter import get_client_and_model
 
 
 class ToolArguments(BaseModel):
-    """Explicit wire fields so structured-output providers preserve tool inputs."""
-    candidate_uid: Optional[str] = None
-    target_id: Optional[str] = None
-    viewpoint_uid: Optional[str] = None
-    frontier_uid: Optional[str] = None
-    task_revision: Optional[int] = None
-    control_epoch: Optional[int] = None
-    request_id: Optional[str] = None
-
+    """Tool boundaries accept exactly the declared fields."""
     class Config:
         extra = "forbid"
 
 
+class CandidateArguments(ToolArguments):
+    """Observed instance for viewpoint lookup."""
+    candidate_uid: str
+
+
+class VerificationArguments(CandidateArguments):
+    """Task-scoped final verification request."""
+    target_id: str
+    task_revision: int
+
+
+class MotionArguments(ToolArguments):
+    """Ownership and idempotency fields shared by motion requests."""
+    task_revision: int
+    control_epoch: int
+    request_id: str
+
+
+class ObjectMotionArguments(MotionArguments):
+    """Navigate to an observed object's associated viewpoint."""
+    candidate_uid: str
+    viewpoint_uid: str
+
+
+class FrontierMotionArguments(MotionArguments):
+    """Navigate to a frontier published by the observation backend."""
+    frontier_uid: str
+
+
+# 每个 name 与唯一参数协议绑定；schema 从结构上排除跨工具参数。
+_TOOL_ARGUMENTS = {
+    "observe": ToolArguments,
+    "query_scene": ToolArguments,
+    "query_viewpoints": CandidateArguments,
+    "submit_motion": Union[ObjectMotionArguments, FrontierMotionArguments],
+    "motion_status": ToolArguments,
+    "cancel_motion": ToolArguments,
+    "verify_target": VerificationArguments,
+    "propose_finish": ToolArguments,
+}
+_TOOL_CALLS = tuple(create_model(
+    "Call_" + name, __base__=ToolArguments,
+    name=(Literal[name], ...), arguments=(arguments, ...), reason=(str, ...),
+) for name, arguments in _TOOL_ARGUMENTS.items())
+
+
 class ToolCall(BaseModel):
-    """One model proposal; execution is admitted by the named domain tool."""
-    name: Literal[
-        "observe", "query_scene", "query_viewpoints", "submit_motion",
-        "motion_status", "cancel_motion", "verify_target", "propose_finish",
-    ]
-    arguments: ToolArguments = Field(default_factory=ToolArguments)
-    reason: str
+    """One typed action; the tool name determines its legal argument fields."""
+    action: Union[_TOOL_CALLS]
 
 
 class AgentRuntime:
@@ -92,7 +125,7 @@ class AgentRuntime:
             model=self.model, messages=messages, response_format=ToolCall,
             temperature=0.0, trace_label="navigation_agent",
         )
-        call = completion.choices[0].message.parsed
+        call = completion.choices[0].message.parsed.action
         arguments = call.arguments.dict(exclude_none=True)
         proposal = {"call_index": self.model_calls, "name": call.name,
                     "arguments": arguments, "reason": call.reason}

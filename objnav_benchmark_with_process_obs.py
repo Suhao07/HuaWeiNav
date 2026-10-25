@@ -10,6 +10,7 @@ from loguru import logger
 from tqdm import tqdm
 
 from benchmark import available_benchmarks, get_provider
+from benchmark.episode_selection import select_episode, episode_identity
 from constants import *
 #指令解析模块
 from instruction_adapter import (
@@ -36,24 +37,6 @@ def write_metrics(metrics, path="objnav_hm3d.csv"):
         writer.writeheader()
         writer.writerows(metrics)
 
-
-def _set_next_episode_by_index(env, index):
-    # 新版 Habitat iterator 提供 set_next_episode_by_index；
-    # 旧版没有该方法，只能重排 episodes 并重建内部 iterator。
-    iterator = env.episode_iterator
-    if hasattr(iterator, "set_next_episode_by_index"):
-        iterator.set_next_episode_by_index(index)
-        return
-
-    episodes = list(iterator.episodes)
-    if not episodes:
-        raise IndexError("No episodes are available in the Habitat iterator.")
-    index = index % len(episodes)
-    iterator.episodes = episodes[index:] + episodes[:index]
-    if hasattr(iterator, "_iterator"):
-        iterator._iterator = iter(iterator.episodes)
-    if hasattr(iterator, "_prev_scene_id"):
-        iterator._prev_scene_id = None
 
 
 def _filter_episodes(env, scene_id_contains=None, object_category=None):
@@ -307,9 +290,6 @@ if __name__ == "__main__":
         )
 
     start_idx = args.start_episode
-    if hasattr(habitat_agent.env.episode_iterator, "set_next_episode_by_index"):
-        # 新版 iterator 需要先 reset 一次完成内部状态初始化。
-        habitat_agent.env.reset()
 
     for i in tqdm(range(start_idx, args.eval_episodes)):
         # try:
@@ -317,9 +297,15 @@ if __name__ == "__main__":
         # logger.add(logger_path, mode="w")
         logger.info(f"Processing episode: i = {i}")
 
-        _set_next_episode_by_index(habitat_agent.env, i)
+        expected_episode = select_episode(habitat_agent.env, i)
         habitat_agent.reset(i)
+        actual_episode = episode_identity(habitat_agent.env.current_episode)
+        if actual_episode != expected_episode:
+            raise RuntimeError("Habitat reset selected a different episode")
         episode_dir = os.path.join(args.save_dir, f"episode-{i}")
+        os.makedirs(episode_dir, exist_ok=True)
+        with open(os.path.join(episode_dir, "episode_identity.json"), "w") as stream:
+            json.dump(actual_episode, stream, indent=2)
         if prior_map_runtime is not None:
             prior_map_runtime.begin_episode(episode_dir, i)
         reset_counts()

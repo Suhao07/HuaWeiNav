@@ -26,7 +26,9 @@ def snapshot_from_mapper(mapper, *, step=0, nodes=()):
             points = obj.pcd.point.positions.cpu().numpy()
             if len(points):
                 lo, hi = points.min(axis=0)[:3], points.max(axis=0)[:3]
-                center, extent = tuple((lo + hi) / 2), tuple(hi - lo)
+                # 快照是可序列化领域数据；在 NumPy 导出边界转换标量类型。
+                center = tuple(((lo + hi) / 2).tolist())
+                extent = tuple((hi - lo).tolist())
         except (AttributeError, TypeError, ValueError):
             pass
         box = tuple(candidate.bbox_2d[:4]) if len(candidate.bbox_2d) >= 4 else None

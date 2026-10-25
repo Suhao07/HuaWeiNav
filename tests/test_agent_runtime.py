@@ -15,6 +15,10 @@ from task.session import TaskSession
 from verification.contracts import VerificationResult
 
 
+def tool_call(*, name, arguments, reason):
+    return ToolCall(action={"name": name, "arguments": arguments, "reason": reason})
+
+
 class Controller:
     def __init__(self):
         self.sent = []
@@ -81,7 +85,7 @@ def test_tool_loop_moves_verifies_and_finishes_from_domain_state(monkeypatch, tm
         ("verify_target", {"candidate_uid": "cup-1", "target_id": "cup", "task_revision": 1}),
         ("propose_finish", {}),
     ]
-    client_model, requests = model_calls([ToolCall(name=n, arguments=a, reason="replay") for n, a in specs])
+    client_model, requests = model_calls([tool_call(name=n, arguments=a, reason="replay") for n, a in specs])
     trace = tmp_path / "events.jsonl"
     runtime = AgentRuntime(tools, trace, max_model_calls=len(specs), client_model=client_model)
     assert not tools.propose_finish()["accepted"]
@@ -107,7 +111,7 @@ def test_tool_loop_moves_verifies_and_finishes_from_domain_state(monkeypatch, tm
 
 def test_model_motion_with_stale_revision_is_recorded_and_propagated(monkeypatch, tmp_path):
     tools = make_tools(monkeypatch)
-    client_model, _ = model_calls([ToolCall(name="submit_motion", arguments={
+    client_model, _ = model_calls([tool_call(name="submit_motion", arguments={
         "candidate_uid": "cup-1", "viewpoint_uid": "view-1", "task_revision": 2,
         "control_epoch": 0, "request_id": "stale",
     }, reason="stale")])
@@ -127,7 +131,7 @@ def test_scene_change_during_model_request_prevents_motion(monkeypatch, tmp_path
         snapshot = tools.session.snapshot
         obj = replace(snapshot.objects[0], position=(8, 0, 0))
         tools.session.snapshot = replace(snapshot, objects=(obj,))
-        call = ToolCall(name="submit_motion", arguments={
+        call = tool_call(name="submit_motion", arguments={
             "candidate_uid": "cup-1", "viewpoint_uid": "view-1", "task_revision": 1,
             "control_epoch": 0, "request_id": "stale-geometry",
         }, reason="late response")
@@ -174,13 +178,49 @@ def test_frontier_motion_uses_exported_frame_and_keeps_receipt(monkeypatch):
     assert tools.motion_status()["status"]["status"] == NavigationStatusCode.REACHED
 
 
-def test_structured_tool_arguments_expose_frontier_submission_fields():
-    from harness.runtime import ToolArguments
-    schema = ToolArguments.schema()
-    assert {"frontier_uid", "task_revision", "control_epoch", "request_id"} <= set(schema["properties"])
-    call = ToolCall(name="submit_motion", arguments={
+def test_tool_schema_binds_names_to_exact_arguments():
+    from pydantic import ValidationError
+    call = tool_call(name="submit_motion", arguments={
         "frontier_uid": "node:2", "task_revision": 1, "control_epoch": 0, "request_id": "r1",
     }, reason="explore")
-    assert call.arguments.dict(exclude_none=True) == {
+    assert call.action.arguments.dict() == {
         "frontier_uid": "node:2", "task_revision": 1, "control_epoch": 0, "request_id": "r1",
     }
+    with pytest.raises(ValidationError):
+        tool_call(name="query_scene", arguments={"target_id": "cup"}, reason="invalid protocol")
+    with pytest.raises(ValidationError):
+        tool_call(name="submit_motion", arguments={}, reason="missing motion fields")
+    assert tool_call(name="query_scene", arguments={}, reason="query").action.arguments.dict() == {}
+
+
+def test_observation_preserves_late_discovered_objects_and_frontiers(monkeypatch):
+    from dataclasses import replace
+    from scene.contracts import FrontierSnapshot
+    tools = make_tools(monkeypatch)
+    objects = tuple(ObjectNodeSnapshot(f"object-{i}", "chair", (i, 0, 0)) for i in range(40))
+    frontiers = tuple(FrontierSnapshot(f"node:{i}", (i, 0, 0)) for i in range(40))
+    tools.session.snapshot = replace(tools.session.snapshot, objects=objects, frontiers=frontiers)
+    observed = tools.observe()
+    assert [obj["uid"] for obj in observed["objects"]] == [obj.uid for obj in objects]
+    assert [node["uid"] for node in observed["frontiers"]] == [node.uid for node in frontiers]
+
+
+def test_arrival_refresh_preserves_object_recheck_until_instance_disappears(monkeypatch):
+    from dataclasses import replace
+    from backends.habitat.agent_runtime import HabitatNavigationTools
+    import backends.habitat.agent_runtime as backend
+    tools = make_tools(monkeypatch)
+    snapshot = tools.session.snapshot
+    recheck = ViewpointSnapshot("recheck-1", Pose3D((1, 1, 0)), visible_objects=("cup-1",))
+    tools.session.snapshot = replace(snapshot, viewpoints=snapshot.viewpoints + (recheck,))
+    tools.agent = SimpleNamespace(mapper=SimpleNamespace(nodes=[]), episode_steps=5, current_node_idx=0)
+    monkeypatch.setattr(tools.session.constraint_evaluator, "register_mapper_objects", lambda **kwargs: None)
+    arrived = replace(snapshot, robot_pose=Pose3D((1, 0, 0)), viewpoints=())
+    monkeypatch.setattr(backend, "snapshot_from_mapper", lambda *args, **kwargs: (arrived, {"cup-1": object()}))
+    HabitatNavigationTools.refresh_scene(tools)
+    tools.submit_motion(1, 0, "recheck-after-arrival", candidate_uid="cup-1", viewpoint_uid="recheck-1")
+    assert tools.motion.controller.sent[-1].goal_pose.position == (1, 1, 0)
+
+    monkeypatch.setattr(backend, "snapshot_from_mapper", lambda *args, **kwargs: (replace(arrived, objects=()), {}))
+    HabitatNavigationTools.refresh_scene(tools)
+    assert tools.session.snapshot.viewpoints == ()

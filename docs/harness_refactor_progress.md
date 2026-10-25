@@ -164,3 +164,77 @@ P4 仍待：完整任务 revision 的运动准入、物理停止确认语义核�
 - 已增加字段 schema 和参数保真回归；全套 **296 passed**。模型保留 ID 前缀是协议要求，系统提示词明确逐字复制观测 ID。
 - 原理性提交说明位于 harness_refactor_design.md；正式实验脚本 compare_harness_episodes.py 按 Git commit 冻结源码，不将中途修复混入同一批结果。
 - 正式比较为 baseline 原策略与重构 Agent 各 5 个 episode。失败计入运行记录；单独报告独立 evaluator 结果与工程失败，避免仅汇总成功运行样本。
+
+### 五例选样与工具协议根因修复（2026-10-25，重跑中）
+
+- `outputs/harness_paired5_20261025` 的旧结果保留为无效配对实验：baseline 重复首个任务，Agent 五次均因 `query_scene(target_id=...)` 异常退出，不能计算五个独立样本的性能。
+- 工具参数原先共用一个可选字段集合，schema 允许把其他工具的字段交给 `query_scene`。现将工具名与各自参数模型绑定，运动参数区分对象视点与 frontier；schema 拒绝跨工具字段与缺失必填字段。调用异常继续向上传播，日志保留失败事实。
+- 当前 Habitat 在构造时预选任务，首次 reset 保留该任务。旧选择函数只重排 iterator，未替换预选任务。现经公开 `env.current_episode` setter 绑定索引，reset 后逐项核验场景、episode ID、起点、朝向、目标类别，索引越界直接报错。
+- 单元回归覆盖非法工具参数、缺失运动参数、独立进程首次 reset 与重复选样；全套 **298 passed**。真实豆包 schema 请求返回有效 frontier 运动参数。
+- 真实 Habitat 已逐一 reset 五例；身份清单为 `outputs/agent_repair_20261025/verified-episodes.json`，五个不同场景，目标分别为 toilet、chair、plant、bed、tv_monitor。episode ID 在场景内解释，两个场景的 ID=5 不是同一任务。
+- Agent 重跑使用 `outputs/agent_repair_20261025/agent_r3/source` 冻结源码与 SHA256 清单；baseline 使用原 `cf8dd8e` 加选样修复，补丁保存在 `outputs/agent_repair_20261025/paired5/baseline/selection-only.patch`。两组使用同一豆包模型、镜像、五例清单及 500 步预算；并发期间的耗时不用于性能结论。
+- 当前记录为重跑中的工程状态，最终完成数量、错误与导航指标以各次退出记录、identity、termination 和 metrics.csv 为准。
+
+#### 真实运行继续定位：观测前缀截断
+
+- r3 在第 155 步已观测到 toilet（`node_info_155.json` 中 index=43），但 `observe()` 的 `objects[:32]` 隐藏该对象，后续模型反复判断未发现目标。已保留模型请求和地图对象清单，主动中止 r3（exit=137），该运行不计入完整五例。
+- 删除对象与 frontier 的固定前缀截断，发送当前观测事实；未增加新策略、重试或静默 fallback。新增超过 32 个实例/探索节点的完整性回归，全套 **299 passed**。
+- r4 使用新的独立冻结源码重跑同一首例。baseline 首例已完成并核验身份：success=1、SPL=0.4708884325、128 步，其余四例继续运行。
+
+#### 真实运行继续定位：NumPy 几何导出边界
+
+- r4 在第 380 步识别到 toilet 并提出 `verify_target`，证明目标已进入模型上下文；随后 `scene.dependencies.object_dependencies` 在 JSON 编码包围盒几何时抛出 `TypeError: Object of type float32 is not JSON serializable`。保留 exit=1 与原始失败 trace。
+- 根因在 `backends/habitat/scene.py`：点云包围盒中心/尺寸经 `tuple(ndarray)` 导出，元素仍为 NumPy 标量。改为在导出边界用 `.tolist()` 转为 Python 数值；依赖哈希和 JSON 编码器保持原协议。
+- 新测试用真实 NumPy float32 点云覆盖完整快照 JSON 编码与对象依赖哈希；相关 12 项回归通过。r5 冻结新源码，先运行固定清单的 index=1，再运行其余四例，包括重新执行 index=0；不复用旧版本失败记录充当最终样本。
+
+- 实验执行约定：修正选样后的 baseline 仅执行这一批五例，结果固定复用；Agent 后续修复不触发 baseline 重跑。当前 baseline 已完成 index=0..3，index=4 运行中。
+
+#### 真实运行继续定位：对象视点生命周期
+
+- r5 已通过目标查询、视点生成、对象导航、依赖哈希与最终验证；验证返回 `need_better_view` 后，请求先前发布的 recheck ID 时异常退出：`Viewpoint is not associated with the observed instance`。
+- 根因是 `refresh_scene()` 每次从 mapper 重建快照时丢弃工具生成的对象视点。修复为保留仍属于当前观测实例的对象视点，实例消失时清理；拓扑节点仍由 mapper 更新。视点表示场景位置，机器人移动不使其失效；该保留规则不改变证据有效性检查。
+- 新回归覆盖“到达后刷新 → 使用原 recheck ID 提交运动 → 实例消失后清理视点”，相关测试通过。r6 冻结同一源码，以两个独立进程并行跑 Agent 清单；保留 r5 失败记录。
+- baseline 单批五例全部正常结束，五份身份和首帧哈希均不同：SR=1.0，平均 SPL=0.6006675182。逐例 SPL：0.4708884325、0.4415102046、0.2635974417、0.9810523365、0.8462891758；步数：128、109、274、87、33。baseline 已固定，后续只迭代 Agent。
+
+#### 真实运行继续定位：实例身份与几何版本混用
+
+- r6 的 tv_monitor 补拍运动已成功执行；后续验证因 `Unknown observed instance` 退出。原实例 UID 来自当前点云尺寸/中心的量化哈希，融合观测后，同一地图实例获得另一 UID。
+- 原生 `ObjectNode` 现在创建时分配稳定 UID；mapper 已有的关联逻辑原位更新该对象并保留 UID。`candidate_from_object` 直接使用原生 UID，旧无 UID 输入仍使用原兼容路径。几何变化继续由 `scene.dependencies` 的内容哈希表达，避免稳定身份掩盖旧证据失效。
+- 新测试覆盖同一原生对象更新位置、点云、标签后 UID 不变、几何依赖哈希变化，以及不同实例 UID 不同；全套 **302 passed**。
+- 保留 r6 的 TV 失败及主动中止的 chair 诊断记录。r7 先跑清单 index=4 的较短场景验证完整闭环，确认后再运行其余四例；baseline 固定不变。
+
+#### r7 首个完整 Agent episode
+
+- 稳定 UID 版本在 index=4（tv_monitor）完成 `query_viewpoints → submit_motion → verify_target(need_better_view) → recheck → verify_target(accept) → propose_finish → STOP`，两次验证引用同一实例 UID。
+- 正常退出，身份核验通过，`termination=verified_finish`，75 步、7 次 Agent 决策；Habitat success=1、SPL=0.5557742140。总模型调用 11（Agent 7、检测框核验 2、最终验证 2）。其余四例使用同一 r7 冻结源码，以两个进程继续执行。
+
+
+#### 最终五例统计口径
+
+- baseline 只执行一次修正选样后的五例，冻结在 `outputs/agent_repair_20261025/paired5/baseline/`；后续 Agent 修复和诊断均复用该结果。旧重复 episode 的批次保留为选样故障记录。
+- 最终 Agent 使用统一 r7 源码及 SHA256 清单。五例分别启动独立进程，使用相同模型、镜像、权重配置、500 步上限；Agent 决策上限为 60 次，感知和验证调用单独统计。
+- 每例比较完整身份（场景、episode ID、起点、朝向、目标类别）及首帧哈希。场景不同而 ID 相同属于独立任务。统计分母固定为五，不排除导航失败。
+- 指标由 Habitat evaluator 输出：SR = Σ successᵢ / 5，mean SPL = Σ SPLᵢ / 5。工程退出错误与有效的步数耗尽分别记录，前者先修复，后者保留为导航失败。
+- 比较对象是原 STRIVE legacy 策略和 STRIVE Agent 主链路，包含策略/指令路径差异；本实验不是纯结构消融，也不是官方 SuperNav 复现或完整 HM3D benchmark。并发运行耗时不用于延迟比较。
+- r7 的 plant 在 500 步终止，Habitat success=0、SPL=0，工具未报错。其地图日志没有 plant/pot/flower 标签，当前证据只支持“未形成可验证目标”，尚不能区分搜索覆盖不足与检测遗漏。
+- chair 成功，但路径从 8.75 米增至 19.75 米；总模型调用从 17 增至 55，其中 38 次为检测框核验。后续应分别分析 frontier 选择、补拍几何和感知调用，避免把此次工程修复等同于性能提升。
+
+
+#### r7 五例最终结果（已全部结束）
+
+完整回执：`outputs/agent_repair_20261025/paired5/combined-results.json`；逐例 command、result、episode.log 分别保存在该目录的 baseline 和 agent_r7 子目录。r7 完整工具日志位于其冻结 source/logs 目录。
+
+| index | 目标 | success（baseline / Agent） | SPL（baseline / Agent） | 步数（baseline / Agent） | Agent 终止原因 |
+| --- | --- | --- | --- | --- | --- |
+| 0 | toilet | 1 / 0 | 0.4709 / 0.0000 | 128 / 500 | episode_limit |
+| 1 | chair | 1 / 1 | 0.4415 / 0.1975 | 109 / 241 | verified_finish |
+| 2 | plant | 1 / 0 | 0.2636 / 0.0000 | 274 / 500 | episode_limit |
+| 3 | bed | 1 / 1 | 0.9811 / 0.7091 | 87 / 118 | verified_finish |
+| 4 | tv_monitor | 1 / 1 | 0.8463 / 0.5558 | 33 / 75 | verified_finish |
+
+- baseline：5/5 成功，SR=1.0000，平均 SPL=0.6006675182；只运行这一批有效五例。
+- Agent r7：3/5 成功，SR=0.6000，平均 SPL=0.2924670952；toilet、plant 均因 500 步上限结束，成功案例均通过 verified_finish。
+- 两组均完成五个独立 episode；逐例身份及首帧哈希相同，组内身份与首帧哈希各有五个不同值。所有进程 exit=0，r7 五份工具 trace 均无 failed 事件。
+- SR 差值为 −40 个百分点，平均 SPL 差值为 −0.3082004230。此五例说明当前 Agent 性能回退，不能声称重构提高导航效果，也不能外推全量 HM3D 结论。
+- 本轮完成工具协议、选样和四处后续运行根因修复；保留 r3–r6 失败/中断证据。全套回归 302 passed；未增加静默参数过滤、自动降级或吞错路径。
+- 下一步应冻结本次 baseline，针对搜索覆盖、frontier 选择和补拍开销做单因素诊断。ROS Agent 接入与实物验收不在本次已完成范围。
