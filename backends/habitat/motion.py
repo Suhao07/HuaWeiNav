@@ -63,7 +63,7 @@ class HabitatMotionController:
         局部规划器返回 STOP 表示该 waypoint 到达，任务 STOP 由完成工具触发。
         """
         import numpy as np
-        from navigation.action_controller import next_action_to_waypoint
+        from navigation.action_controller import next_action_to_waypoint, geodesic_distance_to_waypoint
 
         if self.waypoint_goal is None:
             return
@@ -72,14 +72,21 @@ class HabitatMotionController:
             status = NavigationStatusCode.TIMEOUT
         else:
             waypoint = np.asarray(self.waypoint_goal.goal_pose.position, dtype=float)
-            action = next_action_to_waypoint(self.agent, waypoint)
+            # 复用 baseline 补拍的 0.5m 到达半径；普通 waypoint 沿用 planner 终态。
+            radius = self.waypoint_goal.metadata.get("arrival_radius_m")
+            action = (0 if radius is not None and
+                      geodesic_distance_to_waypoint(self.agent, waypoint) <= radius
+                      else next_action_to_waypoint(self.agent, waypoint))
             if action is None:
                 status = NavigationStatusCode.BLOCKED
             elif int(action) == 0:
                 status = NavigationStatusCode.REACHED
             else:
                 self.agent.obs = self.env.step(int(action))
-                self.agent.update_trajectory()
+                # 原探索器从首次平移起累计沿途点云；出发前原地转向仍属当前节点。
+                if self.waypoint_goal.mode == MotionGoalMode.GO_TO_FRONTIER and int(action) == 1:
+                    self.agent.on_node_flag = False
+                self.agent.update_trajectory(self.agent.on_node_flag)
                 status = NavigationStatusCode.RUNNING
         self.statuses[goal_id] = NavigationStatus(
             status, goal_id=goal_id, stamp=float(self.agent.episode_steps),

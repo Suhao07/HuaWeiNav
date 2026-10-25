@@ -1,6 +1,7 @@
 """Habitat binding of the shared scene query to existing geometry execution."""
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 from pathlib import Path
 
@@ -9,11 +10,23 @@ from prior_map.simulation import refresh_mapper_prior_map_query
 from harness.tools import query_scene
 
 
+def refresh_scene(agent):
+    """Publish mapper facts and retain views of instances still in the scene."""
+    previous = agent.task.snapshot
+    snapshot, objects = snapshot_from_mapper(
+        agent.mapper, step=agent.episode_steps, nodes=agent.mapper.nodes)
+    views = tuple(v for v in previous.viewpoints if v.visible_objects
+                  and all(uid in objects for uid in v.visible_objects))
+    agent.task.snapshot = replace(snapshot, viewpoints=snapshot.viewpoints + views)
+    agent.task.constraint_evaluator.register_mapper_objects(
+        mapper=agent.task, step=agent.episode_steps, current_node_idx=agent.current_node_idx)
+    return objects
+
+
 def select_observed_candidate(agent, *, episode_idx=None, step=0):
     """Query native snapshots and return the existing object for local geometry."""
     session, mapper = agent.task, agent.mapper
-    snapshot, objects = snapshot_from_mapper(mapper, step=step)
-    session.snapshot = snapshot
+    objects = refresh_scene(agent)
     active_id = session.progress.active_target().id
     active = next(t for t in session.plan.terminal_targets if t.id == active_id)
     session.target = active.name

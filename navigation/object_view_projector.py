@@ -97,11 +97,17 @@ def _project_bbox(obj_pcd: Any, camera_intrinsic: Any, position: Any, rotation: 
     return np.array([bbox[0][0], bbox[0][1], bbox[1][0], bbox[1][1]])
 
 
-def project_object_view(agent: Any, obj: Any, images: list[np.ndarray], rotations: list[Any], torch_module: Any) -> ObjectViewEvidence | None:
+def project_object_view(agent: Any, obj: Any, images: list[np.ndarray], rotations: list[Any], torch_module: Any, *, partial: bool = False) -> ObjectViewEvidence | None:
     """Build RGB/bbox evidence for one merged object candidate."""
 
-    image_bin = _view_index_for_object(agent, obj)
-    image, rotation = _evidence_image_and_rotation(images, rotations, image_bin, agent.mapper.camera_intrinsic)
+    if partial:
+        # 部分扫描以真实相机朝向选帧，不依赖转满一圈后回到起始朝向。
+        direction = np.mean(obj.pcd.point.positions.cpu().numpy(), axis=0)[:2] - agent.mapper.current_position[:2]
+        index = int(np.argmax([np.dot(-np.asarray(r)[:2, 2], direction) for r in rotations]))
+        image, rotation = images[index], rotations[index]
+    else:
+        image_bin = _view_index_for_object(agent, obj)
+        image, rotation = _evidence_image_and_rotation(images, rotations, image_bin, agent.mapper.camera_intrinsic)
     bbox_xyxy = _project_bbox(
         obj.pcd_all,
         agent.mapper.camera_intrinsic,

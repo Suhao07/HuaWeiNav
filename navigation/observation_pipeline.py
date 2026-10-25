@@ -97,3 +97,60 @@ def save_observation_pointcloud(agent: Any, pcd: Any, *, episode_idx: int, step:
     else:
         file_path = f"{obs_dir}/obs_{step}_{path_idx}.ply"
     o3d.io.write_point_cloud(file_path, save_pcd)
+
+
+def collect_adaptive_observations(agent):
+    """Observe missing headings in four-view batches, stopping at a target candidate.
+
+    几何更新使用每帧真实 RGB/depth/pose；语义覆盖只在检测完成后提交。
+    同一位姿的候选被否决后继续剩余方向；新位置重新观察，避免视差误复用。
+    12 个方向只需 11 次转向，最后一帧后直接进入导航，无需恢复起始朝向。
+    """
+    reset_panoramic_buffers(agent)
+    pose_key = (agent.task.spec.revision, *np.round(agent.mapper.current_position, 3))
+    covered = agent.semantic_scan_headings.setdefault(pose_key, set())
+    if len(covered) == 12:
+        agent.scan_complete = True
+        return
+    start_step = agent.episode_steps
+    images, depths, positions, rotations, headings = [], [], [], [], []
+
+    def process_batch():
+        agent.rotate_segmentation(images, depths, positions, rotations, partial=True)
+        covered.update(headings)
+        images.clear(); depths.clear(); positions.clear(); rotations.clear(); headings.clear()
+        return any(agent.mapper._is_target_tag(agent.mapper.objects[i].tag)
+                   for i in agent.mapper.current_obj_indices)
+
+    for _ in range(12):
+        rotation = np.asarray(agent.mapper.current_rotation)
+        heading = int(np.round(np.degrees(np.arctan2(-rotation[1, 2], -rotation[0, 2])) / 30)) % 12
+        if heading not in covered:
+            if agent.mapper.current_navigable_pcd is None and agent.mapper.current_pcd is None:
+                pcd = gpu_pointcloud_from_array(np.empty((0, 3)), np.empty((0, 3)), agent.mapper.pcd_device)
+            else:
+                pcd = gpu_merge_pointcloud(agent.mapper.current_navigable_pcd, agent.mapper.current_pcd).voxel_down_sample(agent.mapper.pcd_resolution)
+            agent.temporary_pcd.append(pcd)
+            agent.angles.append(2 * np.arccos(agent.rotation.w))
+            images.append(agent.rgb_trajectory[-1]); depths.append(agent.temporary_depths[-1])
+            positions.append(agent.mapper.current_position.copy()); rotations.append(rotation.copy())
+            headings.append(heading)
+        if len(images) == 4 or len(covered) + len(headings) == 12:
+            candidate_seen = process_batch()
+            if candidate_seen or len(covered) == 12:
+                break
+        agent.obs = agent.execution.step(3)
+        agent.update_trajectory()
+        if agent.env.episode_over:
+            break
+    if images and not agent.env.episode_over:
+        process_batch()
+    agent.scan_complete = len(covered) == 12
+
+    import json
+    from pathlib import Path
+    path = Path(agent.save_dir) / f"episode-{agent.episode_samples - 1}" / "observation_cycles.jsonl"
+    with path.open("a") as stream:
+        stream.write(json.dumps({"start_step": start_step, "end_step": agent.episode_steps,
+                                 "views": len(agent.temporary_pcd), "covered_headings": sorted(covered),
+                                 "complete": agent.scan_complete}) + "\n")

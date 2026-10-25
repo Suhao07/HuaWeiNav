@@ -23,6 +23,7 @@ def build_check_again_viewpoints(
     target_height: float,
     success_distance: float,
     stop_criterion: float,
+    arrival_tolerance: float = 0.0,
 ) -> tuple[list[dict[str, Any]], list[np.ndarray]]:
     """Generate class-agnostic better-view proposals for one object instance.
 
@@ -54,6 +55,7 @@ def build_check_again_viewpoints(
 
     final_pos = np.asarray(object_node.position[:2], dtype=float)
     proposals: list[dict[str, Any]] = []
+    path_origin = path_points[0] if len(path_points) else np.zeros(3)
     for point in interpolated_path:
         point = np.asarray(point, dtype=float)
         rotation_matrix = rotation_towards(point[:2], final_pos)
@@ -92,6 +94,8 @@ def build_check_again_viewpoints(
                 "position": point.copy(),
                 "pose": [float(x) for x in point.reshape(-1).tolist()],
                 "score": quality.score,
+                "travel_distance": float(np.linalg.norm(point[:2] - path_origin[:2])),
+                "stop_feasible": quality.distance_to_target + arrival_tolerance <= success_distance,
                 "visible_ratio": quality.visible_ratio,
                 "area_ratio": quality.area_ratio,
                 "center_score": quality.center_score,

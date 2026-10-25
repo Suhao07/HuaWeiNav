@@ -103,6 +103,8 @@ class ViewpointProposal:
     predicted_quality: dict[str, float] = field(default_factory=dict)
     reason: str = ""
     attempted: bool = False
+    stop_feasible: bool = False
+    travel_distance: float = 0.0
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -225,12 +227,16 @@ class ViewControlState:
                     predicted_quality=dict(item.get("predicted_quality") or {}),
                     reason=str(item.get("reason", "")),
                     attempted=key in attempted_poses,
+                    stop_feasible=bool(item.get("stop_feasible", False)),
+                    travel_distance=float(item.get("travel_distance", 0.0)),
                 )
             )
         self.proposals = sorted(out, key=self._proposal_sort_key, reverse=True)
         self.exhausted = bool(self.proposals) and all(p.attempted for p in self.proposals)
 
     def _proposal_sort_key(self, proposal: ViewpointProposal) -> tuple[float, float, float]:
+        if proposal.stop_feasible:
+            return (2.0, -proposal.travel_distance, proposal.score)
         distance = float(proposal.distance_to_target or 0.0)
         required = self.required_stop_distance()
         if self.physical_contract_pending() and required > 0.0:

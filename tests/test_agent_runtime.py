@@ -208,12 +208,12 @@ def test_observation_preserves_late_discovered_objects_and_frontiers(monkeypatch
 def test_arrival_refresh_preserves_object_recheck_until_instance_disappears(monkeypatch):
     from dataclasses import replace
     from backends.habitat.agent_runtime import HabitatNavigationTools
-    import backends.habitat.agent_runtime as backend
+    import backends.habitat.query as backend
     tools = make_tools(monkeypatch)
     snapshot = tools.session.snapshot
     recheck = ViewpointSnapshot("recheck-1", Pose3D((1, 1, 0)), visible_objects=("cup-1",))
     tools.session.snapshot = replace(snapshot, viewpoints=snapshot.viewpoints + (recheck,))
-    tools.agent = SimpleNamespace(mapper=SimpleNamespace(nodes=[]), episode_steps=5, current_node_idx=0)
+    tools.agent = SimpleNamespace(task=tools.session, mapper=SimpleNamespace(nodes=[]), episode_steps=5, current_node_idx=0)
     monkeypatch.setattr(tools.session.constraint_evaluator, "register_mapper_objects", lambda **kwargs: None)
     arrived = replace(snapshot, robot_pose=Pose3D((1, 0, 0)), viewpoints=())
     monkeypatch.setattr(backend, "snapshot_from_mapper", lambda *args, **kwargs: (arrived, {"cup-1": object()}))

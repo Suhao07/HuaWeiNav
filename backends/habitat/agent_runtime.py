@@ -3,7 +3,6 @@ from dataclasses import replace
 import json
 from pathlib import Path
 
-from backends.habitat.scene import snapshot_from_mapper
 from harness.runtime import AgentRuntime
 from harness.tools import NavigationTools
 from instruction_adapter.verifier import candidate_from_object
@@ -51,20 +50,8 @@ class HabitatNavigationTools(NavigationTools):
 
     def refresh_scene(self):
         """Publish observed geometry after a perception cycle or physical motion."""
-        agent = self.agent
-        previous = self.session.snapshot
-        snapshot, self.objects = snapshot_from_mapper(
-            agent.mapper, step=agent.episode_steps, nodes=agent.mapper.nodes,
-        )
-        # 导航视点是场景中的位置，机器人移动后仍可使用；所属实例离开快照时清理。
-        # 保留同一对象的 recheck 视点，使到达后的补拍请求引用同一份已发布协议。
-        object_views = tuple(view for view in previous.viewpoints
-                             if view.visible_objects and
-                             all(uid in self.objects for uid in view.visible_objects))
-        self.session.snapshot = replace(snapshot, viewpoints=snapshot.viewpoints + object_views)
-        self.session.constraint_evaluator.register_mapper_objects(
-            mapper=self.session, step=agent.episode_steps, current_node_idx=agent.current_node_idx,
-        )
+        from backends.habitat.query import refresh_scene
+        self.objects = refresh_scene(self.agent)
 
     def query_viewpoints(self, candidate_uid):
         """Generate STRIVE's approach/recheck viewpoints for one observed object."""

@@ -57,9 +57,9 @@ def test_waypoint_execution_pumps_existing_planner_and_polling_is_read_only():
 
     agent = SimpleNamespace(
         env=env, mapper=SimpleNamespace(initial_position=np.array([10, 20, 0])),
-        planner=SimpleNamespace(get_next_action=get_next_action), episode_steps=0,
+        planner=SimpleNamespace(get_next_action=get_next_action), episode_steps=0, on_node_flag=True,
     )
-    def update():
+    def update(on_node_flag):
         agent.episode_steps += 1
     agent.update_trajectory = update
     execution.controller.agent = agent

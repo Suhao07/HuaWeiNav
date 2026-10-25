@@ -218,7 +218,7 @@ class HM3D_Objnav_Agent:
         logger.info("object indices")
         logger.info(self.mapper.current_obj_indices)
 
-    def rotate_segmentation(self, images, depths, positions, rotations):
+    def rotate_segmentation(self, images, depths, positions, rotations, *, partial=False):
         """Run panoramic object detection and update mapper object memory.
 
         Parameters are the twelve RGB/depth/pose buffers collected by
@@ -231,8 +231,8 @@ class HM3D_Objnav_Agent:
         C_objs = []
         step_dir = detection_step_dir(self)
 
-        for i in range(12):
-            triplet = build_triplet(images, depths, i, self.mapper.camera_intrinsic)
+        for i in range(len(images)):
+            triplet = build_triplet(images, depths, i, self.mapper.camera_intrinsic, circular=not partial)
             B_classes, B_boxes, B_masks, B_confidences, \
                 C_classes, C_boxes, C_masks, C_confidences = \
                     self.mapper.object_perceiver.perceive(
@@ -305,12 +305,17 @@ class HM3D_Objnav_Agent:
             obj.pcd = gpu_cluster_filter(obj.pcd)
             save_real_object_pointcloud(step_dir, obj, i)
 
+        label_records = {}
         for i, obj in enumerate(real_C_objs):
-            evidence = project_object_view(self, obj, images, rotations, torch)
+            evidence = project_object_view(self, obj, images, rotations, torch, partial=partial)
             if evidence is None:
                 continue
             save_object_view(step_dir, i, evidence.image, evidence.bbox_xyxy)
-            refined_tag = refine_bbox_tag(self, evidence.image, evidence.bbox_tensor, i)
+            if partial:
+                from navigation.bbox_refinement import refine_instance_tag
+                refined_tag, label_records[obj.uid] = refine_instance_tag(self, obj, evidence, i)
+            else:
+                refined_tag = refine_bbox_tag(self, evidence.image, evidence.bbox_tensor, i)
             apply_refined_tag(self, obj, refined_tag, evidence.image)
             if evidence.bbox_real_xyxy is not None:
                 obj.bbox = evidence.bbox_real_xyxy
@@ -320,6 +325,13 @@ class HM3D_Objnav_Agent:
         self.mapper.objects, obj_indices = self.mapper.associate_object_entities(
             self.mapper.objects, real_C_objs)
         self.mapper.current_obj_indices += obj_indices
+        if label_records:
+            from navigation.semantic_label_cache import matching_instance
+            for obj in real_C_objs:
+                if obj.uid in label_records:
+                    instance = matching_instance(obj.pcd.point.positions.cpu().numpy(), self.mapper.objects)
+                    if instance is not None:
+                        self.semantic_label_evidence[instance.uid] = label_records[obj.uid]
         self.object_pcd = self.mapper.update_object_pcd()
 
         self.mapper.current_obj_indices = list(set(self.mapper.current_obj_indices))
@@ -584,71 +596,7 @@ class HM3D_Objnav_Agent:
 
             return True, self.found_goal
 
-        current_node = self.mapper.nodes[self.current_node_idx]
-        room_node = self.mapper.room_nodes[current_node.room_idx]
-        # 优先在当前 room 内推进 frontier，避免频繁跨房间导致局部区域
-        # 没有被充分扫描。
-        self.waypoint = self.mapper.explore_in_room(room_node)
-        if self.waypoint is not None:
-            self.current_node_idx = self.waypoint.idx
-            self.path = np.array([self.waypoint.position])
-            self.path_index = 0
-            self.waypoint_final = self.waypoint
-            logger.info(f'Final waypoint: {self.waypoint_final.position}')
-
-            self.mapper.traj.append(self.waypoint.idx)
-            self.mapper.change_state(self.waypoint)
-
-            self.waypoint = self.path[0]
-
-
-            return True, self.found_goal
-
-        if self.waypoint is None:
-            logger.info("----------------Relocate After Fully Explored----------------")
-            room_state = [room_node.state for room_node in self.mapper.room_nodes]
-            if 0 not in room_state:
-                logger.info("Fully Explored, Visit unvisited nodes!")
-                self.waypoint = self.mapper.explore_after_fully_explored()
-            elif use_gpt_relocate:
-                # LLM room policy 只在当前 room 没有 frontier 时介入，用于
-                # 选择下一个未探索 room，不参与最终目标确认。
-                self.room_final = self.mapper.get_candidate_room_fully_explored(self.instruct_goal,
-                                                                                idx=idx,
-                                                                                step=step)
-                self.waypoint = self.mapper.find_closet_viewpoint_in_room(self.room_final)
-            else:
-                self.room_final = self.mapper.get_candidate_room_fully_explored_by_distance(self.instruct_goal, plan=self.task.plan,
-                                                                                            idx=idx,
-                                                                                            step=step)
-                self.waypoint = self.mapper.find_closet_viewpoint_in_room(self.room_final)
-
-            if self.waypoint is None:
-                logger.info("No unvisited nodes, Fully Explored!!!!!")
-                return False, self.found_goal
-
-            self.current_node_idx = self.waypoint.idx
-            self.waypoint_final = self.waypoint
-            logger.info(f'Final waypoint: {self.waypoint_final.position}')
-
-            self.mapper.traj.append(self.waypoint.idx)
-            self.mapper.change_state(self.waypoint)
-
-            self.path, self.path_node_idx = self.mapper.get_path(self.waypoint)
-
-            self.path[:, 2] = self.mapper.current_position[2]
-            if len(self.path) == 1:
-                self.waypoint = self.path[0]
-                self.path_node_idx = self.path_node_idx[0]
-                self.path_index = 0
-            else:
-                self.path = self.path[1:]
-                self.waypoint = self.path[0]
-                self.path_index = 0
-
-            logger.info(f'Path: {self.path}')
-
-            return True, self.found_goal
+        return self._plan_exploration(idx, step, False, use_gpt_relocate)
 
     def make_plan_mod_relocate(self,
                                   rotate=True,
@@ -679,71 +627,26 @@ class HM3D_Objnav_Agent:
 
             return True, self.found_goal
 
-        current_node = self.mapper.nodes[self.current_node_idx]
-        room_node = self.mapper.room_nodes[current_node.room_idx]
+        return self._plan_exploration(idx, step, True, True)
 
-        # # if enter a new room, decide whether to go back
-        if self.waypoint is not None:
-            previous_node = self.mapper.nodes[self.current_node_idx]
-            if previous_node.room_idx != current_node.room_idx:
-                logger.info('Accidentally enter a new room!!!')
-
-        self.waypoint = self.mapper.explore_in_room_relocate(room_node)
-        if self.waypoint is not None:
-            self.current_node_idx = self.waypoint.idx
-            self.path = np.array([self.waypoint.position])
-            self.path_index = 0
-            self.waypoint_final = self.waypoint
-            logger.info(f'Final waypoint: {self.waypoint_final.position}')
-
-            self.mapper.traj.append(self.waypoint.idx)
-            self.mapper.change_state(self.waypoint)
-
-            self.waypoint = self.path[0]
-
-            return True, self.found_goal
-
-        if self.waypoint is None:
-            logger.info("----------------Relocate----------------")
-            room_state = [room_node.state for room_node in self.mapper.room_nodes]
-            if 0 not in room_state:
-                logger.info("Fully Explored, Visit unvisited nodes!")
-                self.waypoint = self.mapper.explore_after_fully_explored()
-            else:
-                self.room_final = self.mapper.get_candidate_room_fully_explored(self.instruct_goal,
-                                                                                idx=idx,
-                                                                                step=step)
-
-                self.waypoint = self.mapper.find_closet_viewpoint_in_room(self.room_final)
-
-            if self.waypoint is None:
-                logger.info("No unvisited nodes, Fully Explored!!!!!")
-                return False, self.found_goal
-
-            self.current_node_idx = self.waypoint.idx
-            self.waypoint_final = self.waypoint
-            logger.info(f'Final waypoint: {self.waypoint_final.position}')
-            # if self.room_final is None:
-            #     return False, self.found_goal
-
-            self.mapper.traj.append(self.waypoint.idx)
-            self.mapper.change_state(self.waypoint)
-
-            self.path, self.path_node_idx = self.mapper.get_path(self.waypoint)
-
-            self.path[:, 2] = self.mapper.current_position[2]
-            if len(self.path) == 1:
-                self.waypoint = self.path[0]
-                self.path_node_idx = self.path_node_idx[0]
-                self.path_index = 0
-            else:
-                self.path = self.path[1:]
-                self.waypoint = self.path[0]
-                self.path_index = 0
-
-            logger.info(f'Path: {self.path}')
-
-            return True, self.found_goal
+    def _plan_exploration(self, episode_idx, step, relocate, use_gpt_relocate):
+        """Install the shared room-first proposal in the legacy step loop."""
+        from planning.exploration_policy import select_exploration_node
+        node, source = select_exploration_node(
+            self, episode_idx=episode_idx, step=step, relocate=relocate,
+            use_gpt_relocate=use_gpt_relocate)
+        if node is None:
+            return False, self.found_goal
+        self.current_node_idx = node.idx
+        self.waypoint_final = node
+        self.mapper.traj.append(node.idx)
+        self.mapper.change_state(node)
+        self.path, self.path_node_idx = self.mapper.get_path(node)
+        self.path[:, 2] = self.mapper.current_position[2]
+        self.path_index = 0
+        self.waypoint = self.path[0]
+        logger.info("Exploration policy {} selected node {}", source, node.idx)
+        return True, self.found_goal
 
     def make_plan_mod_process(self,
                               rotate=True,

@@ -33,7 +33,7 @@ def interpolate_polyline(points: np.ndarray, spacing: float = 0.25) -> list[np.n
         point1 = np.asarray(points[idx], dtype=float)
         point2 = np.asarray(points[idx + 1], dtype=float)
         distance = float(np.linalg.norm(point1 - point2))
-        num_points = max(1, int(distance / spacing))
+        num_points = max(2, int(np.ceil(distance / spacing)) + 1)
         out.extend([(1.0 - t) * point1 + t * point2 for t in np.linspace(0.0, 1.0, num_points)])
     return out
 

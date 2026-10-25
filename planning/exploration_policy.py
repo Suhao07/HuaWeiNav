@@ -46,6 +46,8 @@ def find_closest_nodes(mapper: Any, nodes: list[Any]) -> Any | None:
     prior_enabled = _prior_frontier_bias_enabled(mapper) and bool(np.any(prior_scores > 0.0))
     adjusted_distance = distance - bias_m * prior_scores if prior_enabled else distance.copy()
     selected_idx = int(np.argmin(adjusted_distance))
+    if getattr(mapper, "coverage_guided_exploration", False):
+        selected_idx = select_coverage_frontier(nodes, adjusted_distance, mapper.frontier_distance_tie_m)
     _record_frontier_choice(
         mapper=mapper,
         nodes=nodes,
@@ -339,3 +341,53 @@ def _open3d() -> Any:
     import open3d as o3d  # type: ignore
 
     return o3d
+
+
+def select_exploration_node(agent, *, episode_idx, step, relocate=None, use_gpt_relocate=None):
+    """Select the original room-first exploration goal for either runtime.
+
+    With priors disabled, n* = argmin d_nav(x, n) within the current room.
+    Room relocation runs only after its local policy returns no candidate.
+    This cycle operation retains the legacy buffer reset; callers invoke it
+    once per planning cycle, never as a read-only model tool.
+    """
+    mapper = agent.mapper
+    relocate = agent.relocate if relocate is None else relocate
+    use_gpt_relocate = agent.gpt_relocate if use_gpt_relocate is None else use_gpt_relocate
+    room = mapper.room_nodes[mapper.nodes[agent.current_node_idx].room_idx]
+    node = (mapper.explore_in_room_relocate(room) if relocate else mapper.explore_in_room(room))
+    if node is not None:
+        return node, "current_room"
+    if all(room.state != 0 for room in mapper.room_nodes):
+        return mapper.explore_after_fully_explored(), "remaining_nodes"
+    if relocate or use_gpt_relocate:
+        room = mapper.get_candidate_room_fully_explored(agent.instruct_goal, idx=episode_idx, step=step)
+        source = "room_semantic_policy"
+    else:
+        room = mapper.get_candidate_room_fully_explored_by_distance(
+            agent.instruct_goal, idx=episode_idx, step=step, plan=agent.task.plan)
+        source = "room_distance_policy"
+    return (mapper.find_closet_viewpoint_in_room(room) if room is not None else None), source
+
+
+def select_coverage_frontier(nodes, distances, tie_distance):
+    """Deduplicate identical frontier cell sets and rank near-cost options by coverage.
+
+    C = {n: d(n) <= min(d) + delta}; n* = argmax_C |F(n)|.
+    delta 使用一个仿真前进步长；代价相近时才以覆盖收益改变原排序。
+    同一 frontier cell 集合保留最近节点，稳定 ID 打破完全并列。
+    """
+    representatives = {}
+    for i, node in enumerate(nodes):
+        if not np.isfinite(distances[i]):
+            continue
+        cells = frozenset(tuple(int(v) for v in cell) for cell in node.frontier_idxs)
+        key = cells if cells else ("node", node.idx)
+        old = representatives.get(key)
+        if old is None or (distances[i], node.idx) < (distances[old], nodes[old].idx):
+            representatives[key] = i
+    if not representatives:
+        return int(np.argmin(distances))
+    minimum = min(distances[i] for i in representatives.values())
+    choices = [i for i in representatives.values() if distances[i] <= minimum + tie_distance]
+    return min(choices, key=lambda i: (-len(set(map(tuple, nodes[i].frontier_idxs))), distances[i], nodes[i].idx))

@@ -30,7 +30,7 @@ def select_check_again_viewpoint(agent: Any) -> None:
     path_request.requested_start = current_position
     target_waypoint = _target_waypoint_for_view_objective(agent)
     pid_waypoint = _habitat_point(agent, target_waypoint)
-    path_request.requested_end = pid_waypoint
+    path_request.requested_end = pathfinder.snap_point(pid_waypoint) if getattr(agent, "adaptive_observation", False) else pid_waypoint
 
     found_path = pathfinder.find_path(path_request)
     if not found_path and getattr(agent, "confirmed_target_waypoint", None) is not None:
@@ -47,11 +47,18 @@ def select_check_again_viewpoint(agent: Any) -> None:
         mapper_initial_position=agent.mapper.initial_position,
         habitat_path_points=points,
         target_height=agent.found_goal_position[2] + 0.88,
-        success_distance=agent.success_distance,
+        success_distance=agent._augment_final_stop_geometry({})["required_stop_distance"],
         stop_criterion=agent.stop_criterion,
+        arrival_tolerance=agent.planner._goal_radius,
     )
     logger.info(f"Interpolated_path: {interpolated_path}")
 
+    # 到达容差是几何预算：d_object(v) + rho <= d_stop。
+    # 可完成的视点先按实际路径代价选；中间取证视点保留质量排序。
+    from navigation.action_controller import geodesic_distance_to_waypoint
+    for proposal in proposals:
+        proposal["travel_distance"] = geodesic_distance_to_waypoint(agent, proposal["position"])
+    proposals = [p for p in proposals if np.isfinite(p["travel_distance"])]
     best_candidate = _log_and_pick_best_proposal(proposals)
     current_candidate = candidate_from_object(
         agent.object_final,
@@ -80,6 +87,13 @@ def select_check_again_viewpoint(agent: Any) -> None:
         agent.check_again_postion = agent.mapper.current_position
 
 
+def _proposal_rank(candidate):
+    """Rank feasible terminal views by travel cost, intermediate views by quality."""
+    if candidate.get("stop_feasible", False):
+        return (1, -candidate["travel_distance"], candidate["score"])
+    return (0, candidate["score"], -candidate.get("travel_distance", 0.0))
+
+
 def _log_and_pick_best_proposal(proposals: list[dict[str, Any]]) -> dict[str, Any] | None:
     best_candidate = None
     for candidate in proposals:
@@ -93,7 +107,7 @@ def _log_and_pick_best_proposal(proposals: list[dict[str, Any]]) -> dict[str, An
             candidate["area_ratio"],
             candidate["distance_to_target"],
         )
-        if best_candidate is None or candidate["score"] > best_candidate["score"]:
+        if best_candidate is None or _proposal_rank(candidate) > _proposal_rank(best_candidate):
             best_candidate = candidate
     return best_candidate
 
@@ -147,6 +161,9 @@ def _target_waypoint_for_view_objective(agent: Any) -> np.ndarray:
     currently pinned object instance.  Reusing a stale discovery waypoint can keep
     all proposals far away and make `budget_exhausted` meaningless.
     """
+
+    if getattr(agent, "adaptive_observation", False):
+        return np.asarray(agent.object_final.find_closest(agent.mapper.current_position), dtype=float)
 
     if getattr(agent.view_control_state, "active", False):
         objective = dict(getattr(agent.view_control_state, "objective", {}) or {})

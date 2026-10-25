@@ -114,7 +114,7 @@ def get_args():
     parser.add_argument("--relocate", default=False, action="store_true")
     parser.add_argument("--no_gpt_relocate", default=False, action="store_true")
     parser.add_argument("--vlm", type=str, default=DEFAULT_VLM)
-    parser.add_argument("--decision_owner", choices=("legacy", "agent"), default="legacy")
+    parser.add_argument("--decision_owner", choices=("legacy", "agent", "baseline_guided"), default="baseline_guided")
     parser.add_argument("--agent_max_model_calls", type=int, default=100)
     parser.add_argument("--custom_instruction", type=str, default="")
     parser.add_argument("--enable_instruction_adapter", default=False, action="store_true")
@@ -350,7 +350,11 @@ if __name__ == "__main__":
 
         habitat_mapper.object_perceiver.sam.initialize(habitat_mapper.target)
 
-        if args.decision_owner == "agent":
+        if args.decision_owner == "baseline_guided":
+            from backends.habitat.guided_runtime import run_guided_episode
+            run_guided_episode(habitat_agent, episode_idx=i, max_steps=args.max_steps,
+                               max_model_calls=args.agent_max_model_calls)
+        elif args.decision_owner == "agent":
             from backends.habitat.agent_runtime import run_agent_episode
             run_agent_episode(habitat_agent, episode_idx=i, max_steps=args.max_steps,
                               max_model_calls=args.agent_max_model_calls)
