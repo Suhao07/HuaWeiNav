@@ -122,6 +122,10 @@ class _TracingParsedCompletions:
         from pydantic import ValidationError
 
         trace_label = kwargs.pop("trace_label", "parse")
+        if kwargs["model"].startswith("doubao-"):
+            # 导航默认采用直接回答；显式请求仍可为复杂任务开启思考。
+            kwargs["extra_body"] = {"thinking": {"type": "disabled"},
+                                    **kwargs.get("extra_body", {})}
         original_messages = list(kwargs["messages"])
         retry_of = None
         for attempt in range(2):
@@ -138,6 +142,7 @@ class _TracingParsedCompletions:
                         metadata={"client": "openai_compatible", "request_id": request_id,
                                   "provider_request_id": payload.get("id"),
                                   "finish_reason": choice.get("finish_reason"),
+                                  "usage": payload.get("usage"),
                                   "attempt": attempt, "retry_of": retry_of,
                                   "latency_ms": (time.perf_counter() - started) * 1000.0})
             try:

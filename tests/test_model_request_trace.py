@@ -70,3 +70,21 @@ def test_verification_schema_declares_nested_fields():
     schema = ParsedVerification.model_json_schema()
     assert 'hard_constraints' not in schema['properties']
     assert 'improve_goals' in schema['$defs']['ParsedViewObjective']['properties']
+
+
+@pytest.mark.parametrize('explicit', [None, {'type': 'enabled'}])
+def test_doubao_thinking_default_and_explicit_override(tmp_path, monkeypatch, explicit):
+    """Provider requests carry the chosen thinking mode and retain usage evidence."""
+    monkeypatch.setenv('STRIVE_LVLM_TRACE_DIR', str(tmp_path))
+    expected = explicit or {'type': 'disabled'}
+    def request(**kwargs):
+        assert kwargs['extra_body']['thinking'] == expected
+        return SimpleNamespace(text=json.dumps({'choices': [{'message': {'content': '{}'},
+            'finish_reason': 'stop'}], 'usage': {'completion_tokens_details': {'reasoning_tokens': 0}}}),
+            parse=lambda: ParsedVerification())
+    adapter = _TracingParsedCompletions(SimpleNamespace(with_raw_response=SimpleNamespace(parse=request)))
+    extra = {'extra_body': {'thinking': explicit}} if explicit else {}
+    adapter.parse(model='doubao-seed-2-0-pro-260215', messages=[],
+                  response_format=ParsedVerification, **extra)
+    response = json.loads(next(tmp_path.glob('[0-9]*.json')).read_text())
+    assert response['metadata']['usage']['completion_tokens_details']['reasoning_tokens'] == 0
