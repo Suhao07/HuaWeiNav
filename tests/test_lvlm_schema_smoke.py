@@ -52,7 +52,6 @@ class _ScriptedStructuredClient:
             parsed = ParsedVerification(
                 satisfied=False,
                 decision="need_better_view",
-                hard_constraints={"satisfied": False},
             )
         else:
             raise AssertionError(f"unexpected schema: {schema}")
@@ -86,14 +85,13 @@ def test_schema_smoke_runs_all_production_trace_labels() -> None:
     ]
 
 
-def test_schema_smoke_rejects_unsafe_final_accept() -> None:
-    """Verify the deployment gate detects a hard-constraint STOP violation."""
+def test_schema_smoke_rejects_inconsistent_visual_accept() -> None:
+    """Verify the deployment gate detects inconsistent visual predicates."""
 
     parsed = ParsedVerification(
         satisfied=True,
-        semantic_satisfied=True,
+        semantic_satisfied=False,
         view_sufficient_for_stop=True,
-        hard_constraints={"satisfied": False},
         decision="accept",
     )
 

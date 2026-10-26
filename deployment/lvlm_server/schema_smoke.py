@@ -109,19 +109,8 @@ def build_schema_cases(image_url: str) -> list[SchemaSmokeCase]:
     }
     final_payload = {
         "raw_instruction": "Find a book on a shelf.",
-        "instruction_plan": {
-            "targets": [{"name": "book", "terminal": True}],
-            "constraints": [{"type": "spatial", "relation": "on", "object": "shelf"}],
-        },
-        "candidate": {"uid": "book_1", "detector_label": "book"},
-        "evidence": {
-            "hard_stop_constraints": {
-                "satisfied": False,
-                "planner_infeasible": False,
-                "reason": "schema smoke intentionally keeps the physical stop contract unsatisfied",
-            },
-            "view_control": {"budget_exhausted": False, "remaining_proposals": 1},
-        },
+        "candidate": {"uid": "book_1"},
+        "image_role": "current_candidate_observation",
     }
 
     return [
@@ -284,14 +273,15 @@ def _check_relation(parsed: ParsedRelationResult) -> list[str]:
 
 
 def _check_final_guard(parsed: ParsedVerification) -> list[str]:
-    """Check that an unsatisfied physical stop contract cannot authorize STOP."""
+    """Check consistency of the visual response; physical STOP is domain-owned."""
 
     decision = _normalize(parsed.decision).replace(" ", "_")
     failures = []
-    if bool(parsed.satisfied):
-        failures.append("final verifier satisfied=true while hard stop constraints are false")
-    if decision == "accept":
-        failures.append("final verifier decision=accept while hard stop constraints are false")
+    visual = bool(parsed.semantic_satisfied and parsed.view_sufficient_for_stop)
+    if bool(parsed.satisfied) and not visual:
+        failures.append("final verifier satisfied=true while visual predicates are false")
+    if decision == "accept" and not (bool(parsed.satisfied) and visual):
+        failures.append("final verifier decision=accept while visual predicates are false")
     return failures
 
 

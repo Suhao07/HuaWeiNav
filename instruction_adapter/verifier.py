@@ -208,7 +208,6 @@ class FinalInstructionVerifier:
 
         geometry = dict((evidence or {}).get("geometry") or {})
         facts = dict((evidence or {}).get("view_quality_facts") or {})
-        view_control = dict((evidence or {}).get("view_control") or {})
         guidance: list[str] = []
         if bool(facts.get("projection_failed", False)):
             guidance.append("current target projection failed; compare against pinned/best evidence")
@@ -227,19 +226,11 @@ class FinalInstructionVerifier:
             if distance_to_object is not None and required_stop_distance is not None:
                 guidance.append(
                     f"current_distance_to_object={float(distance_to_object):.3f}m; "
-                    f"benchmark_success_distance={float(required_stop_distance):.3f}m"
+                    f"predicted_instance_stop_distance={float(required_stop_distance):.3f}m"
                 )
         except Exception:
             pass
-        if view_control:
-            guidance.append(
-                "view_control_budget_exhausted="
-                f"{bool(view_control.get('budget_exhausted', view_control.get('exhausted')))}"
-            )
-        preferred = (
-            "Prefer the closest executable stop view that still keeps the candidate and any "
-            "required relation anchor clearly visible, not clipped, and easy to verify."
-        )
+        preferred = "Resolve the remaining task predicate or stop-distance requirement with a new observation of the candidate."
         return guidance, preferred
 
     def _fallback(self, reason: str) -> VerificationResult:
@@ -253,6 +244,47 @@ class FinalInstructionVerifier:
             reason=f"final verifier unavailable: {reason}",
             diagnostics={"unavailable": reason, "verdict": "unknown"},
         )
+
+    @staticmethod
+    def _visual_task(plan, evidence):
+        """Project active user semantics while excluding grounding and execution."""
+        semantic = plan.get("diagnostics", {}).get("task_spec", plan)
+        targets = semantic.get("targets", [])
+        terminal = [target for target in targets if target.get("terminal", True)]
+        if not terminal:
+            return {}
+        target_id = evidence.get("target_id")
+        if target_id is None:
+            if len(terminal) != 1:
+                raise ValueError("Visual verification of multiple targets requires an explicit target_id")
+            active = terminal[0]
+        else:
+            active = next(target for target in terminal if target["id"] == target_id)
+        predicates = [condition for condition in semantic.get("constraints", [])
+                      if condition.get("subject", "") in ("", active["id"], active["name"])]
+        # 默认 verifier=planner 不代表最终执行归属：ConstraintEvaluator 会
+        # 显式把 room/attribute 等约束委派到 declared_*。沿用该委派事实。
+        delegated = (list(evidence.get("declared_room_constraints", []))
+                     + list(evidence.get("declared_attribute_constraints", [])))
+        visual, domain = [], []
+        for condition in predicates:
+            projected = {key: condition[key] for key in (
+                "type", "subject", "relation", "object", "value", "hardness", "verifier") if key in condition}
+            projected.setdefault("verifier", "planner")
+            is_delegated = any(all(condition.get(key) == item.get(key) for key in (
+                "type", "subject", "relation", "object", "value")) for item in delegated)
+            if projected["verifier"] == "vlm" or is_delegated:
+                visual.append(projected)
+            else:
+                domain.append(projected)
+        anchors = {condition.get("object") for condition in visual}
+        return {
+            "active_target": {key: active[key] for key in ("id", "name", "attributes") if key in active},
+            "visual_predicates": visual,
+            "domain_predicates": domain,
+            "referenced_targets": [{key: target[key] for key in ("id", "name", "attributes") if key in target}
+                                   for target in targets if target.get("id") in anchors or target.get("name") in anchors],
+        }
 
     def verify(
         self,
@@ -274,12 +306,10 @@ class FinalInstructionVerifier:
         plan_dict = instruction_plan.as_dict() if hasattr(instruction_plan, "as_dict") else instruction_plan
         evidence = dict(evidence or {})
         evidence.setdefault("hard_stop_constraints", hard_stop_constraints_from_evidence(evidence))
-        payload = {
-            "raw_instruction": raw_instruction,
-            "instruction_plan": plan_dict or {},
-            "candidate": candidate.as_dict(),
-            "evidence": {k: v for k, v in evidence.items() if not str(k).endswith("_path")},
-        }
+        # V(I, task) 与 G(pose, map) 独立求值；预测标签和接近距离不参与视觉判定。
+        payload = {"raw_instruction": raw_instruction,
+                   "task": self._visual_task(plan_dict or {}, evidence),
+                   "candidate": {"uid": candidate.uid}}
         content: list[dict[str, Any]] = [
             {"type": "text", "text": json.dumps(payload, ensure_ascii=False, indent=2)},
         ]
@@ -296,18 +326,32 @@ class FinalInstructionVerifier:
             return block
 
         for key in ("current_rgb_with_bbox_path", "object_crop_path", "centered_view_path"):
-            block = load_image(str(evidence.get(key) or ""))
+            path = str(evidence.get(key) or "")
+            if path in seen_image_paths:
+                continue
+            block = load_image(path)
             if block is not None:
-                seen_image_paths.add(str(evidence.get(key) or ""))
-                content.append({"type": "text", "text": key})
+                seen_image_paths.add(path)
+                bbox = (evidence.get("object_crop_bbox_xyxy") if key == "object_crop_path"
+                        else evidence.get("geometry", {}).get("bbox_xyxy"))
+                content.append({"type": "text", "text": json.dumps({
+                    "role": "current_candidate_observation", "image_kind": key,
+                    "observation_identity": evidence.get("observation_identity", {}),
+                    "bbox_xyxy_in_this_image": bbox,
+                }, ensure_ascii=False)})
                 content.append(block)
         for item in evidence.get("relation_evidence_paths", []) or []:
-            block = load_image(str(item))
+            path = str(item)
+            if path in seen_image_paths:
+                continue
+            block = load_image(path)
             if block is not None:
-                seen_image_paths.add(str(item))
-                content.append({"type": "text", "text": "relation_evidence"})
+                seen_image_paths.add(path)
+                content.append({"type": "text", "text": "relation observation; identify visible entities from this image"})
                 content.append(block)
         view_control = dict(evidence.get("view_control") or {})
+        excluded_history = []
+        current_identity = evidence.get("observation_identity", {})
         for label in ("pinned_visual_evidence", "latest_visual_evidence", "best_visual_evidence"):
             visual_packet = dict(view_control.get(label) or {})
             image_path = (
@@ -316,16 +360,20 @@ class FinalInstructionVerifier:
             )
             if not image_path or image_path in seen_image_paths:
                 continue
+            identity = visual_packet.get("observation_identity", {})
+            if (not {"candidate_uid", "task_revision", "observation_id"}.issubset(identity)
+                    or identity["candidate_uid"] != candidate.uid
+                    or identity["task_revision"] != current_identity.get("task_revision")):
+                excluded_history.append({"image_path": image_path, "reason": "observation_binding_mismatch"})
+                continue
             block = load_image(image_path)
             if block is not None:
                 seen_image_paths.add(image_path)
-                content.append({
-                    "type": "text",
-                    "text": (
-                        f"{label}: previous VLM-confirmed visual target reference; "
-                        "compare target identity and view quality, but do not treat it as current stop evidence."
-                    ),
-                })
+                content.append({"type": "text", "text": json.dumps({
+                    "role": "earlier_candidate_observation",
+                    "observation_identity": identity,
+                    "bbox_xyxy_in_this_image": visual_packet.get("geometry", {}).get("bbox_xyxy"),
+                }, ensure_ascii=False)})
                 content.append(block)
 
         # 请求异常交由运行时记录和处置，保留原始异常及调用栈。
@@ -351,16 +399,12 @@ class FinalInstructionVerifier:
         semantic_satisfied = bool(getattr(parsed, "semantic_satisfied", False))
         view_sufficient = bool(getattr(parsed, "view_sufficient_for_stop", True))
         parsed_satisfied = bool(getattr(parsed, "satisfied", False))
-        parsed_hard_constraints = dict(getattr(parsed, "hard_constraints", {}) or {})
         hard_constraints = dict(evidence.get("hard_stop_constraints") or hard_stop_constraints_from_evidence(evidence))
         planner_infeasible, planner_infeasible_reason = _planner_hard_constraint_infeasible(hard_constraints)
-        if parsed_satisfied:
-            semantic_satisfied = True
-        if decision == "accept" and not view_sufficient:
+        if decision == "accept" and not (semantic_satisfied and view_sufficient):
             decision = "need_better_view"
-        if decision == "accept" and not bool(hard_constraints.get("satisfied", True)) and not planner_infeasible:
+        if decision == "accept" and not bool(hard_constraints.get("satisfied", True)):
             decision = "need_better_view"
-            view_sufficient = False
             parsed_satisfied = False
         view_guidance, view_guidance_goal = self._view_guidance(evidence)
         failed_constraints = list(getattr(parsed, "failed_constraints", []) or [])
@@ -376,16 +420,12 @@ class FinalInstructionVerifier:
             view_feedback = "; ".join(view_guidance)
         if view_guidance_goal and not preferred_view_goal and decision == "need_better_view":
             preferred_view_goal = view_guidance_goal
-        view_objective = dict(getattr(parsed, "view_objective", {}) or {})
+        view_objective = parsed.view_objective.model_dump(exclude_defaults=True)
         if decision == "need_better_view" and not view_objective:
             view_objective = {
                 "keep_visible_roles": ["candidate"],
                 "improve_goals": [
-                    "move closer when executable",
-                    "keep target visible",
-                    "keep relation anchor visible if required",
-                    "avoid clipping",
-                    "improve clarity",
+                    "resolve the unverified target or relation predicate",
                 ],
                 "minimum_expected_improvement": "moderate",
                 "accept_if_no_better_view": False,
@@ -403,7 +443,7 @@ class FinalInstructionVerifier:
                 current_distance = float(geometry.get("distance_to_object"))
             except Exception:
                 current_distance = 0.0
-            if required_stop_distance > 0:
+            if required_stop_distance > 0 and current_distance > required_stop_distance:
                 view_objective["required_stop_distance"] = required_stop_distance
                 view_objective["current_distance_to_object"] = current_distance
                 goals = list(view_objective.get("improve_goals") or [])
@@ -415,10 +455,11 @@ class FinalInstructionVerifier:
             if not view_feedback:
                 view_feedback = "Hard final-stop constraints are not yet satisfied; continue the view/approach objective."
         return VerificationResult(
-            satisfied=parsed_satisfied and decision == "accept" and view_sufficient,
+            satisfied=parsed_satisfied and decision == "accept" and semantic_satisfied and view_sufficient,
             target_uid=candidate.uid,
             evidence_ids=sorted(set(image_refs.values())),
-            dependencies={**evidence.get("dependencies", {}), **image_dependencies},
+            dependencies={**evidence.get("dependencies", {}), **image_dependencies,
+                          "observation_identity": json.dumps(evidence.get("observation_identity"), sort_keys=True)},
             task_revision=plan_dict.get("diagnostics", {}).get("task_spec", {}).get("revision", 1),
             decision=decision,
             confidence=confidence,
@@ -426,7 +467,6 @@ class FinalInstructionVerifier:
             view_sufficient_for_stop=view_sufficient,
             hard_constraints={
                 **hard_constraints,
-                "vlm_report": parsed_hard_constraints,
                 "planner_infeasible": planner_infeasible,
                 "planner_infeasible_reason": planner_infeasible_reason,
             },
@@ -439,6 +479,7 @@ class FinalInstructionVerifier:
             diagnostics={
                 "source": "vlm",
                 "image_sources": image_refs,
+                "excluded_history": excluded_history,
                 "model_provider": self.vlm,
                 "view_guidance": {
                     "facts": view_guidance,
@@ -447,7 +488,6 @@ class FinalInstructionVerifier:
                 },
                 "hard_stop_constraints": {
                     **hard_constraints,
-                    "vlm_report": parsed_hard_constraints,
                     "planner_infeasible": planner_infeasible,
                     "planner_infeasible_reason": planner_infeasible_reason,
                 },

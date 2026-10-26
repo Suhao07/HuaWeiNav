@@ -114,26 +114,61 @@ class FinalInstructionVerifierAdapter:
             }
             candidate = CandidateInstance(**{key: candidate[key] for key in allowed if key in candidate})
         if candidate is None:
-            # 没有 candidate 就不能让 verifier “猜测”成功目标，直接转成 hard reject 风格结果。
+            # 缺少取证对象属于观测不足，保留候选状态，等待完整证据。
             return {
                 "satisfied": False,
-                "decision": "reject_candidate",
+                "decision": "need_better_view",
                 "reason": "final verifier skipped: missing candidate_instance",
                 "diagnostics": {"missing_candidate": True},
             }
 
         plan = context.get("instruction_plan")
         raw_instruction = str(context.get("raw_instruction", "") or getattr(plan, "raw_instruction", ""))
-        evidence_payload = evidence.for_verifier()
-        # ViewEvidence 是平台无关证据；额外 verifier facts 只能通过 context 追加，不读 ROS msg。
+        if not evidence.image_ref or evidence.metadata.get("image_ref_source") == "object_image_ref":
+            return {
+                "satisfied": False,
+                "decision": "need_better_view",
+                "reason": "final verifier requires a current camera image",
+                "diagnostics": {"missing_current_image": True},
+            }
+        observed_uid = evidence.target_object_uid or evidence.anchor_object_uid
+        if observed_uid != candidate.uid:
+            raise ValueError("ViewEvidence instance differs from the selected candidate")
+
+        plan_dict = plan.as_dict() if hasattr(plan, "as_dict") else plan
+        task_spec = plan_dict.get("diagnostics", {}).get("task_spec")
+        task_revision = context.get("task_revision")
+        if task_revision is None:
+            if task_spec is None:
+                raise ValueError("Final verification requires the task owner's revision")
+            task_revision = task_spec["revision"]
+        evidence_payload = dict(evidence.verifier_payload)
         evidence_payload.update(dict(context.get("verifier_evidence") or {}))
+        # 图像、框和身份来自同一次采集；地图中的旧 bbox 与运动回执不能覆盖它们。
+        geometry = dict(evidence_payload.get("geometry") or {})
+        geometry["bbox_xyxy"] = evidence.bbox_xyxy
+        evidence_payload.update({
+            "target_id": context.get("target_id"),
+            "current_rgb_with_bbox_path": evidence.image_ref,
+            "geometry": geometry,
+            "observation_identity": {
+                "candidate_uid": observed_uid,
+                "task_revision": task_revision,
+                "observation_id": f"{evidence.source.value}:{evidence.timestamp}:{evidence.image_ref}",
+                "timestamp": evidence.timestamp,
+                "pose": evidence.pose.as_dict() if evidence.pose is not None else None,
+            },
+        })
         result = self.verifier.verify(
             raw_instruction=raw_instruction,
             instruction_plan=plan,
             candidate=candidate,
             evidence=evidence_payload,
         )
-        return result.as_dict() if hasattr(result, "as_dict") else dict(result or {})
+        payload = result.as_dict() if hasattr(result, "as_dict") else dict(result)
+        # 返回结论与输入观测使用同一任务版本，兼容尚未携带 TaskSpec 的 parsed plan。
+        payload["task_revision"] = task_revision
+        return payload
 
 
 @dataclass(frozen=True)
@@ -922,6 +957,8 @@ def _verification_context_from_intent(intent: NavigationIntent, goal: MotionGoal
         "instruction_plan": metadata.get("instruction_plan"),
         "candidate_instance": metadata.get("candidate_instance"),
         "candidate_uid": metadata.get("candidate_uid"),
+        "target_id": metadata.get("target_id"),
+        "task_revision": metadata.get("task_revision"),
         "selected_snapshot_uid": metadata.get("selected_snapshot_uid"),
         "selection_role": metadata.get("selection_role"),
         "target_object_uid": goal.target_object_uid,

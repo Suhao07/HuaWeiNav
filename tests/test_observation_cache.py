@@ -245,3 +245,17 @@ def test_viewpoint_evidence_loop_does_not_capture_or_verify_on_timeout() -> None
     assert result.evidence is None
     assert evidence_provider.calls == []
     assert verifier.calls == []
+
+
+def test_evidence_uses_encoded_capture_and_its_pose_after_motion_receipt(tmp_path):
+    cache = RosObservationCache(image_directory=tmp_path, persist_images=True)
+    pose = Pose3D(position=(2, 0, 0), stamp=3.25)
+    cache.update_pose(pose)
+    record = cache.update_rgb_image(_image_msg(sec=3, width=1, height=2, data=b"abcdef"))
+    provider = ObjectCropEvidenceProvider(observation_provider=cache.latest_observation,
+                                          object_provider=lambda: (), mode="full_image")
+    evidence = provider.capture(ViewpointGoal(pose=pose), NavigationStatus(
+        NavigationStatusCode.REACHED, current_pose=Pose3D(position=(1, 0, 0), stamp=2)))
+    assert evidence.image_ref == record.visual_path
+    assert evidence.pose == pose
+    assert evidence.timestamp == cache.latest_observation().timestamp

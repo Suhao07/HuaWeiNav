@@ -1,10 +1,11 @@
 import os
+import json
 import sys
 import time
 from types import SimpleNamespace
 
 from constants import COGNAV_MODEL_NAME, DEFAULT_VLM, GEMINI_MODEL_NAME, require_gemini_key
-from llm_utils.lvlm_call_tracker import record_call, record_request
+from llm_utils.lvlm_call_tracker import record_call, record_request, record_parse_error
 from llm_utils.structured_output import (
     extract_json_object as _extract_json_object,
     fallback_payload as _fallback_payload,
@@ -113,27 +114,47 @@ class _TracingParsedCompletions:
         self._inner = inner
 
     def parse(self, *args, **kwargs):
+        """Save raw content before SDK validation; retry one malformed response.
+
+        重新生成只恢复请求协议，输入观测保持不变。两次校验失败后传播
+        原始异常；超时、鉴权、拒绝及截断异常由其原有执行边界处理。
+        """
+        from pydantic import ValidationError
+
         trace_label = kwargs.pop("trace_label", "parse")
-        request_id = record_request(str(trace_label), model=kwargs["model"],
-                                    messages=kwargs["messages"], response_format=kwargs["response_format"],
-                                    parameters={key: value for key, value in kwargs.items()
-                                                if key not in {"model", "messages", "response_format"}})
-        started = time.perf_counter()
-        completion = self._inner.parse(*args, **kwargs)
-        try:
-            content = completion.choices[0].message.content
-        except Exception:
-            content = ""
-        record_call(
-            str(trace_label),
-            raw_response=str(content or ""),
-            metadata={
-                "client": "openai_compatible",
-                "request_id": request_id,
-                "latency_ms": (time.perf_counter() - started) * 1000.0,
-            },
-        )
-        return completion
+        original_messages = list(kwargs["messages"])
+        retry_of = None
+        for attempt in range(2):
+            request_id = record_request(
+                str(trace_label), model=kwargs["model"], messages=kwargs["messages"],
+                response_format=kwargs["response_format"],
+                parameters={key: value for key, value in kwargs.items()
+                            if key not in {"model", "messages", "response_format"}})
+            started = time.perf_counter()
+            response = self._inner.with_raw_response.parse(*args, **kwargs)
+            payload = json.loads(response.text)
+            choice = payload["choices"][0]
+            record_call(str(trace_label), raw_response=choice["message"].get("content") or "",
+                        metadata={"client": "openai_compatible", "request_id": request_id,
+                                  "provider_request_id": payload.get("id"),
+                                  "finish_reason": choice.get("finish_reason"),
+                                  "attempt": attempt, "retry_of": retry_of,
+                                  "latency_ms": (time.perf_counter() - started) * 1000.0})
+            try:
+                return response.parse()
+            except ValidationError as error:
+                record_parse_error(request_id, error, attempt=attempt)
+                if attempt == 1:
+                    raise
+                retry_of = request_id
+                kwargs["messages"] = original_messages + [{
+                    "role": "user", "content": (
+                        "The previous response failed JSON/schema validation. Regenerate one valid "
+                        "JSON object matching the supplied schema using the same observation. "
+                        "Preserve uncertainty where evidence is insufficient. Validation details: "
+                        + json.dumps(error.errors(include_input=False, include_context=False), ensure_ascii=False)
+                    ),
+                }]
 
 
 class _TracingChat:

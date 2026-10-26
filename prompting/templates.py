@@ -99,92 +99,54 @@ Return strict JSON:
 
 # LVLM最终决策（是否接受当前候选对象作为停靠目标）
 FINAL_VERIFIER_PROMPT = """
-You are the final instruction-satisfaction verifier for an indoor navigation robot.
+You evaluate the visual predicates of an indoor navigation instruction.
+Use the original instruction, the active task predicates and the supplied images.
+Evaluate this candidate's identity and attributes for task.active_target and
+only task.visual_predicates. The existing constraint evaluator assigns these
+visual predicates, including explicitly delegated room/attribute checks.
+Task.domain_predicates retain their declared verifier and are evaluated by the
+domain services. Report no visual judgment for these domain predicates.
+Task progress, ordering and counts are maintained by the controller. Other
+terminal goals belong to their own checks.
+Each candidate observation
+has its own observation identity and bbox in that image's pixel coordinates.
+Identify the actual region enclosed by that bbox. Describe visible structure
+before concluding whether the required object and visual relations are present.
 
-Decide whether stopping at the current candidate object satisfies the original
-natural-language instruction. Use the visual evidence and factual geometry only.
-Do not invent room/object facts that are not visible or provided. If a required
-condition cannot be determined from the evidence, do not accept.
+The navigation controller independently evaluates distance, reachability and
+physical stopping conditions. Your decision concerns visual evidence only.
+Candidate UIDs are tracking identifiers. Establish category, attributes and
+relations directly from visible structure. For ambiguous background, support
+surfaces or depictions, identify the missing visual evidence. A partial view is
+sufficient when its visible structure distinguishes the required object.
 
 Return strict JSON:
-- satisfied: true only if the robot may stop for the original instruction from
-  the current evidence.
-- semantic_satisfied: true if the candidate and explicit instruction constraints
-  are satisfied, even if the current camera view is not yet sufficient to stop.
-- view_sufficient_for_stop: true if the current view is good enough for final
-  stopping evidence. Consider whether the target/relation are clearly visible,
-  the target is not clipped or too close to image borders, and the evidence is
-  not too weak. Use the provided geometry facts as factual cues, not as rigid
-  thresholds. A view can be semantically correct but still insufficient for
-  stopping if a clearer, more centered, less clipped, or closer view is needed.
-  Prefer a stop pose that is as close as the robot can execute while preserving
-  clear visibility of the target and any required relation anchor. Do not ask
-  the robot to move closer if doing so would crop, hide, or confuse the target.
-- hard_constraints: a JSON object. Copy the provided
-  evidence.hard_stop_constraints.satisfied value. Do not invent physical
-  infeasibility from the image or from repeated attempts. Physical reachability,
-  stop distance, collision, and remaining-view feasibility are planner/geometry
-  facts. You may only report infeasible_or_not_applicable=true when the provided
-  hard_stop_constraints already contains a planner_infeasibility_proof or
-  planner_infeasible=true. Include:
-  - satisfied: true or false.
-  - infeasible_or_not_applicable: true only when planner evidence explicitly
-    says the robot cannot execute the hard constraint or the constraint does not
-    apply, with a concrete reason from that evidence.
-  - reason: concise explanation grounded in the provided evidence.
+- satisfied: true only when all required visual predicates are established.
+- semantic_satisfied: true when visible structure establishes the requested
+  object's identity, attributes and explicit visual relations.
+- view_sufficient_for_stop: true when the current observation identifies the
+  candidate and supplies sufficient evidence for the visual predicates.
 - decision:
-  - accept: all explicit requirements are satisfied.
-  - reject_candidate: the candidate is clearly the wrong instance or violates a hard requirement.
-  - need_better_view: the candidate may be correct but the evidence is too weak.
-  - need_relation_check: a spatial/semantic relation must be checked with additional evidence.
-  - uncertain: evidence is insufficient and no specific next check is obvious.
+  - accept: all visual predicates are established by the images.
+  - reject_candidate: visible evidence identifies the wrong instance or attribute.
+  - need_better_view: a specific missing visual observation can resolve ambiguity.
+  - need_relation_check: a required relation needs additional observation.
+  - uncertain: available observations do not resolve the visual predicates.
 - confidence: number in [0, 1].
-- satisfied_constraints: short strings.
-- failed_constraints: short strings.
-- view_feedback: concise feedback for the navigation controller if a better
-  view is needed.
-- preferred_view_goal: a short natural-language view goal, e.g. keep both the
-  candidate and relation anchor visible while making the candidate more central.
-- view_objective: an optional JSON object for the geometry controller when
-  decision=need_better_view. It may include keep_visible_roles, improve_goals,
-  minimum_expected_improvement, accept_if_no_better_view, and reason.
-- reason: concise explanation grounded in the evidence.
+- satisfied_constraints and failed_constraints: visual predicates checked.
+- view_feedback: the visual feature that must become observable.
+- preferred_view_goal: an observation goal for the geometry controller.
+- view_objective: keep_visible_roles, improve_goals, minimum_expected_improvement,
+  accept_if_no_better_view, and reason. Completion requires established visual
+  predicates regardless of remaining execution options.
+- reason: describe the observed structure and explain the predicate judgment.
 
-Important:
-- accept requires satisfied=true, semantic_satisfied=true, and
-  view_sufficient_for_stop=true.
-- accept also requires hard_constraints.satisfied=true. If a hard constraint is
-  not satisfied, use need_better_view unless the provided planner/geometry hard
-  constraints explicitly state infeasible_or_not_applicable=true with a concrete
-  planner-owned reason.
-- If the candidate appears to satisfy the instruction but the target is near
-  the image border, very small, clipped, mostly low/outside the useful camera
-  area, or relation evidence is not jointly visible enough, return
-  decision=need_better_view with semantic_satisfied=true.
-- If the current stop evidence is valid but a clearly closer feasible view is
-  available in view_control proposals, prefer decision=need_better_view and
-  describe the closer-but-visible view goal. If no feasible closer/clearer view
-  remains, decide from the best available evidence instead of repeating
-  need_better_view.
-- Do not reject a candidate only because the view is poor; use
-  need_better_view unless the candidate clearly violates the instruction.
-- If view_control history is provided, use it as a bounded optimization record.
-  If there are remaining feasible proposals and the hard constraints are still
-  unsatisfied, prefer need_better_view over accept. If
-  view_control.budget_exhausted=true or no feasible proposal remains, you may
-  stop optimizing soft visual quality, but you still cannot accept while a
-  planner-owned hard requirement is violated. Hard physical constraints remain
-  blocking unless planner evidence says they are infeasible.
-- If view_control includes pinned_visual_evidence, treat it as the stable visual
-  identity reference that was previously confirmed by the verifier. Compare the
-  current stop evidence against that reference. Do not accept if the current
-  bbox/crop has drifted onto a support object, background surface, surrounding
-  structure, or another non-target region while the true target is clipped,
-  off-center, or only barely visible in the full image.
-- pinned_visual_evidence and best_visual_evidence are not permission to stop by
-  themselves. The current view must still justify STOP, unless the view_control
-  context says the bounded soft-view budget is exhausted and all planner-owned
-  physical stop contracts are satisfied or explicitly infeasible by geometry.
+Accept requires satisfied=true, semantic_satisfied=true and
+view_sufficient_for_stop=true. Once the visual predicates are established,
+return accept; better framing alone adds no task requirement. Each historical
+image is an observation: independently identify its visible object and check
+correspondence with the current candidate. The current view must identify the
+same actual instance. Physical STOP authorization remains with the controller.
 """
 
 ROOM_SEMANTIC_PROMPT = """

@@ -421,6 +421,7 @@ def _selection_metadata(selection: SnapshotTargetSelection, candidate: Any | Non
         "selected_snapshot_uid": selection.selected_snapshot_uid,
         "selection_role": role,
         "target_id": selection.result.target_id,
+        "task_revision": selection.context.spec.revision,
         "selection_answer": selection.result.answer,
         "candidate_instance": candidate,
         "candidate_uid": str(getattr(candidate, "uid", "") if candidate is not None else ""),

@@ -1,6 +1,7 @@
 """Habitat episode binding for the tool-driven navigation Agent."""
 from dataclasses import replace
 import json
+import math
 from pathlib import Path
 
 from harness.runtime import AgentRuntime
@@ -18,6 +19,14 @@ class HabitatEvidenceVerifier:
     def verify(self, *, raw_instruction, instruction_plan, candidate, evidence):
         """Return a scoped judgment; task updates remain in the tool's reducer."""
         agent = self.agent
+        if (evidence.get("observation_identity") != agent._observation_identity(candidate.uid)
+                or evidence.get("observation_status") == "need_observation"):
+            return VerificationResult(
+                False, "need_better_view", task_revision=agent.task.spec.revision,
+                target_uid=candidate.uid, view_sufficient_for_stop=False,
+                reason="Capture a current observation of this candidate.",
+                diagnostics={"observation_status": "need_observation"},
+            )
         target = next(t for t in instruction_plan.terminal_targets if t.id == evidence["target_id"])
         checked = agent.task.constraint_evaluator.evaluate_before_final_verifier(
             mapper=agent.task, plan=instruction_plan, target=target,
@@ -45,6 +54,7 @@ class HabitatNavigationTools(NavigationTools):
     def __init__(self, agent):
         self.agent = agent
         self.objects = {}
+        self.deferred_candidates = set()
         super().__init__(agent.task, agent.execution.motion, HabitatEvidenceVerifier(agent), self.capture_evidence)
         agent.execution.controller.agent = agent
 
@@ -57,19 +67,50 @@ class HabitatNavigationTools(NavigationTools):
         """Generate STRIVE's approach/recheck viewpoints for one observed object."""
         existing = super().query_viewpoints(candidate_uid)
         if existing:
-            return existing
+            return self._moving_viewpoints(candidate_uid, existing)
         agent = self.agent
         agent.object_final = self.objects[candidate_uid]
         agent.found_goal_position = agent.mapper.current_position.copy()
         agent.find_final_waypoint()
         agent.whether_to_check_again()
+        self.publish_object_viewpoints(candidate_uid)
+        return self._moving_viewpoints(candidate_uid, super().query_viewpoints(candidate_uid))
+
+    def _moving_viewpoints(self, candidate_uid, views):
+        """Offer executable displacement after the current view has been checked."""
+        from navigation.action_controller import geodesic_distance_to_waypoint
+        available = []
+        for view in views:
+            distance = geodesic_distance_to_waypoint(self.agent, view["pose"]["position"])
+            if math.isfinite(distance) and distance > self.agent.planner._goal_radius:
+                available.append(view)
+        allowed = {view["uid"] for view in available}
+        self.session.snapshot = replace(self.session.snapshot, viewpoints=tuple(
+            view for view in self.session.snapshot.viewpoints
+            if candidate_uid not in view.visible_objects or view.uid in allowed))
+        return available
+
+    def query_scene(self):
+        """Return candidates with an available observation/execution opportunity."""
+        result = super().query_scene()
+        result["candidates"] = [item for item in result["candidates"]
+                                if item["candidate_uid"] not in self.deferred_candidates]
+        result["deferred_candidate_uids"] = sorted(self.deferred_candidates)
+        return result
+
+    def publish_object_viewpoints(self, candidate_uid):
+        """Publish the same approach/recheck options used by the default policy."""
+        agent = self.agent
+        approach = agent.confirmed_target_waypoint if agent.confirmed_target_waypoint is not None else agent.waypoint
         views = tuple(ViewpointSnapshot(
             uid=f"{candidate_uid}:{name}:{agent.episode_steps}",
             pose=Pose3D(tuple(float(x) for x in position), frame_id="mapper_local"),
-            visible_objects=(candidate_uid,), metadata={"source": "strive_viewpoint_geometry"},
-        ) for name, position in (("approach", agent.waypoint), ("recheck", agent.check_again_postion)))
-        self.session.snapshot = replace(self.session.snapshot, viewpoints=self.session.snapshot.viewpoints + views)
-        return super().query_viewpoints(candidate_uid)
+            visible_objects=(candidate_uid,), metadata={"source": "strive_viewpoint_geometry",
+                                                        "purpose": name, "recommended": name == "recheck"},
+        ) for name, position in (("approach", approach), ("recheck", agent.check_again_postion)))
+        retained = tuple(view for view in self.session.snapshot.viewpoints if candidate_uid not in view.visible_objects)
+        self.session.snapshot = replace(self.session.snapshot, viewpoints=retained + views)
+        return views
 
     def capture_evidence(self, candidate_uid):
         """Face the object and capture the current RGB/depth geometry packet."""
@@ -84,9 +125,9 @@ class HabitatNavigationTools(NavigationTools):
         bbox, geometry = agent._project_object_bbox_on_current_view()
         if bbox is None:
             return {
-                "current_rgb_with_bbox_path": str(Path(agent.save_dir) / f"episode-{agent.episode_samples - 1}"
-                                                   / "rgb" / f"monitor-rgb_{agent.episode_steps}.jpg"),
-                "geometry": {"visible_projected_points": 0},
+                "observation_identity": agent._observation_identity(candidate_uid),
+                "observation_status": "need_observation",
+                "geometry": {"visible_projected_points": 0, "projection_failed_in_final_view": True},
                 "view_quality_facts": {"visible_projected_points": 0},
             }
         return agent._build_final_verifier_evidence(candidate, bbox, geometry)

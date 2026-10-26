@@ -47,6 +47,15 @@ def reset_counts() -> None:
     _RAW_INDEX = 0
 
 
+def record_parse_error(request_id: str, error: Exception, *, attempt: int) -> None:
+    """Persist validation failure separately from the already saved raw response."""
+    trace_dir = os.getenv("STRIVE_LVLM_TRACE_DIR") or "outputs/model_requests"
+    with open(os.path.join(trace_dir, f"error_{request_id}.json"), "w", encoding="utf-8") as stream:
+        json.dump({"request_id": request_id, "attempt": attempt,
+                   "error_type": type(error).__name__, "error": str(error)}, stream,
+                  ensure_ascii=False, indent=2)
+
+
 def set_trace_dir(path: str) -> None:
     if path:
         os.environ["STRIVE_LVLM_TRACE_DIR"] = path

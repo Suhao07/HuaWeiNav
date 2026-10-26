@@ -88,6 +88,7 @@ def _visual_packet_from_evidence(
         "decision": decision,
         "reason": reason,
         "image_paths": image_paths,
+        "observation_identity": dict(evidence.get("observation_identity") or {}),
         "geometry": dict(evidence.get("geometry") or {}),
         "view_quality_facts": dict(evidence.get("view_quality_facts") or {}),
         "quality": view_quality_from_evidence(evidence),
@@ -136,6 +137,7 @@ class ViewControlState:
         self.reset()
 
     def reset(self) -> None:
+        self.task_revision = None
         self.active = False
         self.candidate_uid = ""
         self.objective: dict[str, Any] = {}
@@ -153,7 +155,8 @@ class ViewControlState:
 
     def start(self, candidate_uid: str, objective: dict[str, Any], evidence: dict[str, Any]) -> None:
         new_hash = _objective_hash(candidate_uid, objective)
-        if self.active and self.candidate_uid == candidate_uid:
+        revision = evidence.get("observation_identity", {}).get("task_revision")
+        if self.active and self.candidate_uid == candidate_uid and self.task_revision == revision:
             # 同一目标的 better-view 子任务不能因为 VLM 每次生成的文字略有
             # 不同就重置。否则 attempts/proposals 会被清空，控制器会反复
             # 选择同一视角，最终退回普通探索。
@@ -162,6 +165,7 @@ class ViewControlState:
         self.reset()
         self.active = True
         self.candidate_uid = candidate_uid
+        self.task_revision = revision
         self.objective = dict(objective or {})
         self.objective_hash = new_hash
         self.baseline_quality = view_quality_from_evidence(evidence)
@@ -191,13 +195,13 @@ class ViewControlState:
             step=step,
             decision=decision,
             reason=reason,
-            role="stable_semantic_visual_reference",
+            role="earlier_candidate_observation",
         )
         if not packet:
             return
         packet["instruction"] = (
-            "Compare future stop evidence with this VLM-confirmed visual reference. "
-            "It is a target-identity reference, not automatic permission to stop."
+            "Compare future observations with this earlier image of the tracked candidate. "
+            "Establish semantic identity independently from visible structure."
         )
         # 首次语义确认锁定目标身份；后续更近视角不能覆盖该参照，
         # 否则污染的点云投影会把 reference 从目标漂移到支撑物或背景。
@@ -485,6 +489,7 @@ class ViewControlState:
         return {
             "active": True,
             "candidate_uid": self.candidate_uid,
+            "task_revision": self.task_revision,
             "objective": self.objective,
             "pinned_relation_context": self.pinned_relation_context,
             "pinned_visual_evidence": self.pinned_visual_evidence,

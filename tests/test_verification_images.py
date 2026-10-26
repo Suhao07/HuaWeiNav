@@ -29,7 +29,8 @@ def test_verifier_records_exact_sent_images_and_expired_cache_is_ignored(tmp_pat
 
     def parse(**kwargs):
         requests.append(kwargs)
-        parsed = SimpleNamespace(decision="accept", satisfied=True, semantic_satisfied=True,
+        from prompting.schemas import ParsedVerification
+        parsed = ParsedVerification(decision="accept", satisfied=True, semantic_satisfied=True,
                                  view_sufficient_for_stop=True, confidence=1.0)
         return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(parsed=parsed))])
 
@@ -51,3 +52,40 @@ def test_verifier_records_exact_sent_images_and_expired_cache_is_ignored(tmp_pat
     assert store.get("chair", "chair-1").status == "accepted"
     archived.write_bytes(b"changed archive")
     assert store.get("chair", "chair-1") is None
+
+
+def test_each_image_uses_its_own_observed_box_and_identity(tmp_path, monkeypatch):
+    import json
+    import instruction_adapter.verifier as module
+    from prompting.schemas import ParsedVerification
+    current, earlier, unrelated = (tmp_path / name for name in ("current.jpg", "earlier.jpg", "unrelated.jpg"))
+    for path in (current, earlier, unrelated):
+        path.write_bytes(path.name.encode())
+    requests = []
+    def parse(**kwargs):
+        requests.append(kwargs)
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
+            parsed=ParsedVerification(satisfied=False, decision="uncertain")))])
+    client = SimpleNamespace(beta=SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(parse=parse))))
+    monkeypatch.setenv("STRIVE_FINAL_VERIFIER", "on")
+    monkeypatch.setenv("LLM_OFFLINE", "0")
+    monkeypatch.setattr(module, "get_client_and_model", lambda vlm: (client,"test"))
+    identity = {"candidate_uid": "u", "task_revision": 1, "observation_id": "current"}
+    evidence = {"observation_identity": identity, "current_rgb_with_bbox_path": str(current),
+                "centered_view_path": str(current), "geometry": {"bbox_xyxy": [1,2,3,4], "distance_to_object": .29},
+                "nearby_objects": [{"tag": "chair"}], "view_control": {
+                    "pinned_visual_evidence": {"observation_identity": {**identity, "observation_id": "earlier"},
+                        "geometry": {"bbox_xyxy": [5,6,7,8]},
+                        "image_paths": {"current_rgb_with_bbox_path": str(earlier)}},
+                    "best_visual_evidence": {"image_paths": {"current_rgb_with_bbox_path": str(unrelated)}}}}
+    result = module.FinalInstructionVerifier(evidence_dir=str(tmp_path / "blobs")).verify(
+        "find chair", {}, CandidateInstance("u", "chair", bbox_2d=[100,200,300,400]), evidence)
+    content = requests[0]["messages"][1]["content"]
+    texts = [json.loads(item["text"]) for item in content if item["type"] == "text"]
+    assert texts[0]["candidate"] == {"uid": "u"}
+    assert texts[1]["bbox_xyxy_in_this_image"] == [1,2,3,4]
+    assert texts[2]["bbox_xyxy_in_this_image"] == [5,6,7,8]
+    assert texts[2]["observation_identity"]["observation_id"] == "earlier"
+    assert sum(item["type"] == "image_url" for item in content) == 2
+    assert len(result.diagnostics["excluded_history"]) == 1
+    assert all("distance_to_object" not in str(text) and "nearby_objects" not in str(text) for text in texts)

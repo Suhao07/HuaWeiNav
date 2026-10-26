@@ -856,6 +856,8 @@ class Instruct_Mapper:
                             argmax_entity.tag = self.target
                             argmax_entity.pcd = eval_pcd
                             argmax_entity.position = entity.position
+                            # 同一实例关联成功后同步图像与其 bbox，供证据版本比较。
+                            argmax_entity.rgb, argmax_entity.bbox = entity.rgb, entity.bbox
                             argmax_entity.confidence = entity.confidence
                             argmax_entity.num_list[self.target] = entity.num_list.get(source_tag, 1)
                             argmax_entity.conf_list[self.target] = entity.conf_list.get(
@@ -868,6 +870,7 @@ class Instruct_Mapper:
                             entity_indices.append(len(ref_entities) - 1)
                 else:
                     argmax_entity = ref_entities[arg_overlap_index]
+                    argmax_entity.rgb, argmax_entity.bbox = entity.rgb, entity.bbox
                     argmax_entity.pcd = gpu_merge_pointcloud(argmax_entity.pcd, eval_pcd)
                     argmax_entity.position = np.mean(argmax_entity.pcd.point.positions.cpu().numpy(),
                                                      axis=0)
@@ -2241,6 +2244,13 @@ class Instruct_Mapper:
         return max_cluster
 
     def check_traversability(self, start, end):
+        """Query floor-projected reachability while preserving sensor/map poses.
+
+        高度投影只作用于本次 NavMesh 查询的局部副本；调用方持有的
+        观测位姿和节点位置仍表示实际状态。
+        """
+        start = np.array(start, dtype=float, copy=True)
+        end = np.array(end, dtype=float, copy=True)
         start[2] = self.floor_height
         end[2] = self.floor_height
 

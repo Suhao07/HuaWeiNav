@@ -224,3 +224,23 @@ def test_arrival_refresh_preserves_object_recheck_until_instance_disappears(monk
     monkeypatch.setattr(backend, "snapshot_from_mapper", lambda *args, **kwargs: (replace(arrived, objects=()), {}))
     HabitatNavigationTools.refresh_scene(tools)
     assert tools.session.snapshot.viewpoints == ()
+
+
+def test_recovery_schema_only_selects_supplied_domain_action(monkeypatch, tmp_path):
+    from pydantic import ValidationError
+    tools = make_tools(monkeypatch)
+    requests = []
+    def parse(**kwargs):
+        requests.append(kwargs)
+        schema = kwargs["response_format"]
+        with pytest.raises(ValidationError):
+            schema(action_uid="invented-coordinate", reason="invalid")
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
+            parsed=schema(action_uid="approach:u", reason="untried view")))])
+    client = SimpleNamespace(beta=SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(parse=parse))))
+    runtime = AgentRuntime(tools, tmp_path / "recovery.jsonl", client_model=(client,"replay"))
+    selected = runtime.choose_recovery([
+        {"action_uid": "approach:u", "kind": "viewpoint"},
+        {"action_uid": "frontier:2", "kind": "frontier"}], {"reason": "view_options_exhausted"})
+    assert selected == "approach:u" and runtime.model_calls == 1 and len(requests) == 1
+    assert tools.motion.active_request_id is None  # selection leaves execution to the driver

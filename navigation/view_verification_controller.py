@@ -59,6 +59,10 @@ def select_check_again_viewpoint(agent: Any) -> None:
     for proposal in proposals:
         proposal["travel_distance"] = geodesic_distance_to_waypoint(agent, proposal["position"])
     proposals = [p for p in proposals if np.isfinite(p["travel_distance"])]
+    if agent.view_control_state.active:
+        # 已取得当前视角的判定后，补拍要求可执行位移：d_nav(x,v) > rho。
+        # 到达容差内的提案会立即返回 reached，不能提供新的观察位置。
+        proposals = [p for p in proposals if p["travel_distance"] > agent.planner._goal_radius]
     best_candidate = _log_and_pick_best_proposal(proposals)
     current_candidate = candidate_from_object(
         agent.object_final,

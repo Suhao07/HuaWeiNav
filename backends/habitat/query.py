@@ -23,7 +23,7 @@ def refresh_scene(agent):
     return objects
 
 
-def select_observed_candidate(agent, *, episode_idx=None, step=0):
+def select_observed_candidate(agent, *, episode_idx=None, step=0, deferred_uids=()):
     """Query native snapshots and return the existing object for local geometry."""
     session, mapper = agent.task, agent.mapper
     objects = refresh_scene(agent)
@@ -41,6 +41,9 @@ def select_observed_candidate(agent, *, episode_idx=None, step=0):
     session.prior_result = mapper.search_prior_result
     result = query_scene(session, step=step)
     selected = result.selected
+    if selected is not None and selected.obj.uid in deferred_uids:
+        selected = next((item for item in result.candidates if item.obj.uid not in deferred_uids), None)
+        result.reason = "candidate_waiting_for_new_observation" if selected is None else result.reason
     agent.selected_candidate = selected
     if selected is not None and selected.role == "anchor":
         session.anchor_search_ledger.mark(

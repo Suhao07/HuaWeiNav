@@ -483,7 +483,7 @@ class ObjectCropEvidenceProvider:
         return ViewEvidence(
             source=EvidenceSource.VIEWPOINT_CAPTURE,
             timestamp=_evidence_timestamp(observation, status, self.now_fn),
-            pose=status.current_pose or (observation.robot_pose if observation is not None else None),
+            pose=observation.robot_pose if observation is not None else status.current_pose,
             image_ref=image_ref,
             camera_model=_camera_model(camera, self.default_camera_model),
             bbox_xyxy=bbox if self.mode != "full_image" else None,
@@ -576,7 +576,7 @@ def _select_image_ref(
     if camera is not None:
         # 中文核心边界：运动完成后的当前 RGB 是主证据，mapper 历史 crop 只能
         # 作为 reference，不能覆盖当前视角。
-        return camera.image_ref, "camera_frame"
+        return camera.metadata.get("visual_path") or camera.image_ref, "camera_frame"
     if target_object is not None and target_object.image_ref:
         return target_object.image_ref, "object_image_ref"
     return None, "missing"

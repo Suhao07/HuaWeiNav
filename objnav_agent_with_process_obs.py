@@ -672,6 +672,7 @@ class HM3D_Objnav_Agent:
                                           self.mapper.current_rotation)
         camera_points = np.array(camera_points)
         camera_points = camera_points.T
+        projected_points = camera_points.copy()
         depth = np.array(camera_points[:, 2], dtype=np.float32)
         camera_points = np.array(camera_points[:, :2], dtype=np.int32)
         flag = (camera_points[:, 0] >= 0) & (camera_points[:, 0] < 640) & \
@@ -682,10 +683,31 @@ class HM3D_Objnav_Agent:
         current_depth = current_depth[camera_points[:, 1], camera_points[:, 0]][:, 0]
         current_depth = np.array(current_depth, dtype=np.float32)
         depth_flag = (depth - current_depth) < 0.2
+        # 保存同一次观测的原始输入与实际筛选结果。深度 JPEG 只能预览，
+        # 无法重放 z_map - z_obs 的判断；这里保留传感器输出的米制深度
+        # （含传感器量程截断），供空间支撑审计。
+        # projected_points 顺序对应 project_to_camera 中光轴深度为正的原始点。
+        out_dir = os.path.join(self.save_dir, f'episode-{self.episode_samples - 1}', 'final_verifier')
+        os.makedirs(out_dir, exist_ok=True)
+        identity = self._observation_identity(self.object_final.uid)
+        candidate_key = self.object_final.uid.replace(':', '_')
+        projection_path = os.path.join(
+            out_dir, f'projection_{self.episode_steps}_r{identity["task_revision"]}_{candidate_key}.npz')
+        np.savez_compressed(
+            projection_path,
+            observation_identity=json.dumps(identity),
+            points_xyz=self.object_final.pcd.point.positions.cpu().numpy(),
+            camera_intrinsic=self.mapper.camera_intrinsic,
+            camera_to_mapper_rotation=self.mapper.current_rotation,
+            camera_to_mapper_translation=self.mapper.current_position,
+            rgb=self.obs['rgb'], depth_m=self.obs['depth'],
+            projected_uv_depth=projected_points, in_image=flag,
+            sampled_depth_m=current_depth, passes_occlusion=depth_flag,
+        )
         camera_points = camera_points[depth_flag]
 
         if len(camera_points) == 0:
-            return None, {}
+            return None, {"projection_evidence_path": projection_path}
 
         bbox = np.array([np.min(camera_points, axis=0), np.max(camera_points, axis=0)])
         # x1 y1 x2 y2
@@ -693,6 +715,7 @@ class HM3D_Objnav_Agent:
         width = max(1.0, float(bbox_np[2] - bbox_np[0]))
         height = max(1.0, float(bbox_np[3] - bbox_np[1]))
         geometry = {
+            "projection_evidence_path": projection_path,
             "bbox_xyxy": [float(x) for x in bbox_np.tolist()],
             "bbox_center_norm": [
                 float(((bbox_np[0] + bbox_np[2]) / 2.0) / 640.0),
@@ -738,9 +761,9 @@ class HM3D_Objnav_Agent:
             "target_position_hint": target_position_hint,
             "projection_failed": bool(geometry.get("projection_failed_in_final_view", False)),
             "instruction": (
-                "Use these generic camera-quality facts to judge final stop evidence. "
-                "Large center_offset, small border_margin, tiny bbox area, or failed projection "
-                "means the candidate may need a clearer view even when semantics are correct."
+                "Use camera-quality facts to identify evidence missing for a task predicate. "
+                "A sufficient partial view completes visual verification; centering and "
+                "framing guide additional observation only while a predicate remains unresolved."
             ),
         }
 
@@ -824,6 +847,21 @@ class HM3D_Objnav_Agent:
             return float(distance), "object_final_pointcloud_estimate"
         return None, ""
 
+    def _observation_identity(self, candidate_uid):
+        """Bind evidence to its task, instance and measured camera observation.
+
+        同一内容哈希只证明文件内容一致；对象归属由任务、实例和观测共同确定。
+        位姿保存为值，后续地图更新不能改写已采集证据的观察条件。
+        """
+        return {
+            "task_revision": self.task.spec.revision,
+            "candidate_uid": candidate_uid,
+            "observation_id": f"{self.episode_samples - 1}:{self.episode_steps}",
+            "frame_id": "mapper_local",
+            "sensor_position": self.mapper.current_position.tolist(),
+            "sensor_rotation": self.mapper.current_rotation.tolist(),
+        }
+
     def check_again(self, episode_step):
         bbox, geometry = self._project_object_bbox_on_current_view()
         if bbox is None:
@@ -878,6 +916,7 @@ class HM3D_Objnav_Agent:
         # 成功时直接作为 final verifier 和 relation verifier 的证据，
         # 避免后续几何 stop 流程丢失“book on shelf”这类上下文。
         self.last_check_again_evidence = {
+            "observation_identity": self._observation_identity(candidate.uid),
             "current_rgb_with_bbox_path": self.last_check_again_image_path,
             "object_crop_path": "",
             "centered_view_path": self.last_check_again_image_path,
@@ -887,7 +926,8 @@ class HM3D_Objnav_Agent:
             "room_context": None,
             "relation_evidence_paths": [self.last_check_again_image_path] if flag else [],
             "check_again": {
-                "bbox_verified": bool(flag),
+                "capture_succeeded": True,
+                "bbox_verified": None if instruction_mode else bool(flag),
                 "semantic_decision_deferred": bool(instruction_mode),
                 "candidate": candidate.as_dict(),
             },
@@ -956,8 +996,10 @@ class HM3D_Objnav_Agent:
         geometry = self._augment_final_stop_geometry(geometry)
 
         evidence = {
+            "observation_identity": self._observation_identity(candidate.uid),
             "current_rgb_with_bbox_path": current_path,
             "object_crop_path": crop_path,
+            "object_crop_bbox_xyxy": (bbox_np - np.array([x1, y1, x1, y1])).tolist() if crop_path else None,
             "centered_view_path": current_path,
             "geometry": geometry,
             "view_quality_facts": self._view_quality_facts(geometry),
@@ -977,7 +1019,7 @@ class HM3D_Objnav_Agent:
         """Attach pinned view-control state to final-verifier evidence."""
 
         evidence = dict(evidence or {})
-        if getattr(self.view_control_state, "active", False):
+        if self.view_control_state.active and self.view_control_state.candidate_uid == candidate.uid:
             context = self.view_control_state.as_context()
             context["candidate_uid_matches_current"] = self.view_control_state.candidate_uid == candidate.uid
             context["current_candidate_uid"] = candidate.uid
@@ -985,7 +1027,7 @@ class HM3D_Objnav_Agent:
         else:
             state = getattr(self.task, "progress", None)
             pending = dict(getattr(state, "pending_verified_pair", {}) or {})
-            if getattr(state, "mode", "") == "better_view_for_verified_pair" and pending:
+            if getattr(state, "mode", "") == "better_view_for_verified_pair" and pending.get("candidate_uid") == candidate.uid:
                 evidence["view_control"] = {
                     "active": True,
                     "source": "execution_pending_verified_pair",
@@ -1032,26 +1074,14 @@ class HM3D_Objnav_Agent:
         return bool(context.get("pinned_visual_evidence") or context.get("best_visual_evidence"))
 
     def _planner_hard_stop_allows_accept(self, evidence=None, result=None) -> bool:
-        """Return whether planner-owned stop contracts permit final STOP.
+        """Require satisfied planner-owned physical predicates for STOP.
 
-        LVLM/VLM is responsible for semantics and visual evidence quality.  The
-        controller keeps physical contracts such as stop distance, reachability,
-        and collision feasibility under planner authority.  A failed hard
-        contract may be bypassed only when the evidence contains an explicit
-        planner/geometry infeasibility proof.
+        几何不可达是执行失败事实；完成条件仍为 S_semantic ∧ S_visual ∧ S_physical。
         """
-
-        hard = dict(getattr(result, "hard_constraints", {}) or {})
+        hard = dict((evidence or {}).get("hard_stop_constraints") or {})
         if not hard:
-            hard = dict((evidence or {}).get("hard_stop_constraints") or {})
-        if not hard:
-            return True
-        if bool(hard.get("satisfied", True)):
-            return True
-        if bool(hard.get("planner_infeasible", False)) or bool(hard.get("infeasible_by_geometry", False)):
-            return True
-        proof = hard.get("planner_infeasibility_proof") or hard.get("physical_infeasibility_proof")
-        return bool(isinstance(proof, dict) and proof.get("infeasible_by_geometry"))
+            hard = dict(getattr(result, "hard_constraints", {}) or {})
+        return bool(hard.get("satisfied", True))
 
     def _enforce_planner_hard_stop_contract(self, evidence, result):
         """Demote semantic accept when physical stop contracts are still open."""
@@ -1357,8 +1387,16 @@ class HM3D_Objnav_Agent:
             logger.info("Final verifier skips hard-rejected candidate: {}", candidate.uid)
             return False
 
+        if self.view_control_state.active and (
+                self.view_control_state.candidate_uid != candidate.uid
+                or self.view_control_state.task_revision != self.task.spec.revision):
+            self.view_control_state.reset()
+
         bbox, geometry = self._project_object_bbox_on_current_view()
         constraint_eval = None
+        if evidence_override is not None and evidence_override.get("observation_identity") != self._observation_identity(candidate.uid):
+            logger.info("Capture fresh evidence for candidate {}: observation identity changed", candidate.uid)
+            evidence_override = None
         if evidence_override is not None:
             evidence = dict(evidence_override)
             evidence.setdefault("relation_evidence_paths", [])
@@ -1388,6 +1426,7 @@ class HM3D_Objnav_Agent:
                 )
             else:
                 evidence = self._attach_view_control_context(evidence, candidate)
+                evidence["target_id"] = self.selected_candidate.target_id
                 result = self.final_instruction_verifier.verify(
                     raw_instruction=raw_instruction,
                     instruction_plan=verifier_plan,
@@ -1402,75 +1441,22 @@ class HM3D_Objnav_Agent:
                 ] if path
             ]
         elif bbox is None:
-            # final stop 姿态可能看不到点云投影，但 check_again
-            # 刚刚保存过 VLM 复核图。此时继续用 check_again 图做原始指令
-            # 满足度判断，而不是直接让控制流重新 stop。
-            fallback_path = self.last_check_again_image_path
+            # 当前不可见属于取证需求；它不提供任何对象真假的语义证据。
             evidence = {
-                "current_rgb_with_bbox_path": fallback_path,
-                "object_crop_path": "",
-                "centered_view_path": fallback_path,
-                "geometry": {
+                "observation_identity": self._observation_identity(candidate.uid),
+                "geometry": self._augment_final_stop_geometry({
                     "projection_failed_in_final_view": True,
-                },
-                "view_quality_facts": self._view_quality_facts(
-                    self._augment_final_stop_geometry({"projection_failed_in_final_view": True})
-                ),
-                "nearby_objects": [],
-                "room_context": None,
+                }),
                 "relation_evidence_paths": [],
             }
-            evidence["geometry"] = self._augment_final_stop_geometry(evidence.get("geometry"))
-            if fallback_path and os.path.exists(fallback_path):
-                if plan is not None and target_for_candidate is not None:
-                    evidence = self._attach_view_control_context(evidence, candidate)
-                    constraint_eval = self.task.constraint_evaluator.evaluate_before_final_verifier(
-                        mapper=self.task,
-                        plan=plan,
-                        target=target_for_candidate,
-                        candidate=candidate,
-                        candidate_obj=self.object_final,
-                        evidence=evidence,
-                        step=self.episode_steps,
-                    )
-                    evidence = constraint_eval.evidence
-                    if not constraint_eval.satisfied:
-                        result = VerificationResult(
-                            task_revision=self.task.spec.revision,
-                            target_uid=candidate.uid,
-                            satisfied=False,
-                            decision="need_relation_check" if constraint_eval.decision == "need_relation_check" else "uncertain",
-                            confidence=constraint_eval.confidence,
-                            satisfied_constraints=constraint_eval.satisfied_constraints,
-                            failed_constraints=constraint_eval.failed_constraints,
-                            reason=constraint_eval.reason,
-                            diagnostics={"constraint_eval": constraint_eval.as_dict()},
-                        )
-                        evidence_paths = [fallback_path]
-                    else:
-                        evidence = self._attach_view_control_context(evidence, candidate)
-                        result = self.final_instruction_verifier.verify(
-                            raw_instruction=raw_instruction,
-                            instruction_plan=verifier_plan,
-                            candidate=candidate,
-                            evidence=evidence,
-                        )
-                        evidence_paths = [fallback_path]
-                else:
-                    evidence = self._attach_view_control_context(evidence, candidate)
-                    result = self.final_instruction_verifier.verify(
-                        raw_instruction=raw_instruction,
-                        instruction_plan=verifier_plan,
-                        candidate=candidate,
-                        evidence=evidence,
-                    )
-                    evidence_paths = [fallback_path]
-            else:
-                result = self.final_instruction_verifier._fallback("object_not_projected_in_current_view")
-                result.satisfied = False
-                result.decision = "need_better_view"
-                result.reason = "The candidate object is not visible in the current camera view."
-                evidence_paths = []
+            result = VerificationResult(
+                satisfied=False, decision="need_better_view",
+                task_revision=self.task.spec.revision, target_uid=candidate.uid,
+                view_sufficient_for_stop=False,
+                reason="Capture a current observation of this candidate.",
+                diagnostics={"observation_status": "need_observation"},
+            )
+            evidence_paths = []
         else:
             evidence = self._build_final_verifier_evidence(candidate, bbox, geometry)
             if plan is not None and target_for_candidate is not None:
@@ -1499,6 +1485,7 @@ class HM3D_Objnav_Agent:
                 )
             else:
                 evidence = self._attach_view_control_context(evidence, candidate)
+                evidence["target_id"] = self.selected_candidate.target_id
                 result = self.final_instruction_verifier.verify(
                     raw_instruction=raw_instruction,
                     instruction_plan=verifier_plan,

@@ -107,6 +107,63 @@ class AgentRuntime:
             + contracts + "\n\n" + skills
         )
 
+    def choose_frontier(self, options, recommended_uid, reason):
+        """Choose once from the baseline's reachable options at a search event.
+
+        The domain retains coordinates and execution ownership. The response
+        schema restricts the model to the exact option IDs supplied this turn.
+        """
+        if self.model_calls >= self.max_model_calls:
+            raise RuntimeError("Agent decision-model budget exhausted")
+        choice_type = create_model(
+            "FrontierChoice", __base__=ToolArguments,
+            frontier_uid=(Literal[tuple(option["frontier_uid"] for option in options)], ...),
+            reason=(str, ...),
+        )
+        context = {"observation": self.tools.observe(), "options": options,
+                   "baseline_recommendation": recommended_uid, "event": reason}
+        self.model_calls += 1
+        completion = self.client.beta.chat.completions.parse(
+            model=self.model, temperature=0.0, response_format=choice_type,
+            trace_label="navigation_agent",
+            messages=[{"role": "system", "content": (
+                "Select one reachable exploration branch for the current task. "
+                "Use observed semantics and path costs. The baseline recommendation "
+                "is a valid option. Return its exact frontier_uid and your reason.")},
+                {"role": "user", "content": json.dumps(context, ensure_ascii=False)}],
+        )
+        choice = completion.choices[0].message.parsed
+        self._record({"event": "frontier_choice", "call_index": self.model_calls,
+                      "options": options, "baseline_recommendation": recommended_uid,
+                      "selected_uid": choice.frontier_uid, "reason": choice.reason})
+        return choice.frontier_uid
+
+    def choose_recovery(self, options, reason):
+        """Select one domain-owned action; the driver executes its lifecycle."""
+        if self.model_calls >= self.max_model_calls:
+            raise RuntimeError("Agent decision-model budget exhausted")
+        choice_type = create_model(
+            "RecoveryChoice", __base__=ToolArguments,
+            action_uid=(Literal[tuple(option["action_uid"] for option in options)], ...),
+            reason=(str, ...),
+        )
+        self.model_calls += 1
+        completion = self.client.beta.chat.completions.parse(
+            model=self.model, temperature=0.0, response_format=choice_type,
+            trace_label="navigation_agent",
+            messages=[{"role": "system", "content": (
+                "Choose one executable recovery action for the task. Options contain "
+                "untried object views and reachable exploration branches. Select an exact "
+                "action_uid based on the unresolved evidence and travel cost. "
+                "The navigation driver owns execution and completion verification.")},
+                {"role": "user", "content": json.dumps({"observation": self.tools.observe(),
+                    "options": options, "event": reason}, ensure_ascii=False)}],
+        )
+        choice = completion.choices[0].message.parsed
+        self._record({"event": "recovery_choice", "call_index": self.model_calls,
+                      "options": options, "selected_uid": choice.action_uid, "reason": choice.reason})
+        return choice.action_uid
+
     def step(self):
         """Execute a single proposal and return its recorded tool outcome.
 
