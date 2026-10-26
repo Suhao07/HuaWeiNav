@@ -89,3 +89,33 @@ def test_each_image_uses_its_own_observed_box_and_identity(tmp_path, monkeypatch
     assert sum(item["type"] == "image_url" for item in content) == 2
     assert len(result.diagnostics["excluded_history"]) == 1
     assert all("distance_to_object" not in str(text) and "nearby_objects" not in str(text) for text in texts)
+
+
+def test_exact_visual_cache_rechecks_current_physical_stop(tmp_path, monkeypatch):
+    import instruction_adapter.verifier as module
+    from prompting.schemas import ParsedVerification
+    image = tmp_path/'current.jpg'
+    image.write_bytes(b'current image')
+    calls = []
+    def parse(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(parsed=ParsedVerification(
+            decision='accept', satisfied=True, semantic_satisfied=True, view_sufficient_for_stop=True)))])
+    client = SimpleNamespace(beta=SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(parse=parse))))
+    monkeypatch.setattr(module, 'get_client_and_model', lambda _: (client,'test'))
+    monkeypatch.setenv('LLM_OFFLINE','0')
+    monkeypatch.setenv('STRIVE_FINAL_VERIFIER','on')
+    monkeypatch.setenv('STRIVE_EVIDENCE_REUSE','1')
+    verifier = module.FinalInstructionVerifier(evidence_dir=str(tmp_path/'blobs'))
+    evidence = {'current_rgb_with_bbox_path':str(image), 'hard_stop_constraints':{'satisfied':True}}
+    candidate = CandidateInstance('u','chair')
+    first = verifier.verify('chair',{},candidate,evidence)
+    evidence['hard_stop_constraints'] = {'satisfied':False,'failed':[{'name':'distance'}]}
+    second = verifier.verify('chair',{},candidate,evidence)
+    assert first.accepted and not second.accepted
+    assert len(calls) == 1 and first.evidence_ids == second.evidence_ids
+    image.write_bytes(b'new image')
+    verifier.verify('chair',{},candidate,evidence)
+    assert len(calls) == 2
+    verifier.verify('red chair',{},candidate,evidence)
+    assert len(calls) == 3

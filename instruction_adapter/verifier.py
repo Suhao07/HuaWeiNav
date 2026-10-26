@@ -195,6 +195,8 @@ class FinalInstructionVerifier:
     def __init__(self, vlm: str = "cognav", evidence_dir: str = "outputs/evidence"):
         self.vlm = vlm
         self.evidence_dir = Path(evidence_dir)
+        from verification.store import EvidenceStore
+        self.evidence_store = EvidenceStore()
 
     @staticmethod
     def _view_guidance(evidence: dict[str, Any]) -> tuple[list[str], str]:
@@ -378,18 +380,27 @@ class FinalInstructionVerifier:
 
         # 请求异常交由运行时记录和处置，保留原始异常及调用栈。
         client, model = get_client_and_model(self.vlm)
-        completion = client.beta.chat.completions.parse(
-            model=model,
-            messages=[
-                {"role": "system", "content": FINAL_VERIFIER_PROMPT},
-                {"role": "user", "content": content},
-            ],
-            response_format=ParsedVerification,
-            trace_label=FINAL_VERIFY.trace_label,
-        )
-        parsed = completion.choices[0].message.parsed
+        from llm_utils.structured_output import request_fingerprint
+        from llm_utils.lvlm_call_tracker import record_cache_hit
+        messages = [{"role": "system", "content": FINAL_VERIFIER_PROMPT},
+                    {"role": "user", "content": content}]
+        # 缓存只复用视觉判断 V(E,r)，当前 G_t 与任务进度继续由下方代码求值。
+        revision = plan_dict.get("diagnostics", {}).get("task_spec", {}).get("revision", 1)
+        key = request_fingerprint(model, [messages, revision, evidence.get("observation_identity"),
+            evidence.get("dependencies", {})], ParsedVerification, provider=self.vlm)
+        reuse = os.getenv("STRIVE_EVIDENCE_REUSE", "1") == "1"
+        parsed = self.evidence_store.visual_judgments.get(key) if reuse else None
         if parsed is None:
-            raise ValueError("Final verifier response has no structured judgment")
+            completion = client.beta.chat.completions.parse(
+                model=model, messages=messages, response_format=ParsedVerification,
+                trace_label=FINAL_VERIFY.trace_label)
+            parsed = completion.choices[0].message.parsed
+            if parsed is None:
+                raise ValueError("Final verifier response has no structured judgment")
+            if reuse:
+                self.evidence_store.visual_judgments[key] = parsed
+        else:
+            record_cache_hit("final_visual_judgment")
 
         decision = normalize_term(getattr(parsed, "decision", "")).replace(" ", "_")
         allowed = {"accept", "reject_candidate", "need_better_view", "need_relation_check", "uncertain"}

@@ -58,137 +58,70 @@ def _step_dir(save_dir, episode_idx, episode_step) -> str:
     return path
 
 
-def ask_gpt_object_in_box(img, boxes, save_dir, episode_idx, episode_step, ind, vlm):
+def prepare_bbox_request(img, boxes, save_dir, episode_idx, episode_step, ind, vlm):
+    """Freeze the exact visual request; artifact writes belong to the caller thread."""
     step_dir = _step_dir(save_dir, episode_idx, episode_step)
-    img_vis = visualize_mask(img, boxes, None, None, None)
+    marked = visualize_mask(img, boxes, None, None, None)
+    x1, y1, x2, y2 = map(int, boxes[0])
+    x1, y1 = max(0, x1 - 5), max(0, y1 - 5)
+    x2, y2 = min(img.shape[1], x2 + 5), min(img.shape[0], y2 + 5)
+    crop = img[y1:y2, x1:x2]
+    cv2.imwrite(f"{step_dir}/real_C_image_bbox_for_gpt_{ind}.jpg", marked)
+    cv2.imwrite(f"{step_dir}/real_C_image_cropped_for_gpt_{ind}.jpg", crop)
+    prompt = BBOX_OBJECT_LABEL_PROMPT.format(detect_objects=DETECT_OBJECTS)
+    client, model = _get_client_and_model(vlm)
+    messages = [{"role": "system", "content": prompt}, {"role": "user", "content": [
+        {"type": "text", "text": "This is the whole image with the bounding box."},
+        {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + _encode_image_base64(marked)}},
+        {"type": "text", "text": "This is the cropped image inside the bounding box."},
+        {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + _encode_image_base64(crop)}},
+    ]}]
+    from llm_utils.structured_output import request_fingerprint
+    key = request_fingerprint(model, messages, BBoxObjectLabelResponse, provider=vlm)
+    return {"client": client, "model": model, "messages": messages, "key": key,
+            "step_dir": step_dir, "index": ind}
 
-    cv2.imwrite(
-        f"{step_dir}/real_C_image_bbox_for_gpt_{ind}.jpg",
-        img_vis,
-    )
 
-    img_vis_base64 = _encode_image_base64(img_vis)
-
-    # crop the image to the bounding box
-    box = boxes[0]
-    x1, y1, x2, y2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
-    # bigger the bbox by 5 pixels
-    x1 = max(0, x1 - 5)
-    y1 = max(0, y1 - 5)
-    x2 = min(img.shape[1], x2 + 5)
-    y2 = min(img.shape[0], y2 + 5)
-
-    img_cropped = img[y1:y2, x1:x2]
-
-    cv2.imwrite(
-        f"{step_dir}/real_C_image_cropped_for_gpt_{ind}.jpg",
-        img_cropped,
-    )
-
-    crop_bytes = _image_jpg_bytes(img_cropped)
-    img_cropped_base64 = base64.b64encode(crop_bytes).decode("utf-8")
-    cache_key_raw = json.dumps({
-        "bbox": [x1, y1, x2, y2],
-        "crop_sha1": hashlib.sha1(crop_bytes).hexdigest(),
-        "classes_sha1": hashlib.sha1(json.dumps(DETECT_OBJECTS, sort_keys=True).encode("utf-8")).hexdigest(),
-    }, sort_keys=True)
-    cache_key = hashlib.sha1(cache_key_raw.encode("utf-8")).hexdigest()
-    cache_path = f"{save_dir}/episode-{episode_idx}/detection/object_box_cache.json"
-    try:
-        with open(cache_path, "r", encoding="utf-8") as f:
-            cache = json.load(f)
-    except Exception:
-        cache = {}
-    if cache_key in cache:
-        cached = cache[cache_key]
-        label = str(cached.get("res", "unknown") or "unknown")
-        record_cache_hit("bbox_object_in_box")
-        nwlabels = [label]
-        img_vis = visualize_mask(img, boxes, None, nwlabels, None)
-        cv2.imwrite(f"{step_dir}/real_C_image_gpt_output_{ind}.jpg", img_vis)
-        with open(f"{step_dir}/real_C_image_gpt_output_{ind}.txt", "w", encoding="utf-8") as f:
-            f.write("Cache-Hit: true\n")
-            f.write(f"Cache-Key: {cache_key}\n")
-            f.write(f"Answer: {label}\n")
-        return label
-
-    PROMPT = BBOX_OBJECT_LABEL_PROMPT.format(detect_objects=DETECT_OBJECTS)
-
-    prompt_info = f'box: {boxes[0].tolist()}'
-
-    with open(
-            f"{step_dir}/real_C_image_gpt_input_{ind}.txt",
-            "a",
-    ) as f:
-        f.write(f'Input: {PROMPT}\n')
-        f.write(prompt_info)
-        f.write(f'\n')
-        f.write(f'\n')
-
-    # 这里的 client 可能是 OpenAI/Gemini，也可能是 CogNav 适配后的兼容对象。
-    client, model_name = _get_client_and_model(vlm)
-    completion = client.beta.chat.completions.parse(
-        model=model_name,
-        messages=[{
-            "role": "system",
-            "content": PROMPT
-        }, {
-            "role":
-                "user",
-            "content": [
-                {
-                    "type": "text",
-                    "text": 'This is the whole image with the bounding box.'
-                },
-                {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": f"data:image/jpeg;base64,{img_vis_base64}"
-                    }
-                },
-                {
-                    "type": "text",
-                    "text": 'This is the cropped image inside the bounding box.'
-                },
-                {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": f"data:image/jpeg;base64,{img_cropped_base64}"
-                    }
-                },
-            ]
-        }],
-        response_format=BBoxObjectLabelResponse,
-        trace_label=BBOX_OBJECT_LABEL.trace_label,
-    )
-
+def classify_bbox_request(request):
+    """Execute one frozen request; cache and map ownership remain with the caller."""
+    completion = request["client"].beta.chat.completions.parse(
+        model=request["model"], messages=request["messages"],
+        response_format=BBoxObjectLabelResponse, trace_label=BBOX_OBJECT_LABEL.trace_label)
     answer = completion.choices[0].message.parsed
     if answer is None:
-        raise ValueError("VLM returned empty parsed response for object detection.")
-    nwlabels = [answer.res]
-    img_vis = visualize_mask(img, boxes, None, nwlabels, None)
-    cv2.imwrite(
-        f"{step_dir}/real_C_image_gpt_output_{ind}.jpg",
-        img_vis,
-    )
-
-    with open(
-            f"{step_dir}/real_C_image_gpt_output_{ind}.txt",
-            "w",
-    ) as f:
-        f.write(f'Answer: {answer}\n')
-        f.write(f'\n')
-        f.write(f'\n')
-
-    cache[cache_key] = {
-        "res": answer.res,
-        "cache_key": cache_key,
-        "bbox": [x1, y1, x2, y2],
-    }
-    with open(cache_path, "w", encoding="utf-8") as f:
-        json.dump(cache, f, ensure_ascii=False, indent=2, sort_keys=True)
-
+        raise ValueError("VLM returned empty parsed response for object detection")
     return answer.res
+
+
+def load_bbox_cache(save_dir, episode_idx):
+    """Read the episode cache; malformed files are explicit errors."""
+    path = f"{save_dir}/episode-{episode_idx}/detection/object_box_cache.json"
+    try:
+        with open(path, encoding="utf-8") as stream:
+            return json.load(stream)
+    except FileNotFoundError:
+        return {}
+
+
+def save_bbox_cache(save_dir, episode_idx, cache):
+    """Publish cache entries after the observation barrier on the main thread."""
+    path = f"{save_dir}/episode-{episode_idx}/detection/object_box_cache.json"
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as stream:
+        json.dump(cache, stream, ensure_ascii=False, indent=2, sort_keys=True)
+
+
+def ask_gpt_object_in_box(img, boxes, save_dir, episode_idx, episode_step, ind, vlm):
+    """Classify an exact full-image/crop request through the shared cache contract."""
+    request = prepare_bbox_request(img, boxes, save_dir, episode_idx, episode_step, ind, vlm)
+    cache = load_bbox_cache(save_dir, episode_idx)
+    if request["key"] in cache:
+        record_cache_hit("bbox_object_in_box")
+        return cache[request["key"]]["res"]
+    label = classify_bbox_request(request)
+    cache[request["key"]] = {"res": label}
+    save_bbox_cache(save_dir, episode_idx, cache)
+    return label
 
 
 def refine_tag_with_target(res, target, save_dir, episode_idx, episode_step, ind, vlm):

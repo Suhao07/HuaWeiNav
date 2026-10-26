@@ -36,7 +36,6 @@ from navigation.action_controller import (
     habitat_waypoint,
     next_action_to_waypoint,
 )
-from navigation.bbox_refinement import apply_refined_tag, refine_bbox_tag
 from navigation.detection_artifacts import (
     detection_step_dir,
     save_candidate_object_pointclouds,
@@ -76,6 +75,7 @@ class HM3D_Objnav_Agent:
         self.env = env
         self.mapper = mapper
         self.task = None
+        self.semantic_label_evidence = {}
         self.selected_candidate = None
         self.episode_samples = 0
         self.planner = ShortestPathFollower(env.sim, 0.15, False)
@@ -153,10 +153,12 @@ class HM3D_Objnav_Agent:
     def reset(self, idx):
         self.episode_samples = idx + 1
         self.episode_steps = 0
+        self.final_instruction_verifier.evidence_store.reset()
         self.obs = self.env.reset()
         self.execution = HabitatExecution(self.env)
         self.mapper.initialize(self.position, self.rotation, self.env)
         self.task = None
+        self.semantic_label_evidence = {}
         self.selected_candidate = None
         self.instruct_goal = self.translate_objnav(self.env.current_episode.object_category)
         self.trajectory_summary = ""
@@ -305,20 +307,15 @@ class HM3D_Objnav_Agent:
             obj.pcd = gpu_cluster_filter(obj.pcd)
             save_real_object_pointcloud(step_dir, obj, i)
 
-        label_records = {}
+        from navigation.bbox_refinement import refine_candidates
+        candidates = []
         for i, obj in enumerate(real_C_objs):
             evidence = project_object_view(self, obj, images, rotations, torch, partial=partial)
             if evidence is None:
                 continue
             save_object_view(step_dir, i, evidence.image, evidence.bbox_xyxy)
-            if partial:
-                from navigation.bbox_refinement import refine_instance_tag
-                refined_tag, label_records[obj.uid] = refine_instance_tag(self, obj, evidence, i)
-            else:
-                refined_tag = refine_bbox_tag(self, evidence.image, evidence.bbox_tensor, i)
-            apply_refined_tag(self, obj, refined_tag, evidence.image)
-            if evidence.bbox_real_xyxy is not None:
-                obj.bbox = evidence.bbox_real_xyxy
+            candidates.append((i, obj, evidence))
+        label_records = refine_candidates(self, candidates)
 
         real_C_objs = sort_target_objects_last(real_C_objs, self.mapper.target)
 
@@ -326,12 +323,14 @@ class HM3D_Objnav_Agent:
             self.mapper.objects, real_C_objs)
         self.mapper.current_obj_indices += obj_indices
         if label_records:
-            from navigation.semantic_label_cache import matching_instance
+            from navigation.semantic_label_cache import matching_instance, instance_signature
             for obj in real_C_objs:
                 if obj.uid in label_records:
                     instance = matching_instance(obj.pcd.point.positions.cpu().numpy(), self.mapper.objects)
                     if instance is not None:
-                        self.semantic_label_evidence[instance.uid] = label_records[obj.uid]
+                        record = label_records[obj.uid]
+                        record.instance_dependency = instance_signature(instance)
+                        self.semantic_label_evidence[instance.uid] = record
         self.object_pcd = self.mapper.update_object_pcd()
 
         self.mapper.current_obj_indices = list(set(self.mapper.current_obj_indices))

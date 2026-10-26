@@ -13,6 +13,9 @@ class LabelEvidence:
     sharpness: float
     task_revision: int
     step: int
+    source_id: str = ""
+    configuration: str = ""
+    instance_dependency: str = ""
 
 
 def matching_instance(points, objects):
@@ -48,3 +51,15 @@ def reusable_label(record, *, detector_label, mapped_label, area, sharpness, tas
             and record.label not in {"unknown", "nothing"}
             and area <= 1.25 * record.area
             and sharpness <= 1.25 * record.sharpness)
+
+
+def instance_signature(obj):
+    """Fingerprint the map support owned by an instance after association.
+
+    同 UID 的支撑点替换、合并或标签冲突均使旧记录失效。严格哈希首先保证
+    复用来源正确；点云增长引起的额外失效由实验量化，首版保留这一边界。
+    """
+    import hashlib
+    digest = hashlib.sha256(obj.pcd.point.positions.cpu().numpy().tobytes())
+    digest.update(str(obj.tag).encode())
+    return digest.hexdigest()

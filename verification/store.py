@@ -22,10 +22,12 @@ class EvidenceStore:
         self.task_revision = task_revision
         self.records: dict[tuple, VerificationRecord] = {}
         self.history: list[VerificationRecord] = []
+        self.visual_judgments: dict[str, Any] = {}
 
     def reset(self):
         self.records.clear()
         self.history.clear()
+        self.visual_judgments.clear()
 
     def get(self, raw_instruction: str, candidate_uid: str, *,
             predicate_id: str = "final_stop", anchor_uid: str = "") -> VerificationRecord | None:

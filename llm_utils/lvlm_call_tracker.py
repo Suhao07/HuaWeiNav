@@ -4,6 +4,7 @@ import json
 import os
 import time
 from uuid import uuid4
+from threading import Lock
 from collections import defaultdict
 from typing import Any
 
@@ -11,6 +12,7 @@ from typing import Any
 _COUNTS: dict[str, int] = defaultdict(int)
 _CACHE_HITS: dict[str, int] = defaultdict(int)
 _RAW_INDEX = 0
+_LOCK = Lock()
 
 
 def record_request(kind: str, *, model: str, messages, response_format, parameters: dict) -> str:
@@ -42,9 +44,10 @@ def record_request(kind: str, *, model: str, messages, response_format, paramete
 
 def reset_counts() -> None:
     global _RAW_INDEX
-    _COUNTS.clear()
-    _CACHE_HITS.clear()
-    _RAW_INDEX = 0
+    with _LOCK:
+        _COUNTS.clear()
+        _CACHE_HITS.clear()
+        _RAW_INDEX = 0
 
 
 def record_parse_error(request_id: str, error: Exception, *, attempt: int) -> None:
@@ -63,7 +66,8 @@ def set_trace_dir(path: str) -> None:
 
 
 def record_cache_hit(kind: str) -> None:
-    _CACHE_HITS[str(kind or "unknown")] += 1
+    with _LOCK:
+        _CACHE_HITS[str(kind or "unknown")] += 1
 
 
 def record_call(kind: str, *, raw_response: str = "", metadata: dict[str, Any] | None = None) -> None:
@@ -75,20 +79,22 @@ def record_call(kind: str, *, raw_response: str = "", metadata: dict[str, Any] |
 
     global _RAW_INDEX
     kind = str(kind or "unknown")
-    _COUNTS[kind] += 1
+    with _LOCK:
+        _COUNTS[kind] += 1
+        _RAW_INDEX += 1
+        index = _RAW_INDEX
     trace_dir = os.getenv("STRIVE_LVLM_TRACE_DIR", "")
     if not trace_dir:
         return
     os.makedirs(trace_dir, exist_ok=True)
-    _RAW_INDEX += 1
     payload = {
-        "index": _RAW_INDEX,
+        "index": index,
         "kind": kind,
         "time": time.time(),
         "metadata": dict(metadata or {}),
         "raw_response": str(raw_response or ""),
     }
-    path = os.path.join(trace_dir, f"{_RAW_INDEX:04d}_{kind}.json")
+    path = os.path.join(trace_dir, f"{index:04d}_{kind}.json")
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2, sort_keys=True)
 

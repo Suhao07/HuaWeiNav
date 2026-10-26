@@ -253,3 +253,19 @@ def _fallback_scalar_for_name(name: str, annotation: Any) -> Any:
         if lowered in ("reason", "explanation", "view_feedback", "preferred_view_goal"):
             return "fallback"
     return _fallback_value(annotation)
+
+
+def request_fingerprint(model, messages, response_format, *, provider):
+    """Hash every model-visible input and generation policy for exact reuse.
+
+    K = H(provider, endpoint, model, thinking, prompt, schema, image bytes).
+    图片以实际发送的编码字节参与哈希，日志路径与请求序号不参与。
+    """
+    import hashlib
+    import json
+    import os
+    schema = (response_format.model_json_schema() if hasattr(response_format, "model_json_schema")
+              else response_format.schema())
+    payload = [provider, os.getenv("LLM_API_BASE_URL") or os.getenv("OPENAI_BASE_URL"),
+               model, "disabled" if model.startswith("doubao-") else "provider_default", messages, schema]
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
