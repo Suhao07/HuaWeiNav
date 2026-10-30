@@ -50,6 +50,8 @@ def select_check_again_viewpoint(agent: Any) -> None:
         success_distance=agent._augment_final_stop_geometry({})["required_stop_distance"],
         stop_criterion=agent.stop_criterion,
         arrival_tolerance=agent.planner._goal_radius,
+        image_width=agent.rgb_trajectory[-1].shape[1],
+        image_height=agent.rgb_trajectory[-1].shape[0],
     )
     logger.info(f"Interpolated_path: {interpolated_path}")
 

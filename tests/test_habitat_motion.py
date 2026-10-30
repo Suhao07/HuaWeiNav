@@ -77,3 +77,34 @@ def test_waypoint_execution_pumps_existing_planner_and_polling_is_read_only():
     assert agent.episode_steps == 2
     execution.step(0)
     assert env.actions[-1] == 0
+
+
+def test_historical_base_goal_preserves_floor_height_through_motion_owner():
+    """A historical upstairs base pose must reach the planner without flattening."""
+    from types import SimpleNamespace
+    from motion.contracts import NavigationIntent, MotionGoalMode
+    from scene.contracts import Pose3D
+    env = Environment()
+    env.episode_over = False
+    queried_paths, planner_points = [], []
+    def distance(start, end):
+        queried_paths.append((list(start), end.tolist()))
+        return 8.0
+    env.sim = SimpleNamespace(get_agent_state=lambda: SimpleNamespace(position=(2., 1., -3.)),
+                              geodesic_distance=distance)
+    def action(point):
+        planner_points.append(point.tolist())
+        return 0
+    agent = SimpleNamespace(env=env, episode_steps=0,
+                            planner=SimpleNamespace(get_next_action=action))
+    execution = HabitatExecution(env)
+    execution.controller.agent = agent
+    intent = NavigationIntent(MotionGoalMode.IMPROVE_VIEW,
+        goal_pose=Pose3D((4., 7., 5.), frame_id="map_z_up"),
+        metadata={"arrival_radius_m": .2, "historical_object_uid": "prior:desk"})
+    execution.motion.submit(intent, intent.to_motion_goal())
+    execution.controller.advance()
+    assert queried_paths == [([2., 1., -3.], [4., 5., -7.])]
+    assert planner_points == [[4., 5., -7.]]
+    assert execution.motion.poll_active().status.succeeded()
+    assert env.actions == []  # Waypoint arrival does not issue task STOP.

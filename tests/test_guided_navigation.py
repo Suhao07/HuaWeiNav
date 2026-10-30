@@ -48,6 +48,17 @@ def test_fully_explored_uses_original_remaining_nodes():
     agent.mapper.get_candidate_room_fully_explored.assert_not_called()
 
 
+def test_task_free_patrol_reuses_room_distance_policy():
+    agent = policy_agent()
+    agent.task, agent.instruct_goal, agent.gpt_relocate = None, "", False
+    agent.mapper.explore_in_room.return_value = None
+    node, source = select_exploration_node(agent, episode_idx=0, step=32)
+    assert source == "room_distance_policy" and node.idx == 1
+    agent.mapper.get_candidate_room_fully_explored_by_distance.assert_called_once_with(
+        "", idx=0, step=32, plan=None)
+    agent.mapper.get_candidate_room_fully_explored.assert_not_called()
+
+
 def test_distance_ranking_keeps_stable_tie_break(monkeypatch):
     import numpy as np
     import planning.exploration_policy as policy
@@ -136,8 +147,8 @@ def test_initial_and_feedback_views_share_planner_arrival(monkeypatch):
     from motion.supervisor import MotionSupervisor
     from motion.contracts import NavigationStatusCode
     import navigation.action_controller as actions
-    monkeypatch.setattr(actions, "geodesic_distance_to_waypoint", lambda *args: 0.3)
-    monkeypatch.setattr(actions, "next_action_to_waypoint", lambda *args: 1)
+    monkeypatch.setattr(actions, "geodesic_distance_to_waypoint", lambda *args, **kwargs: 0.3)
+    monkeypatch.setattr(actions, "next_action_to_waypoint", lambda *args, **kwargs: 1)
     env = NS(episode_over=False, step=Mock(return_value={}))
     agent = NS(task=NS(spec=NS(revision=1)), episode_steps=20, update_trajectory=Mock(), on_node_flag=True)
     controller = HabitatMotionController(env, agent)
@@ -168,7 +179,7 @@ def test_exploration_preserves_node_turns_then_accumulates_translation(monkeypat
     from scene.contracts import Pose3D
     import navigation.action_controller as actions
     commands = iter([3, 1, 3])
-    monkeypatch.setattr(actions, "next_action_to_waypoint", lambda *args: next(commands))
+    monkeypatch.setattr(actions, "next_action_to_waypoint", lambda *args, **kwargs: next(commands))
     agent = NS(episode_steps=13, on_node_flag=True, update_trajectory=Mock())
     controller = HabitatMotionController(NS(episode_over=False, step=lambda action: {}), agent)
     controller.send_goal(MotionGoal(mode=MotionGoalMode.GO_TO_FRONTIER,

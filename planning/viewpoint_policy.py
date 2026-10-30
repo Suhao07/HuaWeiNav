@@ -24,6 +24,8 @@ def build_check_again_viewpoints(
     success_distance: float,
     stop_criterion: float,
     arrival_tolerance: float = 0.0,
+    image_width: int = 640,
+    image_height: int = 480,
 ) -> tuple[list[dict[str, Any]], list[np.ndarray]]:
     """Generate class-agnostic better-view proposals for one object instance.
 
@@ -72,9 +74,9 @@ def build_check_again_viewpoints(
         camera_points = np.asarray(camera_points[:, :2], dtype=np.int32)
         in_frame = (
             (camera_points[:, 0] >= 0)
-            & (camera_points[:, 0] < 640)
+            & (camera_points[:, 0] < image_width)
             & (camera_points[:, 1] >= 0)
-            & (camera_points[:, 1] < 480)
+            & (camera_points[:, 1] < image_height)
         )
         camera_points = camera_points[in_frame]
         quality = score_projection(
@@ -86,6 +88,8 @@ def build_check_again_viewpoints(
             original_bbox_length=obj_bbox_length,
             original_bbox_width=obj_bbox_width,
             success_distance=success_distance,
+            image_width=image_width,
+            image_height=image_height,
         )
         if quality is None:
             continue

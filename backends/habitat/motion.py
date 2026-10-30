@@ -28,8 +28,8 @@ class HabitatMotionController:
         if goal.action is None:
             if self.agent is None or goal.goal_pose is None:
                 raise ValueError("Habitat waypoint execution requires an agent and pose")
-            if goal.goal_pose.frame_id != "mapper_local":
-                raise ValueError("Habitat waypoints require mapper_local coordinates")
+            if goal.goal_pose.frame_id not in ("mapper_local", "map_z_up"):
+                raise ValueError("Habitat waypoints require mapper_local or map_z_up coordinates")
             self.waypoint_goal, self.waypoint_goal_id = goal, goal_id
             self.statuses[goal_id] = NavigationStatus(NavigationStatusCode.QUEUED, goal_id=goal_id)
             return goal_id
@@ -72,11 +72,12 @@ class HabitatMotionController:
             status = NavigationStatusCode.TIMEOUT
         else:
             waypoint = np.asarray(self.waypoint_goal.goal_pose.position, dtype=float)
+            frame_id = self.waypoint_goal.goal_pose.frame_id
             # 复用 baseline 补拍的 0.5m 到达半径；普通 waypoint 沿用 planner 终态。
             radius = self.waypoint_goal.metadata.get("arrival_radius_m")
             action = (0 if radius is not None and
-                      geodesic_distance_to_waypoint(self.agent, waypoint) <= radius
-                      else next_action_to_waypoint(self.agent, waypoint))
+                      geodesic_distance_to_waypoint(self.agent, waypoint, frame_id=frame_id) <= radius
+                      else next_action_to_waypoint(self.agent, waypoint, frame_id=frame_id))
             if action is None:
                 status = NavigationStatusCode.BLOCKED
             elif int(action) == 0:
