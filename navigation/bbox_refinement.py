@@ -100,7 +100,7 @@ def refine_candidates(agent, candidates):
     from constants import DETECT_OBJECTS
 
     started = time.perf_counter()
-    enabled = os.getenv("STRIVE_EVIDENCE_REUSE", "1") == "1"
+    enabled = os.getenv("STRIVE_EVIDENCE_REUSE", "0") == "1"
     workers = int(os.getenv("STRIVE_VLM_WORKERS", "2"))
     directory = Path(agent.save_dir) / f"episode-{agent.episode_samples - 1}"
     cache = load_bbox_cache(agent.save_dir, agent.episode_samples - 1) if enabled else {}

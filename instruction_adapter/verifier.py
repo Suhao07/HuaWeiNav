@@ -388,7 +388,7 @@ class FinalInstructionVerifier:
         revision = plan_dict.get("diagnostics", {}).get("task_spec", {}).get("revision", 1)
         key = request_fingerprint(model, [messages, revision, evidence.get("observation_identity"),
             evidence.get("dependencies", {})], ParsedVerification, provider=self.vlm)
-        reuse = os.getenv("STRIVE_EVIDENCE_REUSE", "1") == "1"
+        reuse = os.getenv("STRIVE_EVIDENCE_REUSE", "0") == "1"
         parsed = self.evidence_store.visual_judgments.get(key) if reuse else None
         if parsed is None:
             completion = client.beta.chat.completions.parse(
