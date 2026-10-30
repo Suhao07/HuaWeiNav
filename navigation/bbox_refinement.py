@@ -81,6 +81,9 @@ def refine_candidates(agent, candidates):
     网络等待并发，地图写入顺序保持 candidates 顺序；任一请求失败时传播异常，
     已保存的原始模型响应保留。线程池退出形成观察屏障，随后才更新对象地图。
     """
+    # 无任务巡视只有词表检测；空目标集合无需任务上下文或模型请求。
+    if not candidates:
+        return {}
     import os
     import json
     import time

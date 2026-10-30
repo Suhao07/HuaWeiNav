@@ -282,11 +282,16 @@ def test_associated_instance_publishes_corresponding_new_image_and_box(target):
                   nodes=[], confidence=.8, num_list={"object": 1}, conf_list={"object": .8},
                   rgb=np.full((4,4,3), value), bbox=[value,0,3,3])
     old, new = instance(0), instance(1)
-    namespace = methods("mapper_with_process_obs.py", {"associate_object_entities"}, {
-        "np": np, "torch": torch, "pointcloud_distance": lambda *args: torch.zeros(4),
-        "gpu_merge_pointcloud": lambda *args: cloud})
-    mapper = NS(_is_target_tag=lambda tag: target, target="object")
-    merged, _ = namespace["associate_object_entities"](mapper, [old], [new])
+    # 融合算法已抽到共享模块；测试真实函数，几何计算仍使用固定输入。
+    path = ROOT / "mapping/object_fusion.py"
+    nodes = [node for node in ast.parse(path.read_text()).body
+             if isinstance(node, ast.FunctionDef) and node.name == "associate_object_entities"]
+    namespace = {"np": np, "torch": torch, "nearest_distances": lambda *args: torch.zeros(4),
+                 "clouds_may_overlap": lambda *args: True,
+                 "gpu_merge_pointcloud": lambda *args: cloud}
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"), namespace)
+    merged, _ = namespace["associate_object_entities"]([old], [new], target="object",
+                                                       is_target_tag=lambda tag: target)
     assert merged[0].uid == "0"
     assert merged[0].rgb is new.rgb and merged[0].bbox is new.bbox
 

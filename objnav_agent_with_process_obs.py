@@ -71,10 +71,13 @@ class HM3D_Objnav_Agent:
                  do_seg=True,
                  relocate=False,
                  gpt_relocate=True,
-                 vlm='cognav'):
+                 vlm='cognav',
+                 observation_recorder=None):
         self.env = env
+        self.observation_recorder = observation_recorder
         self.mapper = mapper
         self.task = None
+        self.patrol = False
         self.semantic_label_evidence = {}
         self.selected_candidate = None
         self.episode_samples = 0
@@ -150,7 +153,13 @@ class HM3D_Objnav_Agent:
     def rotation(self):
         return self.env.sim.get_agent_state().sensor_states['rgb'].rotation
 
-    def reset(self, idx):
+    def reset(self, idx, *, patrol=False):
+        """Reset navigation or task-free collection with the same mapper.
+
+        巡视只消费传感器观察，采用完整全景采集；任务目标与 ObjectNav
+        指标由导航分支读取。终止预算交给对应运行入口。
+        """
+        self.patrol = patrol
         self.episode_samples = idx + 1
         self.episode_steps = 0
         self.final_instruction_verifier.evidence_store.reset()
@@ -160,7 +169,11 @@ class HM3D_Objnav_Agent:
         self.task = None
         self.semantic_label_evidence = {}
         self.selected_candidate = None
-        self.instruct_goal = self.translate_objnav(self.env.current_episode.object_category)
+        self.instruct_goal = "" if patrol else self.translate_objnav(self.env.current_episode.object_category)
+        if patrol:
+            self.mapper.target = None
+            self.mapper.object_perceiver.sam.initialize(None)
+            self.adaptive_observation = False
         self.trajectory_summary = ""
         self.reset_debug_probes()
 
@@ -173,7 +186,7 @@ class HM3D_Objnav_Agent:
         self.waypoint = None
         self.on_node_flag = False
         self.travel_distance = 0.0
-        self.start_end_episode_distance = self.env.get_metrics()['distance_to_goal']
+        self.start_end_episode_distance = None if patrol else self.env.get_metrics()['distance_to_goal']
 
         self.current_node_idx = 0
         self.update_trajectory()
@@ -357,7 +370,9 @@ class HM3D_Objnav_Agent:
 
     def update_trajectory(self, on_node_flag=False):
         self.episode_steps += 1
-        self.metrics = self.env.get_metrics()
+        if self.observation_recorder is not None:
+            self.observation_recorder(self)
+        self.metrics = {} if self.patrol else self.env.get_metrics()
         self.rgb_trajectory.append(cv2.cvtColor(self.obs['rgb'], cv2.COLOR_BGR2RGB))
         self.depth_trajectory.append((self.obs['depth'] / 5.0 * 255.0).astype(np.uint8))
         self.temporary_depths.append(self.obs['depth'].copy())
@@ -372,8 +387,11 @@ class HM3D_Objnav_Agent:
                 cv2.COLOR_BGR2RGB)
             topdown_image = cv2.flip(topdown_image, 0)
         # Habitat 新旧版本对 SoftSPL 的 key 命名不同。
-        soft_spl = self.metrics.get('soft_spl', self.metrics.get('softspl', 0.0))
-        text = f"Success:{self.metrics['success']:.2f}, SPL:{self.metrics['spl']:.2f}, SoftSPL:{soft_spl:.2f}, DTS:{self.metrics['distance_to_goal']:.2f}, Step:{self.episode_steps}, Goal:{self.env.current_episode.object_category}"
+        if self.patrol:
+            text = f"Patrol, Step:{self.episode_steps}"
+        else:
+            soft_spl = self.metrics.get('soft_spl', self.metrics.get('softspl', 0.0))
+            text = f"Success:{self.metrics['success']:.2f}, SPL:{self.metrics['spl']:.2f}, SoftSPL:{soft_spl:.2f}, DTS:{self.metrics['distance_to_goal']:.2f}, Step:{self.episode_steps}, Goal:{self.env.current_episode.object_category}"
         topdown_image = cv2.putText(
             topdown_image, text, (0, 100),
             cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 0), 2, cv2.LINE_AA)

@@ -364,8 +364,10 @@ def select_exploration_node(agent, *, episode_idx, step, relocate=None, use_gpt_
         room = mapper.get_candidate_room_fully_explored(agent.instruct_goal, idx=episode_idx, step=step)
         source = "room_semantic_policy"
     else:
+        # 无指令巡视复用距离策略；None 表示没有任务合同，而非伪造空目标。
+        plan = agent.task.plan if agent.task is not None else None
         room = mapper.get_candidate_room_fully_explored_by_distance(
-            agent.instruct_goal, idx=episode_idx, step=step, plan=agent.task.plan)
+            agent.instruct_goal, idx=episode_idx, step=step, plan=plan)
         source = "room_distance_policy"
     return (mapper.find_closet_viewpoint_in_room(room) if room is not None else None), source
 

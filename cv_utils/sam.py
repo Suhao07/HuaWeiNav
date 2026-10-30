@@ -35,7 +35,9 @@ class MMDINO_Grounded_SAM:
         self.grounding_model = inferencer
 
     def _run_grounding(self, img, text_prompt):
-        result = self.grounding_model(inputs=img,
+        # segment 的图像协议为 RGB；MMDetection ndarray loader 接收 BGR，
+        # 再由模型的 bgr_to_rgb 预处理还原 RGB。SAM 始终读取原始 RGB。
+        result = self.grounding_model(inputs=img[..., ::-1].copy(),
                                       texts=text_prompt,
                                       pred_score_thr=self.TEXT_THRESHOLD,
                                       custom_entities=True)
@@ -61,10 +63,12 @@ class MMDINO_Grounded_SAM:
         # classes.remove(target)
 
         class_num = len(classes)
-        split = 4
+        if class_num == 0:
+            raise ValueError("Detector vocabulary must contain at least one concept")
+        split = min(4, class_num)
         step = class_num // split
-        start_and_end = [(i * step, (i + 1) * step) for i in range(split - 1)]
-        start_and_end.append((start_and_end[-1][1], class_num))
+        start_and_end = [(i * step, (i + 1) * step if i < split - 1 else class_num)
+                         for i in range(split)]
         for start, end in start_and_end:
             TEXT_PROMPT = ""
             class_labels.append(np.asarray(classes[start:end]))
@@ -83,19 +87,18 @@ class MMDINO_Grounded_SAM:
                 save_dir="",
                 episode_idx=-1,
                 episode_step=-1):
+        """Segment a uint8 RGB image using vocabulary and optional task target."""
         self.sam_predictor.set_image(img)
         boxes = []
         confidences = []
         labels = []
 
-        target_predictions = self._run_grounding(img, target)
-        target_boxes = target_predictions["bboxes"]
-        target_confidences = target_predictions["scores"]
-
-        target_confidences = torch.tensor(target_confidences)
-        target_boxes = torch.tensor(target_boxes)
-
-        target_mask = target_confidences >= self.TARGET_PRESENCE_THRESHOLD
+        # 离线先验建图没有任务目标；只执行共享词表检测与 SAM 分割。
+        if target is not None:
+            target_predictions = self._run_grounding(img, target)
+            target_confidences = torch.tensor(target_predictions["scores"])
+            target_boxes = torch.tensor(target_predictions["bboxes"]).reshape(-1, 4)
+            target_mask = target_confidences >= self.TARGET_PRESENCE_THRESHOLD
 
         # do detection for all categories
         for i in range(self.split):
@@ -104,7 +107,7 @@ class MMDINO_Grounded_SAM:
             confidences = confidences + predictions["scores"]
             labels = labels + self.class_labels[i][predictions["labels"]].tolist()
 
-        boxes = torch.tensor(boxes)
+        boxes = torch.tensor(boxes).reshape(-1, 4)
         confidences = torch.tensor(confidences)
 
         mask = confidences > self.BOX_THRESHOLD
@@ -115,7 +118,7 @@ class MMDINO_Grounded_SAM:
         C_boxes = torch.zeros((0, 4))
         C_confidences = torch.zeros(0)
 
-        if target in labels or target_mask.sum() > 0:
+        if target is not None and (target in labels or target_mask.sum() > 0):
             target_mask = target_confidences >= self.TARGET_BOX_THRESHOLD
             if target_mask.sum() > 0:
                 C_boxes = target_boxes[target_mask]
