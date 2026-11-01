@@ -114,18 +114,24 @@ class _TracingParsedCompletions:
         self._inner = inner
 
     def parse(self, *args, **kwargs):
-        """Save raw content before SDK validation; retry one malformed response.
+        """Save raw content before SDK validation; regenerate one invalid output.
 
         重新生成只恢复请求协议，输入观测保持不变。两次校验失败后传播
-        原始异常；超时、鉴权、拒绝及截断异常由其原有执行边界处理。
+        原始异常。截断与损坏JSON共享这一次预算；超时、鉴权和拒绝直接传播。
         """
         from pydantic import ValidationError
+        from openai import LengthFinishReasonError
+        from openai.lib._parsing import parse_chat_completion
 
         trace_label = kwargs.pop("trace_label", "parse")
-        if kwargs["model"].startswith("doubao-"):
+        local_schema = kwargs["model"].startswith("doubao-")
+        if local_schema:
             # 导航默认采用直接回答；显式请求仍可为复杂任务开启思考。
             kwargs["extra_body"] = {"thinking": {"type": "disabled"},
                                     **kwargs.get("extra_body", {})}
+            # 豆包服务端约束解码在冻结请求中产生损坏JSON；提示词携带合同，
+            # 本地继续调用SDK同一个严格解析器，保留截断、拒绝与schema错误语义。
+            kwargs["messages"] = inject_json_schema(kwargs["messages"], kwargs["response_format"])
         original_messages = list(kwargs["messages"])
         retry_of = None
         for attempt in range(2):
@@ -133,9 +139,14 @@ class _TracingParsedCompletions:
                 str(trace_label), model=kwargs["model"], messages=kwargs["messages"],
                 response_format=kwargs["response_format"],
                 parameters={key: value for key, value in kwargs.items()
-                            if key not in {"model", "messages", "response_format"}})
+                            if key not in {"model", "messages", "response_format"}},
+            )
             started = time.perf_counter()
-            response = self._inner.with_raw_response.parse(*args, **kwargs)
+            if local_schema:
+                response = self._inner.with_raw_response.create(
+                    *args, **{**kwargs, "response_format": {"type": "text"}})
+            else:
+                response = self._inner.with_raw_response.parse(*args, **kwargs)
             payload = json.loads(response.text)
             choice = payload["choices"][0]
             record_call(str(trace_label), raw_response=choice["message"].get("content") or "",
@@ -144,20 +155,29 @@ class _TracingParsedCompletions:
                                   "finish_reason": choice.get("finish_reason"),
                                   "usage": payload.get("usage"),
                                   "attempt": attempt, "retry_of": retry_of,
+                                  "structured_output": "text_with_local_schema" if local_schema else "json_schema",
                                   "latency_ms": (time.perf_counter() - started) * 1000.0})
             try:
+                if local_schema:
+                    return parse_chat_completion(response_format=kwargs["response_format"],
+                                                 input_tools=[], chat_completion=response.parse())
                 return response.parse()
-            except ValidationError as error:
+            except (ValidationError, LengthFinishReasonError) as error:
                 record_parse_error(request_id, error, attempt=attempt)
                 if attempt == 1:
                     raise
                 retry_of = request_id
+                details = (
+                    json.dumps(error.errors(include_input=False, include_context=False), ensure_ascii=False)
+                    if isinstance(error, ValidationError)
+                    else "Output reached the token limit. Keep explanations concise and complete the JSON object."
+                )
                 kwargs["messages"] = original_messages + [{
                     "role": "user", "content": (
                         "The previous response failed JSON/schema validation. Regenerate one valid "
                         "JSON object matching the supplied schema using the same observation. "
                         "Preserve uncertainty where evidence is insufficient. Validation details: "
-                        + json.dumps(error.errors(include_input=False, include_context=False), ensure_ascii=False)
+                        + details
                     ),
                 }]
 

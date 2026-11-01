@@ -79,12 +79,80 @@ def test_doubao_thinking_default_and_explicit_override(tmp_path, monkeypatch, ex
     expected = explicit or {'type': 'disabled'}
     def request(**kwargs):
         assert kwargs['extra_body']['thinking'] == expected
-        return SimpleNamespace(text=json.dumps({'choices': [{'message': {'content': '{}'},
-            'finish_reason': 'stop'}], 'usage': {'completion_tokens_details': {'reasoning_tokens': 0}}}),
-            parse=lambda: ParsedVerification())
-    adapter = _TracingParsedCompletions(SimpleNamespace(with_raw_response=SimpleNamespace(parse=request)))
+        assert json.dumps(ParsedVerification.model_json_schema(), ensure_ascii=False,
+                          separators=(',', ':')) in kwargs['messages'][0]['content']
+        assert kwargs['response_format'] == {'type': 'text'}
+        from openai.types.chat import ChatCompletion
+        payload = dict(id='test', model='doubao-seed-2-0-pro-260215', created=0,
+            object='chat.completion', choices=[dict(index=0, message=dict(role='assistant', content='{}'),
+            finish_reason='stop')], usage=dict(completion_tokens=1,prompt_tokens=1,total_tokens=2,
+            completion_tokens_details=dict(reasoning_tokens=0)))
+        return SimpleNamespace(text=json.dumps(payload), parse=lambda: ChatCompletion(**payload))
+    adapter = _TracingParsedCompletions(SimpleNamespace(with_raw_response=SimpleNamespace(create=request)))
     extra = {'extra_body': {'thinking': explicit}} if explicit else {}
     adapter.parse(model='doubao-seed-2-0-pro-260215', messages=[],
                   response_format=ParsedVerification, **extra)
     response = json.loads(next(tmp_path.glob('[0-9]*.json')).read_text())
     assert response['metadata']['usage']['completion_tokens_details']['reasoning_tokens'] == 0
+
+
+@pytest.mark.parametrize('recover', [True, False])
+def test_truncated_output_shares_single_regeneration_budget(tmp_path, monkeypatch, recover):
+    """截断输出保留原文；一次重生成后仍失败则传播SDK异常。"""
+    from openai import LengthFinishReasonError
+    from openai.types.chat import ChatCompletion
+    monkeypatch.setenv('STRIVE_LVLM_TRACE_DIR', str(tmp_path))
+    requests = []
+    completion = ChatCompletion(id='truncated', model='test', created=0,
+        object='chat.completion', choices=[dict(index=0, finish_reason='length',
+        message=dict(role='assistant', content='{"satisfied":'))])
+    failure = LengthFinishReasonError(completion=completion)
+    def request(**kwargs):
+        requests.append(kwargs)
+        success = recover and len(requests) == 2
+        raw = '{}' if success else '{"satisfied":'
+        def parse():
+            assert any(json.loads(p.read_text())['raw_response'] == raw
+                       for p in tmp_path.glob('[0-9]*.json'))
+            if not success:
+                raise failure
+            return ParsedVerification()
+        return SimpleNamespace(text=json.dumps({'choices': [{'message': {'content': raw},
+            'finish_reason': 'stop' if success else 'length'}]}), parse=parse)
+    adapter = _TracingParsedCompletions(SimpleNamespace(with_raw_response=SimpleNamespace(parse=request)))
+    messages = [{'role': 'user', 'content': 'frozen image evidence'}]
+    if recover:
+        assert adapter.parse(model='test', messages=messages,
+                             response_format=ParsedVerification).decision == 'uncertain'
+    else:
+        with pytest.raises(LengthFinishReasonError) as caught:
+            adapter.parse(model='test', messages=messages, response_format=ParsedVerification)
+        assert caught.value is failure
+    assert len(requests) == 2
+    assert requests[1]['messages'][:-1] == messages
+
+
+@pytest.mark.parametrize('recover', [True, False])
+def test_doubao_text_keeps_strict_local_validation(tmp_path, monkeypatch, recover):
+    from openai.types.chat import ChatCompletion
+    from pydantic import ValidationError
+    monkeypatch.setenv('STRIVE_LVLM_TRACE_DIR', str(tmp_path))
+    calls = []
+    def create(**kwargs):
+        calls.append(kwargs)
+        raw = '{}' if recover and len(calls) == 2 else '{"decision":'
+        completion = ChatCompletion(id='text', model=kwargs['model'], created=0,
+            object='chat.completion', choices=[dict(index=0, finish_reason='stop',
+            message=dict(role='assistant', content=raw))])
+        return SimpleNamespace(text=completion.model_dump_json(), parse=lambda: completion)
+    adapter = _TracingParsedCompletions(SimpleNamespace(with_raw_response=SimpleNamespace(create=create)))
+    kwargs = dict(model='doubao-seed-2-0-pro-260215', messages=[{'role':'user','content':'same evidence'}],
+                  response_format=ParsedVerification)
+    if recover:
+        assert adapter.parse(**kwargs).choices[0].message.parsed.decision == 'uncertain'
+    else:
+        with pytest.raises(ValidationError):
+            adapter.parse(**kwargs)
+    assert len(calls) == 2
+    assert all(call['response_format'] == {'type':'text'} for call in calls)
+    assert len(list(tmp_path.glob('error_*.json'))) == (1 if recover else 2)
