@@ -22,6 +22,8 @@ class CaptureConfig:
     hfov: float = 90.
     sensor_height: float = 1.25
     samples: int = 256
+    audit_seed: int = 17001
+    audit_samples: int = 1024
     max_positions: int = 8
     spacing: float = 1.0
     headings: int = 8
@@ -30,8 +32,10 @@ class CaptureConfig:
     island: int = -1
 
     def __post_init__(self):
-        if min(self.width, self.height, self.samples, self.max_positions, self.headings) <= 0:
+        if min(self.width, self.height, self.samples, self.audit_samples, self.max_positions, self.headings) <= 0:
             raise ValueError("Counts and image dimensions must be positive")
+        if self.audit_seed == self.seed:
+            raise ValueError("Coverage audit seed must differ from candidate seed")
         if not 0 < self.hfov < 180 or min(self.spacing, self.sensor_height) <= 0:
             raise ValueError("Invalid field of view, spacing or sensor height")
 
@@ -138,6 +142,8 @@ def collect(scene_dir, output, config):
             regions.append(region)
             if not included:
                 continue
+            # 每个连通区域独立采样，候选预算不影响其他区域或审计随机流。
+            pf.seed(config.seed + island)
             samples = np.array([pf.get_random_navigable_point(island_index=island)
                                 for _ in range(config.samples)])
             if not np.isfinite(samples).all():
@@ -152,7 +158,8 @@ def collect(scene_dir, output, config):
                 coverage.append({"island_id": island, "position_count": 0, "fraction": 0.})
                 continue
             # 独立检查点作为分母；测量 NavMesh 路径距离，不把欧氏接近当作跨墙覆盖。
-            checks = [pf.get_random_navigable_point(island_index=island) for _ in range(config.samples)]
+            pf.seed(config.audit_seed + island)
+            checks = [pf.get_random_navigable_point(island_index=island) for _ in range(config.audit_samples)]
             nearest = [min(path_distance(check, position) for position in positions) for check in checks]
             uncovered = [i for i, value in enumerate(nearest) if value > config.spacing]
             covered = len(checks) - len(uncovered)
@@ -167,6 +174,7 @@ def collect(scene_dir, output, config):
             plan.extend((island, p) for p in positions)
         write_json(output / "regions.json", regions)
         write_json(output / "coverage.json", {"measurement": "sampled_geodesic_position_coverage",
+                                               "audit_seed": config.audit_seed,
                                                "regions": coverage, "selection": "geodesic_probe_coverage_then_nearest_order",
                                                "surface_coverage": "not_measured"})
         if not plan:
