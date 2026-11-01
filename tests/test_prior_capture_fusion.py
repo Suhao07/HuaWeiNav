@@ -132,6 +132,28 @@ class CaptureFusionTest(unittest.TestCase):
         assert output[0].shape == (0, 4)
         assert output[3].shape == (0, 32, 32)
 
+    def test_target_detection_gets_masks_when_vocabulary_is_empty(self):
+        from cv_utils.sam import MMDINO_Grounded_SAM
+        from cv_utils.image_perceiver import ImagePerceiver
+        from types import SimpleNamespace
+        detector = MMDINO_Grounded_SAM.__new__(MMDINO_Grounded_SAM)
+        detector.sam_predictor = SimpleNamespace(set_image=lambda image: None)
+        detector.classes = ["table"]
+        detector.initialize(target="chair")
+        detector.BOX_THRESHOLD, detector.NMS_IOU_THRESHOLD = .2, .8
+        target_box = [[2., 2., 20., 20.]]
+        detector._run_grounding = lambda image, prompt: (
+            {"bboxes": target_box, "scores": [.9], "labels": np.array([0])} if prompt == "chair"
+            else {"bboxes": [], "scores": [], "labels": np.array([], dtype=int)})
+        detector._predict_masks = lambda image, boxes: torch.ones((len(boxes), 32, 32), dtype=torch.bool)
+        output = detector.segment(np.zeros((32, 32, 3), dtype=np.uint8), target="chair")
+        assert output[0].shape == (0, 4) and output[3].shape == (0, 32, 32)
+        assert output[4].shape == (1, 4) and output[6].shape == (1, 32, 32)
+        perceiver = ImagePerceiver.__new__(ImagePerceiver)
+        perceiver.segment = lambda *args: output
+        result = perceiver.perceive(np.zeros((32, 32, 3), dtype=np.uint8), target="chair")
+        assert list(result[4]) == ["chair"] and result[6].shape == (1, 32, 32)
+
     def test_single_concept_vocabulary_has_one_nonempty_prompt(self):
         from cv_utils.sam import MMDINO_Grounded_SAM
         detector = MMDINO_Grounded_SAM.__new__(MMDINO_Grounded_SAM)

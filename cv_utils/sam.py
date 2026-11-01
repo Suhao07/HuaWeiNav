@@ -126,27 +126,19 @@ class MMDINO_Grounded_SAM:
 
         h, w, _ = img.shape
 
-        if B_boxes.shape[0] == 0:
-            return B_boxes, B_confidences, B_labels, torch.zeros(
-                (0, h, w)), C_boxes, C_confidences, torch.zeros((0, h, w))
+        # 词表检测为空时目标检测仍独立成立，目标框必须继续生成对应掩码。
+        B_masks = torch.zeros((0, h, w))
+        if B_boxes.shape[0] > 0:
+            logger.info(f"Before NMS: {B_boxes.shape[0]} boxes")
+            nms_idx = nms(B_boxes, B_confidences, self.NMS_IOU_THRESHOLD)
+            B_boxes = B_boxes[nms_idx, :]
+            B_confidences = B_confidences[nms_idx]
+            B_labels = B_labels[nms_idx.cpu().numpy()]
+            logger.info(f"After NMS: {B_boxes.shape[0]} boxes")
 
-        boxes_xyxy = B_boxes
-
-        # NMS post process
-        logger.info(f"Before NMS: {boxes_xyxy.shape[0]} boxes")
-        nms_idx = nms(boxes_xyxy, B_confidences, self.NMS_IOU_THRESHOLD)
-
-        boxes_xyxy = boxes_xyxy[nms_idx, :]
-        B_boxes = B_boxes[nms_idx, :]
-        B_confidences = B_confidences[nms_idx]
-        B_labels = B_labels[nms_idx.cpu().numpy()]
-
-        logger.info(f"After NMS: {boxes_xyxy.shape[0]} boxes")
-
-        B_masks = self._predict_masks(img, boxes_xyxy)
-        B_confidences = B_confidences.cpu()
-
-        logger.info("{} {} {}", B_labels.shape, B_confidences.shape, B_masks.shape)
+            B_masks = self._predict_masks(img, B_boxes)
+            B_confidences = B_confidences.cpu()
+            logger.info("{} {} {}", B_labels.shape, B_confidences.shape, B_masks.shape)
 
         if C_boxes.shape[0] == 0:
             return B_boxes, B_confidences, B_labels, B_masks, C_boxes, C_confidences, torch.zeros(
@@ -161,7 +153,7 @@ class MMDINO_Grounded_SAM:
         C_confidences = C_confidences.cpu()
 
         # remove target from background detections
-        keep_mask_np = (B_labels != target)
+        keep_mask_np = np.array([label != target for label in B_labels], dtype=bool)
         keep_mask_torch = torch.as_tensor(keep_mask_np, device=B_boxes.device)
         B_boxes = B_boxes[keep_mask_torch]
         B_confidences = B_confidences[keep_mask_torch]
