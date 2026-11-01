@@ -177,3 +177,19 @@ def test_memory_rejects_unknown_prior_ids() -> None:
 
     with pytest.raises(KeyError):
         memory.mark_prior_rejected("missing_object", "reason", step=1)
+
+
+def test_canonical_mapper_observation_uses_episode_origin():
+    """机器人、轨迹与frontier必须位于同一先验坐标系。"""
+    from prior_map.visualizer import build_floorplan_overlay
+    base = PriorMapData(scene_id='scene', frame_id='map_z_up')
+    alignment = PriorMapAlignment.identity(prior_frame_id='map_z_up', runtime_frame_id='map_z_up')
+    memory = PriorMapMemory(base, alignment)
+    mapper = SimpleNamespace(current_position=(0., 0., .073), initial_position=(-1.88458, -11.11461, .896))
+    obs = memory.update_from_mapper(mapper, step=12)
+    assert obs.frame_id == 'map_z_up'
+    assert obs.pose_xyz == pytest.approx((-1.88458, 11.11461, .969))
+    overlay = build_floorplan_overlay(base, observations=memory.observations,
+        robot_position_xyz=obs.pose_xyz, alignment=alignment)
+    assert overlay.robot_position_xy == pytest.approx((-1.88458, 11.11461))
+    assert overlay.trajectory_xy[-1] == pytest.approx(overlay.robot_position_xy)

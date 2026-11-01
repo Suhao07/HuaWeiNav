@@ -653,7 +653,10 @@ def refresh_mapper_prior_map_query(
 def _load_alignment(value: str, base_map: PriorMapData) -> PriorMapAlignment:
     normalized = str(value or "identity").strip()
     if normalized in {"", "identity", "auto"}:
-        return PriorMapAlignment.identity(prior_frame_id=base_map.frame_id, runtime_frame_id="map")
+        # Canonical capture maps use global (x,-z,y); frontier extraction converts
+        # Habitat/world or mapper-local coordinates into this plane before alignment.
+        runtime_frame = "map_z_up" if base_map.frame_id == "map_z_up" else "map"
+        return PriorMapAlignment.identity(prior_frame_id=base_map.frame_id, runtime_frame_id=runtime_frame)
     if normalized in {"unavailable", "disabled", "prompt_context_only"}:
         return PriorMapAlignment.unavailable(prior_frame_id=base_map.frame_id, runtime_frame_id="map")
     return PriorMapAlignment.load(normalized)

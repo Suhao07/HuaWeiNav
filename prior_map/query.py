@@ -843,13 +843,17 @@ def _plane_xy_from_xyz(
         source: Extraction source hint.
 
     Returns:
-        Plane coordinate. Habitat-world points use \(x,z\); generic map points
-        use \(x,y\).
+        Plane coordinate. Habitat-world frames use (x,z); canonical map_z_up
+        converts explicit Habitat sources to (x,-z). Native map points use (x,y).
     """
 
     point = _vector3_or_none(position_xyz) or (0.0, 0.0, 0.0)
     frame = _normalize(frame_id)
     source_text = _normalize(source)
+    # 统一采集地图 p_M=(x_H,-z_H,y_H)。只转换明确来自 Habitat 的输入；
+    # 原生 map_z_up 点直接使用 xy，避免实物快照和已转换点被再次翻转。
+    if frame == "map z up" and ("habitat" in source_text or "mapper local" in source_text):
+        return (point[0], -point[2])
     if "habitat" in frame or "habitat" in source_text or "mapper local" in source_text:
         return (point[0], point[2])
     return (point[0], point[1])

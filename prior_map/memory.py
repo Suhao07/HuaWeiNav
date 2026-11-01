@@ -216,6 +216,14 @@ class PriorMapMemory:
         pose_xyz = _pose_xyz(
             _first_attr(mapper, ("robot_pose", "pose", "current_pose", "agent_pose", "current_position"))
         )
+        frame_id = _text_or_none(_first_attr(mapper, ("frame_id", "world_frame", "map_frame"))) or "map"
+        initial = _pose_xyz(_first_attr(mapper, ("initial_position",)))
+        if self.alignment.runtime_frame_id == "map_z_up" and initial is not None:
+            local = _pose_xyz(mapper.current_position)
+            # STRIVE局部坐标加episode原点后为(x,z,y)，统一地图采用(x,-z,y)。
+            # p_map = diag(1,-1,1) (p_local + p_initial)，与frontier查询共用坐标约定。
+            pose_xyz = (local[0] + initial[0], -(local[1] + initial[1]), local[2] + initial[2])
+            frame_id = "map_z_up"
 
         observed_object_uids: List[str] = []
         observed_object_labels: List[str] = []
@@ -252,7 +260,7 @@ class PriorMapMemory:
         record = PriorObservationRecord(
             timestamp=float(step),
             pose_xyz=pose_xyz,
-            frame_id=_text_or_none(_first_attr(mapper, ("frame_id", "world_frame", "map_frame"))) or "map",
+            frame_id=frame_id,
             observed_object_uids=tuple(_dedupe(observed_object_uids)),
             observed_object_labels=tuple(_dedupe(observed_object_labels)),
             room_hypothesis_uid=room_hypothesis_uid,

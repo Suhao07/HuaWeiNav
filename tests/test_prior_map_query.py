@@ -179,3 +179,27 @@ def test_query_result_is_ranking_only_and_has_no_motion_goal() -> None:
         "no_runtime_frontier_world_position",
         "frontier_bias_empty",
     }
+
+
+def test_canonical_capture_prior_ranks_actual_habitat_side():
+    """Canonical (x,-z,y) maps must not attract frontiers across the Z mirror."""
+    from prior_map.simulation import _load_alignment
+    base = PriorMapData(scene_id='scene', frame_id='map_z_up', objects=(
+        PriorObject(uid='mug', label='mug', position_xyz=(10., -10., 1.), confidence=.9),))
+    memory = PriorMapMemory(base_map=base, alignment=_load_alignment('identity', base))
+    for frontiers, initial in [
+        ((SimpleNamespace(uid='actual', habitat_world_position=(10., 0., 10.)),
+          SimpleNamespace(uid='mirror', habitat_world_position=(10., 0., -10.))), None),
+        ((SimpleNamespace(uid='actual', position=(7., 6., 0.)),
+          SimpleNamespace(uid='mirror', position=(7., -14., 0.))), (3., 4., .88)),
+    ]:
+        context = SimpleNamespace(objects=(), rooms=(), frontiers=frontiers)
+        if initial is not None:
+            context.initial_position = initial
+        result = PriorMapQueryService().query(_plan_without_room_hint(), context, memory)
+        assert result.frontier_biases[0].frontier_uid == 'actual'
+
+
+def test_canonical_native_position_preserves_y_sign():
+    from prior_map.query import _plane_xy_from_xyz
+    assert _plane_xy_from_xyz((10., -10., 1.), 'map_z_up', 'position_xyz') == (10., -10.)
