@@ -10,7 +10,99 @@ from PIL import Image
 
 from .bundle import write_bundle, new_map_id
 from .contracts import PriorMapData, PriorObject
-from .observations import COORDINATES, SCHEMA_VERSION, backproject, read_records, write_json, metric_depth_validity
+from .observations import (COORDINATES, SCHEMA_VERSION, backproject, load_depth,
+                           read_records, write_json, metric_depth_validity)
+
+
+def capture_free_cells(capture, *, resolution, robot_height_m, robot_radius_m, stride, max_depth_m):
+    r"""Derive traversable floor cells from a portable RGB-D capture.
+
+    Args:
+        capture: Completed portable capture directory.
+        resolution: Map grid cell size in metres.
+        robot_height_m: Body height; points below it block the robot.
+        robot_radius_m: Footprint radius used to erode free floor.
+        stride: Pixel stride for back-projection.
+        max_depth_m: Maximum depth used as a geometric measurement.
+
+    Returns:
+        ``(cells, floor_height, diagnostics)`` with integer map_z_up cells.
+
+    Raises:
+        ValueError: Capture protocol, status or settings are incompatible, or the
+            trajectory reaches no robot-traversable floor.
+
+    地面高度 z_f 取相机下方点高度直方图(0.05m格)的众数格中位数。
+    地面带沿用 mapper 约定 |z-z_f|<0.2，障碍带为 z_f+0.2 <= z < z_f+h：
+
+    .. math::
+        F(c) = 1[\exists p\in c: |p_z-z_f|<0.2]\;\wedge\;
+               1[\nexists p\in c: z_f+0.2 \le p_z < z_f+h],\qquad
+        F_{robot} = F \ominus \mathrm{Disk}(r),\qquad
+        F_{reach} = \bigcup\{K \in \mathrm{cc}_4(F_{robot}) : K \cap T \ne \emptyset\}
+
+    未观测格不属于 F；腐蚀后的 F_robot 与按机器人半径生成的 NavMesh 同义。
+    T 为相机轨迹投影格：手持采集者走过的地面可达，透过窗口观测到的孤立地面不可达。
+    """
+    import math
+    from scipy import ndimage
+
+    root = Path(capture)
+    manifest = json.loads((root / "manifest.json").read_text())
+    if manifest["coordinates"] != COORDINATES or manifest["schema_version"] != SCHEMA_VERSION:
+        raise ValueError("Capture must use the portable optical-camera protocol")
+    if manifest["status"] != "complete":
+        raise ValueError("Capture must complete before layout extraction")
+    if min(resolution, robot_height_m, max_depth_m) <= 0 or robot_radius_m < 0 or stride < 1:
+        raise ValueError("Use positive grid, robot, depth and stride settings")
+    profile = manifest.get("capture_profile")
+    clouds, below_camera, camera_xy = [], [], []
+    for frame in read_records(root / "frames.jsonl"):
+        depth = load_depth(root / frame["depth_path"])
+        valid = metric_depth_validity(depth, profile) & (depth <= max_depth_m)
+        pose = np.asarray(frame["camera_to_map"])
+        points = backproject(np.where(valid, depth, 0), np.asarray(frame["intrinsics"]), pose,
+                             stride=stride).astype(np.float32)
+        clouds.append(points)
+        below_camera.append(points[points[:, 2] < pose[2, 3], 2])
+        camera_xy.append(pose[:2, 3])
+    points, below_camera = np.concatenate(clouds), np.concatenate(below_camera)
+    if not len(below_camera):
+        raise ValueError("Capture contains no valid depth below the camera")
+    bins = np.floor(below_camera / 0.05).astype(np.int64)
+    values, counts = np.unique(bins, return_counts=True)
+    mode = values[np.argmax(counts)]
+    floor_height = float(np.median(below_camera[bins == mode]))
+    cell_xy = np.round(points[:, :2] / resolution).astype(np.int64)
+    height = points[:, 2] - floor_height
+    floor = {tuple(c) for c in np.unique(cell_xy[np.abs(height) < 0.2], axis=0)}
+    blocked = {tuple(c) for c in np.unique(cell_xy[(height >= 0.2) & (height < robot_height_m)], axis=0)}
+    free = floor - blocked
+    if not free:
+        raise ValueError("Capture observed no unobstructed floor cells")
+    indices = np.asarray(sorted(free))
+    offset = indices.min(axis=0)
+    grid = np.zeros(tuple(indices.max(axis=0) - offset + 1), dtype=bool)
+    grid[tuple((indices - offset).T)] = True
+    radius = robot_radius_m / resolution
+    xx, yy = np.mgrid[-math.ceil(radius):math.ceil(radius) + 1, -math.ceil(radius):math.ceil(radius) + 1]
+    eroded = ndimage.binary_erosion(grid, structure=xx * xx + yy * yy <= radius ** 2)
+    components, _ = ndimage.label(eroded)
+    trajectory = np.round(np.asarray(camera_xy) / resolution).astype(np.int64) - offset
+    trajectory = trajectory[np.all((trajectory >= 0) & (trajectory < eroded.shape), axis=1)]
+    reachable = np.isin(components, np.setdiff1d(components[tuple(trajectory.T)], [0]))
+    if not reachable.any():
+        raise ValueError("Capture trajectory crosses no robot-traversable floor")
+    cells = {tuple(int(v) for v in c + offset) for c in np.argwhere(reachable)}
+    diagnostics = {"geometry_source": "rgbd_capture", "frame_count": len(clouds),
+                   "point_count": int(len(points)), "floor_height_estimate": floor_height,
+                   "floor_mode_point_count": int(counts.max()), "floor_cell_count": len(floor),
+                   "blocked_cell_count": len(blocked), "unobstructed_floor_cell_count": len(free),
+                   "robot_cell_count": int(eroded.sum()), "reachable_cell_count": len(cells),
+                   "robot_height_m": robot_height_m,
+                   "robot_radius_m": robot_radius_m, "stride": stride, "max_depth_m": max_depth_m,
+                   "capture_manifest_sha256": hashlib.sha256((root / "manifest.json").read_bytes()).hexdigest()}
+    return cells, floor_height, diagnostics
 
 
 def build_capture_map(capture, output, *, classes, max_frames=None, voxel_m=0.05,
