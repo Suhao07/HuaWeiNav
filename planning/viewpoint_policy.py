@@ -26,12 +26,15 @@ def build_check_again_viewpoints(
     arrival_tolerance: float = 0.0,
     image_width: int = 640,
     image_height: int = 480,
+    align_pitch: bool = False,
 ) -> tuple[list[dict[str, Any]], list[np.ndarray]]:
     """Generate class-agnostic better-view proposals for one object instance.
 
     The caller owns navigation state and final verifier decisions. This helper
     only projects the current object point cloud from reachable path samples and
-    scores how useful each sample is as visual evidence.
+    scores how useful each sample is as visual evidence. ``align_pitch`` uses
+    a target-facing camera for executors that pitch toward the object center.
+    The projection measures image bounds, without new-view occlusion testing.
     """
 
     positions = object_node.pcd.point.positions.cpu().numpy()
@@ -60,7 +63,11 @@ def build_check_again_viewpoints(
     path_origin = path_points[0] if len(path_points) else np.zeros(3)
     for point in interpolated_path:
         point = np.asarray(point, dtype=float)
-        rotation_matrix = rotation_towards(point[:2], final_pos)
+        # 先验执行器会俯仰对准当前观察中心，评分使用相同目标与相机高度。
+        # theta = atan2(z_target - z_camera, ||target_xy - camera_xy||).
+        pitch = (float(np.arctan2(object_node.position[2] - point[2],
+                                 np.linalg.norm(final_pos - point[:2]))) if align_pitch else 0.0)
+        rotation_matrix = rotation_towards(point[:2], final_pos, pitch=pitch)
         if rotation_matrix is None:
             continue
         camera_points = project_to_camera(object_node.pcd, camera_intrinsic, point, rotation_matrix)

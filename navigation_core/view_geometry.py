@@ -62,13 +62,20 @@ def truncate_at_stop_radius(
     return path[: stop_idx + 1]
 
 
-def rotation_towards(stop_pos_xy: np.ndarray, target_pos_xy: np.ndarray) -> np.ndarray | None:
+def rotation_towards(stop_pos_xy: np.ndarray, target_pos_xy: np.ndarray, *,
+                     pitch: float = 0.0) -> np.ndarray | None:
+    """Camera-to-mapper rotation; positive pitch raises the optical forward axis.
+
+    R = R_yaw @ R_x(pitch). The optical forward direction is camera -Z;
+    pitch is in radians. Mapper axes (x, z, y) include the existing reflection;
+    this basis transform has determinant -1. Zero pitch preserves baseline views.
+    """
     orient = np.asarray(target_pos_xy, dtype=float) - np.asarray(stop_pos_xy, dtype=float)
     orient_norm = float(np.linalg.norm(orient))
     if orient_norm < 1e-6:
         return None
     orient = orient / orient_norm
-    return np.array(
+    yaw_rotation = np.array(
         [
             [-orient[1], 0.0, -orient[0]],
             [orient[0], 0.0, -orient[1]],
@@ -76,6 +83,8 @@ def rotation_towards(stop_pos_xy: np.ndarray, target_pos_xy: np.ndarray) -> np.n
         ],
         dtype=float,
     )
+    c, s = np.cos(pitch), np.sin(pitch)
+    return yaw_rotation @ np.array([[1., 0., 0.], [0., c, -s], [0., s, c]])
 
 
 def score_projection(
