@@ -93,7 +93,7 @@ class AgentRuntime:
         self.history = []
         self.client, self.model = client_model or get_client_and_model(vlm)
         skill_root = Path(__file__).resolve().parent.parent / "skills"
-        skills = "\n\n".join((skill_root / name).read_text() for name in (
+        skills = "\n\n".join((skill_root / name).read_text(encoding="utf-8") for name in (
             "search.md", "active_observation.md", "recovery.md", "completion.md",
         ))
         contracts = "\n".join(

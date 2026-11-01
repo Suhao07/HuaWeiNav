@@ -244,3 +244,18 @@ def test_recovery_schema_only_selects_supplied_domain_action(monkeypatch, tmp_pa
         {"action_uid": "frontier:2", "kind": "frontier"}], {"reason": "view_options_exhausted"})
     assert selected == "approach:u" and runtime.model_calls == 1 and len(requests) == 1
     assert tools.motion.active_request_id is None  # selection leaves execution to the driver
+
+
+def test_skill_loading_uses_utf8_after_native_locale_change(tmp_path):
+    import locale
+    from types import SimpleNamespace
+    from harness.runtime import AgentRuntime
+    previous = locale.setlocale(locale.LC_CTYPE)
+    try:
+        locale.setlocale(locale.LC_CTYPE, 'C')
+        runtime = AgentRuntime(SimpleNamespace(names=()), tmp_path/'trace.jsonl',
+                               client_model=(object(), 'mock'))
+        assert 'Return one ToolCall' in runtime.system_prompt
+        assert len(runtime.system_prompt) > 500
+    finally:
+        locale.setlocale(locale.LC_CTYPE, previous)
