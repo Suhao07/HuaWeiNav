@@ -188,6 +188,9 @@ def write_hm3d_floorplan_layout(
     output = result.layout.save(output_path)
     paths = {"floorplan": str(output)}
     output_dir = output.parent
+    canonical = output_dir / "prior_map.json"
+    canonical.write_text(json.dumps(result.prior_map.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
+    paths["canonical_map"] = str(canonical)
     # 中文：BEV 是仿真与实物共用的语义先验接口，必须和 JSON 同源生成。
     # 这里渲染房间边界、拓扑和标签，不把 Habitat 的 NavMesh 真值泄漏到输出。
     from .visualizer import PriorMapFloorPlanVisualizer
@@ -221,11 +224,12 @@ def write_hm3d_floorplan_layout(
                 "source_format": result.metadata.get("source_format", "hm3d_floorplan_layout"),
                 "frame_id": result.layout.frame_id,
                 "coordinate_convention": result.metadata.get("coordinate_convention"),
-                "authority": "semantic_prior_only",
+                "authority": result.metadata.get("authority", "semantic_prior_only"),
                 "artifact_policy": "semantic_bundle_only",
                 "object_instances_omitted": True,
                 "artifacts": {
                     "floorplan": output.name,
+                    "canonical_map": canonical.name,
                     "prior_map_bev_png": Path(bev_paths["png"]).name,
                     "prior_map_bev_svg": Path(bev_paths["svg"]).name,
                     "prior_map_bev_markers": Path(bev_paths["markers"]).name,
@@ -272,3 +276,133 @@ __all__ = [
     "build_hm3d_floorplan_layout_from_sim",
     "write_hm3d_floorplan_layout",
 ]
+
+
+def build_navigation_region_layout(simulator, scene_id, *, floor_height, clearance_m, config):
+    """Build unknown navigation regions using NavMesh geometry only.
+
+    Args:
+        simulator: Maintained Habitat simulator with a loaded pathfinder.
+        scene_id: Environment identity.
+        floor_height: Explicit Habitat y slice in metres.
+        clearance_m: Additional erosion radius used to identify broad-area seeds.
+        config: Existing grid resolution, area and resource settings.
+
+    Returns:
+        Shared floorplan layout and canonical map; all semantic labels are unknown.
+
+    Raises:
+        ValueError: Sampling or clearance settings produce no traversable cells.
+
+    Habitat 格(i_x, i_z)对应地图格(i_x, -i_z)，与map_z_up=(x,-z,y)一致。
+    """
+    from .hm3d_groundtruth import _sample_traversable_cells
+
+    lower, upper = simulator.pathfinder.get_bounds()
+    cells = _sample_traversable_cells(simulator.pathfinder, lower, upper, [floor_height], config)
+    return build_free_cell_region_layout(
+        {(x, -z) for x, z, _ in cells}, scene_id, floor_height=floor_height,
+        clearance_m=clearance_m, config=config, source='navmesh_geometry',
+        metadata={'geometry_source': 'habitat_navmesh'})
+
+
+def build_free_cell_region_layout(cells, scene_id, *, floor_height, clearance_m, config,
+                                  source, metadata):
+    """Partition traversable map cells into unknown navigation regions.
+
+    Args:
+        cells: Integer map_z_up cells ``(i_x, i_y)`` centred at ``i * resolution``.
+        scene_id: Environment identity.
+        floor_height: Map z of the traversable floor in metres.
+        clearance_m: Additional erosion radius used to identify broad-area seeds.
+        config: Grid resolution, area and height-tolerance settings.
+        source: Room provenance and canonical ``source_format``.
+        metadata: Source-specific diagnostics merged into every region and the map.
+
+    Returns:
+        Shared floorplan layout and canonical map; all semantic labels are unknown.
+
+    Raises:
+        ValueError: Empty cells, negative clearance or a non-finite floor height.
+
+    区域种子 S = components(F eroded by disk(r)); then multi-source BFS
+    assigns every reachable free cell to a seed through free cells only.
+    Region boundaries express a geometric partition, not inferred room semantics.
+    """
+    from collections import deque
+    import math
+    import numpy as np
+    from scipy import ndimage
+    from .contracts import PriorMapData, PriorRoom
+    from .floorplan_layout import FloorplanLevel, FloorplanRegion
+    from .hm3d_groundtruth import _boundary_from_cells
+
+    if clearance_m < 0 or not math.isfinite(floor_height):
+        raise ValueError('Use nonnegative clearance and a finite floor height')
+    if not cells:
+        raise ValueError('No traversable cells on the requested floor')
+    resolution = config.topdown_resolution
+    indices = np.asarray(sorted(cells))
+    offset = indices.min(axis=0)
+    indices = indices - offset
+    free = np.zeros(tuple(indices.max(axis=0) + 1), dtype=bool)
+    free[indices[:, 0], indices[:, 1]] = True
+    radius = int(math.ceil(clearance_m / resolution))
+    xx, zz = np.mgrid[-radius:radius + 1, -radius:radius + 1]
+    kernel = xx * xx + zz * zz <= (clearance_m / resolution) ** 2
+    seeds, count = ndimage.label(ndimage.binary_erosion(free, structure=kernel))
+    labels = np.zeros(free.shape, dtype=np.int32)
+    region_count = 0
+    for seed in range(1, count + 1):
+        mask = seeds == seed
+        if mask.sum() * resolution ** 2 >= config.min_room_area_m2:
+            region_count += 1
+            labels[mask] = region_count
+    # 狭窄连通分量可能没有宽区域种子；保留整个分量，避免侵蚀丢失可达区域。
+    components, component_count = ndimage.label(free)
+    for component in range(1, component_count + 1):
+        mask = components == component
+        if not np.any(labels[mask]):
+            region_count += 1
+            labels[mask] = region_count
+    queue = deque(map(tuple, np.argwhere(labels > 0)))
+    while queue:
+        x, z = queue.popleft()
+        for dx, dz in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            nx, nz = x + dx, z + dz
+            if 0 <= nx < free.shape[0] and 0 <= nz < free.shape[1] and free[nx, nz] and labels[nx, nz] == 0:
+                labels[nx, nz] = labels[x, z]
+                queue.append((nx, nz))
+    neighbors = {i: set() for i in range(1, region_count + 1)}
+    for left, right in ((labels[:-1], labels[1:]), (labels[:, :-1], labels[:, 1:])):
+        contacts = np.stack((left.ravel(), right.ravel()), axis=1)
+        for a, b in np.unique(contacts[(contacts[:, 0] > 0) & (contacts[:, 1] > 0)], axis=0):
+            if a != b:
+                neighbors[int(a)].add(int(b))
+                neighbors[int(b)].add(int(a))
+    uid = lambda i: f'{scene_id}:nav_region:{i}'
+    rooms, regions = [], []
+    height_range = (floor_height - config.floor_height_tolerance, floor_height + config.floor_height_tolerance)
+    for index in range(1, region_count + 1):
+        points = np.argwhere(labels == index) + offset
+        boundary = _boundary_from_cells(((int(x), int(y), 0) for x, y in points), resolution)
+        center = tuple(float(v) for v in points.mean(axis=0) * resolution)
+        links = tuple(uid(i) for i in sorted(neighbors[index]))
+        region_metadata = {'region_height_range': height_range, 'area_m2': len(points) * resolution ** 2,
+                           'semantic_status': 'unknown', 'geometry_source': metadata['geometry_source']}
+        rooms.append(PriorRoom(uid=uid(index), boundary_xy=boundary, centroid_xy=center,
+                               neighbors=links, source=source, metadata=region_metadata))
+        regions.append(FloorplanRegion(uid=uid(index), boundary_xy=boundary, center_xy=center,
+                                       connectivity=links, height_range=height_range,
+                                       metadata=region_metadata))
+    metadata = {**metadata, 'semantic_gt_used': False,
+                'authority': 'navigation_region_prior', 'floor_height': floor_height,
+                'resolution_m': resolution, 'clearance_m': clearance_m,
+                'free_cell_count': int(free.sum()), 'region_count': region_count,
+                'interpretation': 'geometric_regions_with_unknown_room_type'}
+    prior_map = PriorMapData(scene_id=scene_id, rooms=tuple(rooms), frame_id='map_z_up',
+                             source_format=source, metadata=metadata)
+    layout = FloorplanLayout(scene_id=scene_id, frame_id='floorplan_metric',
+                             levels=(FloorplanLevel(level=0, height_range=height_range, regions=tuple(regions)),),
+                             metadata=metadata)
+    return HM3DLayoutBuildResult(layout=layout, prior_map=prior_map, metadata=metadata)

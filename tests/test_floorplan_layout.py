@@ -154,5 +154,42 @@ def test_hm3d_layout_writer_persists_semantic_bev_bundle(tmp_path) -> None:
     assert Path(paths["prior_map_bev_markers"]).is_file()
     assert Path(paths["manifest"]).is_file()
     manifest = json.loads(Path(paths["manifest"]).read_text(encoding="utf-8"))
-    assert manifest["authority"] == "semantic_prior_only"
+    assert manifest["authority"] == "semantic_region_geometry"
+    assert PriorMapLoader().load(paths["canonical_map"]).rooms == result.prior_map.rooms
     assert not list(tmp_path.rglob("*.npy"))
+
+
+def test_geometry_regions_keep_corridor_and_unknown_semantics():
+    """A narrow doorway splits seeds while all navigable cells remain assigned."""
+    from types import SimpleNamespace
+    from prior_map.hm3d_layout import build_navigation_region_layout
+    from prior_map.hm3d_groundtruth import HM3DGroundTruthBuildConfig
+
+    class Pathfinder:
+        def get_bounds(self):
+            return ((0., 0., 0.), (6., 0., 2.))
+
+        def is_navigable(self, p):
+            x, _, z = p
+            return (x <= 2. or x >= 4.) or (.9 <= z <= 1.1)
+
+    result = build_navigation_region_layout(SimpleNamespace(pathfinder=Pathfinder()), 'two_areas',
+        floor_height=0., clearance_m=.35,
+        config=HM3DGroundTruthBuildConfig(topdown_resolution=.1, min_room_area_m2=.25))
+    rooms = result.prior_map.rooms
+    assert len(rooms) == 2
+    assert all(r.label == 'unknown' and len(r.neighbors) == 1 for r in rooms)
+    assert abs(sum(r.metadata['area_m2'] for r in rooms) - result.metadata['free_cell_count'] * .01) < 1e-8
+    assert result.metadata['semantic_gt_used'] is False
+    assert all(-2.05 - 1e-10 <= y <= .05 + 1e-10 for room in rooms for _, y in room.boundary_xy)  # Cell boundary extends half a pixel.
+
+
+def test_decimal_grid_contour_preserves_concavity():
+    """Decimal cell sizes must preserve shared endpoints and the L-shaped area."""
+    from prior_map.hm3d_groundtruth import _boundary_from_cells
+    cells = [(x, z, 0) for x in range(3) for z in range(3) if x == 0 or z == 0]
+    polygon = _boundary_from_cells(cells, .1)
+    area = abs(sum(x * polygon[(i + 1) % len(polygon)][1] - z * polygon[(i + 1) % len(polygon)][0]
+                   for i, (x, z) in enumerate(polygon))) / 2
+    assert abs(area - .05) < 1e-10
+    assert len(polygon) > 4
