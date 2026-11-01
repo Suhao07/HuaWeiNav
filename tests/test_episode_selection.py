@@ -33,3 +33,14 @@ def test_selection_is_stable_and_out_of_range_does_not_wrap():
     for index in (-1, 5):
         with pytest.raises(IndexError):
             select_episode(env, index)
+
+
+def test_frozen_identity_survives_iterator_sampling_order():
+    env=Environment()
+    expected=episode_identity(env.episode_iterator.episodes[2])
+    env.episode_iterator.episodes.reverse()
+    assert select_episode(env,0,expected_identity=expected)==expected
+    assert episode_identity(env.reset())==expected
+    expected=dict(expected,start_position=[99,0,0])
+    with pytest.raises(ValueError,match='found 0'):
+        select_episode(env,0,expected_identity=expected)

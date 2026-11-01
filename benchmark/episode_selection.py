@@ -11,7 +11,7 @@ def episode_identity(episode):
     }
 
 
-def select_episode(env, index):
+def select_episode(env, index, *, expected_identity=None):
     """Bind the exact indexed episode to the next reset, including the first one.
 
     Habitat construction preselects an episode and retains it on first reset.
@@ -21,6 +21,14 @@ def select_episode(env, index):
     episodes = env.episode_iterator.episodes
     if not 0 <= index < len(episodes):
         raise IndexError(f"Episode index {index} is outside [0, {len(episodes)})")
-    episode = episodes[index]
+    if expected_identity is None:
+        episode = episodes[index]
+    else:
+        # Habitat sampling can reorder even with shuffle=False. Frozen paired
+        # evaluations bind the full task identity, including start pose/category.
+        matches = [item for item in episodes if episode_identity(item) == expected_identity]
+        if len(matches) != 1:
+            raise ValueError(f"Expected one frozen episode identity, found {len(matches)}")
+        episode = matches[0]
     env.current_episode = episode
     return episode_identity(episode)

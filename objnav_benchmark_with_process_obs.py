@@ -95,6 +95,8 @@ def get_args():
     parser.add_argument("--success_distance", type=float, default=None)
     parser.add_argument("--eval_episodes", type=int, default=1000)
     parser.add_argument("--start_episode", type=int, default=0)
+    parser.add_argument("--episode_manifest", type=str, default="",
+                        help="Frozen runtime_episodes identities for paired evaluation.")
     parser.add_argument("--dataset_episodes", type=int, default=None)
     parser.add_argument("--scene_id", type=str, default=None)
     parser.add_argument("--scene_id_contains", type=str, default=None)
@@ -289,6 +291,10 @@ if __name__ == "__main__":
             prior_map_runtime.alignment.diagnostics_payload(),
         )
 
+    frozen_episodes = None
+    if args.episode_manifest:
+        with open(args.episode_manifest) as stream:
+            frozen_episodes = json.load(stream)["runtime_episodes"]
     start_idx = args.start_episode
 
     for i in tqdm(range(start_idx, args.eval_episodes)):
@@ -297,7 +303,8 @@ if __name__ == "__main__":
         # logger.add(logger_path, mode="w")
         logger.info(f"Processing episode: i = {i}")
 
-        expected_episode = select_episode(habitat_agent.env, i)
+        expected_episode = select_episode(habitat_agent.env, i,
+            expected_identity=frozen_episodes[i] if frozen_episodes is not None else None)
         habitat_agent.reset(i)
         actual_episode = episode_identity(habitat_agent.env.current_episode)
         if actual_episode != expected_episode:
