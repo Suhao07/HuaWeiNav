@@ -184,3 +184,33 @@ def test_inverse_depth_sampling_preserves_planar_geometry_and_pose_bias():
     np.testing.assert_allclose(sampled, expected, rtol=1e-12)
     # 插值仅修正取样；真实相机 z 偏差仍保留在残差中。
     np.testing.assert_allclose(expected - .3 - sampled, [-.3, -.3])
+
+
+def test_unassigned_evidence_roundtrips_without_creating_object(tmp_path):
+    prior = PriorMapData(scene_id='scene', frame_id='map_z_up', objects=())
+    observations = [dict(observation_id='pending', object_uids=[],
+                         camera_to_map=np.eye(4).tolist(), intrinsics=np.eye(3).tolist())]
+    write_bundle(tmp_path, map_id='map', revision=1, prior_map=prior,
+                 observations=observations, viewpoints=[])
+    restored = load_bundle(tmp_path)
+    assert restored['observations'] == observations
+    assert len(restored['prior_map'].objects) == 0
+
+
+def test_shared_loader_accepts_complete_bundle_and_checks_evidence(tmp_path):
+    from prior_map.loaders import PriorMapLoader
+    root = tmp_path / 'bundle'
+    root.mkdir()
+    (root / 'rgb.png').write_bytes(b'evidence')
+    prior = PriorMapData(scene_id='scene', frame_id='map_z_up', objects=(
+        PriorObject(uid='chair', label='chair', position_xyz=(1., -2., 0.)),))
+    obs = dict(observation_id='frame0', object_uids=['chair'], image_ref='rgb.png',
+               camera_to_map=np.eye(4).tolist(), intrinsics=np.eye(3).tolist())
+    write_bundle(root, map_id='map', revision=1, prior_map=prior,
+                 observations=[obs], viewpoints=[])
+    loader = PriorMapLoader()
+    assert loader.load(root).to_dict() == loader.load(root/'prior_map.json').to_dict()
+    assert loader.load(root, source_format='bundle').objects[0].uid == 'chair'
+    (root / 'rgb.png').unlink()
+    with pytest.raises(FileNotFoundError):
+        loader.load(root)
