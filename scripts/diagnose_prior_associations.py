@@ -18,6 +18,23 @@ from mapping_utils.representation import ObjectNode
 from mapping.object_fusion import associate_object_entities, clouds_may_overlap, nearest_distances
 
 
+def coview_bridge_candidates(scores, coview_masks, min_iou):
+    """Find geometrically eligible instances with conflicting co-visible masks.
+
+    The existing fusion admission score is 0.25. A new mask eligible for two
+    instances whose same-frame masks have IoU below min_iou leaves identity
+    unresolved in this experiment. This is an ambiguity test, not GT identity.
+    """
+    candidates = [s['uid'] for s in scores if s['overlap'] >= .25]
+    conflict = set()
+    for index, first in enumerate(candidates):
+        for second in candidates[index + 1:]:
+            if any(float((a & b).sum() / (a | b).sum()) < min_iou
+                   for a in coview_masks.get(first, []) for b in coview_masks.get(second, [])):
+                conflict.update((first, second))
+    return sorted(conflict)
+
+
 def main():
     """Hold masks/depth fixed; trace shared fusion without detector or GT input."""
     parser = argparse.ArgumentParser(description=__doc__)
@@ -29,9 +46,19 @@ def main():
                         help="Experimental constraint: prohibit same-frame low-IoU observations sharing one UID")
     experiment.add_argument("--min-visible-mask-overlap", type=float,
                             help="Experimental projected-visible-reference mask support threshold")
+    parser.add_argument('--defer-coview-bridges', action='store_true',
+                        help='Keep masks linking conflicting co-visible candidates unassigned')
+    parser.add_argument('--deferred-association', action='store_true')
+    parser.add_argument('--balanced-coverage', action='store_true', help='Equal directional weights for candidate ranking')
     args = parser.parse_args()
+    if args.balanced_coverage and not args.deferred_association:
+        parser.error('--balanced-coverage requires --deferred-association')
+    if args.deferred_association and (args.min_coview_iou is not None or args.min_visible_mask_overlap is not None or args.defer_coview_bridges):
+        parser.error('Use deferred association independently of older ablations')
     if args.max_frames < 1:
         parser.error("Use at least one frame")
+    if args.defer_coview_bridges and args.min_coview_iou is None:
+        parser.error('--defer-coview-bridges requires --min-coview-iou')
     if args.min_coview_iou is not None and not 0 <= args.min_coview_iou <= 1:
         parser.error("Co-view IoU must be in [0, 1]")
     if args.min_visible_mask_overlap is not None and not 0 <= args.min_visible_mask_overlap <= 1:
@@ -40,6 +67,29 @@ def main():
     bundle = load_bundle(root)
     receipt = json.loads((root / "build_receipt.json").read_text())
     frame_ids = sorted({o["frame_id"] for o in bundle["observations"]})[:args.max_frames]
+    if args.deferred_association:
+        import time
+        import hashlib
+        from prior_map.association import PriorAssociation, AssociationConfig
+        from prior_map.observations import load_fusion_observation
+        records = {o['observation_id']: o for o in bundle['observations'] if o['frame_id'] in frame_ids}
+        def load(oid):
+            return load_fusion_observation(root, records[oid], voxel_m=receipt['voxel_m'],
+                max_depth_m=receipt['max_depth_m'], profile=receipt['capture_manifest'].get('capture_profile'))
+        started = time.monotonic()
+        coordinator = PriorAssociation(load, AssociationConfig(balanced_coverage=args.balanced_coverage))
+        for frame_id in frame_ids:
+            coordinator.add_frame(frame_id, [oid for oid, o in records.items() if o['frame_id'] == frame_id])
+        coordinator.resolve_pending()
+        result = coordinator.trace()
+        result.update(scope='experimental_observation_owned_fusion', elapsed_s=time.monotonic()-started,
+                      object_count=len(coordinator.entities), frame_ids=frame_ids,
+                      source_sha256={str(path): hashlib.sha256(path.read_bytes()).hexdigest()
+                        for path in (root/'observations.jsonl', root/'build_receipt.json',
+                                     Path('prior_map/association.py'), Path('mapping/object_fusion.py'))})
+        write_json(args.output, result)
+        print(json.dumps({k: result[k] for k in ('scope', 'elapsed_s', 'object_count')}))
+        return
     entities, trace = [], []
     profile = receipt["capture_manifest"].get("capture_profile")
     current_frame, coview_masks = None, {}
@@ -109,22 +159,30 @@ def main():
             scores.append({"uid": other.uid, "label": other.tag, "points": len(b),
                 "overlap": score, "new_to_old": float((a < .1).float().mean()),
                 "old_to_new": float((b < .1).float().mean())})
-        eligible, indices = associate_object_entities(eligible, [entity], target="", is_target_tag=lambda tag: False)
-        assigned = eligible[indices[0]]
-        actual_uid = assigned.uid
-        if not any(old.uid == actual_uid for old in entities):
-            entities.append(assigned)
-        coview_masks.setdefault(actual_uid, []).append(mask)
+        deferred = (coview_bridge_candidates(scores, coview_masks, args.min_coview_iou)
+                    if args.defer_coview_bridges else [])
+        if deferred:
+            # 保存观察及候选关系，当前不改变任何实例的几何或类别计数。
+            actual_uid = None
+        else:
+            eligible, indices = associate_object_entities(eligible, [entity], target="", is_target_tag=lambda tag: False)
+            assigned = eligible[indices[0]]
+            actual_uid = assigned.uid
+            if not any(old.uid == actual_uid for old in entities):
+                entities.append(assigned)
+            coview_masks.setdefault(actual_uid, []).append(mask)
         saved_uid = obs["object_uids"][0].split(":", 1)[1]
         trace.append({"observation_id": obs["observation_id"], "frame_id": obs["frame_id"],
             "label": obs["detector_label"], "points": len(xyz), "assigned_uid": actual_uid,
             "saved_uid": saved_uid, "assignment_matches": actual_uid == saved_uid,
             "excluded_coview_uids": excluded,
+            "deferred_candidate_uids": deferred,
             "projection_support": projected,
             "candidates": sorted(scores, key=lambda item: item["overlap"], reverse=True)[:3]})
     write_json(args.output, {"scope": "frozen_accepted_mask_fusion_trace", "device": "CPU:0",
         "experimental_min_coview_iou": args.min_coview_iou, "object_count": len(entities),
         "experimental_min_visible_mask_overlap": args.min_visible_mask_overlap,
+        "experimental_defer_coview_bridges": args.defer_coview_bridges,
         "frame_ids": frame_ids, "assignment_parity": all(r["assignment_matches"] for r in trace),
         "observations": trace})
     print(json.dumps({"observations": len(trace), "assignment_parity": all(r["assignment_matches"] for r in trace)}))
