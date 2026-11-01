@@ -10,7 +10,7 @@ from PIL import Image
 
 from .bundle import write_bundle, new_map_id
 from .contracts import PriorMapData, PriorObject
-from .observations import (COORDINATES, SCHEMA_VERSION, backproject, load_depth,
+from .observations import (COORDINATES, SCHEMA_VERSION, backproject, camera_to_base_pose, load_depth,
                            read_records, write_json, metric_depth_validity)
 
 
@@ -103,6 +103,75 @@ def capture_free_cells(capture, *, resolution, robot_height_m, robot_radius_m, s
                    "robot_radius_m": robot_radius_m, "stride": stride, "max_depth_m": max_depth_m,
                    "capture_manifest_sha256": hashlib.sha256((root / "manifest.json").read_bytes()).hexdigest()}
     return cells, floor_height, diagnostics
+
+
+def resolve_capture_viewpoints(bundle_directory, capture, *, resolution, robot_height_m, robot_radius_m,
+                               stride, max_depth_m, object_uid=None, observation_ids=None):
+    r"""Place historical camera poses on the robot-traversable floor of their capture.
+
+    Args:
+        bundle_directory: Map bundle built from ``capture``; read-only.
+        capture: Completed portable capture that produced the bundle.
+        resolution: Free-space grid cell size in metres.
+        robot_height_m: Body height used for the obstacle band.
+        robot_radius_m: Footprint radius used to erode free floor.
+        stride: Pixel stride for free-space back-projection.
+        max_depth_m: Maximum depth used as a geometric measurement.
+        object_uid: Optional historical instance restricting the evidence.
+        observation_ids: Optional query-specific subset of that evidence.
+
+    Returns:
+        Candidate report with admitted navigation viewpoints and rejections.
+
+    Raises:
+        ValueError: The bundle comes from another capture, the instance or
+            evidence is unknown, or the capture yields no traversable floor.
+
+    手持相机高度逐帧变化，基座取相机竖直投影到估计地面 z_f：
+
+    .. math::
+        p_{base} = (x_{cam},\, y_{cam},\, z_f),\qquad
+        \mathrm{admit} \iff \mathrm{round}(p_{base,xy}/s) \in F_{reach}
+
+    F_reach 为 ``capture_free_cells`` 的轨迹连通、按机器人半径腐蚀的可通行格。
+    候选表示历史视点落在可通行地面；相对当前起点的路径可达性由运行时检查。
+    """
+    from .bundle import load_bundle, select_evidence_ids
+
+    root = Path(bundle_directory)
+    bundle = load_bundle(root)
+    evidence_ids = select_evidence_ids(bundle, object_uid, observation_ids)
+    capture_digest = hashlib.sha256((Path(capture) / "manifest.json").read_bytes()).hexdigest()
+    if json.loads((root / "build_receipt.json").read_text())["capture_manifest_sha256"] != capture_digest:
+        raise ValueError("Bundle was built from a different capture")
+    cells, floor_height, free_space = capture_free_cells(
+        capture, resolution=resolution, robot_height_m=robot_height_m, robot_radius_m=robot_radius_m,
+        stride=stride, max_depth_m=max_depth_m)
+    profile = {"source": "declared_robot_dimensions", "radius_m": robot_radius_m, "height_m": robot_height_m}
+    viewpoints, rejected = [], []
+    for historical in bundle["viewpoints"]:
+        if historical["kind"] != "observation_pose":
+            continue
+        supported = [uid for uid in historical["observation_ids"] if uid in evidence_ids]
+        if not supported:
+            continue
+        camera = np.asarray(historical["pose_in_map"], dtype=float)
+        base = camera_to_base_pose(camera, camera[2, 3] - floor_height)
+        if tuple(int(v) for v in np.round(base[:2, 3] / resolution)) not in cells:
+            rejected.append({"source_viewpoint": historical["uid"], "reason": "base_outside_robot_free_space"})
+            continue
+        viewpoints.append({"uid": f"navigation:{historical['uid']}", "kind": "navigation_viewpoint",
+            "pose_in_map": base.tolist(), "pose_axes": "x_forward_y_left_z_up",
+            "observation_ids": supported, "historical_object_uid": object_uid,
+            "robot_profile": profile, "reachability_status": "trajectory_connected_free_space",
+            "checked_map_revision": capture_digest,
+            "source_map_revision": bundle["manifest"]["map_revision"],
+            "motion_admission": "requires_runtime_robot_profile_match_and_current_path_check"})
+    return {"scope": "historical_viewpoint_candidates_not_motion_execution",
+            "map_id": bundle["manifest"]["map_id"], "historical_object_uid": object_uid,
+            "historical_observation_ids": sorted(evidence_ids), "capture_manifest_sha256": capture_digest,
+            "free_space": free_space, "robot_profile": profile,
+            "viewpoints": viewpoints, "rejected": rejected}
 
 
 def build_capture_map(capture, output, *, classes, max_frames=None, voxel_m=0.05,

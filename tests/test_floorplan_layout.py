@@ -215,6 +215,45 @@ def test_capture_free_cells_block_obstacles_and_erode_footprint(tmp_path):
     assert robot < free and (3, 0) in free and (3, 0) not in robot and (4, 0) in robot
 
 
+def test_capture_viewpoints_drop_handheld_poses_onto_reachable_floor(tmp_path):
+    """Handheld poses become floor-level bases; blocked or unwalked floor is rejected."""
+    import hashlib
+    import numpy as np
+    import pytest
+    from prior_map.bundle import write_bundle
+    from prior_map.capture_builder import resolve_capture_viewpoints
+    from prior_map.contracts import PriorObject
+    from prior_map.observations import write_json
+
+    capture, bundle = tmp_path / "capture", tmp_path / "bundle"
+    capture.mkdir()
+    _write_box_capture(capture)
+    level = np.array([[0., 0, 1], [-1, 0, 0], [0, -1, 0]])  # 光轴朝 +x 的水平手持相机。
+    views, observations = [], []
+    for name, xy in [("walked", (.6, 0.)), ("box", (0., 0.)), ("unwalked", (3.25, .25))]:
+        pose = np.eye(4)
+        pose[:3, :3], pose[:3, 3] = level, (*xy, 1.3)
+        observations.append(dict(observation_id=name, object_uids=["chair"],
+                                 camera_to_map=pose.tolist(), intrinsics=np.eye(3).tolist()))
+        views.append({"uid": f"view:{name}", "kind": "observation_pose",
+                      "pose_in_map": pose.tolist(), "observation_ids": [name]})
+    prior = PriorMapData(scene_id="box", frame_id="map_z_up", objects=(
+        PriorObject(uid="chair", label="chair", position_xyz=(1., 0., .5)),))
+    write_bundle(bundle, map_id="map", revision="1", prior_map=prior, observations=observations, viewpoints=views)
+    digest = hashlib.sha256((capture / "manifest.json").read_bytes()).hexdigest()
+    write_json(bundle / "build_receipt.json", {"capture_manifest_sha256": digest})
+    settings = dict(resolution=.05, robot_height_m=.88, robot_radius_m=.1, stride=1, max_depth_m=6.)
+    result = resolve_capture_viewpoints(bundle, capture, object_uid="chair", **settings)
+    admitted, = result["viewpoints"]
+    base = np.asarray(admitted["pose_in_map"])
+    assert admitted["observation_ids"] == ["walked"] and abs(base[2, 3]) < .05
+    np.testing.assert_allclose(base[:3, 0], [1., 0., 0.])
+    assert {r["source_viewpoint"] for r in result["rejected"]} == {"view:box", "view:unwalked"}
+    write_json(bundle / "build_receipt.json", {"capture_manifest_sha256": "other"})
+    with pytest.raises(ValueError, match="different capture"):
+        resolve_capture_viewpoints(bundle, capture, **settings)
+
+
 def test_decimal_grid_contour_preserves_concavity():
     """Decimal cell sizes must preserve shared endpoints and the L-shaped area."""
     from prior_map.hm3d_groundtruth import _boundary_from_cells

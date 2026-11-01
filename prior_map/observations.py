@@ -81,6 +81,39 @@ def backproject(depth, intrinsic, camera_to_map, stride=1):
     return (camera_to_map[:3, :3] @ camera).T + camera_to_map[:3, 3]
 
 
+def camera_to_base_pose(camera_to_map, camera_height_m):
+    r"""Drop a camera pose vertically onto an x-forward, z-up robot base.
+
+    Args:
+        camera_to_map: 4x4 optical camera pose in map_z_up.
+        camera_height_m: Camera height above the base origin.
+
+    Returns:
+        4x4 base pose with axes x forward, y left, z up.
+
+    Raises:
+        ValueError: The optical axis is vertical, so heading is undefined.
+
+    .. math::
+        f = \frac{(R e_3)_{xy}}{\lVert (R e_3)_{xy} \rVert},\quad
+        R_{base} = [f,\; e_z \times f,\; e_z],\quad
+        t_{base} = t_{cam} - h\, e_z
+
+    固定安装相机取安装高度；手持相机取逐帧 h = z_cam - z_f，基座落在地面。
+    """
+    camera = np.asarray(camera_to_map, dtype=float)
+    forward = camera[:3, 2].copy()
+    forward[2] = 0
+    if np.linalg.norm(forward) < 1e-8:
+        raise ValueError('Camera has no horizontal viewing direction')
+    forward /= np.linalg.norm(forward)
+    up = np.array([0., 0., 1.])
+    base = np.eye(4)
+    base[:3, :3] = np.column_stack([forward, np.cross(up, forward), up])
+    base[:3, 3] = camera[:3, 3] - [0., 0., camera_height_m]
+    return base
+
+
 def metric_depth_validity(depth, capture_profile=None):
     """Mark depths that represent measured surfaces rather than clipped bounds.
 

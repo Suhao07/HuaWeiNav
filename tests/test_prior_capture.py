@@ -147,7 +147,7 @@ def test_semantic_audit_uses_full_mask_majority_and_retains_conflicting_votes():
 
 
 def test_historical_camera_pose_resolves_base_height_and_heading():
-    from backends.habitat.prior_viewpoints import camera_to_base_pose
+    from prior_map.observations import camera_to_base_pose
     camera = np.eye(4)
     camera[:3, :3] = WORLD_TO_MAP @ OPTICAL_TO_GL
     camera[:3, 3] = [2., 3., 2.25]

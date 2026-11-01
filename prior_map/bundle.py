@@ -71,6 +71,32 @@ def load_bundle(directory):
             "observations": observations, "viewpoints": viewpoints}
 
 
+def select_evidence_ids(bundle, object_uid=None, observation_ids=None):
+    """Select the historical observations that support a queried instance.
+
+    Args:
+        bundle: Result of ``load_bundle``.
+        object_uid: Optional historical instance; None keeps every observation.
+        observation_ids: Optional query-specific subset of that evidence.
+
+    Returns:
+        Set of observation IDs.
+
+    Raises:
+        ValueError: Unknown instance, or requested evidence outside it.
+    """
+    if object_uid is not None and object_uid not in {obj.uid for obj in bundle["prior_map"].objects}:
+        raise ValueError(f"Unknown historical object: {object_uid}")
+    evidence_ids = {obs["observation_id"] for obs in bundle["observations"]
+                    if object_uid is None or object_uid in obs["object_uids"]}
+    if observation_ids is None:
+        return evidence_ids
+    requested = set(observation_ids)
+    if not requested <= evidence_ids:
+        raise ValueError("Requested evidence is outside the selected historical instance")
+    return requested
+
+
 def write_bundle(directory, *, map_id, revision, prior_map, observations, viewpoints):
     """Write portable indices after the caller copies evidence into directory.
 

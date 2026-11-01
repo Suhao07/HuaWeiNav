@@ -3,32 +3,14 @@ import hashlib
 import json
 from pathlib import Path
 import numpy as np
-from prior_map.bundle import load_bundle
+from prior_map.bundle import load_bundle, select_evidence_ids
+from prior_map.observations import camera_to_base_pose
 from .capture import WORLD_TO_MAP
 from .navmesh_build import verify_build_receipt
 
 
-def camera_to_base_pose(camera_to_map, sensor_height):
-    """Remove the known vertical camera offset and orient an x-forward base.
-
-    Applies to the collector's [0, sensor_height, 0] Habitat sensor mounting.
-    Handheld camera trajectories require a separate ground/robot pose resolver.
-    """
-    camera = np.asarray(camera_to_map, dtype=float)
-    forward = camera[:3, 2].copy()
-    forward[2] = 0
-    if np.linalg.norm(forward) < 1e-8:
-        raise ValueError('Camera has no horizontal viewing direction')
-    forward /= np.linalg.norm(forward)
-    up = np.array([0., 0., 1.])
-    base = np.eye(4)
-    base[:3, :3] = np.column_stack([forward, np.cross(up, forward), up])
-    base[:3, 3] = camera[:3, 3] - [0., 0., sensor_height]
-    return base
-
-
 def resolve_habitat_viewpoints(bundle_directory, navmesh_path, start_habitat, *, build_receipt=None,
-                              object_uid=None):
+                              object_uid=None, observation_ids=None):
     """Return current-path-checked candidates while keeping the map read-only.
 
     Requires the known simulation capture mounting. A rebuilt NavMesh must
@@ -37,25 +19,29 @@ def resolve_habitat_viewpoints(bundle_directory, navmesh_path, start_habitat, *,
     meshes can omit build settings; Habitat then guesses defaults. These values
     remain unverified and cannot establish robot compatibility for admission.
     object_uid restricts candidates to evidence of that historical instance.
+    observation_ids further binds candidates to query-specific source observations.
     This function never submits a goal, changes task progress or verifies an object.
     """
     import habitat_sim
     root, navmesh_path = Path(bundle_directory), Path(navmesh_path)
     bundle = load_bundle(root)
-    if object_uid is not None and object_uid not in {obj.uid for obj in bundle['prior_map'].objects}:
-        raise ValueError(f'Unknown historical object: {object_uid}')
-    evidence_ids = {obs['observation_id'] for obs in bundle['observations']
-                    if object_uid is None or object_uid in obs['object_uids']}
+    evidence_ids = select_evidence_ids(bundle, object_uid, observation_ids)
     capture = json.loads((root / 'build_receipt.json').read_text())['capture_manifest']
-    # 两种采集器使用相同的刚性相机安装；采集运动方式不改变外参。
-    if capture['pose_source'] != 'simulator_gt' or capture['mode'] not in ('coverage_scan', 'continuous_walk'):
+    # 独立采集与 baseline 巡视都使用竖直偏移的固定相机；巡视沿用其已发布的位姿源名称。
+    simulation_captures = {('simulator_gt', 'coverage_scan'),
+                           ('simulator_gt', 'continuous_walk'),
+                           ('habitat_gt_camera_pose', 'baseline_patrol')}
+    if (capture['pose_source'], capture['mode']) not in simulation_captures:
         raise ValueError('This resolver requires the known Habitat capture sensor mounting')
     digest = hashlib.sha256(navmesh_path.read_bytes()).hexdigest()
     verified_settings = None
     if build_receipt is not None:
         verified_settings = verify_build_receipt(build_receipt, digest, capture['scene_sha256'])
-    elif digest != capture['navmesh_sha256']:
-        raise ValueError('NavMesh differs from the recorded scene geometry')
+    else:
+        recorded_mesh = (capture['capture_profile']['navmesh_sha256']
+                         if capture['mode'] == 'baseline_patrol' else capture['navmesh_sha256'])
+        if digest != recorded_mesh:
+            raise ValueError('NavMesh differs from the recorded scene geometry')
     pf = habitat_sim.PathFinder()
     if not pf.load_nav_mesh(str(navmesh_path)):
         raise ValueError(f'Cannot load NavMesh: {navmesh_path}')
@@ -103,5 +89,6 @@ def resolve_habitat_viewpoints(bundle_directory, navmesh_path, start_habitat, *,
                                  else 'requires_verified_navmesh_build_profile_and_current_runtime_recheck')})
     return {'scope': 'historical_viewpoint_candidates_not_motion_execution',
         'map_id': bundle['manifest']['map_id'], 'historical_object_uid': object_uid,
+        'historical_observation_ids': sorted(evidence_ids),
         'navmesh_sha256': digest,
         'robot_profile': profile, 'viewpoints': viewpoints, 'rejected': rejected}
