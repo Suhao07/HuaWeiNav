@@ -683,7 +683,26 @@ class HM3D_Objnav_Agent:
         self.mapper.get_nodes_process(node, idx=idx, step=step, path_idx=path_idx)
 
     def _project_object_bbox_on_current_view(self):
+        r"""Project the candidate into the current frame and measure its visible support.
+
+        图像、bbox 与停止距离共用同一个当前可见支撑集合：
+
+        .. math::
+            V = \{p \in P : z_{cam}(p) > 0,\ (u,v) \in \Omega_{H \times W},\
+                z_{cam}(p) - D(u,v) < 0.2\},\qquad
+            d = \min_{p \in V} \lVert p_{xy} - c_{xy} \rVert_2
+
+        其中 P 是实例累计点云，D 是当前米制深度，c 是当前相机位置。
+        累计点云中当前帧看不到的表面不参与距离，避免 STOP 距离与图像证据
+        来自不同观察。
+
+        Returns:
+            ``(bbox_tensor, geometry)``；当前帧没有可见支撑时 bbox 为 None，
+            geometry 只含投影回执路径。
+        """
         current_depth = self.obs['depth'].copy()
+        height, width = current_depth.shape[:2]
+        positions = self.object_final.pcd.point.positions.cpu().numpy()
         camera_points = project_to_camera(self.object_final.pcd, self.mapper.camera_intrinsic,
                                           self.mapper.current_position,
                                           self.mapper.current_rotation)
@@ -692,14 +711,18 @@ class HM3D_Objnav_Agent:
         projected_points = camera_points.copy()
         depth = np.array(camera_points[:, 2], dtype=np.float32)
         camera_points = np.array(camera_points[:, :2], dtype=np.int32)
-        flag = (camera_points[:, 0] >= 0) & (camera_points[:, 0] < 640) & \
-               (camera_points[:, 1] >= 0) & (camera_points[:, 1] < 480)
+        flag = (camera_points[:, 0] >= 0) & (camera_points[:, 0] < width) & \
+               (camera_points[:, 1] >= 0) & (camera_points[:, 1] < height)
         camera_points = camera_points[flag]
         depth = depth[flag]
 
         current_depth = current_depth[camera_points[:, 1], camera_points[:, 0]][:, 0]
         current_depth = np.array(current_depth, dtype=np.float32)
         depth_flag = (depth - current_depth) < 0.2
+        # project_to_camera 只返回光轴前方的点：z_cam = R[:,2]^T (p - t)，深度 = -z_cam > 0。
+        # 用同一判据恢复原始点序号，使可见支撑能回到世界坐标求距离。
+        front = (positions - self.mapper.current_position) @ self.mapper.current_rotation[:, 2] < 0
+        visible_point_index = np.flatnonzero(front)[flag][depth_flag]
         # 保存同一次观测的原始输入与实际筛选结果。深度 JPEG 只能预览，
         # 无法重放 z_map - z_obs 的判断；这里保留传感器输出的米制深度
         # （含传感器量程截断），供空间支撑审计。
@@ -713,13 +736,14 @@ class HM3D_Objnav_Agent:
         np.savez_compressed(
             projection_path,
             observation_identity=json.dumps(identity),
-            points_xyz=self.object_final.pcd.point.positions.cpu().numpy(),
+            points_xyz=positions,
             camera_intrinsic=self.mapper.camera_intrinsic,
             camera_to_mapper_rotation=self.mapper.current_rotation,
             camera_to_mapper_translation=self.mapper.current_position,
             rgb=self.obs['rgb'], depth_m=self.obs['depth'],
             projected_uv_depth=projected_points, in_image=flag,
             sampled_depth_m=current_depth, passes_occlusion=depth_flag,
+            visible_point_index=visible_point_index,
         )
         camera_points = camera_points[depth_flag]
 
@@ -729,17 +753,21 @@ class HM3D_Objnav_Agent:
         bbox = np.array([np.min(camera_points, axis=0), np.max(camera_points, axis=0)])
         # x1 y1 x2 y2
         bbox_np = np.array([bbox[0][0], bbox[0][1], bbox[1][0], bbox[1][1]], dtype=np.float32)
-        width = max(1.0, float(bbox_np[2] - bbox_np[0]))
-        height = max(1.0, float(bbox_np[3] - bbox_np[1]))
+        bbox_width = max(1.0, float(bbox_np[2] - bbox_np[0]))
+        bbox_height = max(1.0, float(bbox_np[3] - bbox_np[1]))
+        visible_xy = positions[visible_point_index, :2]
         geometry = {
             "projection_evidence_path": projection_path,
             "bbox_xyxy": [float(x) for x in bbox_np.tolist()],
             "bbox_center_norm": [
-                float(((bbox_np[0] + bbox_np[2]) / 2.0) / 640.0),
-                float(((bbox_np[1] + bbox_np[3]) / 2.0) / 480.0),
+                float(((bbox_np[0] + bbox_np[2]) / 2.0) / width),
+                float(((bbox_np[1] + bbox_np[3]) / 2.0) / height),
             ],
-            "bbox_area_ratio": float((width * height) / (640.0 * 480.0)),
+            "bbox_area_ratio": float((bbox_width * bbox_height) / (width * height)),
             "visible_projected_points": int(len(camera_points)),
+            "distance_to_object": float(np.min(np.linalg.norm(
+                visible_xy - self.mapper.current_position[:2], axis=1))),
+            "distance_source": "current_view_visible_support",
         }
         return torch.tensor(bbox_np).unsqueeze(0), geometry
 
@@ -921,14 +949,7 @@ class HM3D_Objnav_Agent:
             canonical_label=getattr(self.mapper, "target", ""),
             step=episode_step,
         )
-        distance = self._estimate_distance_to_object_final()
-        geometry_for_evidence = {
-            **dict(geometry or {}),
-            "source": "check_again",
-        }
-        if distance is not None:
-            geometry_for_evidence["distance_to_object"] = distance
-        geometry_for_evidence = self._augment_final_stop_geometry(geometry_for_evidence)
+        geometry_for_evidence = self._augment_final_stop_geometry({**geometry, "source": "check_again"})
         # check_again 的 bbox 图通常是目标最清楚的一帧。
         # 成功时直接作为 final verifier 和 relation verifier 的证据，
         # 避免后续几何 stop 流程丢失“book on shelf”这类上下文。
@@ -1006,11 +1027,7 @@ class HM3D_Objnav_Agent:
             crop_path = os.path.join(out_dir, f'object_crop_{self.episode_steps}.jpg')
             cv2.imwrite(crop_path, crop)
 
-        positions = self.object_final.pcd.point.positions.cpu().numpy()
-        distance = float(np.min(np.linalg.norm(positions[:, :2] - self.mapper.current_position[:2], axis=1)))
-        geometry = dict(geometry or {})
-        geometry["distance_to_object"] = distance
-        geometry = self._augment_final_stop_geometry(geometry)
+        geometry = self._augment_final_stop_geometry(dict(geometry))
 
         evidence = {
             "observation_identity": self._observation_identity(candidate.uid),

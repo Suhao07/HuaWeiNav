@@ -211,17 +211,41 @@ class GuidedNavigation:
                     selected_uid=selected, options=options)
         return agent.mapper.nodes[selected_index], "agent_search_review"
 
-    def verify(self):
-        """Reuse baseline evidence capture, final verifier and view-control."""
+    def verify(self, scored_position):
+        r"""Reuse baseline evidence capture, final verifier and view-control.
+
+        Args:
+            scored_position: Viewpoint ``v`` scored by the projection policy.
+
+        评分假设相机位于 v 且光轴正对目标中心；执行在到达容差内停下并按
+        30° 离散转向。日志记录两者差异，与本次取证的观察绑定：
+
+        .. math::
+            \Delta p = \lVert x_{xy} - v_{xy} \rVert_2,\qquad
+            \Delta\psi = \arccos\frac{f_{xy} \cdot (o_{xy} - x_{xy})}
+                {\lVert f_{xy} \rVert \lVert o_{xy} - x_{xy} \rVert}
+
+        其中 x 为执行位置，f = -R_{:,2} 为相机光轴，o 为目标中心。
+        """
         from navigation.goal_approach_controller import rotate_toward_object_for_recheck
         agent = self.agent
         agent.need_check_again = False
         if not rotate_toward_object_for_recheck(agent):
             return "episode_limit"
         agent.check_again(agent.episode_steps)
+        position = np.asarray(agent.mapper.current_position, dtype=float)
+        forward = -np.asarray(agent.mapper.current_rotation)[:2, 2]
+        bearing = np.asarray(agent.object_final.position[:2], dtype=float) - position[:2]
+        heading_offset = np.degrees(np.arccos(np.clip(
+            forward @ bearing / (np.linalg.norm(forward) * np.linalg.norm(bearing)), -1.0, 1.0)))
+        pose_gap = {"observation_id": agent._observation_identity(agent.object_final.uid)["observation_id"],
+                    "scored_position": [float(x) for x in scored_position],
+                    "execution_position": position.tolist(),
+                    "position_offset_m": float(np.linalg.norm(position[:2] - np.asarray(scored_position)[:2])),
+                    "heading_offset_deg": float(heading_offset)}
         complete = agent.final_instruction_check(evidence_override=agent.last_check_again_evidence)
         self.record("verified", candidate_uid=agent.object_final.uid,
-                    decision=agent.final_stop_decision, task_complete=complete)
+                    decision=agent.final_stop_decision, task_complete=complete, pose_gap=pose_gap)
         if complete:
             return "verified_finish"
         if agent.need_check_again or agent._continue_better_view_control():
@@ -328,7 +352,7 @@ def run_guided_episode(agent, *, episode_idx, max_steps, max_model_calls=100):
                 state = "select"
             else:
                 agent.object_final = guided.tools.objects[feedback.intent.target_object_uid]
-                state = guided.verify()
+                state = guided.verify(feedback.intent.goal_pose.position)
         elif state == "select":
             if not guided.select(episode_idx):
                 termination = "search_exhausted"

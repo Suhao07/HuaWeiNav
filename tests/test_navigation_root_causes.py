@@ -45,7 +45,8 @@ def test_traversability_preserves_both_input_poses():
 def test_projection_receipt_preserves_metric_depth_and_actual_filter(tmp_path):
     """Replay inputs retain sensor clipping values and the production occlusion mask."""
     projected = np.array([[10, 20, .19], [30, 40, 1.0]], dtype=float)
-    points = np.array([[1, 2, 3], [4, 5, 6]], dtype=float)
+    # R=I、t=0 时光轴前方为 z<0；第三个点在相机后方，不进入投影序列。
+    points = np.array([[1, 2, -3], [4, 5, 6], [0.1, 0.1, -6]], dtype=float)
     ns = methods("objnav_agent_with_process_obs.py", {"_project_object_bbox_on_current_view"}, {
         "np": np, "os": os, "json": json,
         "project_to_camera": lambda *args: projected.T,
@@ -61,11 +62,15 @@ def test_projection_receipt_preserves_metric_depth_and_actual_filter(tmp_path):
                _observation_identity=lambda uid: {"candidate_uid": uid, "observation_id": "0:4", "task_revision": 1})
     bbox, geometry = ns["_project_object_bbox_on_current_view"](agent)
     np.testing.assert_array_equal(bbox, [10, 20, 10, 20])
+    # 停止距离只取当前可见支撑；更近的被遮挡点与相机后方点不参与。
+    assert geometry["distance_to_object"] == pytest.approx(np.sqrt(5))
+    assert geometry["distance_source"] == "current_view_visible_support"
     with np.load(geometry["projection_evidence_path"], allow_pickle=False) as receipt:
         np.testing.assert_array_equal(receipt["depth_m"], agent.obs["depth"])
         np.testing.assert_array_equal(receipt["points_xyz"], points)
         np.testing.assert_array_equal(receipt["projected_uv_depth"], projected)
         np.testing.assert_array_equal(receipt["passes_occlusion"], [True, False])
+        np.testing.assert_array_equal(receipt["visible_point_index"], [0])
         assert json.loads(str(receipt["observation_identity"]))["candidate_uid"] == "candidate"
     # 同一步可能检查多个实例，后一个实例的投影不得覆盖前一个的证据。
     agent.object_final.uid = "other"
@@ -189,7 +194,7 @@ def test_object_viewpoints_are_shared_and_replaced_on_feedback(monkeypatch):
     from backends.habitat.agent_runtime import HabitatNavigationTools
     from scene.contracts import SemanticMapSnapshot, Pose3D, ObjectNodeSnapshot
     tools = HabitatNavigationTools.__new__(HabitatNavigationTools)
-    tools.agent = NS(episode_steps=10, planner=NS(_goal_radius=.25), confirmed_target_waypoint=None, waypoint=(1, 2, 0), check_again_postion=(3, 4, 0))
+    tools.agent = NS(episode_steps=10, planner=NS(_goal_radius=.25), approach_viewpoint=(1, 2, 0), check_again_postion=(3, 4, 0))
     tools.session = NS(snapshot=SemanticMapSnapshot(10, Pose3D((0, 0, 0)),
         objects=(ObjectNodeSnapshot(uid="obj", label="chair"),)))
     views = tools.publish_object_viewpoints("obj")
@@ -200,6 +205,43 @@ def test_object_viewpoints_are_shared_and_replaced_on_feedback(monkeypatch):
     offered = tools.query_viewpoints("obj")
     assert len(offered) == 2
     assert next(v for v in offered if v["metadata"]["recommended"])["pose"]["position"] == (5, 6, 0)
+    tools.agent.approach_viewpoint = None
+    assert [v.metadata["purpose"] for v in tools.publish_object_viewpoints("obj")] == ["recheck"]
+
+
+def test_check_again_scores_at_camera_height_and_approach_is_best_feasible_view(monkeypatch):
+    import importlib, sys
+    import navigation.action_controller as actions
+    calls = {}
+    proposals = [
+        {"position": np.array([.2, 0, .2]), "score": .6, "stop_feasible": True},
+        {"position": np.array([.5, 0, .2]), "score": .9, "stop_feasible": True},
+        {"position": np.array([2., 0, .2]), "score": .95, "stop_feasible": False},
+    ]
+    def build(**kwargs):
+        calls.update(kwargs)
+        metrics = dict.fromkeys(["visible_ratio", "center_score", "border_score", "area_ratio", "distance_to_target"], 0.)
+        return [{**metrics, **p} for p in proposals], []
+    monkeypatch.setitem(sys.modules, "loguru", NS(logger=NS(info=lambda *a, **k: None)))
+    monkeypatch.setitem(sys.modules, "habitat_sim", NS(ShortestPath=lambda: NS(points=[])))
+    monkeypatch.setitem(sys.modules, "planning.viewpoint_policy", NS(build_check_again_viewpoints=build))
+    monkeypatch.delitem(sys.modules, "navigation.view_verification_controller", raising=False)
+    controller = importlib.import_module("navigation.view_verification_controller")
+    monkeypatch.setattr(actions, "geodesic_distance_to_waypoint", lambda agent, p: float(p[0]) + 1.)
+    sim = NS(pathfinder=NS(snap_point=lambda p: p, find_path=lambda request: True),
+             get_agent_state=lambda: NS(position=np.zeros(3)))
+    agent = NS(env=NS(sim=sim), adaptive_observation=True, episode_steps=3,
+               mapper=NS(current_position=np.array([1., 1., .2]), initial_position=np.zeros(3),
+                         camera_intrinsic=np.eye(3), target="toilet"),
+               object_final=NS(find_closest=lambda p: np.zeros(3), position=np.zeros(3), uid="obj"),
+               found_goal_position=np.array([1., 1., .2]), confirmed_target_waypoint=None,
+               _augment_final_stop_geometry=lambda d: {"required_stop_distance": 1.},
+               stop_criterion=.7, planner=NS(_goal_radius=.15),
+               rgb_trajectory=[np.zeros((480, 640, 3))], view_control_state=NS(active=False))
+    controller.select_check_again_viewpoint(agent)
+    assert calls["target_height"] == pytest.approx(.2)
+    np.testing.assert_allclose(agent.approach_viewpoint, [.5, 0, .2])
+    np.testing.assert_allclose(agent.check_again_postion, [.2, 0, .2])
 
 
 def test_visual_history_is_scoped_to_task_revision():
@@ -222,7 +264,10 @@ def test_uncertain_exhausted_view_defers_candidate_until_new_observation(monkeyp
     state = ViewControlState()
     state.start("obj", {}, {})
     state.exhausted = True
-    agent = NS(episode_steps=30, object_final=NS(uid="obj", rgb=np.zeros((4,4,3)), bbox=[0,0,2,2]),
+    agent = NS(episode_steps=30, object_final=NS(uid="obj", rgb=np.zeros((4,4,3)), bbox=[0,0,2,2],
+                                                 position=np.ones(3)),
+               mapper=NS(current_position=np.zeros(3), current_rotation=np.eye(3)[:, ::-1]),
+               _observation_identity=lambda uid: {"observation_id": "0:30"},
                task=NS(spec=NS(revision=1)), need_check_again=False,
                last_check_again_evidence={}, final_stop_decision="uncertain",
                check_again=Mock(), final_instruction_check=Mock(return_value=False),
@@ -232,7 +277,7 @@ def test_uncertain_exhausted_view_defers_candidate_until_new_observation(monkeyp
     guided.deferred_candidates = set()
     guided.deferred_evidence, guided.candidate_view_states = {}, {}
     guided.tools = NS(refresh_scene=Mock(), objects={"obj": agent.object_final})
-    assert guided.verify() == "recovery"
+    assert guided.verify((0, 0, 0)) == "recovery"
     assert guided.deferred_candidates == {"obj"}
     guided.observation_updated()
     assert guided.deferred_candidates == {"obj"} and state.active

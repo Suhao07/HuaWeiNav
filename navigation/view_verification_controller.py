@@ -46,7 +46,8 @@ def select_check_again_viewpoint(agent: Any) -> None:
         camera_intrinsic=agent.mapper.camera_intrinsic,
         mapper_initial_position=agent.mapper.initial_position,
         habitat_path_points=points,
-        target_height=agent.found_goal_position[2] + 0.88,
+        # 建图坐标原点是初始 RGB 传感器，current_position[2] 已是相机高度。
+        target_height=agent.mapper.current_position[2],
         success_distance=agent._augment_final_stop_geometry({})["required_stop_distance"],
         stop_criterion=agent.stop_criterion,
         arrival_tolerance=agent.planner._goal_radius,
@@ -61,6 +62,9 @@ def select_check_again_viewpoint(agent: Any) -> None:
     for proposal in proposals:
         proposal["travel_distance"] = geodesic_distance_to_waypoint(agent, proposal["position"])
     proposals = [p for p in proposals if np.isfinite(p["travel_distance"])]
+    # 接近视点取停止半径内投影质量最高者；没有可见且可停的视点时不提供接近选项。
+    feasible = [p for p in proposals if p["stop_feasible"]]
+    agent.approach_viewpoint = max(feasible, key=lambda p: p["score"])["position"] if feasible else None
     if agent.view_control_state.active:
         # 已取得当前视角的判定后，补拍要求可执行位移：d_nav(x,v) > rho。
         # 到达容差内的提案会立即返回 reached，不能提供新的观察位置。

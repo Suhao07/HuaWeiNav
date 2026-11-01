@@ -99,15 +99,19 @@ class HabitatNavigationTools(NavigationTools):
         return result
 
     def publish_object_viewpoints(self, candidate_uid):
-        """Publish the same approach/recheck options used by the default policy."""
+        """Publish projection-scored approach/recheck options for one object.
+
+        approach 是停止半径内投影质量最高的视点，满足
+        d_object(v) + rho <= d_stop 且目标点云落入画面；物体表面点不作为视点。
+        """
         agent = self.agent
-        approach = agent.confirmed_target_waypoint if agent.confirmed_target_waypoint is not None else agent.waypoint
+        options = (("approach", agent.approach_viewpoint), ("recheck", agent.check_again_postion))
         views = tuple(ViewpointSnapshot(
             uid=f"{candidate_uid}:{name}:{agent.episode_steps}",
             pose=Pose3D(tuple(float(x) for x in position), frame_id="mapper_local"),
             visible_objects=(candidate_uid,), metadata={"source": "strive_viewpoint_geometry",
                                                         "purpose": name, "recommended": name == "recheck"},
-        ) for name, position in (("approach", approach), ("recheck", agent.check_again_postion)))
+        ) for name, position in options if position is not None)
         retained = tuple(view for view in self.session.snapshot.viewpoints if candidate_uid not in view.visible_objects)
         self.session.snapshot = replace(self.session.snapshot, viewpoints=retained + views)
         return views
