@@ -20,13 +20,19 @@ def main():
     parser.add_argument("--max-frames", type=int)
     parser.add_argument("--voxel-m", type=float, default=0.05)
     parser.add_argument("--max-depth-m", type=float, default=6.0)
+    parser.add_argument("--deferred-association", action="store_true",
+                        help="Opt into experimental observation-owned fusion")
     args = parser.parse_args()
+    association_config = None
+    if args.deferred_association:
+        from prior_map.association import AssociationConfig
+        association_config = AssociationConfig()
     # 多词类别按行读取，与独立建图器使用同一词表，保留词内空格。
     classes = (args.classes if args.classes_file is None else
                [line.strip() for line in args.classes_file.read_text(encoding="utf-8").splitlines()
                 if line.strip()])
     result = build_capture_map(args.capture, args.output, classes=classes,
-        max_frames=args.max_frames, voxel_m=args.voxel_m, max_depth_m=args.max_depth_m)
+        max_frames=args.max_frames, voxel_m=args.voxel_m, max_depth_m=args.max_depth_m, association_config=association_config)
     print(json.dumps({k: v for k, v in result.items() if k not in ("frames", "capture_manifest")}, indent=2))
 
 

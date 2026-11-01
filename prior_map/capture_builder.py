@@ -14,7 +14,7 @@ from .observations import COORDINATES, SCHEMA_VERSION, backproject, read_records
 
 
 def build_capture_map(capture, output, *, classes, max_frames=None, voxel_m=0.05,
-                      max_depth_m=6.0, device="cuda:0"):
+                      max_depth_m=6.0, device="cuda:0", association_config=None):
     """Detect, fuse and export observed instances with their original evidence.
 
     Args:
@@ -25,6 +25,7 @@ def build_capture_map(capture, output, *, classes, max_frames=None, voxel_m=0.05
         voxel_m: Per-observation voxel size before existing instance fusion.
         max_depth_m: Maximum depth retained in each masked cloud, in metres.
         device: Torch device used by the maintained detector stack.
+        association_config: Opt-in deferred association configuration; None keeps legacy fusion.
 
     Returns:
         Build receipt with counts, timings and predicted label distribution.
@@ -68,13 +69,23 @@ def build_capture_map(capture, output, *, classes, max_frames=None, voxel_m=0.05
     source_root = Path(__file__).resolve().parents[1]
     provenance = {"source_sha256": {name: file_digest(source_root / name) for name in (
         "prior_map/capture_builder.py", "prior_map/observations.py", "cv_utils/sam.py",
-        "mapping/object_fusion.py", "mapping_utils/geometry.py")},
+        "mapping/object_fusion.py", "mapping_utils/geometry.py", "prior_map/association.py")},
         "model_sha256": {"sam": file_digest(SAM_CHECKPOINT),
                          "grounding_dino": file_digest(GROUNDING_DINO_CHECKPOINT),
                          "grounding_dino_config": file_digest(GROUNDING_DINO_CONFIG)}}
     cloud_device = o3d.core.Device(device.upper())
     entities, observations, viewpoints, frame_reports = [], [], [], []
     map_id = new_map_id()
+    observation_records = {}
+    coordinator = None
+    if association_config is not None:
+        from .association import PriorAssociation
+        from .observations import load_fusion_observation
+        def load_observation(oid):
+            return load_fusion_observation(destination, observation_records[oid],
+                voxel_m=voxel_m, max_depth_m=max_depth_m,
+                profile=manifest.get("capture_profile"), device=device.upper(), uid=f"{map_id}:{oid}")
+        coordinator = PriorAssociation(load_observation, association_config)
     for frame in frames:
         tick = time.monotonic()
         rgb = np.asarray(Image.open(root / frame["rgb_path"]).convert("RGB"))
@@ -109,9 +120,10 @@ def build_capture_map(capture, output, *, classes, max_frames=None, voxel_m=0.05
             entity.uid = f"{map_id}:frame{frame['frame_id']}:detection{index}"
             observed.append(entity)
             accepted.append((index, mask, bbox.tolist(), str(label), float(score)))
-        entities, indices = associate_object_entities(
-            entities, observed, target="", is_target_tag=lambda tag: False,
-        )
+        if coordinator is None:
+            entities, indices = associate_object_entities(
+                entities, observed, target="", is_target_tag=lambda tag: False,
+            )
         frame_observations = []
         if accepted:
             image_ref = f"evidence/{frame['frame_id']:06d}.png"
@@ -122,16 +134,20 @@ def build_capture_map(capture, output, *, classes, max_frames=None, voxel_m=0.05
             if frame.get("confidence_ref") is not None:
                 confidence_ref = f"evidence/{frame['frame_id']:06d}-confidence.png"
                 shutil.copyfile(root / frame["confidence_ref"], destination / confidence_ref)
-        for (index, mask, bbox, label, score), object_index in zip(accepted, indices):
+        for offset, (index, mask, bbox, label, score) in enumerate(accepted):
             obs_id = f"frame{frame['frame_id']}:detection{index}"
             mask_ref = f"evidence/{frame['frame_id']:06d}-{index}.png"
             Image.fromarray(mask.astype(np.uint8) * 255).save(destination / mask_ref)
             observations.append({"observation_id": obs_id, "frame_id": frame["frame_id"],
-                "object_uids": [entities[object_index].uid], "image_ref": image_ref,
+                "object_uids": [entities[indices[offset]].uid] if coordinator is None else [], "image_ref": image_ref,
                 "depth_ref": depth_ref, "mask_ref": mask_ref, "confidence_ref": confidence_ref, "bbox_xyxy": bbox,
                 "detector_label": label, "detector_score": score,
                 "camera_to_map": frame["camera_to_map"], "intrinsics": frame["intrinsics"]})
+            observation_records[obs_id] = observations[-1]
             frame_observations.append(obs_id)
+        if coordinator is not None:
+            coordinator.add_frame(frame["frame_id"], frame_observations)
+            entities = list(coordinator.entities.values())
         if frame_observations:
             viewpoints.append({"uid": f"view:{frame['frame_id']}", "kind": "observation_pose",
                 "pose_in_map": frame["camera_to_map"], "observation_ids": frame_observations})
@@ -140,6 +156,13 @@ def build_capture_map(capture, output, *, classes, max_frames=None, voxel_m=0.05
                "elapsed_s": time.monotonic() - tick}
         frame_reports.append(row)
         print(json.dumps(row), flush=True)
+    if coordinator is not None:
+        coordinator.resolve_pending()
+        entities = list(coordinator.entities.values())
+        for observation in observations:
+            uid = coordinator.assignment[observation['observation_id']]
+            observation['object_uids'] = [] if uid is None else [uid]
+        write_json(destination / "association_trace.json", coordinator.trace())
     objects = tuple(PriorObject(uid=e.uid, label=e.tag, position_xyz=tuple(map(float, e.position)),
         exact=True, confidence=float(e.confidence), source="strive_rgbd_fusion",
         metadata={"identity_kind": "predicted_instance", "point_count": int(e.pcd.point.positions.shape[0])})
@@ -150,7 +173,8 @@ def build_capture_map(capture, output, *, classes, max_frames=None, voxel_m=0.05
                   "semantic_gt_used": False, "navigation_ready": False})
     write_bundle(destination, map_id=map_id, revision="1", prior_map=prior,
                  observations=observations, viewpoints=viewpoints)
-    receipt = {"status": "complete", "frame_count": len(frames), "object_count": len(objects),
+    receipt = {"association_policy": "legacy" if coordinator is None else coordinator.trace()["config"],
+        "status": "complete", "frame_count": len(frames), "object_count": len(objects),
         "observation_count": len(observations), "elapsed_s": time.monotonic() - started,
         "provenance": provenance, "confidence_policy": "preserved_not_filtered", "classes": classes, "voxel_m": voxel_m, "max_depth_m": max_depth_m,
         "depth_policy": "positive_within_fusion_range_excluding_recorded_sensor_clip_endpoints",

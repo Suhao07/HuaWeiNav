@@ -91,3 +91,30 @@ def metric_depth_validity(depth, capture_profile=None):
     if capture_profile is not None:
         valid &= (depth > capture_profile["depth_min_m"]) & (depth < capture_profile["depth_max_m"])
     return valid
+
+
+def load_fusion_observation(root, record, *, voxel_m, max_depth_m, profile=None,
+                            device="CPU:0", uid=None):
+    """Reconstruct a fresh filtered observation using the capture-builder geometry.
+
+    RGB-D and masks remain the durable source for local instance reconstruction.
+    The returned ObjectNode belongs to this call and can be merged safely.
+    """
+    import open3d as o3d
+    from PIL import Image
+    from mapping_utils.geometry import gpu_pointcloud_from_array, gpu_cluster_filter
+    from mapping_utils.representation import ObjectNode
+    root = Path(root)
+    depth = load_depth(root / record['depth_ref'])
+    mask = np.asarray(Image.open(root / record['mask_ref'])) > 0
+    valid = metric_depth_validity(depth, profile) & (depth <= max_depth_m)
+    points = backproject(np.where(mask & valid, depth, 0),
+                        np.asarray(record['intrinsics']), np.asarray(record['camera_to_map']))
+    cloud = gpu_pointcloud_from_array(points, np.full(points.shape, 160), o3d.core.Device(device))
+    cloud = gpu_cluster_filter(cloud.voxel_down_sample(voxel_m))
+    xyz = cloud.point.positions.cpu().numpy()
+    rgb = np.asarray(Image.open(root / record['image_ref']).convert('RGB'))
+    entity = ObjectNode(cloud, cloud, record['detector_label'], record['detector_score'],
+                        xyz.mean(axis=0), len(xyz), rgb, record['bbox_xyxy'])
+    entity.uid = uid if uid is not None else record['observation_id']
+    return entity, mask
