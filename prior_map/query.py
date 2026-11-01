@@ -315,7 +315,9 @@ class PriorMapQueryService:
             concept_relevance = _best_match_score(object_terms, target_terms)
             support_relevance = _best_match_score(object_terms, support_terms)
             room_relevance = max(0.0, room_scores.get(obj.parent_room_uid or "", 0.0))
-            live_match = 1.0 if object_terms & live_labels or _normalize(obj.uid) in live_uids else 0.0
+            # 类别相同只支持类别先验；具体历史实例的在线支持来自身份对应。
+            live_match = 1.0 if (_normalize(obj.uid) in live_uids or
+                                (not obj.exact and object_terms & live_labels)) else 0.0
             if state.matched_runtime_uid and _normalize(state.matched_runtime_uid) in live_uids:
                 live_match = 1.0
             if state.observation_count > 0:

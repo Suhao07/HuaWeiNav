@@ -350,6 +350,10 @@ class PriorMapMemory:
     def mark_object_verified(self, prior_uid: str, runtime_uid: str, step: int) -> None:
         """Mark a prior object as verified by runtime evidence.
 
+        The caller establishes correspondence to this historical instance.
+        Acceptance of a category-only navigation target establishes task
+        completion, but supplies no such cross-map identity evidence.
+
         Args:
             prior_uid: Prior object uid.
             runtime_uid: Runtime object uid that verified the prior.
@@ -536,7 +540,11 @@ class PriorMapMemory:
         label: str,
         parent_room_uid: Optional[str],
     ) -> Optional[str]:
-        """Match a runtime object to a prior object hypothesis.
+        """Match established identity, or one unambiguous category hypothesis.
+
+        Concrete historical instances require their persisted UID or an
+        explicitly verified correspondence. A shared label is category evidence;
+        it cannot select one instance among multiple historical objects.
 
         Args:
             runtime_uid: Runtime object uid.
@@ -549,20 +557,26 @@ class PriorMapMemory:
 
         if runtime_uid and runtime_uid in self.object_states:
             return runtime_uid
+        if runtime_uid:
+            verified = [state.object_uid for state in self.object_states.values()
+                        if state.verified and state.matched_runtime_uid == runtime_uid]
+            if verified:
+                return verified[0] if len(verified) == 1 else None
         normalized_label = _normalize_text(label)
         if not normalized_label:
             return None
+        hypotheses = []
         for obj in self.base_map.objects:
             state = self.object_states[obj.uid]
-            if state.rejected:
+            if state.rejected or obj.exact:
                 continue
             terms = {_normalize_text(obj.label), *(_normalize_text(alias) for alias in obj.aliases)}
             if normalized_label not in terms:
                 continue
             if parent_room_uid and obj.parent_room_uid and parent_room_uid != obj.parent_room_uid:
                 continue
-            return obj.uid
-        return None
+            hypotheses.append(obj.uid)
+        return hypotheses[0] if len(hypotheses) == 1 else None
 
     def _room_with_state(self, room: PriorRoom) -> PriorRoom:
         """Return a copy of a room with runtime metadata.
