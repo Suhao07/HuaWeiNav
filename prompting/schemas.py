@@ -6,7 +6,7 @@ inside a minimal container.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 try:
     from pydantic import BaseModel, Field
@@ -144,8 +144,9 @@ class ParsedHighLevelSelection(BaseModel):
     """Room/frontier selection returned from a dynamic prior-map BEV."""
 
     selected_uid: str = ""
-    selected_type: str = ""
-    decision: str = "uncertain"
+    selected_type: Literal["", "room", "frontier"] = ""
+    # 与规划器消费的动作域一致，未知动词在模型协议边界显式报错。
+    decision: Literal["select", "uncertain"] = "uncertain"
     confidence: float = 0.0
     reason: str = ""
     alternatives: list[str] = Field(default_factory=list)

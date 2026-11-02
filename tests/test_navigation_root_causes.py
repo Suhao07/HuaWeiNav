@@ -182,15 +182,15 @@ def test_search_review_preserves_baseline_option_set_and_interval():
     guided.search_review_step, guided.search_review_interval = 0, 100
     guided.runtime = NS(model_calls=0, max_model_calls=5, choose_frontier=Mock(return_value="node:1"))
     guided.record = Mock()
-    assert guided.review_search_branch(nodes[0], "current_room") == (nodes[0], "current_room")
+    assert guided.review_search_branch(nodes[0], "current_room", 0) == (nodes[0], "current_room")
     guided.runtime.choose_frontier.assert_not_called()
     guided.agent.episode_steps = 100
-    assert guided.review_search_branch(nodes[0], "current_room") == (nodes[1], "agent_search_review")
+    assert guided.review_search_branch(nodes[0], "current_room", 0) == (nodes[1], "agent_search_review")
     options, recommended, event = guided.runtime.choose_frontier.call_args.args
     assert [o["frontier_uid"] for o in options] == ["node:0", "node:1"]
     assert recommended == "node:0" and event["reason"] == "prolonged_target_search"
     guided.agent.episode_steps = 101
-    guided.review_search_branch(nodes[0], "current_room")
+    guided.review_search_branch(nodes[0], "current_room", 0)
     assert guided.runtime.choose_frontier.call_count == 1
 
 

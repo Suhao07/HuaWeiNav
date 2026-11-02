@@ -14,7 +14,8 @@ from harness.runtime import AgentRuntime
 from motion.contracts import MotionGoalMode, NavigationIntent
 from navigation.planner_loop import run_observation_mapping_cycle
 from navigation_core.view_geometry import camera_pitch
-from planning.exploration_policy import select_exploration_node
+from planning.exploration_policy import (select_baseline_exploration_node, select_exploration_node,
+                                         select_prior_region_node)
 from scene.contracts import Pose3D
 
 
@@ -135,7 +136,7 @@ class GuidedNavigation:
         if node is None:
             self.record("search_exhausted", decision_source=source)
             return False
-        node, source = self.review_search_branch(node, source)
+        node, source = self.review_search_branch(node, source, episode_idx)
         # selected 由 active goal 表达；观察完成后才更新地图的 explored 状态。
         self.submit(node.position, node=node, source=source)
         return True
@@ -186,19 +187,44 @@ class GuidedNavigation:
                 self.record("candidate_evidence_updated", candidate_uid=uid,
                             evidence_fingerprint=fingerprint)
 
-    def review_search_branch(self, node, source):
-        """Review prolonged target search using the exact baseline option set.
+    def exploration_options(self, episode_idx):
+        r"""Return the default branch and the reachable exploration option set.
+
+        .. math::
+            U(s) = N_{baseline}(s) \cup \{n_{prior}\}
+
+        先验区域只追加其推荐分支并标记，不裁剪 baseline 候选；默认分支与
+        select_exploration_node 一致。baseline 先计算，使最后记录的排序为默认选择。
+        """
+        agent = self.agent
+        node, source = select_baseline_exploration_node(agent, episode_idx=episode_idx,
+                                                        step=agent.episode_steps)
+        rows = list(agent.mapper.prior_map_last_chosen_frontier["candidates"]) if node is not None else []
+        prior = select_prior_region_node(agent)
+        if prior is not None:
+            node, source = prior, "prior_region_policy"
+            prior_row = next(row for row in agent.mapper.prior_map_last_chosen_frontier["candidates"]
+                             if row["node_idx"] == prior.idx)
+            rows = [row for row in rows if row["node_idx"] != prior.idx]
+            rows.append({**prior_row, "prior_region_recommended": True})
+        return node, source, [row for row in rows if math.isfinite(row["raw_distance_m"])]
+
+    def review_search_branch(self, node, source, episode_idx):
+        """Review prolonged target search over the baseline options plus the prior branch.
 
         触发条件为距上次发现候选/搜索复议的动作步数达到配置间隔。
-        普通局部推进继续使用 baseline；复议只选择现有可达节点的 ID。
+        普通局部推进继续使用默认分支；复议只选择现有可达节点的 ID。
         """
         agent = self.agent
         if (agent.episode_steps - self.search_review_step < self.search_review_interval
                 or self.runtime.model_calls >= self.runtime.max_model_calls):
             return node, source
-        ranking = agent.mapper.prior_map_last_chosen_frontier
-        options = [{**row, "frontier_uid": f"node:{row['node_idx']}"}
-                   for row in ranking["candidates"] if math.isfinite(row["raw_distance_m"])]
+        if source == "prior_region_policy":
+            node, source, rows = self.exploration_options(episode_idx)
+        else:
+            rows = [row for row in agent.mapper.prior_map_last_chosen_frontier["candidates"]
+                    if math.isfinite(row["raw_distance_m"])]
+        options = [{**row, "frontier_uid": f"node:{row['node_idx']}"} for row in rows]
         if len(options) <= 1:
             return node, source
         recommended = f"node:{node.idx}"
@@ -281,14 +307,10 @@ class GuidedNavigation:
         """
         agent = self.agent
         self.tools.refresh_scene()
-        node, source = select_exploration_node(agent, episode_idx=episode_idx,
-                                              step=agent.episode_steps)
+        _, _, rows = self.exploration_options(episode_idx)
         failed_index = reason.get("goal", {}).get("node_index")
-        options = []
-        if node is not None:
-            options.extend({**row, "action_uid": f"frontier:{row['node_idx']}", "kind": "frontier"}
-                           for row in agent.mapper.prior_map_last_chosen_frontier["candidates"]
-                           if math.isfinite(row["raw_distance_m"]) and row["node_idx"] != failed_index)
+        options = [{**row, "action_uid": f"frontier:{row['node_idx']}", "kind": "frontier"}
+                   for row in rows if row["node_idx"] != failed_index]
         uid = reason.get("candidate_uid")
         if uid is not None:
             for view in self.tools.query_viewpoints(uid):

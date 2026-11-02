@@ -173,11 +173,15 @@ def _geodesic_distances_to_nodes(mapper: Any, nodes: list[Any]) -> np.ndarray:
 def _prior_frontier_bias_enabled(mapper: Any) -> bool:
     """Return whether frontier bias may affect active planning."""
 
+    runtime = getattr(mapper, "prior_map_runtime", None)
+    if runtime is not None and runtime.region_candidates and runtime.high_level_selector is not None:
+        # 高层只决定区域；区域内完整复用baseline路径代价，避免重复叠加对象奖励。
+        return False
     adapter = getattr(mapper, "prior_map_policy_adapter", None)
     if adapter is not None and not bool(getattr(adapter, "enabled", True)):
         return False
     prior_result = getattr(mapper, "search_prior_result", None)
-    return bool(getattr(prior_result, "frontier_biases", ()) or ())
+    return bool(getattr(prior_result, "frontier_biases", ()) or _selected_prior_frontier(mapper))
 
 
 def _frontier_prior_score(mapper: Any, node: Any) -> float:
@@ -193,11 +197,11 @@ def _frontier_prior_score(mapper: Any, node: Any) -> float:
 
     prior_result = getattr(mapper, "search_prior_result", None)
     priors = tuple(getattr(prior_result, "frontier_biases", ()) or ())
-    if not priors:
-        return 0.0
     node_uid = _node_uid(node)
     room_terms = _node_room_terms(mapper, node)
-    best = 0.0
+    # d_adjusted = d_nav - bias_m * max(geometry_score, selected_frontier_score).
+    # 高层偏好沿用房间选择的单位软分数；不创建节点，也不替代路径距离。
+    best = 1.0 if node_uid == _selected_prior_frontier(mapper) else 0.0
     for prior in priors:
         prior_uid = _norm(getattr(prior, "frontier_uid", ""))
         direct_match = prior_uid and prior_uid == _norm(node_uid)
@@ -209,6 +213,14 @@ def _frontier_prior_score(mapper: Any, node: Any) -> float:
         if direct_match or room_match:
             best = max(best, float(getattr(prior, "score_delta", 0.0) or 0.0))
     return best
+
+
+def _selected_prior_frontier(mapper: Any) -> str:
+    """Read the explicit frontier choice published by the prior-map runtime."""
+    selection = getattr(mapper, "prior_map_high_level_selection", None)
+    if selection is None or selection["decision"] != "select" or selection["selected_type"] != "frontier":
+        return ""
+    return selection["selected_uid"]
 
 
 def _node_room_terms(mapper: Any, node: Any) -> set[str]:
@@ -344,9 +356,37 @@ def _open3d() -> Any:
 
 
 def select_exploration_node(agent, *, episode_idx, step, relocate=None, use_gpt_relocate=None):
-    """Select the original room-first exploration goal for either runtime.
+    """Select the prior-region branch if one is active, else the baseline branch."""
+    node = select_prior_region_node(agent)
+    if node is not None:
+        return node, "prior_region_policy"
+    return select_baseline_exploration_node(agent, episode_idx=episode_idx, step=step,
+                                            relocate=relocate, use_gpt_relocate=use_gpt_relocate)
 
-    With priors disabled, n* = argmin d_nav(x, n) within the current room.
+
+def select_prior_region_node(agent):
+    """Return the nearest open frontier inside the VLM-selected prior region.
+
+    n* = argmin_{n in R} d_nav(x, n)，R 为选中区域冻结的节点集合中仍有 frontier 的节点。
+    """
+    mapper = agent.mapper
+    runtime = getattr(mapper, "prior_map_runtime", None)
+    selection = getattr(mapper, "prior_map_high_level_selection", None)
+    if runtime is None or not isinstance(selection, dict) or selection.get("decision") != "select":
+        return None
+    selected = next((r for r in runtime.region_candidates if r.uid == selection["selected_uid"]), None)
+    if selected is None:
+        return None
+    # 区域可能由多个在线room片段组成，执行同一快照中已绑定的节点集合。
+    members = set(selected.metadata["node_ids"])
+    nodes = [n for n in mapper.nodes if n.idx in members and n.has_frontier and n.state == 0]
+    return find_closest_nodes(mapper, nodes)
+
+
+def select_baseline_exploration_node(agent, *, episode_idx, step, relocate=None, use_gpt_relocate=None):
+    """Select the original room-first exploration goal without prior regions.
+
+    n* = argmin d_nav(x, n) within the current room.
     Room relocation runs only after its local policy returns no candidate.
     This cycle operation retains the legacy buffer reset; callers invoke it
     once per planning cycle, never as a read-only model tool.

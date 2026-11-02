@@ -124,6 +124,7 @@ def get_args():
     parser.add_argument("--instruction_adapter_strict_classes", default=False, action="store_true")
     parser.add_argument("--enable_prior_map", default=False, action="store_true")
     parser.add_argument("--prior_map_path", type=str, default="")
+    parser.add_argument("--prior_map_layout", type=str, default="", help="Canonical region map sharing the object map scene and frame.")
     parser.add_argument("--prior_map_source", type=str, default="auto")
     parser.add_argument("--prior_map_alignment", type=str, default="identity")
     parser.add_argument(
@@ -374,6 +375,9 @@ if __name__ == "__main__":
             while flag and not habitat_env.episode_over and habitat_agent.episode_steps < args.max_steps:
                 flag = habitat_agent.step_mod(idx=i)
 
+        if prior_map_runtime is not None:
+            prior_map_runtime.finish_episode(mapper=habitat_mapper,
+                plan=habitat_agent.task.plan, step=habitat_agent.episode_steps)
         habitat_agent.save_trajectory(f"./{args.save_dir}/episode-{i}/")
         prior_map_summary = (
             prior_map_runtime.metrics_summary()

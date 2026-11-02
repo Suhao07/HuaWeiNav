@@ -8,6 +8,7 @@ run in offline tests and deployment smoke checks.
 from __future__ import annotations
 
 import json
+import math
 import re
 import struct
 import zlib
@@ -146,6 +147,7 @@ class FloorPlanOverlay:
         selected_frontier_uid: Active selected frontier uid.
         baseline_frontier_uid: Baseline frontier uid before prior ranking.
         robot_position_xy: Current robot position in prior-map coordinates.
+        robot_heading_rad: Heading in the prior-map plane, counter-clockwise from +x.
         current_room_uid: Runtime room containing the robot, when known.
         candidate_room_uids: Room UIDs currently offered to high-level policy.
         selected_room_uid: Room UID selected by the high-level policy.
@@ -159,6 +161,7 @@ class FloorPlanOverlay:
     selected_frontier_uid: Optional[str] = None
     baseline_frontier_uid: Optional[str] = None
     robot_position_xy: Optional[Tuple[float, float]] = None
+    robot_heading_rad: Optional[float] = None
     current_room_uid: Optional[str] = None
     candidate_room_uids: Tuple[str, ...] = ()
     selected_room_uid: Optional[str] = None
@@ -180,6 +183,7 @@ class FloorPlanOverlay:
             "selected_frontier_uid": self.selected_frontier_uid,
             "baseline_frontier_uid": self.baseline_frontier_uid,
             "robot_position_xy": list(self.robot_position_xy) if self.robot_position_xy else None,
+            "robot_heading_rad": self.robot_heading_rad,
             "current_room_uid": self.current_room_uid,
             "candidate_room_uids": list(self.candidate_room_uids),
             "selected_room_uid": self.selected_room_uid,
@@ -834,6 +838,12 @@ class PriorMapFloorPlanVisualizer:
                 f'  <text x="{x + 14:.1f}" y="{y - 12:.1f}" font-family="sans-serif" '
                 f'font-size="12" font-weight="700" fill="#115e59">robot</text>'
             )
+        if overlay.robot_position_xy is not None and overlay.robot_heading_rad is not None:
+            px, py = overlay.robot_position_xy
+            start = transform.to_canvas((px, py))
+            end = transform.to_canvas((px + 0.6 * math.cos(overlay.robot_heading_rad),
+                                       py + 0.6 * math.sin(overlay.robot_heading_rad)))
+            lines.append(f'<path d="M{start[0]},{start[1]} L{end[0]},{end[1]}" stroke="#0f766e" stroke-width="5"/>')
         for index, room in enumerate(rooms):
             anchor = _room_anchor(room)
             if anchor is None:
@@ -930,7 +940,42 @@ class PriorMapFloorPlanVisualizer:
             x, y = _int_point(transform.to_canvas(view.overlay.robot_position_xy))
             canvas.fill_circle(x, y, 11, color=(15, 118, 110))
             canvas.stroke_circle(x, y, 11, color=(4, 47, 46))
-        return canvas.to_png()
+        if view.overlay.robot_position_xy is not None and view.overlay.robot_heading_rad is not None:
+            px, py = view.overlay.robot_position_xy
+            start = _int_point(transform.to_canvas((px, py)))
+            end = _int_point(transform.to_canvas((px + 0.6 * math.cos(view.overlay.robot_heading_rad),
+                                                  py + 0.6 * math.sin(view.overlay.robot_heading_rad))))
+            canvas.draw_line(start, end, color=(15, 118, 110), width=5)
+        # 模型实际读取PNG；在同一像素坐标中补齐身份和语义，避免SVG有字而模型输入无字。
+        from io import BytesIO
+        from PIL import Image, ImageDraw, ImageFont
+        image = Image.frombytes("RGB", (self.width, self.height), bytes(canvas.pixels))
+        draw = ImageDraw.Draw(image)
+        font = ImageFont.truetype("DejaVuSans.ttf", 14)
+        draw.text((24, 20), "Prior map | red: target hypothesis | teal: robot | orange/purple: frontier", fill="#111827", font=font)
+        target_index = 0
+        for marker in view.markers:
+            if marker.get("target_prior"):
+                x, y = transform.to_canvas(marker["xy"])
+                target_index += 1
+                label = f"T{target_index}"
+                draw.text((x + 12, y - 18 - 18 * (target_index % 2)), label, fill="#991b1b", font=font)
+                # 长实例UID放入图例，保留近邻目标的位置可读性。
+                draw.text((self.width // 2, 48 + target_index * 22),
+                          f"{label}: {marker.get('label', '')} | {marker['uid']}", fill="#991b1b", font=font)
+            elif marker.get("marker_type") == "room":
+                x, y = transform.to_canvas(marker["xy"])
+                draw.text((x + 12, y - 18), f"{marker.get('label', '')} {marker['uid']}", fill="#334155", font=font)
+        for point in view.overlay.frontiers:
+            x, y = transform.to_canvas(point.xy)
+            label = f"frontier {point.uid}" + (" (selected)" if point.selected else "")
+            draw.text((x + 12, y + 4), label, fill="#581c87", font=font)
+        if view.overlay.robot_position_xy is not None:
+            x, y = transform.to_canvas(view.overlay.robot_position_xy)
+            draw.text((x + 14, y - 18), "robot", fill="#115e59", font=font)
+        output = BytesIO()
+        image.save(output, format="PNG")
+        return output.getvalue()
 
 
 @dataclass(frozen=True)

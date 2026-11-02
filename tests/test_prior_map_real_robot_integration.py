@@ -174,3 +174,13 @@ def test_real_robot_node_and_launch_expose_prior_map_parameters() -> None:
         assert text in launch_source
     assert "build_prior_map_real_robot_runtime" in node_source
     assert "prior_context_provider" in node_source
+
+
+def test_config_factory_preserves_high_level_interval(tmp_path):
+    from prior_map.real_robot import PriorMapRealRobotConfig
+    path = tmp_path / 'prior.json'
+    path.write_text(json.dumps(_base_map().to_dict()))
+    runtime = PriorMapRealRobotRuntime.from_config(PriorMapRealRobotConfig(
+        prior_map_path=str(path), run_directory=str(tmp_path/'runtime'), high_level_interval=7))
+    assert runtime.high_level_interval == 7
+    assert runtime.high_level_selector is None

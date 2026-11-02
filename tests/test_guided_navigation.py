@@ -219,8 +219,9 @@ def test_recovery_selects_untried_approach_once_and_returns_to_driver(monkeypatc
     guided.runtime = NS(model_calls=0, max_model_calls=3,
                         choose_recovery=Mock(return_value="approach"), step=Mock())
     guided.record, guided.submit = Mock(), Mock()
-    monkeypatch.setattr(module, "select_exploration_node", lambda *a, **kw:
+    monkeypatch.setattr(module, "select_baseline_exploration_node", lambda *a, **kw:
                         (nodes[0] if nodes else None, "current_room"))
+    monkeypatch.setattr(module, "select_prior_region_node", lambda agent: None)
     assert guided.recover({"candidate_uid": "u", "reason": "view_options_exhausted"}, 0) == "moving"
     guided.submit.assert_called_once_with((2,0,0), candidate_uid="u",
                                           source="agent_recovery" if frontiers else "default_recovery")
@@ -229,6 +230,34 @@ def test_recovery_selects_untried_approach_once_and_returns_to_driver(monkeypatc
         options = guided.runtime.choose_recovery.call_args.args[0]
         assert {o["action_uid"] for o in options} == {"approach", "frontier:0", "frontier:1"}
     guided.runtime.step.assert_not_called()
+
+
+def test_prior_region_adds_its_branch_without_pruning_baseline_options(monkeypatch):
+    """A one-node prior region must not reduce recovery to returning to that node."""
+    import backends.habitat.guided_runtime as module
+    nodes = [NS(idx=i, position=(i, 0, 0)) for i in range(3)]
+    mapper = NS(nodes=nodes, prior_map_last_chosen_frontier=None)
+    def ranking(*indices):
+        mapper.prior_map_last_chosen_frontier = {"candidates": [
+            {"node_idx": i, "raw_distance_m": float(i + 1)} for i in indices]}
+    def baseline(agent, **kw):
+        ranking(1, 2)
+        return nodes[1], "current_room"
+    def prior(agent):
+        ranking(0)
+        return nodes[0]
+    monkeypatch.setattr(module, "select_baseline_exploration_node", baseline)
+    monkeypatch.setattr(module, "select_prior_region_node", prior)
+    guided = GuidedNavigation.__new__(GuidedNavigation)
+    guided.agent = NS(episode_steps=36, mapper=mapper)
+    guided.tools = NS(refresh_scene=Mock())
+    guided.runtime = NS(model_calls=0, max_model_calls=3, choose_recovery=Mock(return_value="frontier:1"))
+    guided.record, guided.submit = Mock(), Mock()
+    assert guided.recover({"reason": "blocked"}, 0) == "moving"
+    options = guided.runtime.choose_recovery.call_args.args[0]
+    assert [o["action_uid"] for o in options] == ["frontier:1", "frontier:2", "frontier:0"]
+    assert [o.get("prior_region_recommended", False) for o in options] == [False, False, True]
+    guided.submit.assert_called_once_with(nodes[1].position, node=nodes[1], source="agent_recovery")
 
 
 def test_feedback_retains_initial_motion_attempt_in_view_history(monkeypatch):
@@ -277,3 +306,19 @@ def test_motion_terminal_history_is_scoped_to_evidence_and_arrival_tolerance():
     obj.rgb[0,0] = 255
     assert not guided.view_attempted("u", (1,0,0))
     assert guided.candidate_motion_goals[(1,"u",fingerprint)][(1,0,0)] == "BLOCKED"
+
+
+def test_selected_region_drives_existing_navigation(monkeypatch):
+    """A selected region uses its bound nodes across online room fragments."""
+    import planning.exploration_policy as policy
+    node = NS(idx=7, has_frontier=True, state=0)
+    region = NS(uid='prior:kitchen', metadata={'node_ids': (7,)})
+    choose = Mock(return_value=node)
+    monkeypatch.setattr(policy, 'find_closest_nodes', choose)
+    mapper = NS(prior_map_runtime=NS(region_candidates=(region,)),
+                prior_map_high_level_selection={'decision': 'select', 'selected_uid': region.uid},
+                nodes=[node, NS(idx=8, has_frontier=True, state=0)])
+    agent = NS(mapper=mapper, relocate=False, gpt_relocate=False)
+    actual, source = select_exploration_node(agent, episode_idx=0, step=10)
+    assert actual is node and source == 'prior_region_policy'
+    choose.assert_called_once_with(mapper, [node])

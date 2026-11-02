@@ -171,6 +171,10 @@ The original instruction, structured plan, candidate records, and dynamic BEV
 are soft planning context. Select at most one UID from the supplied candidate
 UID contract.
 
+Return decision="select" with the chosen UID and its candidate type (room or
+frontier). When evidence is insufficient, return decision="uncertain" with
+empty selected_uid and selected_type. These are the two supported decisions.
+
 Use the BEV for room-level exploration order and spatial context. Treat live
 object observations and candidate geometry as factual runtime evidence. Do not
 invent candidate UIDs, object instances, exact paths, relation edges, or
