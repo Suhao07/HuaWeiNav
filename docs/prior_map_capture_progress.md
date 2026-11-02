@@ -2287,3 +2287,26 @@ r=0.10、h=1.5、0.1m格，`outputs/prior_diagnostics/phone-d655a5ce86-layout-co
 ### 边界
 
 无卷尺，绝对尺度、物体位置误差未验收；LiDAR/VIO 2–3%不一致未定位来源；关联碎片化与标签错误未处理；手机地图未在机器人上使用（D阶段）。
+
+## 2026-11-02：关联碎片化根因分解与重复实例合并
+
+**冻结重放**（不重跑检测器）：HM3D matched-baseline 80帧/2003观察（有GT审计）、手机d655a5ce86 conf≥1 345帧/4409观察（无GT）。legacy重放与保存UID逐条一致（parity=true）。
+
+**根因分解（HM3D，逐观察）**：1587条并入正确实例；104条在正确实例为候选时另起新实例——新→旧覆盖中位1.0、旧→新中位0.12，即局部视图完全落在大实例表面上，被点数加权pooled<0.25拒绝。主要为部件检测（drawer→table/piano/cabinet、outlet→wall、pillows→armchair）。仅凭几何无法区分部件与相邻物体：新→旧≥0.8且pooled<0.25的候选中同GT 628、异GT 365；最终实例对按任意覆盖阈值约半数异GT（max方向≥0.85同标签对象54对中29对同GT），异GT者多为同类相邻物体（沙发上的枕头、书架上的书、并排椅子413/414）。手机实验室同标签近邻对以table/chair/tv为主，与成排课桌椅一致。**同标签0.5m近邻数不等于碎片数。**
+
+| 变体 | HM3D对象 | 同标签近邻对象 | TP/FP/FN | Precision | F1 | 手机对象 | 手机同标签近邻对象 |
+|---|---:|---:|---|---:|---:|---:|---:|
+| legacy | 200 | 79 | 18889/2553/48778 | 0.8809 | 0.4240 | 202 | 101 |
+| 合并时5cm体素去重 | 200 | 71 | 20476/3172/47191 | 0.8659 | 0.4485 | 208 | 113 |
+| 实例重复表面合并（采用） | 197 | 76 | 20812/2715/46855 | 0.8846 | 0.4564 | 197 | 96 |
+
+（近邻数按体素去重后的质心计算，legacy手机为101，与C5按保存质心的92口径不同。）
+
+- **体素去重拒绝**：累计重复点确会把pooled变为观察次数加权，但去重后FP +24%，手机对象反增。
+- **采用`mapping/object_fusion.py::merge_duplicate_instances`**：legacy只把观察并入argmax候选，从不合并实例；建图结束后对体素化表面S计算双向覆盖，c(S_A,S_B)>0.85且c(S_B,S_A)>0.85则合并（沿用目标分支的同物判据），迭代至稳定；单向包含（部件、桌上小物）不合并。`build_capture_map`在legacy路径调用并重映射observations的object_uids，回执记录`duplicate_instance_merges`。HM3D合并3对，94个支持GT全部保留；手机合并5对（tv/tv、drawer、wall、table、desk）。门槛对照：双向≥0.7时FP翻倍，未采用。
+- 在线导航融合（`mapper_with_process_obs.py`）未改，冻结仿真基线不受影响。
+- **手机重建**：`outputs/prior_bundles/phone-d655a5ce86-concepts100-conf1-dedup`（同采集、同100类词表、conf≥1），202→197对象、4409观察，合并5对与冻结重放逐项一致；按C5口径（保存质心）同标签近邻对象92→87；observations的object_uids无悬空、无未观察对象；1068s，113MB。原bundle保留。
+
+**剩余碎片**：主要为部件/整体与标注粒度、标签漂移，以及同类相邻物体；需要几何以外的身份证据，延续此前IoU、可见支持、外观、延迟消歧等负结果，不再调几何阈值。
+
+测试：新增`test_duplicate_surfaces_merge_but_contained_part_stays`（三倍重复点的同一表面合并、0.2m局部不合并）；容器内通过，其余7项为容器未设SAM_CHECKPOINT的环境错误；主机489通过、2个既有失败。产物：`outputs/prior_diagnostics/fragmentation_fix_evaluation.json`、`matched80_fusion_{legacy,dedup,consolidate}_replay.json`、`phone-d655a5ce86-fusion_{legacy,dedup,consolidate}_replay.json`。

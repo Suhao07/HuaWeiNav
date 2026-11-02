@@ -122,6 +122,45 @@ def merge_object_observation(argmax_entity, entity):
             argmax_entity.confidence = c2
 
 
+def merge_duplicate_instances(entities, voxel_m):
+    """Merge instances describing one surface; observation-to-instance fusion never re-merges.
+
+    S=voxel(P, voxel_m) removes point multiplicity from repeated observations;
+    c(X,Y)=mean_x 1[d(x,Y)<0.1]. A and B merge iff c(S_A,S_B)>0.85 and
+    c(S_B,S_A)>0.85, the same-object test of the target branch. One-sided
+    containment (part on whole, small object on large) does not merge.
+
+    Returns:
+        Surviving entities and {merged_uid: surviving_uid}.
+    """
+    entities = list(entities)
+    surfaces = [e.pcd.voxel_down_sample(voxel_m) for e in entities]
+    merged = {}
+
+    def same_surface(a, b):
+        return (clouds_may_overlap(a, b) and float((nearest_distances(a, b) < .1).float().mean()) > .85
+                and float((nearest_distances(b, a) < .1).float().mean()) > .85)
+
+    changed = True
+    while changed:
+        changed = False
+        for i in range(len(entities)):
+            j = i + 1
+            while j < len(entities):
+                if same_surface(surfaces[i], surfaces[j]):
+                    merge_object_observation(entities[i], entities[j])
+                    merged[entities[j].uid] = entities[i].uid
+                    surfaces[i] = entities[i].pcd.voxel_down_sample(voxel_m)
+                    del entities[j], surfaces[j]
+                    changed = True
+                else:
+                    j += 1
+    for uid in merged:
+        while merged[uid] in merged:
+            merged[uid] = merged[merged[uid]]
+    return entities, merged
+
+
 def associate_object_entities(ref_entities, eval_entities, *, target, is_target_tag):
     """Associate observed clouds using the existing STRIVE overlap policy.
 

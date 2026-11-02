@@ -208,11 +208,12 @@ def build_capture_map(capture, output, *, classes, max_frames=None, voxel_m=0.05
         FileExistsError: Output already exists.
 
     Geometry uses p_map = T_map_camera [z K^-1(u,v,1), 1]. Instance overlap and
-    confidence aggregation reuse STRIVE's shared fusion implementation. Object
-    identities denote predictions; acceptance still requires live evidence.
+    confidence aggregation reuse STRIVE's shared fusion implementation; after all
+    frames, instances with mutual surface coverage >0.85 merge into one identity.
+    Object identities denote predictions; acceptance still requires live evidence.
     """
     from cv_utils.sam import MMDINO_Grounded_SAM
-    from mapping.object_fusion import associate_object_entities
+    from mapping.object_fusion import associate_object_entities, merge_duplicate_instances
     from mapping_utils.geometry import gpu_pointcloud_from_array, gpu_cluster_filter
     from mapping_utils.representation import ObjectNode
     import open3d as o3d
@@ -333,6 +334,7 @@ def build_capture_map(capture, output, *, classes, max_frames=None, voxel_m=0.05
                "elapsed_s": time.monotonic() - tick}
         frame_reports.append(row)
         print(json.dumps(row), flush=True)
+    duplicate_merges = {}
     if coordinator is not None:
         coordinator.resolve_pending()
         entities = list(coordinator.entities.values())
@@ -340,6 +342,10 @@ def build_capture_map(capture, output, *, classes, max_frames=None, voxel_m=0.05
             uid = coordinator.assignment[observation['observation_id']]
             observation['object_uids'] = [] if uid is None else [uid]
         write_json(destination / "association_trace.json", coordinator.trace())
+    else:
+        entities, duplicate_merges = merge_duplicate_instances(entities, voxel_m)
+        for observation in observations:
+            observation['object_uids'] = [duplicate_merges.get(uid, uid) for uid in observation['object_uids']]
     objects = tuple(PriorObject(uid=e.uid, label=e.tag, position_xyz=tuple(map(float, e.position)),
         exact=True, confidence=float(e.confidence), source="strive_rgbd_fusion",
         metadata={"identity_kind": "predicted_instance", "point_count": int(e.pcd.point.positions.shape[0])})
@@ -352,7 +358,8 @@ def build_capture_map(capture, output, *, classes, max_frames=None, voxel_m=0.05
                  observations=observations, viewpoints=viewpoints)
     receipt = {"association_policy": "legacy" if coordinator is None else coordinator.trace()["config"],
         "status": "complete", "frame_count": len(frames), "object_count": len(objects),
-        "observation_count": len(observations), "elapsed_s": time.monotonic() - started,
+        "observation_count": len(observations), "duplicate_instance_merges": duplicate_merges,
+        "elapsed_s": time.monotonic() - started,
         "provenance": provenance, "classes": classes, "voxel_m": voxel_m, "max_depth_m": max_depth_m,
         "confidence_policy": ("preserved_not_filtered" if min_depth_confidence is None
                               else f"fused_depth_requires_confidence_ge_{min_depth_confidence}"),

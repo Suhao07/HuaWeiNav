@@ -115,6 +115,19 @@ class CaptureFusionTest(unittest.TestCase):
         expected = (.7 ** 3 + .9 ** 3) / (.7 ** 2 + .9 ** 2)
         self.assertAlmostEqual(refs[0].confidence, expected)
 
+    def test_duplicate_surfaces_merge_but_contained_part_stays(self):
+        from mapping.object_fusion import merge_duplicate_instances
+        def plane(size, copies=1):
+            grid = np.arange(0., size, .05, dtype=np.float32)
+            points = np.array([[x, y, 0.] for x in grid for y in grid] * copies, dtype=np.float32)
+            cloud = gpu_pointcloud_from_array(points, np.full(points.shape, 100), o3d.core.Device("CPU:0"))
+            return ObjectNode(cloud, cloud, "table", .7, points.mean(axis=0), len(points), None, [0, 0, 1, 1])
+        # 重复观察叠加的点不影响表面覆盖；局部部件仅单向包含，不合并。
+        whole, duplicate, part = plane(1., copies=3), plane(1.), plane(.2)
+        survivors, merged = merge_duplicate_instances([whole, part, duplicate], .05)
+        self.assertEqual([e.uid for e in survivors], [whole.uid, part.uid])
+        self.assertEqual(merged, {duplicate.uid: whole.uid})
+
 
     def test_detector_without_target_only_queries_vocabulary(self):
         from cv_utils.sam import MMDINO_Grounded_SAM
