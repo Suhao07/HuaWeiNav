@@ -18,7 +18,8 @@ from contextlib import contextmanager
 from typing import Any, Iterable, Iterator, Optional, Sequence
 
 from .alignment import PriorMapAlignment
-from .contracts import BoundaryXY, PriorMapData, PriorObject, PriorRoom, PriorTopologyEdge, Vector2, Vector3
+from .contracts import (STRUCTURAL_LABELS, BoundaryXY, PriorMapData, PriorObject, PriorRoom,
+                        PriorTopologyEdge, Vector2, Vector3)
 
 _GridCell = tuple[int, int, int]
 _TEXTURE_COLOR_TOLERANCE_SQUARED = 20 * 20 * 3
@@ -607,7 +608,7 @@ def _extract_objects(
     seen_ids: dict[str, int] = {}
     for index, obj in enumerate(getattr(semantic_scene, "objects", ()) or ()):
         label = _category_name(obj, fallback=f"object_{index}")
-        if not include_structural and _norm(label) in _STRUCTURAL_LABELS:
+        if not include_structural and _norm(label) in STRUCTURAL_LABELS:
             continue
         aabb = _read_aabb(obj)
         center = _vector3_or_default(aabb.get("center"), (0.0, 0.0, 0.0))
@@ -1738,19 +1739,6 @@ def _safe_uid(value: Any) -> str:
 
 def _norm(value: Any) -> str:
     return str(value or "").strip().lower().replace("_", " ").replace("-", " ")
-
-
-_STRUCTURAL_LABELS = {
-    "ceiling",
-    "door",
-    "door frame",
-    "floor",
-    "railing",
-    "stairs",
-    "wall",
-    "window",
-    "window frame",
-}
 
 
 __all__ = [

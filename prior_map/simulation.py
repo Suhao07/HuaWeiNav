@@ -186,6 +186,11 @@ class PriorMapSimulationRuntime:
                 metadata={**base_map.metadata, "region_layout": {
                     "sha256": hashlib.sha256(layout_path.read_bytes()).hexdigest(),
                     "source": layout.metadata, "path": str(layout_path)}})
+        if config.prior_map_layout and Path(config.prior_map_path).is_dir():
+            from .query_binding import historical_region_observations
+            summaries = historical_region_observations(config.prior_map_path, base_map.rooms)
+            base_map = replace(base_map, metadata={**base_map.metadata,
+                "region_observation_summaries": summaries})
         alignment = _load_alignment(config.prior_map_alignment, base_map)
         selector = (
             PriorMapHighLevelSelector(vlm=config.vlm, scene_id=base_map.scene_id)

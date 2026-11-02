@@ -175,6 +175,12 @@ Return decision="select" with the chosen UID and its candidate type (room or
 frontier). When evidence is insufficient, return decision="uncertain" with
 empty selected_uid and selected_type. These are the two supported decisions.
 
+Region observed_from_region summaries describe predicted labels seen by cameras
+in that region, possibly across a doorway. Counts are distinct frames, not
+independent objects or calibrated confidence. Preserve conflicting labels as
+uncertain evidence. Use these observations to reason about room function; an
+unknown region label alone does not imply equal target relevance.
+
 Use the BEV for room-level exploration order and spatial context. Treat live
 object observations and candidate geometry as factual runtime evidence. Do not
 invent candidate UIDs, object instances, exact paths, relation edges, or

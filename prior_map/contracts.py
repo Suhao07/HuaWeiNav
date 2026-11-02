@@ -16,6 +16,12 @@ Vector2 = Tuple[float, float]
 Vector3 = Tuple[float, float, float]
 BoundaryXY = Tuple[Vector2, ...]
 
+# 建筑构件与场所类别：不是可搜索的物体，不进入对象先验与区域语义摘要。
+STRUCTURAL_LABELS = frozenset({
+    "ceiling", "door", "door frame", "floor", "railing", "stairs", "staircase",
+    "wall", "window", "window frame", "hallway", "entryway",
+})
+
 
 @dataclass(frozen=True)
 class PriorRoom:

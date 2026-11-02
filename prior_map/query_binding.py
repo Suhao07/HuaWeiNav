@@ -2,6 +2,7 @@
 import hashlib
 from pathlib import Path
 from .bundle import load_bundle
+from .contracts import STRUCTURAL_LABELS
 
 
 def query_execution_task(query, explicit_task=None):
@@ -155,3 +156,46 @@ def historical_object_evidence(directory, plan, result, output):
         text_context='Red box: historical detection hypothesis. Use for search ranking only; '
                      'current observations must establish identity, visibility and task completion.',
         metadata=metadata),)
+
+
+def historical_region_observations(directory, rooms):
+    """Summarize predicted labels observed from each uniquely located camera.
+
+    Args:
+        directory: Existing portable map bundle with observations.jsonl.
+        rooms: Canonical geometric regions in the bundle coordinate frame.
+    Returns:
+        Region summaries with distinct-frame label counts and evidence references.
+
+    N(r,c)=|{frame: camera(frame) in r and label c was detected}|, c ∉ STRUCTURAL_LABELS.
+    同帧重复框只计一次；冲突类别各自保留。观察来源表达可见语义，
+    不把自由空间多边形当成家具归属边界，也不宣称独立对象数量。
+    墙、地面、门窗等构件几乎每帧可见，不区分区域，只从摘要隐去；
+    frame_ids 仍计全部观察帧，地图与observations.jsonl保持不变。
+    """
+    import json
+    from collections import defaultdict
+    from matplotlib.path import Path as Polygon
+
+    path = Path(directory) / 'observations.jsonl'
+    content = path.read_bytes()
+    polygons = [(room.uid, Polygon(room.boundary_xy)) for room in rooms if len(room.boundary_xy) >= 3]
+    frames, label_frames, examples = defaultdict(set), defaultdict(lambda: defaultdict(set)), defaultdict(dict)
+    for line in content.decode('utf-8').splitlines():
+        observation = json.loads(line)
+        pose = observation['camera_to_map']
+        matches = [uid for uid, polygon in polygons if polygon.contains_point((pose[0][3], pose[1][3]))]
+        if len(matches) != 1:
+            continue
+        uid, frame, label = matches[0], observation['frame_id'], observation['detector_label']
+        frames[uid].add(frame)
+        if label in STRUCTURAL_LABELS:
+            continue
+        label_frames[uid][label].add(frame)
+        examples[uid].setdefault(label, observation['observation_id'])
+    return {uid: {'meaning': 'predicted_labels_observed_from_region',
+                  'frame_ids': sorted(frames[uid]),
+                  'label_frame_counts': {label: len(ids) for label, ids in sorted(counts.items())},
+                  'example_observation_ids': examples[uid],
+                  'observations_sha256': hashlib.sha256(content).hexdigest()}
+            for uid, counts in label_frames.items()}

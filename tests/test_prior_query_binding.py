@@ -152,3 +152,22 @@ def test_historical_reference_binds_raw_observation_and_keeps_pending_out(tmp_pa
     assert evidence[0].available
     result.object_rankings=[SimpleNamespace(object_uid='unassigned')]
     assert historical_object_evidence(root,plan,result,tmp_path/'unused')==()
+
+
+def test_region_observations_keep_conflicts_and_deduplicate_frames(tmp_path):
+    import json
+    from prior_map.contracts import PriorRoom
+    from prior_map.query_binding import historical_region_observations
+    room = PriorRoom(uid='region', boundary_xy=((-1., -1.), (1., -1.), (1., 1.), (-1., 1.)))
+    pose = [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 1], [0, 0, 0, 1]]
+    observations = [dict(frame_id=frame, detector_label=label, observation_id=str(i), camera_to_map=pose)
+                    for i, (frame, label) in enumerate([(0, 'monitor'), (0, 'monitor'), (0, 'mirror'), (1, 'mirror'),
+                                                        (1, 'wall'), (2, 'window'), (2, 'hallway')])]
+    (tmp_path/'observations.jsonl').write_text('\n'.join(json.dumps(o) for o in observations))
+    summary = historical_region_observations(tmp_path, (room,))['region']
+    # 构件与场所标签不进入摘要，但只看到构件的帧仍计入观察覆盖。
+    assert summary['label_frame_counts'] == {'mirror': 2, 'monitor': 1}
+    assert set(summary['example_observation_ids']) == {'mirror', 'monitor'}
+    assert summary['frame_ids'] == [0, 1, 2]
+    assert summary['example_observation_ids']['monitor'] == '0'
+    assert summary['meaning'] == 'predicted_labels_observed_from_region'
