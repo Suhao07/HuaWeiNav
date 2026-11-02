@@ -8,7 +8,7 @@ invoke live model clients.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .alignment import PriorMapAlignment
@@ -617,17 +617,8 @@ class PriorMapMemory:
         state = self.object_states[obj.uid]
         metadata = dict(obj.metadata)
         metadata["runtime_state"] = state.to_dict()
-        return PriorObject(
-            uid=obj.uid,
-            label=obj.label,
-            position_xyz=obj.position_xyz,
-            parent_room_uid=obj.parent_room_uid,
-            exact=obj.exact,
-            confidence=state.confidence if state.confidence_samples > 0 else obj.confidence,
-            source=obj.source,
-            aliases=obj.aliases,
-            metadata=metadata,
-        )
+        return replace(obj, metadata=metadata,
+                       confidence=state.confidence if state.confidence_samples > 0 else obj.confidence)
 
 
 def _ema_update(current: float, sample: float, sample_count: int, alpha: float) -> Tuple[float, int]:

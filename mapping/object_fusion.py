@@ -79,19 +79,24 @@ def merge_object_observation(argmax_entity, entity):
     for node in entity.nodes:
         if node not in argmax_entity.nodes:
             argmax_entity.nodes.append(node)
+    accumulate_label_vote(argmax_entity, entity.tag, entity.num_list[entity.tag], entity.conf_list[entity.tag])
 
+
+def accumulate_label_vote(argmax_entity, new_tag, n2, c2):
+    """Add n2 points voting new_tag with confidence c2, then re-decide the tag.
+
+    Votes weigh w=c^alpha n (alpha=2); confidences of one label average with
+    those weights. The tag keeps ori unless w_new >= w_ori.
+    """
     alpha = 2
     ori_tag = argmax_entity.tag
-    new_tag = entity.tag
 
     if new_tag not in argmax_entity.num_list.keys():
-        argmax_entity.num_list[new_tag] = entity.num_list[new_tag]
-        argmax_entity.conf_list[new_tag] = entity.conf_list[new_tag]
+        argmax_entity.num_list[new_tag] = n2
+        argmax_entity.conf_list[new_tag] = c2
     else:
         n1 = argmax_entity.num_list[new_tag]
-        n2 = entity.num_list[new_tag]
         c1 = argmax_entity.conf_list[new_tag]
-        c2 = entity.conf_list[new_tag]
         w1 = (c1**alpha * n1) / (c1**alpha * n1 + c2**alpha * n2)
         w2 = 1 - w1
         argmax_entity.conf_list[new_tag] = c1 * w1 + c2 * w2
@@ -122,13 +127,20 @@ def merge_object_observation(argmax_entity, entity):
             argmax_entity.confidence = c2
 
 
+def label_probabilities(entity):
+    """Category posterior from the fusion's own votes: p(l)=c_l^2 n_l / sum_k c_k^2 n_k."""
+    votes = {tag: float(entity.conf_list[tag]) ** 2 * float(n) for tag, n in entity.num_list.items()}
+    total = sum(votes.values())
+    return {tag: vote / total for tag, vote in votes.items()}
+
 def merge_duplicate_instances(entities, voxel_m):
     """Merge instances describing one surface; observation-to-instance fusion never re-merges.
 
     S=voxel(P, voxel_m) removes point multiplicity from repeated observations;
     c(X,Y)=mean_x 1[d(x,Y)<0.1]. A and B merge iff c(S_A,S_B)>0.85 and
     c(S_B,S_A)>0.85, the same-object test of the target branch. One-sided
-    containment (part on whole, small object on large) does not merge.
+    containment (part on whole, small object on large) does not merge. Every
+    label vote of the merged instance carries over, not only its current tag.
 
     Returns:
         Surviving entities and {merged_uid: surviving_uid}.
@@ -149,6 +161,9 @@ def merge_duplicate_instances(entities, voxel_m):
             while j < len(entities):
                 if same_surface(surfaces[i], surfaces[j]):
                     merge_object_observation(entities[i], entities[j])
+                    for tag, n in entities[j].num_list.items():
+                        if tag != entities[j].tag:
+                            accumulate_label_vote(entities[i], tag, n, entities[j].conf_list[tag])
                     merged[entities[j].uid] = entities[i].uid
                     surfaces[i] = entities[i].pcd.voxel_down_sample(voxel_m)
                     del entities[j], surfaces[j]

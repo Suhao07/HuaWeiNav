@@ -210,10 +210,11 @@ def build_capture_map(capture, output, *, classes, max_frames=None, voxel_m=0.05
     Geometry uses p_map = T_map_camera [z K^-1(u,v,1), 1]. Instance overlap and
     confidence aggregation reuse STRIVE's shared fusion implementation; after all
     frames, instances with mutual surface coverage >0.85 merge into one identity.
+    Each object keeps its vote posterior p(l) besides the decided label.
     Object identities denote predictions; acceptance still requires live evidence.
     """
     from cv_utils.sam import MMDINO_Grounded_SAM
-    from mapping.object_fusion import associate_object_entities, merge_duplicate_instances
+    from mapping.object_fusion import associate_object_entities, label_probabilities, merge_duplicate_instances
     from mapping_utils.geometry import gpu_pointcloud_from_array, gpu_cluster_filter
     from mapping_utils.representation import ObjectNode
     import open3d as o3d
@@ -348,7 +349,7 @@ def build_capture_map(capture, output, *, classes, max_frames=None, voxel_m=0.05
             observation['object_uids'] = [duplicate_merges.get(uid, uid) for uid in observation['object_uids']]
     objects = tuple(PriorObject(uid=e.uid, label=e.tag, position_xyz=tuple(map(float, e.position)),
         exact=True, confidence=float(e.confidence), source="strive_rgbd_fusion",
-        metadata={"identity_kind": "predicted_instance", "point_count": int(e.pcd.point.positions.shape[0])})
+        label_probabilities=label_probabilities(e), metadata={"identity_kind": "predicted_instance", "point_count": int(e.pcd.point.positions.shape[0])})
         for e in entities)
     prior = PriorMapData(scene_id=manifest["scene_id"], objects=objects,
         source_format="predicted_rgbd", frame_id="map_z_up",

@@ -203,3 +203,19 @@ def test_canonical_capture_prior_ranks_actual_habitat_side():
 def test_canonical_native_position_preserves_y_sign():
     from prior_map.query import _plane_xy_from_xyz
     assert _plane_xy_from_xyz((10., -10., 1.), 'map_z_up', 'position_xyz') == (10., -10.)
+
+
+def test_minority_label_votes_rank_by_category_posterior():
+    """p(monitor) is the concept relevance; a canonical roundtrip keeps it."""
+    def obj(uid, label, probabilities):
+        return PriorObject(uid=uid, label=label, exact=True, confidence=.5, label_probabilities=probabilities)
+    base = PriorMapData.from_dict(PriorMapData(scene_id='scene', objects=(
+        obj('screen', 'tv', {'tv': .62, 'monitor': .38}), obj('sign', 'monitor', {'monitor': .58, 'picture frame': .42}),
+        obj('fan', 'fan', {'fan': 1.}), PriorObject(uid='plain', label='monitor', exact=True))).to_dict())
+    plan = _plan_without_room_hint()
+    plan.targets = [TargetQuery(id='target', name='monitor', detector_terms=['monitor'], terminal=True)]
+    memory = PriorMapMemory(base_map=base, alignment=PriorMapAlignment.identity())
+    result = PriorMapQueryService().query(plan, SimpleNamespace(objects=(), rooms=(), frontiers=()), memory)
+    relevance = {p.object_uid: p.metadata['score_components']['concept_relevance'] for p in result.object_rankings}
+    assert relevance == {'plain': 1., 'sign': .58, 'screen': .38, 'fan': 0.}
+    assert [p.object_uid for p in result.object_rankings][:3] == ['plain', 'sign', 'screen']

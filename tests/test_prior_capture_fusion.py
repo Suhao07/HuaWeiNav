@@ -116,7 +116,7 @@ class CaptureFusionTest(unittest.TestCase):
         self.assertAlmostEqual(refs[0].confidence, expected)
 
     def test_duplicate_surfaces_merge_but_contained_part_stays(self):
-        from mapping.object_fusion import merge_duplicate_instances
+        from mapping.object_fusion import label_probabilities, merge_duplicate_instances
         def plane(size, copies=1):
             grid = np.arange(0., size, .05, dtype=np.float32)
             points = np.array([[x, y, 0.] for x in grid for y in grid] * copies, dtype=np.float32)
@@ -124,9 +124,15 @@ class CaptureFusionTest(unittest.TestCase):
             return ObjectNode(cloud, cloud, "table", .7, points.mean(axis=0), len(points), None, [0, 0, 1, 1])
         # 重复观察叠加的点不影响表面覆盖；局部部件仅单向包含，不合并。
         whole, duplicate, part = plane(1., copies=3), plane(1.), plane(.2)
+        duplicate.num_list["desk"], duplicate.conf_list["desk"] = 100, .5
         survivors, merged = merge_duplicate_instances([whole, part, duplicate], .05)
         self.assertEqual([e.uid for e in survivors], [whole.uid, part.uid])
         self.assertEqual(merged, {duplicate.uid: whole.uid})
+        # 被并实例的少数类别票随合并保留：p(l)∝c_l²n_l。
+        self.assertEqual(whole.num_list, {"table": 1600, "desk": 100})
+        p = label_probabilities(whole)
+        self.assertAlmostEqual(p["desk"], .25 * 100 / (.49 * 1600 + .25 * 100))
+        self.assertEqual(whole.tag, "table")
 
 
     def test_detector_without_target_only_queries_vocabulary(self):

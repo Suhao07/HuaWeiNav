@@ -312,8 +312,8 @@ class PriorMapQueryService:
         for obj in current_map.objects:
             state = memory.object_states[obj.uid]
             object_terms = {_normalize(obj.uid), _normalize(obj.label), *(_normalize(alias) for alias in obj.aliases)}
-            concept_relevance = _best_match_score(object_terms, target_terms)
-            support_relevance = _best_match_score(object_terms, support_terms)
+            concept_relevance = _concept_relevance(obj, target_terms)
+            support_relevance = _concept_relevance(obj, support_terms)
             room_relevance = max(0.0, room_scores.get(obj.parent_room_uid or "", 0.0))
             # 类别相同只支持类别先验；具体历史实例的在线支持来自身份对应。
             live_match = 1.0 if (_normalize(obj.uid) in live_uids or
@@ -398,8 +398,7 @@ class PriorMapQueryService:
         if not support_terms:
             return results
         for obj in current_map.objects:
-            object_terms = {_normalize(obj.uid), _normalize(obj.label), *(_normalize(alias) for alias in obj.aliases)}
-            relevance = _best_match_score(object_terms, support_terms)
+            relevance = _concept_relevance(obj, support_terms)
             if relevance <= 0.0:
                 continue
             score = self.weights.concept_relevance * relevance + 0.25 * max(0.0, object_scores.get(obj.uid, 0.0))
@@ -583,8 +582,7 @@ def _target_object_geometry(
     for obj in getattr(current_map, "objects", ()) or ():
         if obj.position_xyz is None:
             continue
-        object_terms = {_normalize(obj.uid), _normalize(obj.label), *(_normalize(alias) for alias in obj.aliases)}
-        relevance = _best_match_score(object_terms, target_terms)
+        relevance = _concept_relevance(obj, target_terms)
         if relevance <= 0.0:
             continue
         output[obj.uid] = {
@@ -1098,6 +1096,31 @@ def _concept_terms(value: Any) -> List[str]:
     if concept is not None:
         terms.extend(_concept_terms(concept))
     return terms
+
+
+def _concept_relevance(obj: Any, query_terms: Sequence[str]) -> float:
+    """Expected text match of an object's category against query terms.
+
+    r = max(m({uid}), sum_l p(l) m(T_l)), with T_label = {label} ∪ aliases and
+    T_l = {l} for other observed labels; m is ``_best_match_score``. Without an
+    observed posterior p = {label: 1}, so r equals the plain label/alias match.
+
+    Args:
+        obj: Prior object with label, aliases and optional label_probabilities.
+        query_terms: Normalized query terms.
+
+    Returns:
+        Score in ``[0, 1]``.
+    """
+
+    probabilities = obj.label_probabilities or {obj.label: 1.0}
+    expected = 0.0
+    for label, probability in probabilities.items():
+        terms = {_normalize(label)}
+        if label == obj.label:
+            terms.update(_normalize(alias) for alias in obj.aliases)
+        expected += probability * _best_match_score(terms, query_terms)
+    return max(_best_match_score({_normalize(obj.uid)}, query_terms), expected)
 
 
 def _best_match_score(candidate_terms: Iterable[str], query_terms: Iterable[str]) -> float:
