@@ -130,3 +130,25 @@ def test_current_observation_requires_raw_support_for_fused_label(tmp_path):
     (root/'observations.jsonl').write_text(''.join(json.dumps(r)+'\n' for r in records))
     with pytest.raises(ValueError,match='no concept-matching observation'):
         current_concept_observation(root,'chair')
+
+
+def test_historical_reference_binds_raw_observation_and_keeps_pending_out(tmp_path):
+    from types import SimpleNamespace
+    from prior_map.query_binding import historical_object_evidence
+    from instruction_adapter.contracts import InstructionPlan, TargetQuery
+    root=tmp_path/'map'
+    _source(root)
+    from prior_map.bundle import write_bundle
+    data=load_bundle(root)
+    write_bundle(root, map_id=data['manifest']['map_id'], revision=1,
+        prior_map=data['prior_map'], viewpoints=data['viewpoints'],
+        observations=[dict(o, bbox_xyxy=[0,0,3,3]) for o in data['observations']])
+    plan=InstructionPlan(raw_instruction='chair', targets=[TargetQuery(id='target', name='chair', detector_terms=['chair'])], valid=True)
+    result=SimpleNamespace(object_rankings=[SimpleNamespace(object_uid='instance')])
+    evidence=historical_object_evidence(root,plan,result,tmp_path/'evidence')
+    assert len(evidence)==1
+    assert evidence[0].metadata['object_uid']=='instance'
+    assert evidence[0].metadata['observation_id'] in {o['observation_id'] for o in load_bundle(root)['observations']}
+    assert evidence[0].available
+    result.object_rankings=[SimpleNamespace(object_uid='unassigned')]
+    assert historical_object_evidence(root,plan,result,tmp_path/'unused')==()

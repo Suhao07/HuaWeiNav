@@ -56,6 +56,7 @@ class PriorMapSimulationConfig:
     """
 
     enabled: bool = False
+    enable_object_evidence: bool = False
     prior_map_path: str = ""
     prior_map_layout: str = ""
     prior_map_source: str = "auto"
@@ -82,6 +83,7 @@ class PriorMapSimulationConfig:
         return cls(
             enabled=bool(getattr(args, "enable_prior_map", False)),
             prior_map_layout=str(getattr(args, "prior_map_layout", "") or ""),
+            enable_object_evidence=bool(getattr(args, "enable_prior_object_evidence", False)),
             prior_map_path=str(getattr(args, "prior_map_path", "") or ""),
             prior_map_source=str(getattr(args, "prior_map_source", "auto") or "auto"),
             prior_map_alignment=str(getattr(args, "prior_map_alignment", "identity") or "identity"),
@@ -119,10 +121,12 @@ class PriorMapSimulationRuntime:
         high_level_interval: int = 10,
         room_semantic_interval: int = 10,
         room_semantic_classifier: Optional[RoomSemanticClassifier] = None,
+        evidence_bundle: str | Path | None = None,
     ) -> None:
         """Create simulation runtime state."""
 
         self.base_map = base_map
+        self.evidence_bundle = evidence_bundle
         self.alignment = alignment
         self.memory = PriorMapMemory(base_map=base_map, alignment=alignment)
         self.artifact_root = Path(artifact_root)
@@ -168,6 +172,10 @@ class PriorMapSimulationRuntime:
             return None
         if not config.prior_map_path:
             raise ValueError("--enable_prior_map requires --prior_map_path")
+        if config.enable_object_evidence and not config.enable_high_level_vlm:
+            raise ValueError("Historical object evidence requires the high-level selector")
+        if config.enable_object_evidence and not Path(config.prior_map_path).is_dir():
+            raise ValueError("Historical object evidence requires a complete bundle directory")
         base_map = PriorMapLoader().load(config.prior_map_path, source_format=config.prior_map_source)
         if config.prior_map_layout:
             layout_path = Path(config.prior_map_layout)
@@ -191,6 +199,7 @@ class PriorMapSimulationRuntime:
         )
         return cls(
             base_map=base_map,
+            evidence_bundle=config.prior_map_path if config.enable_object_evidence else None,
             alignment=alignment,
             artifact_root=config.artifact_root,
             high_level_selector=selector,
@@ -499,7 +508,13 @@ class PriorMapSimulationRuntime:
                 source="deterministic",
             )
             return self.last_high_level_selection
+        evidence = ()
+        if self.evidence_bundle is not None:
+            from .query_binding import historical_object_evidence
+            evidence = historical_object_evidence(self.evidence_bundle, plan, result,
+                self.episode_dir / f"historical_evidence_{self.last_query_step:06d}")
         selection = self.high_level_selector.select(
+            evidence_contexts=evidence,
             instruction=str(getattr(plan, "raw_instruction", "") or ""),
             instruction_plan=plan,
             context=self.last_multimodal_context,

@@ -274,6 +274,30 @@ def test_dynamic_overlay_does_not_fabricate_runtime_position_without_alignment()
     assert overlay.trajectory_xy == ()
 
 
+def test_historical_image_is_sent_and_versions_selection_cache(tmp_path, monkeypatch):
+    monkeypatch.delenv('LLM_OFFLINE', raising=False)
+    image = tmp_path/'bev.png'
+    image.write_bytes(b'bev')
+    reference = tmp_path/'reference.png'
+    reference.write_bytes(b'historical')
+    context = PriorMapMultimodalContext(image_path=str(image))
+    evidence = PriorMapMultimodalContext(image_path=str(reference),
+        image_role='historical_object_reference', metadata={'observation_id':'o1'})
+    fake = _FakeClient(ParsedHighLevelSelection(selected_uid='f1', selected_type='frontier',
+        decision='select', confidence=.8), '{}')
+    selector = PriorMapHighLevelSelector(vlm='mock', client=fake, model='mock')
+    candidates = (HighLevelCandidate(uid='f1', candidate_type='frontier'),)
+    args = dict(instruction='find chair', instruction_plan={}, context=context, candidates=candidates)
+    result = selector.select(**args, evidence_contexts=(evidence,))
+    content = fake.completions.messages[1]['content']
+    assert len(content) == 3
+    assert json.loads(content[0]['text'])['historical_evidence'][0]['metadata']['observation_id']=='o1'
+    assert result.request_metadata['historical_evidence'][0]['image_sha256']==evidence.image_sha256
+    assert selector.select(**args, evidence_contexts=(evidence,)).source == 'cache'
+    changed = PriorMapMultimodalContext(image_path=str(reference), metadata={'observation_id':'o2'})
+    assert selector.select(**args, evidence_contexts=(changed,)).source != 'cache'
+
+
 def test_model_bev_png_contains_readable_identity_labels():
     """真实PNG必须带文字，SVG或markers存在标签不能替代模型输入。"""
     from io import BytesIO

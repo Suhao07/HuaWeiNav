@@ -113,3 +113,45 @@ def current_concept_observation(directory, concept):
         raise ValueError('Current candidate has no concept-matching observation')
     best = sorted(candidates, key=lambda row: (-row[0], -row[1], row[2]))[0]
     return dict(candidate_uid=uid, observation_id=best[2])
+
+
+def historical_object_evidence(directory, plan, result, output):
+    """Build one historical reference for the top ranked object's matching observation.
+
+    Reuse query vocabulary matching, then detector confidence and observation ID.
+    The annotated image identifies the raw detection, not the fused object's whole
+    extent. Historical evidence can guide search; current verification owns STOP.
+    """
+    from PIL import Image, ImageDraw
+    from .query import _extract_target_terms, _normalize, _best_match_score
+    from .multimodal import PriorMapMultimodalContext
+    root = Path(directory)
+    bundle = load_bundle(root)
+    if not result.object_rankings:
+        return ()
+    uid = result.object_rankings[0].object_uid
+    terms = [_normalize(term) for term in _extract_target_terms(plan)]
+    matches = []
+    for obs in bundle['observations']:
+        relevance = _best_match_score([_normalize(obs['detector_label'])], terms)
+        if uid in obs['object_uids'] and relevance > 0:
+            matches.append((relevance, obs['detector_score'], obs['observation_id'], obs))
+    if not matches:
+        return ()
+    obs = sorted(matches, key=lambda row: (-row[0], -row[1], row[2]))[0][3]
+    image = Image.open(root / obs['image_ref']).convert('RGB')
+    ImageDraw.Draw(image).rectangle(obs['bbox_xyxy'], outline='red', width=2)
+    output = Path(output)
+    output.mkdir(parents=True, exist_ok=True)
+    path = output / 'historical-object.png'
+    image.save(path)
+    metadata = dict(map_id=bundle['manifest']['map_id'],
+        map_revision=bundle['manifest']['map_revision'], object_uid=uid,
+        observation_id=obs['observation_id'], detector_label=obs['detector_label'],
+        bbox_xyxy=obs['bbox_xyxy'], mask_sha256=hashlib.sha256((root/obs['mask_ref']).read_bytes()).hexdigest(),
+        prior_map_sha256=hashlib.sha256((root/'prior_map.json').read_bytes()).hexdigest())
+    return (PriorMapMultimodalContext(image_path=str(path.resolve()),
+        image_role='historical_object_reference', map_frame_id=bundle['prior_map'].frame_id,
+        text_context='Red box: historical detection hypothesis. Use for search ranking only; '
+                     'current observations must establish identity, visibility and task completion.',
+        metadata=metadata),)

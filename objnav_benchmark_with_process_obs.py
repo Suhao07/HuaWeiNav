@@ -133,6 +133,8 @@ def get_args():
         action="store_true",
         help="Send dynamic prior-map BEV to the optional high-level room selector.",
     )
+    parser.add_argument("--enable_prior_object_evidence", action="store_true",
+                        help="Add a bound historical detection image to prior-map high-level selection.")
     parser.add_argument("--prior_map_vlm_interval", type=int, default=10)
     parser.add_argument("--room_semantic_interval", type=int, default=10)
     parser.add_argument("--enable_room_semantics", default=False, action="store_true")
