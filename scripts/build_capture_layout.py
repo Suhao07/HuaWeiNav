@@ -24,12 +24,15 @@ def main():
     parser.add_argument("--min_room_area_m2", type=float, default=0.25)
     parser.add_argument("--stride", type=int, default=4)
     parser.add_argument("--max_depth_m", type=float, default=6.0)
+    parser.add_argument("--min_depth_confidence", type=int, choices=(0, 1, 2),
+                        help="Sensor confidence required for floor and obstacle points")
     args = parser.parse_args()
     config = HM3DGroundTruthBuildConfig(topdown_resolution=args.topdown_resolution,
         floor_height_tolerance=args.floor_height_tolerance, min_room_area_m2=args.min_room_area_m2)
     cells, floor_height, diagnostics = capture_free_cells(args.capture,
         resolution=args.topdown_resolution, robot_height_m=args.robot_height,
-        robot_radius_m=args.robot_radius, stride=args.stride, max_depth_m=args.max_depth_m)
+        robot_radius_m=args.robot_radius, stride=args.stride, max_depth_m=args.max_depth_m,
+        min_depth_confidence=args.min_depth_confidence)
     scene_id = json.loads((Path(args.capture) / "manifest.json").read_text())["scene_id"]
     result = build_free_cell_region_layout(cells, scene_id, floor_height=floor_height,
         clearance_m=args.region_clearance, config=config, source="rgbd_free_space",

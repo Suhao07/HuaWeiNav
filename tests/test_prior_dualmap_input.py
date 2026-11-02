@@ -24,6 +24,16 @@ def test_dualmap_clip_endpoints_follow_shared_metric_support(tmp_path):
     np.testing.assert_array_equal(np.load(tmp_path / 'depth/000000.npy'), depth)
 
 
+def test_confidence_threshold_is_explicit_metric_support():
+    from prior_map.observations import metric_depth_validity
+    depth = np.array([[0., 1., 1., 1.]], dtype=np.float32)
+    confidence = np.array([[2, 0, 1, 2]], dtype=np.uint8)
+    np.testing.assert_array_equal(metric_depth_validity(depth, confidence=confidence), [[0, 1, 1, 1]])
+    np.testing.assert_array_equal(metric_depth_validity(depth, None, confidence, 2), [[0, 0, 0, 1]])
+    with pytest.raises(ValueError, match='confidence map'):
+        metric_depth_validity(depth, min_confidence=1)
+
+
 def test_dualmap_input_preserves_rgb_depth_and_world_pose(tmp_path):
     rgb = np.zeros((2, 3, 3), dtype=np.uint8)
     rgb[..., 0] = 251

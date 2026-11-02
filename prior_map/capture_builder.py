@@ -14,7 +14,8 @@ from .observations import (COORDINATES, SCHEMA_VERSION, backproject, camera_to_b
                            read_records, write_json, metric_depth_validity)
 
 
-def capture_free_cells(capture, *, resolution, robot_height_m, robot_radius_m, stride, max_depth_m):
+def capture_free_cells(capture, *, resolution, robot_height_m, robot_radius_m, stride, max_depth_m,
+                       min_depth_confidence=None):
     r"""Derive traversable floor cells from a portable RGB-D capture.
 
     Args:
@@ -24,6 +25,8 @@ def capture_free_cells(capture, *, resolution, robot_height_m, robot_radius_m, s
         robot_radius_m: Footprint radius used to erode free floor.
         stride: Pixel stride for back-projection.
         max_depth_m: Maximum depth used as a geometric measurement.
+        min_depth_confidence: Sensor confidence required for floor and obstacle
+            points; None keeps every metric depth.
 
     Returns:
         ``(cells, floor_height, diagnostics)`` with integer map_z_up cells.
@@ -59,7 +62,10 @@ def capture_free_cells(capture, *, resolution, robot_height_m, robot_radius_m, s
     clouds, below_camera, camera_xy = [], [], []
     for frame in read_records(root / "frames.jsonl"):
         depth = load_depth(root / frame["depth_path"])
-        valid = metric_depth_validity(depth, profile) & (depth <= max_depth_m)
+        confidence = (None if frame.get("confidence_ref") is None
+                      else np.asarray(Image.open(root / frame["confidence_ref"])))
+        valid = (metric_depth_validity(depth, profile, confidence, min_depth_confidence)
+                 & (depth <= max_depth_m))
         pose = np.asarray(frame["camera_to_map"])
         points = backproject(np.where(valid, depth, 0), np.asarray(frame["intrinsics"]), pose,
                              stride=stride).astype(np.float32)
@@ -101,12 +107,14 @@ def capture_free_cells(capture, *, resolution, robot_height_m, robot_radius_m, s
                    "robot_cell_count": int(eroded.sum()), "reachable_cell_count": len(cells),
                    "robot_height_m": robot_height_m,
                    "robot_radius_m": robot_radius_m, "stride": stride, "max_depth_m": max_depth_m,
+                   "min_depth_confidence": min_depth_confidence,
                    "capture_manifest_sha256": hashlib.sha256((root / "manifest.json").read_bytes()).hexdigest()}
     return cells, floor_height, diagnostics
 
 
 def resolve_capture_viewpoints(bundle_directory, capture, *, resolution, robot_height_m, robot_radius_m,
-                               stride, max_depth_m, object_uid=None, observation_ids=None):
+                               stride, max_depth_m, object_uid=None, observation_ids=None,
+                               min_depth_confidence=None):
     r"""Place historical camera poses on the robot-traversable floor of their capture.
 
     Args:
@@ -119,6 +127,7 @@ def resolve_capture_viewpoints(bundle_directory, capture, *, resolution, robot_h
         max_depth_m: Maximum depth used as a geometric measurement.
         object_uid: Optional historical instance restricting the evidence.
         observation_ids: Optional query-specific subset of that evidence.
+        min_depth_confidence: Free-space confidence threshold; must match the layout.
 
     Returns:
         Candidate report with admitted navigation viewpoints and rejections.
@@ -146,7 +155,7 @@ def resolve_capture_viewpoints(bundle_directory, capture, *, resolution, robot_h
         raise ValueError("Bundle was built from a different capture")
     cells, floor_height, free_space = capture_free_cells(
         capture, resolution=resolution, robot_height_m=robot_height_m, robot_radius_m=robot_radius_m,
-        stride=stride, max_depth_m=max_depth_m)
+        stride=stride, max_depth_m=max_depth_m, min_depth_confidence=min_depth_confidence)
     profile = {"source": "declared_robot_dimensions", "radius_m": robot_radius_m, "height_m": robot_height_m}
     viewpoints, rejected = [], []
     for historical in bundle["viewpoints"]:
@@ -175,7 +184,8 @@ def resolve_capture_viewpoints(bundle_directory, capture, *, resolution, robot_h
 
 
 def build_capture_map(capture, output, *, classes, max_frames=None, voxel_m=0.05,
-                      max_depth_m=6.0, device="cuda:0", association_config=None):
+                      max_depth_m=6.0, device="cuda:0", association_config=None,
+                      min_depth_confidence=None):
     """Detect, fuse and export observed instances with their original evidence.
 
     Args:
@@ -187,6 +197,8 @@ def build_capture_map(capture, output, *, classes, max_frames=None, voxel_m=0.05
         max_depth_m: Maximum depth retained in each masked cloud, in metres.
         device: Torch device used by the maintained detector stack.
         association_config: Opt-in deferred association configuration; None keeps legacy fusion.
+        min_depth_confidence: Sensor confidence level required for fused depth;
+            None keeps every metric depth. Raw depth and confidence stay in evidence.
 
     Returns:
         Build receipt with counts, timings and predicted label distribution.
@@ -245,14 +257,18 @@ def build_capture_map(capture, output, *, classes, max_frames=None, voxel_m=0.05
         def load_observation(oid):
             return load_fusion_observation(destination, observation_records[oid],
                 voxel_m=voxel_m, max_depth_m=max_depth_m,
-                profile=manifest.get("capture_profile"), device=device.upper(), uid=f"{map_id}:{oid}")
+                profile=manifest.get("capture_profile"), device=device.upper(), uid=f"{map_id}:{oid}",
+                min_confidence=min_depth_confidence)
         coordinator = PriorAssociation(load_observation, association_config)
     for frame in frames:
         tick = time.monotonic()
         rgb = np.asarray(Image.open(root / frame["rgb_path"]).convert("RGB"))
         depth = np.load(root / frame["depth_path"], allow_pickle=False)
         profile = manifest.get("capture_profile")
-        valid_depth = metric_depth_validity(depth, profile) & (depth <= max_depth_m)
+        confidence = (None if frame.get("confidence_ref") is None
+                      else np.asarray(Image.open(root / frame["confidence_ref"])))
+        valid_depth = (metric_depth_validity(depth, profile, confidence, min_depth_confidence)
+                       & (depth <= max_depth_m))
         intrinsic = np.asarray(frame["intrinsics"])
         pose = np.asarray(frame["camera_to_map"])
         boxes, scores, labels, masks, _, _, _ = detector.segment(rgb, target=None)
@@ -337,7 +353,9 @@ def build_capture_map(capture, output, *, classes, max_frames=None, voxel_m=0.05
     receipt = {"association_policy": "legacy" if coordinator is None else coordinator.trace()["config"],
         "status": "complete", "frame_count": len(frames), "object_count": len(objects),
         "observation_count": len(observations), "elapsed_s": time.monotonic() - started,
-        "provenance": provenance, "confidence_policy": "preserved_not_filtered", "classes": classes, "voxel_m": voxel_m, "max_depth_m": max_depth_m,
+        "provenance": provenance, "classes": classes, "voxel_m": voxel_m, "max_depth_m": max_depth_m,
+        "confidence_policy": ("preserved_not_filtered" if min_depth_confidence is None
+                              else f"fused_depth_requires_confidence_ge_{min_depth_confidence}"),
         "depth_policy": "positive_within_fusion_range_excluding_recorded_sensor_clip_endpoints",
         "capture_manifest_sha256": hashlib.sha256((root / "manifest.json").read_bytes()).hexdigest(),
         "capture_manifest": manifest, "frames": frame_reports,

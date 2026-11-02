@@ -184,9 +184,10 @@ def test_geometry_regions_keep_corridor_and_unknown_semantics():
     assert all(-2.05 - 1e-10 <= y <= .05 + 1e-10 for room in rooms for _, y in room.boundary_xy)  # Cell boundary extends half a pixel.
 
 
-def _write_box_capture(root):
+def _write_box_capture(root, box_confidence=None):
     """Write three downward views at x=0, 0.5 and 3 m; boxes sit under x=0 and x=3 m."""
     import numpy as np
+    from PIL import Image
     from prior_map.observations import COORDINATES, SCHEMA_VERSION, write_frame, write_json
 
     write_json(root / "manifest.json", {"coordinates": COORDINATES, "schema_version": SCHEMA_VERSION,
@@ -198,7 +199,24 @@ def _write_box_capture(root):
     for index, (x, depth) in enumerate([(0., box), (.5, np.ones_like(box)), (3., box)]):
         pose = np.diag([1., -1., -1., 1.])
         pose[:3, 3] = x, 0., 1.
-        write_frame(root, index, np.zeros((64, 64, 3), np.uint8), depth, k, pose)
+        metadata = {}
+        if box_confidence is not None:
+            (root / "confidence").mkdir(exist_ok=True)
+            metadata["confidence_ref"] = f"confidence/{index:06d}.png"
+            Image.fromarray(np.where(depth < 1, box_confidence, 2).astype(np.uint8)).save(
+                root / metadata["confidence_ref"])
+        write_frame(root, index, np.zeros((64, 64, 3), np.uint8), depth, k, pose, **metadata)
+
+
+def test_low_confidence_depth_neither_blocks_nor_invents_floor(tmp_path):
+    from prior_map.capture_builder import capture_free_cells
+
+    _write_box_capture(tmp_path, box_confidence=0)
+    settings = dict(resolution=.05, robot_height_m=.88, robot_radius_m=0., stride=1, max_depth_m=6.)
+    _, _, kept = capture_free_cells(tmp_path, **settings)
+    free, _, filtered = capture_free_cells(tmp_path, min_depth_confidence=1, **settings)
+    assert kept["blocked_cell_count"] > 0 and filtered["blocked_cell_count"] == 0
+    assert (0, 0) not in free and filtered["min_depth_confidence"] == 1
 
 
 def test_capture_free_cells_block_obstacles_and_erode_footprint(tmp_path):

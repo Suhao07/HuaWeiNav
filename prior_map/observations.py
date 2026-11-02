@@ -114,20 +114,25 @@ def camera_to_base_pose(camera_to_map, camera_height_m):
     return base
 
 
-def metric_depth_validity(depth, capture_profile=None):
+def metric_depth_validity(depth, capture_profile=None, confidence=None, min_confidence=None):
     """Mark depths that represent measured surfaces rather than clipped bounds.
 
     For D=clip(Z, z_min, z_max), metric support requires z_min < D < z_max.
     Raw captures without a clipping profile retain their positive depth values.
+    With min_confidence c, a sensor confidence map C additionally requires C >= c.
     """
     valid = depth > 0
     if capture_profile is not None:
         valid &= (depth > capture_profile["depth_min_m"]) & (depth < capture_profile["depth_max_m"])
+    if min_confidence is not None:
+        if confidence is None:
+            raise ValueError("Depth confidence filtering requires a confidence map for every frame")
+        valid &= np.asarray(confidence) >= min_confidence
     return valid
 
 
 def load_fusion_observation(root, record, *, voxel_m, max_depth_m, profile=None,
-                            device="CPU:0", uid=None):
+                            device="CPU:0", uid=None, min_confidence=None):
     """Reconstruct a fresh filtered observation using the capture-builder geometry.
 
     RGB-D and masks remain the durable source for local instance reconstruction.
@@ -140,7 +145,9 @@ def load_fusion_observation(root, record, *, voxel_m, max_depth_m, profile=None,
     root = Path(root)
     depth = load_depth(root / record['depth_ref'])
     mask = np.asarray(Image.open(root / record['mask_ref'])) > 0
-    valid = metric_depth_validity(depth, profile) & (depth <= max_depth_m)
+    confidence = (None if record.get('confidence_ref') is None
+                  else np.asarray(Image.open(root / record['confidence_ref'])))
+    valid = metric_depth_validity(depth, profile, confidence, min_confidence) & (depth <= max_depth_m)
     points = backproject(np.where(mask & valid, depth, 0),
                         np.asarray(record['intrinsics']), np.asarray(record['camera_to_map']))
     cloud = gpu_pointcloud_from_array(points, np.full(points.shape, 160), o3d.core.Device(device))

@@ -22,6 +22,8 @@ def main():
     parser.add_argument("--max-depth-m", type=float, default=6.0)
     parser.add_argument("--deferred-association", action="store_true",
                         help="Opt into experimental observation-owned fusion")
+    parser.add_argument("--min-depth-confidence", type=int, choices=(0, 1, 2),
+                        help="Fuse only depth whose sensor confidence reaches this level")
     args = parser.parse_args()
     association_config = None
     if args.deferred_association:
@@ -32,7 +34,8 @@ def main():
                [line.strip() for line in args.classes_file.read_text(encoding="utf-8").splitlines()
                 if line.strip()])
     result = build_capture_map(args.capture, args.output, classes=classes,
-        max_frames=args.max_frames, voxel_m=args.voxel_m, max_depth_m=args.max_depth_m, association_config=association_config)
+        max_frames=args.max_frames, voxel_m=args.voxel_m, max_depth_m=args.max_depth_m, association_config=association_config,
+        min_depth_confidence=args.min_depth_confidence)
     print(json.dumps({k: v for k, v in result.items() if k not in ("frames", "capture_manifest")}, indent=2))
 
 
