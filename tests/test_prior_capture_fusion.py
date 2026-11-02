@@ -59,7 +59,9 @@ class CaptureFusionTest(unittest.TestCase):
     def test_viewpoint_visibility_uses_actual_image_dimensions(self):
         from unittest.mock import patch
         from planning.viewpoint_policy import build_check_again_viewpoints
-        projected = np.array([[80, 240, 400], [60, 180, 120], [1, 1, 1]])
+        # 8 个实例点都在光轴前方，其中 6 个落入 320x240 画面。
+        projected = np.array([[80, 240, 80, 240, 80, 240, 400, 400],
+                              [60, 180, 180, 60, 60, 180, 120, 120], [1] * 8])
         with patch('planning.viewpoint_policy.project_to_camera', return_value=projected):
             proposals, _ = build_check_again_viewpoints(object_node=_entity(),
                 camera_intrinsic=np.eye(3), mapper_initial_position=np.zeros(3),
@@ -67,7 +69,7 @@ class CaptureFusionTest(unittest.TestCase):
                 success_distance=1., stop_criterion=.7, image_width=320, image_height=240)
         assert proposals
         for proposal in proposals:
-            self.assertAlmostEqual(proposal['visible_ratio'], 2/3)
+            self.assertAlmostEqual(proposal['visible_ratio'], 6/8)
             self.assertAlmostEqual(proposal['center_score'], 1.)
 
     def test_task_free_perceiver_keeps_vocabulary_and_empty_target_group(self):

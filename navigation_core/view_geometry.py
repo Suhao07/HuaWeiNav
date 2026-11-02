@@ -83,8 +83,37 @@ def rotation_towards(stop_pos_xy: np.ndarray, target_pos_xy: np.ndarray, *,
         ],
         dtype=float,
     )
+    return yaw_rotation @ pitch_rotation(pitch)
+
+
+def pitch_rotation(pitch: float) -> np.ndarray:
+    r"""Camera-local rotation about the right axis; positive pitch looks up.
+
+    .. math::
+        R_x(\phi) = \begin{bmatrix}1&0&0\\0&\cos\phi&-\sin\phi\\0&\sin\phi&\cos\phi\end{bmatrix}
+
+    右乘作用于相机局部系，与 Habitat LOOK_UP/LOOK_DOWN 的传感器旋转一致。
+
+    Args:
+        pitch: Rotation angle in radians.
+    Returns:
+        The 3x3 rotation matrix.
+    """
     c, s = np.cos(pitch), np.sin(pitch)
-    return yaw_rotation @ np.array([[1., 0., 0.], [0., c, -s], [0., s, c]])
+    return np.array([[1., 0., 0.], [0., c, -s], [0., s, c]])
+
+
+def camera_pitch(rotation: np.ndarray) -> float:
+    r"""Return the optical-axis elevation of a camera-to-mapper rotation.
+
+    光轴 f = -R_{:,2}，建图系第三轴竖直向上：\phi = \arcsin(f_z) = \arcsin(-R_{2,2})。
+
+    Args:
+        rotation: Camera-to-mapper rotation.
+    Returns:
+        Pitch in radians; positive above the horizon.
+    """
+    return float(np.arcsin(np.clip(-rotation[2, 2], -1.0, 1.0)))
 
 
 def score_projection(

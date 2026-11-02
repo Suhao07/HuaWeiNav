@@ -13,6 +13,7 @@ from backends.habitat.query import select_observed_candidate
 from harness.runtime import AgentRuntime
 from motion.contracts import MotionGoalMode, NavigationIntent
 from navigation.planner_loop import run_observation_mapping_cycle
+from navigation_core.view_geometry import camera_pitch
 from planning.exploration_policy import select_exploration_node
 from scene.contracts import Pose3D
 
@@ -227,7 +228,7 @@ class GuidedNavigation:
 
         其中 x 为执行位置，f = -R_{:,2} 为相机光轴，o 为目标中心。
         """
-        from navigation.goal_approach_controller import rotate_toward_object_for_recheck
+        from navigation.goal_approach_controller import rotate_toward_object_for_recheck, tilt_camera
         agent = self.agent
         agent.need_check_again = False
         if not rotate_toward_object_for_recheck(agent):
@@ -242,12 +243,16 @@ class GuidedNavigation:
                     "scored_position": [float(x) for x in scored_position],
                     "execution_position": position.tolist(),
                     "position_offset_m": float(np.linalg.norm(position[:2] - np.asarray(scored_position)[:2])),
-                    "heading_offset_deg": float(heading_offset)}
+                    "heading_offset_deg": float(heading_offset),
+                    "pitch_deg": float(np.degrees(camera_pitch(np.asarray(agent.mapper.current_rotation))))}
         complete = agent.final_instruction_check(evidence_override=agent.last_check_again_evidence)
         self.record("verified", candidate_uid=agent.object_final.uid,
                     decision=agent.final_stop_decision, task_complete=complete, pose_gap=pose_gap)
         if complete:
             return "verified_finish"
+        # 复核结束后恢复水平相机，后续移动与建图沿用水平观测。
+        if not tilt_camera(agent, 0.0):
+            return "episode_limit"
         if agent.need_check_again or agent._continue_better_view_control():
             views = self.tools.publish_object_viewpoints(agent.object_final.uid)
             key = (agent.task.spec.revision, agent.object_final.uid)

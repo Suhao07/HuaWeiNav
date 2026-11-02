@@ -74,9 +74,17 @@ def test_distance_ranking_keeps_stable_tie_break(monkeypatch):
 def test_directed_verification_reuses_feedback_without_panorama(monkeypatch):
     import backends.habitat.guided_runtime as runtime
     import sys
+    import numpy as np
+    tilts = []
     monkeypatch.setitem(sys.modules, "navigation.goal_approach_controller",
-                        NS(rotate_toward_object_for_recheck=lambda agent: True))
-    agent = NS(episode_steps=20, task=NS(spec=NS(revision=1)), object_final=NS(uid="obj"), need_check_again=False,
+                        NS(rotate_toward_object_for_recheck=lambda agent: True,
+                           tilt_camera=lambda agent, pitch: tilts.append(pitch) or True))
+    # 光轴 f=-R[:,2] 指向 +x；目标中心在 (2,2)，残余偏角 45°。
+    camera = np.array([[0, 0, -1], [-1, 0, 0], [0, 1, 0]], dtype=float)
+    agent = NS(episode_steps=20, task=NS(spec=NS(revision=1)), need_check_again=False,
+               object_final=NS(uid="obj", position=np.array([2., 2., 1.])),
+               mapper=NS(current_position=np.zeros(3), current_rotation=camera),
+               _observation_identity=lambda uid: {"observation_id": "0:20"},
                last_check_again_evidence={"frame": 20}, final_stop_decision="need_better_view",
                check_again=Mock(), check_again_postion=(1, 2, 0))
     def verify(**kwargs):
@@ -90,8 +98,14 @@ def test_directed_verification_reuses_feedback_without_panorama(monkeypatch):
     guided.view_attempted = lambda *args: False
     guided.tools = NS(publish_object_viewpoints=lambda uid: [NS(
         pose=NS(position=(1, 2, 0)), metadata={"recommended": True})])
-    assert guided.verify() == "moving"
+    assert guided.verify((1, 2, 0)) == "moving"
+    # 未完成的复核在下一次移动前恢复水平相机。
+    assert tilts == [0.0]
     guided.submit.assert_called_once_with((1, 2, 0), candidate_uid="obj", source="baseline_view_feedback")
+    gap = guided.record.call_args.kwargs["pose_gap"]
+    assert gap["observation_id"] == "0:20" and gap["scored_position"] == [1, 2, 0]
+    assert gap["position_offset_m"] == pytest.approx(np.sqrt(5))
+    assert gap["heading_offset_deg"] == pytest.approx(45)
 
 
 @pytest.mark.parametrize("kind", ["frontier", "object", "blocked"])
@@ -112,7 +126,7 @@ def test_terminal_event_dispatches_observation_or_verification_once(monkeypatch,
     metadata = {"node_index": 0} if kind != "object" else {}
     status = NavigationStatusCode.BLOCKED if kind == "blocked" else NavigationStatusCode.REACHED
     feedback = NS(tracking_active=False, status=NavigationStatus(status),
-                  intent=NS(metadata=metadata, target_object_uid="obj"))
+                  intent=NS(metadata=metadata, target_object_uid="obj", goal_pose=NS(position=(1, 2, 0))))
     motion = NS(active_request_id="goal")
     def poll():
         motion.active_request_id = None
@@ -120,8 +134,8 @@ def test_terminal_event_dispatches_observation_or_verification_once(monkeypatch,
     motion.poll_active = poll
     def construct(agent, directory, max_calls):
         Path(directory).mkdir(parents=True)
-        def verify():
-            events.append("verify")
+        def verify(scored_position):
+            events.append(("verify", scored_position))
             agent.task.progress.completed = True
             return "verified_finish"
         def recover(reason, episode_idx):
@@ -137,7 +151,7 @@ def test_terminal_event_dispatches_observation_or_verification_once(monkeypatch,
     if kind == "frontier":
         assert events == ["observe", "advance", "observe", "visited"]
     elif kind == "object":
-        assert events == ["observe", "advance", "verify", "stop"]
+        assert events == ["observe", "advance", ("verify", (1, 2, 0)), "stop"]
     else:
         assert events == ["observe", "advance", "recover"]
 
@@ -219,12 +233,17 @@ def test_recovery_selects_untried_approach_once_and_returns_to_driver(monkeypatc
 
 def test_feedback_retains_initial_motion_attempt_in_view_history(monkeypatch):
     import sys
+    import numpy as np
     from instruction_adapter.view_control import ViewControlState
+    tilts = []
     monkeypatch.setitem(sys.modules, "navigation.goal_approach_controller",
-                        NS(rotate_toward_object_for_recheck=lambda agent: True))
+                        NS(rotate_toward_object_for_recheck=lambda agent: True,
+                           tilt_camera=lambda agent, pitch: tilts.append(pitch) or True))
     state = ViewControlState()
     state.start("u", {}, {})
-    agent = NS(episode_steps=20, task=NS(spec=NS(revision=1)), object_final=NS(uid="u"),
+    agent = NS(episode_steps=20, task=NS(spec=NS(revision=1)), object_final=NS(uid="u", position=np.ones(3)),
+               mapper=NS(current_position=np.zeros(3), current_rotation=np.eye(3)[:, ::-1]),
+               _observation_identity=lambda uid: {"observation_id": "0:20"},
                check_again=Mock(), last_check_again_evidence={}, final_stop_decision="need_better_view",
                view_control_state=state, _continue_better_view_control=lambda: True,
                final_instruction_check=Mock(return_value=False))
@@ -234,7 +253,7 @@ def test_feedback_retains_initial_motion_attempt_in_view_history(monkeypatch):
     agent.planner = NS(_goal_radius=.25)
     guided.tools = NS(objects={"u": NS(rgb=None,bbox=None)}, publish_object_viewpoints=lambda uid: [NS(
         pose=NS(position=(1,0,0)), metadata={"recommended": True})])
-    assert guided.verify() == "recovery"
+    assert guided.verify((1, 0, 0)) == "recovery"
     guided.submit.assert_not_called()
     guided.defer_candidate.assert_called_once_with("view_options_exhausted")
 

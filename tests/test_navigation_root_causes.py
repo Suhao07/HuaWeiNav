@@ -225,6 +225,8 @@ def test_check_again_scores_at_camera_height_and_approach_is_best_feasible_view(
     monkeypatch.setitem(sys.modules, "loguru", NS(logger=NS(info=lambda *a, **k: None)))
     monkeypatch.setitem(sys.modules, "habitat_sim", NS(ShortestPath=lambda: NS(points=[])))
     monkeypatch.setitem(sys.modules, "planning.viewpoint_policy", NS(build_check_again_viewpoints=build))
+    monkeypatch.setitem(sys.modules, "navigation.goal_approach_controller",
+                        NS(recheck_pitches=lambda agent: (0., -.5)))
     monkeypatch.delitem(sys.modules, "navigation.view_verification_controller", raising=False)
     controller = importlib.import_module("navigation.view_verification_controller")
     monkeypatch.setattr(actions, "geodesic_distance_to_waypoint", lambda agent, p: float(p[0]) + 1.)
@@ -240,6 +242,8 @@ def test_check_again_scores_at_camera_height_and_approach_is_best_feasible_view(
                rgb_trajectory=[np.zeros((480, 640, 3))], view_control_state=NS(active=False))
     controller.select_check_again_viewpoint(agent)
     assert calls["target_height"] == pytest.approx(.2)
+    # 视点评分的俯仰集合与复核执行一致。
+    assert calls["pitches"] == (0., -.5)
     np.testing.assert_allclose(agent.approach_viewpoint, [.5, 0, .2])
     np.testing.assert_allclose(agent.check_again_postion, [.2, 0, .2])
 
@@ -260,7 +264,8 @@ def test_uncertain_exhausted_view_defers_candidate_until_new_observation(monkeyp
     from backends.habitat.guided_runtime import GuidedNavigation
     from instruction_adapter.view_control import ViewControlState
     monkeypatch.setitem(sys.modules, "navigation.goal_approach_controller",
-                        NS(rotate_toward_object_for_recheck=lambda agent: True))
+                        NS(rotate_toward_object_for_recheck=lambda agent: True,
+                           tilt_camera=lambda agent, pitch: True))
     state = ViewControlState()
     state.start("obj", {}, {})
     state.exhausted = True

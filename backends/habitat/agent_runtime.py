@@ -137,7 +137,11 @@ class HabitatNavigationTools(NavigationTools):
         return agent._build_final_verifier_evidence(candidate, bbox, geometry)
 
     def verify_target(self, candidate_uid, target_id, task_revision):
-        """Apply shared verification and export benchmark-facing diagnostics."""
+        """Apply shared verification and export benchmark-facing diagnostics.
+
+        判定绑定取证时的观察；判定后若任务未完成，恢复水平相机供后续移动与建图。
+        """
+        from navigation.goal_approach_controller import tilt_camera
         result = super().verify_target(candidate_uid, target_id, task_revision)
         agent = self.agent
         agent.instruction_decision = agent.final_stop_decision = result["decision"]
@@ -146,6 +150,8 @@ class HabitatNavigationTools(NavigationTools):
             agent.instruction_success = agent.final_stop_success = True
             agent.instruction_accept_step = agent.final_stop_accept_step = agent.episode_steps
             agent.accepted_candidate_uid = candidate_uid
+        else:
+            tilt_camera(agent, 0.0)
         return result
 
 

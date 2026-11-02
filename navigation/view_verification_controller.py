@@ -8,6 +8,7 @@ import numpy as np
 from loguru import logger
 
 from instruction_adapter.verifier import candidate_from_object
+from navigation.goal_approach_controller import recheck_pitches
 from planning.viewpoint_policy import build_check_again_viewpoints
 
 
@@ -53,6 +54,8 @@ def select_check_again_viewpoint(agent: Any) -> None:
         arrival_tolerance=agent.planner._goal_radius,
         image_width=agent.rgb_trajectory[-1].shape[1],
         image_height=agent.rgb_trajectory[-1].shape[0],
+        # 视点评分只用复核时可执行的俯仰角，由 rotate_toward_object_for_recheck 执行。
+        pitches=recheck_pitches(agent),
     )
     logger.info(f"Interpolated_path: {interpolated_path}")
 

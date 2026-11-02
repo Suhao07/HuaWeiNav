@@ -48,6 +48,7 @@ from navigation.goal_approach_controller import (
     action_after_instruction_reject,
     distance_to_object,
     rotate_toward_object_for_recheck,
+    tilt_camera,
 )
 from navigation.object_cluster_merger import merge_candidate_objects, sort_target_objects_last
 from navigation.object_view_projector import project_object_view
@@ -1678,6 +1679,8 @@ class HM3D_Objnav_Agent:
                     logger.info("Check again: {}", self.found_goal)
 
                     if not self.found_goal:
+                        if not tilt_camera(self, 0.0):
+                            return False
                         self.after_check_again()
                     else:
                         final_instruction_flag = self.final_instruction_check(
@@ -1687,6 +1690,9 @@ class HM3D_Objnav_Agent:
                             self.final_instruction_accepted_this_step = True
                             act = 0
                         else:
+                            # 复核结束后恢复水平相机，后续移动与建图沿用水平观测。
+                            if not tilt_camera(self, 0.0):
+                                return False
                             act = action_after_instruction_reject(self)
             else:
                 if to_target_distance > self.success_distance * self.stop_criterion:
