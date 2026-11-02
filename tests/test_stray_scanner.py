@@ -8,10 +8,11 @@ from PIL import Image
 import pytest
 
 from prior_map.observations import read_records
-from prior_map.stray_scanner import import_stray_capture, stray_camera_to_map
+from prior_map.stray_scanner import ARKIT_TO_MAP, import_stray_capture, stray_camera_to_map
+from scipy.spatial.transform import Rotation
 
 
-def make_scan(root, *, modern=True, video_frames=2):
+def make_scan(root, *, modern=True, video_frames=2, quaternion=(1, 0, 0, 0)):
     root.mkdir()
     (root / 'depth').mkdir()
     (root / 'confidence').mkdir()
@@ -25,7 +26,7 @@ def make_scan(root, *, modern=True, video_frames=2):
         header += ', fx, fy, cx, cy'
     lines = [header]
     for index in range(2):
-        line = f'{1.25+index*.05}, {index}, 1, 2, 3, 1, 0, 0, 0'
+        line = f'{1.25+index*.05}, {index}, 1, 2, 3, ' + ', '.join(map(str, quaternion))
         if modern:
             line += f', {100+index*20}, 100, 32, 24'
         lines.append(line)
@@ -54,7 +55,31 @@ def test_video_decode_per_frame_intrinsics_and_depth_units(tmp_path):
     rgb = np.asarray(Image.open(output / frames[0]['rgb_path']))
     assert rgb[..., 0].mean() > 230 and rgb[..., 2].mean() < 5
     assert frames[1]['timestamp'] == 1.3
-    assert (output / frames[0]['confidence_ref']).read_bytes() == (source / 'confidence/000000.png').read_bytes()
+    np.testing.assert_array_equal(np.asarray(Image.open(output / frames[0]['confidence_ref'])),
+                                  np.asarray(Image.open(source / 'confidence/000000.png')))
+
+
+def test_portrait_scan_is_turned_upright_without_moving_points(tmp_path):
+    source, output = tmp_path / 'scan', tmp_path / 'capture'
+    portrait = np.array([[0., -1, 0], [0, 0, 1], [-1, 0, 0]])  # 世界向上指向图像左侧
+    quaternion = Rotation.from_matrix(ARKIT_TO_MAP.T @ portrait).as_quat()
+    make_scan(source, quaternion=quaternion)
+    depth_mm = (1000 + np.arange(12 * 16).reshape(12, 16)).astype(np.uint16)
+    Image.fromarray(depth_mm).save(source / 'depth/000000.png')
+    result = import_stray_capture(source, output)
+    frame = read_records(output / 'frames.jsonl')[0]
+    assert result['config']['upright_quarter_turns_cw'] == 1 and frame['size_hw'] == [16, 12]
+
+    def points(depth, k, pose):
+        v, u = np.indices(depth.shape)
+        rays = np.linalg.inv(k) @ np.stack([u.ravel(), v.ravel(), np.ones(u.size)])
+        xyz = (np.asarray(pose)[:3, :3] @ (rays * depth.ravel()) + np.asarray(pose)[:3, 3:]).T
+        return xyz[np.lexsort(xyz.round(6).T)]
+
+    expected = points(depth_mm / 1000., np.diag([.25, .25, 1]) @ [[100, 0, 32], [0, 100, 24], [0, 0, 1]],
+                      stray_camera_to_map([1, 2, 3], quaternion))
+    actual = points(np.load(output / frame['depth_path']), np.array(frame['intrinsics']), frame['camera_to_map'])
+    np.testing.assert_allclose(actual, expected, atol=1e-5)
 
 
 def test_legacy_intrinsics_and_sampling_preserve_frame_identity(tmp_path):
