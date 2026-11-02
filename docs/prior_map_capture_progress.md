@@ -1,5 +1,7 @@
 # HM3D 先验采集首轮实现记录
 
+> 2026-11-01整理：本文件保留历史实施、临时实验及失败证据，文中的“下一步”反映记录当时判断。当前执行清单统一以 [设计方案的必要交付](prior_map_mode.md#距离交付仍需完成的必要工作) 为准，历史测试无需逐项重跑。
+
 状态：P1 协议基础、P2 有预算采集、P3 投影诊断已实现；P4 逐帧检测与共享实例融合、P5 导出和跨进程重载检索已跑通。P3/P4 的几何及实例质量仍在验收，P6–P8 尚未完成。RGB-D capture 与预测地图分别报告，预测对象不作为真值或导航完成证据。
 
 ## 实现范围
@@ -958,3 +960,1330 @@ DualMap 对 TEEsav 72帧进行100概念、20%点采样、seed17建图，耗时11
 TEEsav连续地图的chair概念查询产生一个假设，未调用语言编译器或外部模型。起点为采集末端时，最近历史视点与起点重合，只执行6次旋转；该结果保留为零平移诊断。随后从原采集起点重新初始化独立模拟运行：35动作、1.9999995m平移、0碰撞、motion_status=reached、heading_alignment=true，最终路径距离0，保存36帧当前RGB-D。它不是前次执行的连续片段，也不是完整自然语言任务episode。
 
 运动产物 `outputs/prior_motion/TEEsav-chair-bound-query-from-start`，查询 `outputs/prior_diagnostics/TEEsav_chair_bound_query.json`。最终图像本地查看为客厅座椅场景，但没有绑定当前检测对象与历史实例，也未调用最终验证器/reducer或发送任务STOP。此项只证明查询到实际到达链路；P8仍需在同一运行中接当前检测、接近/补拍和完成判定，不能将reached作为task_success。
+
+
+### P8 同一模拟器会话内的到达后感知
+
+将原 `extract_prior_arrival.py` 的逻辑提取到 `prior_map/arrival.py`，独立复放入口与运动入口共用最终帧打包函数。`check_prior_motion.py --arrival-classes` 在位置到达和定向结束后，保持原 simulator 打开，调用 `build_capture_map` 处理当前最终帧；生成arrival_capture、arrival_bundle及arrival_perception.json。类表来自显式文件，未用历史预测标签替代当前检测。没有新增外部模型请求，也未写任务进度或发送任务STOP。
+
+TEEsav chair查询实测：35动作、1.9999995m平移、0碰撞、第35帧。当前100概念检测28框，27条观察经共享融合产生16个预测实例，其中1个chair标签实例。当前单帧建图耗时10.10s（包含模型初始化等），帧内处理约3.02s。前后模拟器位置一致，arrival_capture绑定的运动receipt SHA256与终态文件一致。
+
+13项测试通过，覆盖最终帧ID、位姿、float32深度、运动回执哈希、非reached终态拒绝取证及现有查询/运动行为。此次仍未匹配历史/当前实例，未生成新的接近/补拍动作，未通过最终验证器和reducer，所以是同会话运动→感知的接入证据，不是完整指令episode。产物 `outputs/prior_motion/TEEsav-chair-same-session-perception`。
+
+
+### P8 当前接近提案的共享入口
+
+对同会话到达感知的chair候选核查：当前chair中心与历史查询chair中心距离0.19025m；两个desk chair候选分别1.06621m、5.05243m。现有概念查询将chair评分1.25置于首位，desk chair为0.905。此为候选选择依据，不是身份确认，尚未融合历史与当前UID。
+
+将 `resolve_prior_approach.py` 的实际几何代码提取为 `backends/habitat/prior_approach.py::resolve_current_approach`，CLI保留为薄入口。继续校验当前证据与运动receipt哈希、NavMesh构建记录，复用现有点云投影、baseline视点生成与排序；没有新增阈值或类别特例。
+
+真实保存输入产生10个可达提案。选中点的预测目标距离0.59178m、路径距离1.83759m、可见率0.33942；既有stop_feasible规则将0.2m到达容差计入1m距离限制。提取前已提交脚本与新函数分别运行，全部输出字段与选中结果完全一致，36项相关回归测试通过。
+
+结果 `outputs/prior_diagnostics/TEEsav_current_chair_approach.json`。尚未执行该提案，预测stop_feasible不能作为当前任务完成依据；下一步将共享入口接入同会话的再次运动和当前取证。P8完成判定仍未验收。
+
+
+### P8 同会话两段运动与再次取证
+
+`check_prior_motion.py --approach-current`复用一次simulator初始化及同一个HabitatExecution。历史视点到达后当前感知，通过现有概念查询选择当前候选，调用共享baseline接近提案，再执行第二段运动并重新检测最终帧。当前UID独立保留，不被历史UID覆盖；该选取只是候选，不是历史身份确认。单概念诊断范围明确，不作为任意复杂TaskSpec的执行器。
+
+实测 `outputs/prior_motion/TEEsav-chair-continuous-approach001`：第一段35动作/2.00m，第二段16动作/1.75m，两段均reached、零碰撞，第二段终点距提案0.09174m。总51动作，最终第51帧检测21框、19条观察形成10个预测实例。当前chair mask有12038个有效深度点，平面最近距离0.67772m；最终图像本地查看为近距离扶手椅。该距离属于当前预测mask，不是数据集目标距离或任务成功证明。
+
+帧35在第一段终点与第二段起点的位姿和RGB字节完全一致；两份arrival_capture与各自不可变运动receipt哈希匹配。14项相关测试通过。执行后补充了当前候选的运动元数据与后续失败单独写session_receipt的逻辑，避免失败改写已经被证据引用的前段回执；此补充尚未单独重跑同一完整仿真。
+
+未执行最终VLM/reducer/STOP。已询问是否允许将本次第51帧及框/裁剪发送到豆包，等待新图像授权；此前另一组新图像曾被自动审批以授权不明确拒绝，旧授权不自动扩展到这组图像。下一步需将最终验证真正接回同会话任务完成；当前仍不能标记P8完成。
+
+
+### P8 已授权最终图像的真实豆包验证
+
+用户明确允许TEEsav第51帧及目标框/裁剪发送豆包后，实际调用现有 `FinalInstructionVerifier`，模型doubao-seed-2-0-pro-260215、thinking disabled、证据复用关闭。使用明确的单目标chair合同（source=explicit_concept_diagnostic），没有宣称额外完成自然语言编译。
+
+验证结果：decision=accept、semantic_satisfied=true、view_sufficient_for_stop=true、confidence=0.99；模型解释框内为深棕色皮质躺椅。代码硬约束采用当前mask深度距离0.67771997m≤1m。现有TaskProgress reducer计入当前UID，count=1、completed=true。证据、判断和进度保存在 `outputs/prior_verification/TEEsav-chair-final-authorized/verification.json` 与receipt.json。
+
+将原check_prior_arrival逻辑提取为 `prior_map/arrival_verification.py::verify_arrival`，供CLI与下一步会话编排复用。接口接显式TaskSpec、当前候选UID和运动绑定；prepare_only不会实例化外部验证器。7项到达/验证测试通过，注入判断仅验证协议与reducer行为，不作为模型性能结果。
+
+真实验证发生于连续轨迹结束后的保存证据上，原simulator已关闭；task_stop_sent=false。故此证明了该样本“当前证据→真实最终验证→任务进度”的链路，尚不证明同一会话的验证完成事件及STOP，也不等于HM3D官方成功率/SPL。P8仍待整合验收。新图像授权已明确收到，本组调用已完成，先前等待状态解除。
+
+
+### P8 单目标同会话最终验证与STOP闭环
+
+实测产物 `outputs/prior_motion/TEEsav-chair-live-verification001`。同一个simulator与现有HabitatExecution/MotionSupervisor依次执行历史视点到达、当前检测、当前候选接近、再次检测、真实豆包最终验证及STOP。显式TaskSpec为“Find a chair.”，source=explicit_concept_diagnostic；此次覆盖单目标合同执行。
+
+`session_receipt.json`记录status=complete、simulator_initializations=1、total_actions=52、task_completed=true、task_stop_sent=true。`session_actions.json`总移动3.74999921m、零碰撞；最后action=0，translation_m=0。最终第51帧框图SHA256为 `0dd6496efec4558b89456528edc3af99ec5d766a109f008b20797e0ff371d78f`，与用户已授权保存图像一致；外部临时运行器在真实模型调用前校验图像哈希，验证结果由实际请求产生。
+
+豆包返回accept、confidence=0.99、semantic_satisfied=true、view_sufficient_for_stop=true。当前预测mask深度的平面最近距离0.67771997m，满足1m停止约束；该距离仍是预测实例距离。reducer接受当前frame51候选后completed=true，调用方通过运动所有者执行STOP。验证服务receipt中的task_stop_sent=false描述服务本身不发送停止；最终停止事实以session_receipt与session_actions为准。
+
+终止后端为habitat_sim_task_adapter：STOP结束任务会话，保持位姿并读取当前传感器，不产生移动。official_objectnav_metrics_evaluated=false，因此本次没有官方SR/SPL。17项到达、验证、查询绑定及运动测试通过，最新元数据与失败回执逻辑也已随本次真实会话执行。
+
+P8现已取得一个显式概念任务的完整执行闭环证据；自然语言复杂合同、历史与当前实例对应、多样本泛化及官方评测仍待完成。地图融合质量、覆盖缺口和真实手机/机器人重定位维持原有待验收状态。
+
+
+### P8 历史实例—当前mask—停止距离的独立空间核查
+
+对 `TEEsav-chair-live-verification001` 的两份当前预测地图运行既有 `diagnose_prior_instances.py`，仅离线渲染HM3D语义标注，不将GT送入查询、建图或验证器。核对历史/当前预测地图SHA256、同一semantic mesh与labels哈希，以及最终语义缓存与RGB哈希。第35/51帧重渲染深度最大误差分别0.000430m/0.000341m，两帧超过1cm的像素均为0，空间对齐检查通过。
+
+| 阶段 | 预测实例的标注支持 | 结论范围 |
+| --- | --- | --- |
+| 历史chair | 26条mask观察；25条过50%多数支持，唯一强支持ID为266（armchair） | 含1条仅33.61%支持的低质量观察，不能宣称所有历史证据纯净 |
+| 当前到达，第35帧 | 99.3175% mask像素属于266 | 本帧候选与历史强支持对应同一实例 |
+| 接近后，第51帧 | 99.9003% mask像素属于266 | 最终候选仍为同一实例 |
+
+进一步复算停止距离：对最终mask内满足原验证器有效深度条件的12038点，使用同一公式 `d=min ||p_map,xy - camera_map,xy||_2`。最小值0.6777199749643563m来自像素(u=193,v=157)，该像素GT ID=266；仅保留属于266的12029点后，最小距离完全相同。其他9个有效深度点的最小距离0.70316946m。本例停止距离由椅子表面支持，并非mask边缘污染点制造的虚假近距离。
+
+汇总与来源哈希：`outputs/prior_diagnostics/TEEsav_chair_live_identity_distance.json`；逐mask报告为 `TEEsav_chair_live_arrival_semantic.json` 和 `TEEsav_chair_live_final_semantic.json`。这是一例离线GT空间归属诊断，不是运行时实例关联算法，也不是官方ObjectNav任务成功判定。其他当前实例仍有混合GT：到达地图2个、最终地图1个，地图融合质量问题仍存在。
+
+后续重点：当前 `current_concept_candidate` 每阶段独立按概念排序，尚未携带历史实例约束；简单“找一把椅子”允许同类替代，但指代某个历史实例或属性消歧任务需要独立的关联与拒绝判定。应在固定的相似实例/不可见对象案例上验证该边界，不能把本例一致性推广为通用关联正确。
+
+
+### P8 编译任务与当前候选查询的语义绑定
+
+源码审计发现，`query_prior_bundle.py --compile-instruction` 的concept字段保存原始自然语言，而同会话接近阶段直接将该字段传给概念查询；最终验证另读verify-task文件。因此接近和验证原先没有共享同一任务合同，也没有在运动前检查合同一致性。
+
+在 `prior_map/query_binding.py` 增加query_execution_task，复用已有TaskSpec。编译查询以回执中的合同为准，另传合同必须与该版本一致；纯概念查询允许绑定同名目标的显式合同。单目标诊断的数量/约束范围在运动前明确检查。`check_prior_motion.py` 仅解析一次，接近和最终验证均使用同一task的目标名称，保留属性与其他合同字段供最终验证使用。此修改不新增实例关联算法。
+
+21项相关测试通过，覆盖自然语言输入解析为当前目标概念、属性及版本保留、不同任务版本拒绝、纯概念兼容、多目标范围检查，以及现有到达/运动/验证回归。语法检查与git diff --check通过。
+
+实际保存数据回放：`compiled_nightstand_query.json` 的“Find a nightstand.”解析为nightstand，在nightstand-arrival-current和nightstand-approach-current两份地图中均选择既有nightstand候选。旧原始句子路径在这两例也能选中相同候选，因为现有概念评分支持文本匹配；本次修复证明合同来源一致，尚无这两例选择准确率提升的证据。回放报告 `outputs/prior_diagnostics/compiled_task_binding_replay.json` 保存查询与地图哈希，无模型调用、无新增运动。最新任务绑定代码尚未重跑完整仿真闭环。
+
+另一个待处理的边界：PriorMapMemory._match_prior_object在标签匹配后返回首个对象，现有代码不足以提供多实例身份关联保证；TaskSpec目前也没有显式历史实例引用字段。应先固定实例指代的合同，再联合空间与视觉证据验证，不能把prior对象exact=true解释成用户指定了该实例。
+
+
+### P8 在线记忆中的类别与实例身份分离
+
+先写行为测试复现：现有 `_match_prior_object` 遇到同名对象直接返回列表首项，mapper与snapshot均会把新观察记到第一个历史对象；已有显式verified对应也未被优先使用。查询评分同时把同类标签当作每个具体历史实例的live_match。新增测试在修复前6失败/1通过。
+
+修复限定在memory/query：具体历史实例使用持久化UID或已有显式verified对应；类别/概率先验仅在标签与房间筛选后唯一时更新；多候选保留未确定状态。观察记录仍保存当前UID和类别。具体实例的live_match依据身份，类别先验仍可使用标签支持。mark_object_verified说明调用方须先建立实例对应，类别任务验证通过本身不提供该身份依据。没有增加几何距离阈值，也没有新增模型调用或更改建图融合。
+
+91项相关测试通过，覆盖先验协议、查询、记忆、仿真/实物适配、到达、任务验证和运动接口。真实保存数据回放将最终10个当前对象送入TEEsav历史地图：旧逻辑自动绑定2对，离线GT核查这2对均正确；新逻辑保留10个观察、自动跨图绑定0对。结果说明本例没有错误关联收益，新增限制需要后续空间/视觉关联服务补全召回。报告 `outputs/prior_diagnostics/TEEsav_memory_instance_binding_replay.json` 记录旧新代码及地图哈希。
+
+这一步修正身份所有权与证据含义，通用在线关联、相似实例消歧与不可见对象重新搜索仍待实现；没有重跑导航或产生新SR/SPL。
+
+
+### P8 跨地图表面对应诊断：同类标签之外的空间依据
+
+新增离线脚本 `scripts/diagnose_prior_correspondence.py`。在同一Habitat资产、simulator_gt世界位姿与坐标协议下，从两份地图的保存mask、深度、K和相机位姿重建体素表面。使用5cm体素中心、10cm最近邻半径、6m最大深度；保留原采集量程截断规则。输出每对对象的方向性覆盖 `f(C,H)=mean_p[min_q ||p-q||<r]`、反向覆盖、按点数加权的合并覆盖和当前点中位距离。其距离统计与已有STRIVE融合原则一致，但重建表面没有复现建图器内部采样/聚类/过滤，不能称为原融合精确重放。
+
+该脚本不读取GT、不改变地图或身份状态；记录所有mask/depth、观测索引、构建回执及核心地图哈希。相同frame_id并非跨次实物对齐证明，因此脚本明确限定同一仿真世界。3项算法测试通过：部分视图的方向非对称性、分离表面零覆盖、共同刚体变换不变性。
+
+实际运行：历史33个对象，对第35帧16个对象产生528对；对第51帧10个对象产生330对。独立GT评估事后读取冻结报告，未参与打分。
+
+| 当前阶段 | 有单一GT支持且历史存在对应：最高分正确 | 历史没有单一强支持对应 | 当前混合或证据不足 |
+| --- | --- | --- | --- |
+| 第35帧 | 3 | 11 | 2 |
+| 第51帧 | 4 | 5 | 1 |
+
+这些是同一场景两帧的对象计数，含重复真实实例，不能作为7个独立任务成功样本。chair两帧正确历史对象的当前点覆盖均1.0；次优分别0.02145和0.02817，合并覆盖0.96620/0.95450。
+
+发现的限制：当前table与历史shelf unit实际同属GT267，当前点覆盖0.9943，说明严格同类别门控会漏掉真实对应；当前混合table候选包含GT336/351，仍对历史cabinet351产生0.8849当前覆盖及0.9382合并覆盖，说明高覆盖不能排除对象混合。oven与stove两个当前候选都指向GT348，历史也有类别不同的同实例碎片，不能直接把最高分转换成唯一实例计数。
+
+产物：`TEEsav_arrival_historical_surface_pairs.json`、`TEEsav_current_historical_surface_pairs.json`、`TEEsav_surface_correspondence_evaluation.json`，均在outputs/prior_diagnostics。下一步应检查逐观察对应的一致性，再制定候选关联与拒绝规则；当前没有把离线分数或本例阈值接入运行时验证。
+
+
+### P4/P8 混合实例的逐观察证据与原融合复放
+
+将跨地图诊断扩展为 `--current-observations`：逐mask重建表面，保留observation_id到原object_uids的映射，保持预测地图不变。最终19条观察对33个历史对象输出627对，4项测试通过（新增同一融合UID内两个独立mask保持分离的测试）。报告 `TEEsav_final_observation_surface_pairs.json`。
+
+逐观察显示，混合UID detection8包含ironing board（GT336占85.75%）、drawer（GT351占93.22%）、table（GT351占71.74%）。三者对历史cabinet351的当前表面覆盖分别0.67778、1.0、0.88353。因此逐观察最高分一致，也不能直接确认同一实例：相邻表面在10cm半径内互相支持。
+
+随后使用维护中的strive-hm3d:local运行已有diagnose_prior_associations.py，对保存的19条accepted观察重放原STRIVE融合。assignment_parity=true，输出10个实例，保存UID归属逐条一致；证据为 `TEEsav_final_fusion_trace.json`。错误合并实际发生顺序如下：
+
+1. detection8 ironing board先形成独立90点实例。
+2. detection13 drawer的51点与它的合并近邻覆盖为0.333333，两个方向分别0.392157/0.300000，超过原0.25阈值，被并入detection8。两个当前mask交集为0像素。
+3. detection14 table的249点与已混合141点实例的合并覆盖0.717949，方向分别0.558233/1.0，再次并入。
+
+直接mask核查：table覆盖99.03%的ironing board区域及100%的drawer区域；同一个较大的检测mask把两个分离区域同时纳入，强化已发生的混合。报告 `TEEsav_final_mixed_mask_intersections.json`。这里既有近邻关联误合并，也有跨对象的宽泛mask；不能把原因全部归于跨地图关联或类别名称。
+
+对应数学边界：当前融合计算的是带半径容差的表面邻近 `P(d(p,H)<0.1m)`，它并不是“同一物理实例”的概率。相邻物体、包含关系和宽mask均可得到高值；混合点云并集又会进一步提高后续覆盖。当前证据支持在融合中保留逐观察归属与冲突，而不是直接提高/降低一个全局阈值。此前co-view IoU与投影支持消融已暴露召回损失，未将这些规则作为默认修复。
+
+本轮取得可重复的具体根因；未修改生产融合阈值、未宣称实例质量修复成功。下一步应围绕同帧独立区域和跨对象宽mask构建关联对照，联合报告错误合并与同实例拆分，避免只优化单个混合case。
+
+
+### P4 同帧混合case的约束对照与统一关联评估
+
+固定最终第51帧全部19条accepted观察，在维护容器中分别运行现有coview IoU≥0.05及可见mask支持≥0.25两种实验约束，原深度、位姿、检测与融合阈值保持一致。生产融合未修改。独立语义审计中19条mask均达到多数支持门槛，覆盖10个GT实例。
+
+| 变体 | 预测实例 | 混合实例 | 被拆分GT实例 | TP/FP/FN观察对 | Precision | Recall | F1 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 原融合 | 10 | 1 | 1 | 11/2/9 | 0.8462 | 0.5500 | 0.6667 |
+| coview≥0.05 | 11 | 1 | 2 | 10/1/10 | 0.9091 | 0.5000 | 0.6452 |
+| visible≥0.25 | 11 | 1 | 2 | 10/1/10 | 0.9091 | 0.5000 | 0.6452 |
+
+两种变体均将drawer从ironing board拆开，但后来的宽table mask仍归入ironing board，混合未消除，并损失了drawer与table之间的同实例关联。该结果与之前13帧消融中的精度/召回权衡一致，不能将两种约束提升为默认修复。
+
+新增 `prior_map/association_evaluation.py::evaluate_association` 统一计算观察对指标：TP为同时同预测UID/同GT的对数，FP为同预测UID/不同GT，FN为同GT/不同预测UID。利用组内组合数计算，避免枚举全部观察对。报告支持与未支持mask数量，分母为当前固定输入中通过GT多数支持的观察；指标不代表mask纯度或导航成功。3项测试覆盖误合并与拆分并存、输入顺序不变性、无多数支持及缺失/错位标注。
+
+结果及来源哈希见 `outputs/prior_diagnostics/TEEsav_final_fusion_ablation_evaluation.json`；两份trace为 `TEEsav_final_fusion_coview005.json` 与 `TEEsav_final_fusion_visible025.json`。下一步候选方案应显式处理宽mask跨越多个已分离区域的歧义，同时检查其对部件/整体关系的影响；当前尚未选出有效的生产关联修复。
+
+
+### P2/P6 覆盖预算对照与独立审计随机流修复
+
+沿用TEEsav场景资产、原NavMesh、种子17、320×240、HFOV90、相机高1.25m、8朝向、1m测地覆盖半径，完成三组新增离散RGB-D采集。只增加位置预算，主区域从16位置增至28后停止（未用满128预算）；再增加候选样本至512，主区域达到47位置。此后以相同512候选预算将clearance从0.25m降至0.1m做独立对照。
+
+发现评估协议缺陷：原采集器先在同一随机流中产生候选样本，再产生检查点；当候选预算增加，旧检查点可能进入新候选池。先前在旧128检查点上得到的90.625%/99.21875%只保留作诊断，不作为独立覆盖结论。新增 `scripts/evaluate_prior_coverage.py`，固定资产/NavMesh哈希，用独立种子17001、每个连通区域1024个检查点重评全部四组，核验各组审计点逐项相同。
+
+| 变体（候选数/位置上限/clearance） | 实际总位置/帧 | 主区域覆盖 | island1覆盖 | 采集耗时 | 保存大小 |
+| --- | --- | --- | --- | --- | --- |
+| 128/16/0.25m | 21/168 | 47.4609% | 62.8906% | 2.93s | 66.19MB |
+| 128/128/0.25m | 33/264 | 67.7734% | 62.8906% | 4.07s | 100.54MB |
+| 512/128/0.25m | 52/416 | 86.5234% | 64.0625% | 6.44s | 158.33MB |
+| 512/128/0.10m | 59/472 | 92.5781% | 100% | 8.52s | 178.91MB |
+
+这是几何辅助离散扫描的位置覆盖，不是表面覆盖、语义房间覆盖或连续导航成功率。clearance=0.1m组有2帧超过半幅图像处于0.25m近距离内，全体平均近距离像素占比1.3256%；其他三组该占比为0。相机采集clearance也不能代替机器人尺寸和运动可达性验收。因此当前不将0.1m作为默认配置。
+
+原采集器 `CaptureConfig` 新增audit_seed与audit_samples，将候选和审计按连通区域分别设种子；默认审计种子17001、1024点，候选数量不影响其他区域或审计流。选择算法、几何传感器与默认clearance保持原样。16项采集/比较测试通过；另在真实Habitat用32×24、每位置1朝向、每区域最多1位置完成128/512候选两组小样本，所有纳入区域的32个审计点完全相同。新随机流规则会改变旧实现中第二个及后续岛的候选序列，已有采集保留其原始配置与回执。
+
+产物：新增采集目录 `multiscene-TEEsavR23oF-128`、`multiscene-TEEsavR23oF-s512`、`multiscene-TEEsavR23oF-s512-c010`；汇总 `outputs/prior_diagnostics/TEEsav_coverage_budget_comparison.json`，各变体独立评估报告以 `_independent_coverage.json` 结尾。新的416/472帧数据尚未进行对象融合、语义质量评估或多层逐层验收。
+
+
+### 2026-10-31：416帧DualMap质量审计与STRIVE同输入对照启动
+
+用户恢复推进，顺序为新增地图审计→同输入STRIVE构建→根据质量决定融合改进。已核对DualMap实际处理416帧，生成24个预测实例、391条证据，构建回执耗时60.1616s。当前DualMap提交dd9045c相对原上游的差异与旧168帧实验保存的upstream.patch逐字节相同；模型与词表沿用已有配置，pcd_sample_ratio=0.2、seed=17。
+
+独立Habitat语义审计完成，深度对齐通过；391条mask中367条有超过50%的单一标注支持。23个预测UID有强支持，2个UID跨GT实例混合，1个GT被多个预测UID支持。所有受支持UID涉及26个GT实例，其中21个GT出现在单一GT支持的预测UID内。旧168帧地图仅1个GT支持实例，因此新增观察确实增加了可支持对象，但覆盖、视角数与上游稳定性筛选同时变化，不能单独归因于覆盖率一个变量。
+
+混合UID：door关联GT107门、106墙、108/109玩具；sofa关联GT132沙发与165毛绒玩具。保存证据显示同帧或多帧跨对象观察仍被计入同一UID，实例身份质量尚未通过。26个GT中含墙体等对象，该数量不是导航目标召回率。报告 `outputs/prior_diagnostics/TEEsav_s512_dualmap_semantic.json`，旧新比较 `TEEsav_dualmap_coverage_quality_comparison.json`。
+
+STRIVE对照已启动，输入完全相同416帧、100概念词表，原SAM+DINO、5cm体素、6m深度上限、共享原融合；输出 `outputs/prior_bundles/multiscene-TEEsavR23oF-s512`，日志 `outputs/prior_diagnostics/TEEsav_s512_strive_build.log`。启动时GPU为RTX3090，读取设备必须在允许设备访问的环境，沙箱内nvidia-smi失败不能代表驱动故障。
+
+已为此次实际运行容器1eec8dcaf980安排成功后的独立语义审计，报告目标 `TEEsav_s512_strive_semantic.json`，审计日志 `TEEsav_s512_strive_audit.log`。等待器先检查docker wait返回的真实退出码；失败时不启动审计。本文记录启动安排，不代表构建或后续审计已经完成，最终以进程与回执为准。
+
+对照判读约束：两种建图器的检测模型、实例稳定性过滤不同，即使使用相同原始观察，accepted mask分母仍不同。分别报告强支持、混合、重复实例、证据与资源成本；不能把预测实例数量较少直接解释为融合更准确。完整对照结果出来前不修改生产融合或扩大导航验证。
+
+
+### 2026-10-31：等待416帧对照期间的已有证据与改进边界
+
+完整416帧STRIVE构建及语义审计尚未完成；禁止将其中间UID数量与DualMap最终稳定实例直接比较。已重新读取并核对此前相同80帧的完整对照：STRIVE 200预测UID/2003观察，199UID有强支持、41混合UID、94受支持GT、47个GT有多个UID、70个GT出现在单一GT支持UID内，耗时337.33s；DualMap 25UID/499观察，25UID有强支持、4混合UID、25受支持GT、4个GT有多个UID、18个GT出现在单一GT支持UID内，耗时24.13s。
+
+新增 `scripts/compare_prior_map_quality.py`，检查完整采集manifest与处理帧数一致、语义资产哈希一致、审计绑定到当前地图且覆盖全部观察。输出同时保留预测UID、观察分母、混合、拆分、支持GT、单一GT支持UID、耗时和存储。实际80帧结果复核成功，产物 `outputs/prior_diagnostics/matched80_map_quality_comparison.json`。该对照比较整套系统，检测器和稳定性筛选不同，无法孤立证明某个融合模块更好。
+
+源码边界核对：STRIVE以当前mask的几何准入及重叠合并后直接导出全部entities；DualMap使用stable_num=8，随后类别众数>observed_num/3或类别收敛判定稳定。源码注释中的1/2与实际1/3不一致，分析采用实际表达式。重复帧计数不等于独立观察基线，该稳定性规则也未消除最新地图中的混合对象。
+
+后续改进应分开验证：
+1. 关联提交：宽mask同时覆盖多个已有独立区域时保留观察与候选关联，避免立即将点云并入一个身份；必须保留部件/整体关系的不确定性。当前证据支持该问题存在，具体判定规则尚需固定观察对照。
+2. 实例输出：区分暂定候选与已获多视角一致支持的实例，检索保留暂定候选；验证独立视角证据而非照搬8帧硬门槛。验收同时检查支持GT损失和错误关联。
+3. 分裂诊断：部分视图与大历史点云的合并重叠会受点数分母影响，应检查方向性和当前可见支持；已有简单IoU/投影门槛实验失败，不能直接启用。
+4. 运行成本：每候选遍历所有实例并重复计算AABB/构建最近邻索引是源码可见开销；先测组件耗时，再验证AABB/空间索引缓存是否保持逐观察关联等价。当前逐帧日志不能单独区分检测与融合耗时。
+
+以上为待验证方案，不代表已修复生产融合。仍以当前完整建图→语义审计→同输入质量报告作为下一道判定依据。
+
+
+### 质量对照报告的验证补充
+
+新增test_prior_quality_comparison.py，验证混合UID涉及多个GT时不会增加单一GT支持计数，以及拒绝深度对齐失败、地图哈希不符和观察集合缺失的审计。连同关联评估测试共7项通过。此为评估工具验证，不代表当前416帧建图或语义审计完成。
+
+
+### 2026-10-31：416帧STRIVE建图、语义审计及完整系统对照完成
+
+原STRIVE建图会话与自动审计会话均以退出码0完成。STRIVE回执status=complete，416帧、782个预测实例、7516条观察，elapsed_s=2616.0438（43.60分钟）。DualMap同一416帧回执24实例、391观察、60.1616秒。两者均包含模型初始化与构建/导出计时，但构建流程不同，不能将速度差完全归因于融合模块。
+
+两套审计均alignment_valid=true，各审计帧超过1cm的深度误差像素比例最大值为0。完整输入manifest、处理帧数、语义资产、地图哈希、观察集合已由compare_prior_map_quality.py检查通过。正式报告 `outputs/prior_diagnostics/TEEsav_s512_map_quality_comparison.json`。
+
+| 指标 | STRIVE | DualMap |
+| --- | --- | --- |
+| 完整输入帧 | 416 | 416 |
+| 带保存证据的帧 | 416 | 204 |
+| 预测UID | 782 | 24 |
+| 观察mask | 7516 | 391 |
+| 多数GT支持mask | 6611 | 367 |
+| 有GT支持UID | 756 | 23 |
+| 跨GT混合UID | 206 | 2 |
+| 有支持的不同GT | 341 | 26 |
+| 出现在单一GT支持UID中的不同GT | 232 | 21 |
+| 对应多个预测UID的GT | 198 | 1 |
+| 建图时间 | 2616.04s | 60.16s |
+| 地图包大小 | 167.45MB | 79.43MB |
+
+GT多数支持表示mask超过50%的像素属于该标注实例；单一GT支持UID仍可能有像素污染或错误预测类别，不能称为类别准确率。两种系统使用不同检测器与稳定性筛选，表中分母差异很大。
+
+#### 共同对象控制
+
+两者共同支持24个GT，STRIVE独有317个、DualMap独有2个（plush toy165、toy109）。共同GT在STRIVE涉及99个预测UID，其中32个UID全局存在混合，20个GT有多个UID；DualMap涉及23个预测UID、2个混合、1个GT有多个UID。共同GT中有单一GT支持UID的数量分别22/21。因此，在保留共同对象时STRIVE仍有明显碎片问题，差异并非只来自总对象范围。该子集是事后诊断，不是独立测试集。报告 `TEEsav_s512_common_gt_comparison.json`。
+
+STRIVE的206个混合UID中，41个涉及同一标注类别的不同实例，165个涉及不同标注类别；最多一个UID涉及6个GT（plant、couch、table、basket等）。仅做类别一致性门控既无法解决同类多实例，也可能错拆检测器标签不同但实际相同的对象。
+
+#### 输出稳定性筛选的负结果
+
+保持所有预测归属不变，分别模拟输出数量筛选，结果如下：
+
+| 筛选 | 保留UID | 有支持UID | 混合UID | 支持GT | 单一GT支持UID涉及的GT |
+| --- | --- | --- | --- | --- | --- |
+| 全部 | 782 | 756 | 206 | 341 | 232 |
+| 至少8条观察 | 342 | 340 | 158 | 238 | 103 |
+| 至少2个采集位置 | 538 | 529 | 193 | 288 | 159 |
+
+混合占有支持UID的比例从27.25%升至46.47%/36.48%。这是输出筛选消融，没有复现DualMap完整稳定性算法，也没有重新融合。结论是直接删除低频UID会丢失大量单一实例支持，同时保留已有混合。报告 `TEEsav_s512_strive_support_filter_ablation.json`。
+
+#### 融合改进的优先级
+
+首要问题是关联归属，而非输出数量。令a(o)表示观察o的预测实例归属，n_i=sum_o 1[a(o)=i]；错误关联本身就会增加n_i，所以观察次数不能作为独立的身份验证。
+
+下一版先在冻结观察上试验可回溯的归属决策：保留原始mask/位姿、候选关联及冲突证据，宽mask跨越已有独立区域时保留未确定归属，避免立即并入一个UID；关联得到新证据后再决定合并或拆分，点云几何由已确定的观察重建。优先复用已有observations与空间查询，不引入第二套地图框架。
+
+分别在固定坏例（相邻熨衣板/抽屉/宽table mask）与正常多视图/部件整体例上评估；同时报告FP误合并、FN错拆、GT支持损失和未确定观察数。现有IoU/可见支持门槛及本轮次数筛选均未达标，保留为负结果。稳定实例分级置于关联修复之后；效率优化单独测量并要求关联结果保持一致。
+
+完整对照已完成，但可靠融合修复仍待实现和验证；当前不扩大导航评测，也不将地图质量标记为验收通过。
+
+
+### 延迟同帧歧义关联：实现、对照与未通过结论
+
+在既有诊断脚本增加 `--defer-coview-bridges`（要求显式min-coview-iou）。保留原0.25几何关联准入；当前观察同时匹配至少两个候选，且候选已有同帧mask互相低IoU时，记录assigned_uid=null和全部冲突候选UID，不改变任何实例的点云或类别计数。原始观察仍在源bundle中。该实现只保存未确定关联，没有宣称具备后续消歧。生产mapping/object_fusion.py保持不变。
+
+评估器将每条deferred观察作为独立单例参与观察对评估：同GT的未完成关联仍计入FN，不能通过把所有观察推迟而虚增分数。报告增加deferred_observation_count，supported_predicted_instances只统计已分配实例。4项CPU评估测试通过；维护容器没有pytest，直接执行2项无fixture断言测试通过；8项评估/质量比较回归测试通过。
+
+| 固定输入 | 变体 | 混合UID | deferred观察 | TP/FP/FN | F1 |
+| --- | --- | --- | --- | --- | --- |
+| TEEsav最终19观察 | 原融合 | 1 | 0 | 11/2/9 | 0.6667 |
+| TEEsav最终19观察 | coview≥0.05+延迟桥接 | 0 | 2 | 9/0/11 | 0.6207 |
+| 既有13帧298观察 | 原融合 | 10 | 0 | 650/116/657 | 0.6271 |
+| 既有13帧298观察 | coview≥0.05+延迟桥接 | 7 | 17 | 422/29/885 | 0.4801 |
+
+两组都减少错误关联，但未确定观察和错拆增多，整体F1下降。因此只能保留为诊断机制，未作为可靠融合修复。第二组有293条观察达到GT多数支持，5条另计证据不足；17条deferred为全部输入中的数量。报告 `outputs/prior_diagnostics/coview_bridge_deferral_evaluation.json`，保留两组trace与审计哈希。
+
+进一步核对两个deferred案例：table观察主要支持GT351 kitchen cabinet，冲突候选分别是预测drawer/GT351与预测ironing board/GT336 worktop；另一个floor观察主要支持GT289，与GT289/292两个地面区域发生歧义。这里“ironing board”等是检测标签，实际标注是worktop，不能当作物理类别真值。标注实例粒度与部件/整体关系需要明确，不能把所有空间邻近或不同标注ID都解释为同一种物理实例错误。
+
+下一阶段必须补全歧义处理闭环：保留观察→获得额外空间/视觉或任务粒度证据→重新确定归属；只做延迟、只加观察次数和简单同帧门槛均不足以实现已验收地图。需要使用独立正常样本验证可恢复关联的召回，同时维持完整错误/未确定分母。
+
+
+### 复用DualMap外观特征的冻结候选诊断
+
+核对DualMap实际实现：局部关联使用空间相似度+视觉余弦相似度；视觉表示为normalize(0.7×image_feature+0.3×class_text_feature)，上游sim_threshold=1.2，空间定义与STRIVE并不相同。全局/地图内合并还有不同路径。因此本实验检验外观信息能否辅助STRIVE，不宣称复现DualMap完整关联。
+
+新增extract_prior_appearance.py，直接复用DualMap Detector.compute_clip_features_batched和本地MobileCLIP-S2权重，对保存的RGB、bbox进行上游20像素padding裁剪；不重新检测，不发送图像到外部服务。19+298条观察全部实际编码，保存image/text/weighted三个归一化特征、观察ID、源图像和权重哈希；显式类别不执行unknown类别替换。实际检查特征全为有限值，19例最大归一化误差1.2e-7。
+
+新增diagnose_prior_appearance.py，按原关联trace聚合特征，保持原几何与身份决策。仅在候选已有单一GT多数支持时，使用GT判断当前观察与候选是否同实例；混合/证据不足候选另计且不进入AUC。原trace每观察最多保存3个空间候选，所以该统计是条件候选诊断，不能当作全局匹配准确率。UrbanNav环境无sklearn，诊断使用已有依赖的dualmap环境运行，未安装新依赖。
+
+| 冻结输入 | 全部候选对/可判定对 | 图像AUC | 图像+类别加权AUC | 几何AUC | 几何+加权外观AUC |
+| --- | --- | --- | --- | --- | --- |
+| 最终19观察 | 36/32 | 0.5333 | 0.6000 | 0.7917 | 0.7875 |
+| 13帧298观察 | 686/565 | 0.5906 | 0.6538 | 0.9143 | 0.8688 |
+
+在已知存在正确候选的观察子集中，19例条件首选正确数为8/8→8/8；13帧为197/201→195/201。该指标排除了无正确候选和不可判定关系，不能用来证明完整关联成功。
+
+坏例局部结果：宽table与drawer加权相似度0.4059，高于与ironing board的0.3425；但floor同GT对应0.2739，低于不同GT floor的0.2914。整体分布重叠，不能从单个有利例子设置外观门槛。原几何分数与外观直接相加没有改善两组候选排序，因此尚不接入生产融合。
+
+产物目录 `outputs/prior_diagnostics/TEEsav_final_appearance`、`matched13_appearance`；诊断报告 `TEEsav_final_appearance_diagnosis.json`、`matched13_appearance_diagnosis.json`。后续需区分padding背景干扰、局部视图变化、类别文本对不同实例的同质化，以及原错误关联对聚合特征的污染；当前结果不能推广为所有视觉特征无效。
+
+## 2026-11-01：观察归属、延迟消歧与局部重建首轮实现
+
+实现：只读几何评分和显式更新分开；新 `PriorAssociation` 统一建图与重放；暂缓观察保留原始证据；
+候选版本变化触发重评；提供带原因的撤销与局部重建入口。原在线策略继续使用共享旧算法。
+`--deferred-association` 显式启用，默认配置保持原融合。自动错误发现/撤销规则尚未验收。
+
+### 工程验收
+
+- 维护镜像 `strive-hm3d:local`：13 项 unittest 通过，包括新增协调器、原融合几何回归、
+  固定检测输出下的真实几何构建/导出/重载。该集成测试使用固定检测器结果，未验证模型推理。
+- UrbanNav CPU 环境：27 项 pytest 通过，覆盖评测、bundle、深度存储和质量比较。
+- `py_compile` 与 `git diff --check` 通过。
+- 未新增依赖，未调用外部图像模型，未改在线导航决策。
+
+### 冻结观察质量结果
+
+| 输入 | 方法 | TP/FP/FN | F1 | 最终暂缓 | 原有支持 GT 集合保留 |
+|---|---|---|---:|---:|---:|
+| 最终帧19观察 | 原融合 | 11/2/9 | 0.666667 | 0 | 100% |
+| 最终帧19观察 | 新协调器 | 10/1/10 | 0.645161 | 1 | 100% |
+| 13帧298观察 | 原融合 | 650/116/657 | 0.627110 | 0 | 100% |
+| 13帧298观察 | 新协调器 | 621/116/686 | 0.607632 | 5 | 100% |
+
+19观察 FP 减半，但 F1 下降 0.021505，超过冻结容差0.02。
+298观察 FP 没有下降；F1 下降0.019478；对象保留通过。
+因此总体质量门槛未通过，停止扩大建图规模，保留显式实验入口。
+
+298观察中14项曾暂缓，9项最终归属（64.29%）：6项最终同组GT一致，1项与纯净参考组GT不同，
+2项参考组已混合而无法确定。这里是最终组一致性，不是消歧时刻的因果正确率。
+- `frame7:detection27` GT457归入`frame5:detection7` GT428，是明确错误；原因从候选分差转为唯一候选。
+- `frame0:detection12` 的参考组涉及GT415/416；`frame0:detection39` 涉及GT402/404；
+  两项不能仅凭最终混合组断言消歧当时选错。
+
+结果表明队列机制已工作，但累计几何分差及单个独立观察仍不足以确定身份。
+下一步应检查唯一候选为何是错误实例、其原始观察的共同可见区域与空间冲突。
+优先改接纳证据，保持覆盖；不通过调宽验收门槛或删除待定观察宣称成功。
+局部重建目前由明确纠错调用触发；自动触发与完整导航收益仍待验证。
+
+### 产物与边界
+
+- `outputs/prior_diagnostics/TEEsav_final_owned_association_v1.json`：0.2283秒，10个实例。
+- `outputs/prior_diagnostics/matched13_owned_association_v1.json`：16.8851秒，72个实例。
+- `outputs/prior_diagnostics/owned_association_evaluation_v1.json`：指标、集合保留、门槛与输入哈希。
+- 上述时间仅为新实现重放时间；未完成同环境配对时间与峰值内存验收。
+- 本轮没有重跑检测器、完整场景地图或导航episode；查询/可执行视点保留尚未验收。
+- 前期无v1后缀的产物保留；最初“3项消歧错误”的描述已细化为1项明确错误、2项不可判定。
+
+## 2026-11-01：误接纳根因定位与固定准入的双向排序对照
+
+上一轮产生了实现与冻结结果，本轮据此继续定位 `frame7:detection27`，没有扩大到全场景。
+独立审计：该观察91%像素属于window GT457，9%属于armchair GT428。
+错误候选`frame5:detection7`的已接纳成员全部是armchair428；另一候选`frame4:detection0`成员全部是window457。
+因此本例可明确区分错误对象与同类部件粒度问题。
+
+### 机制证据
+
+原评分是按点数加权的双向近邻覆盖：
+\[
+s_{pool}=\frac{N_P c(P,Q)+N_Q c(Q,P)}{N_P+N_Q+\epsilon}.
+\]
+第7帧错误armchair候选：总分0.483871，观察到参考覆盖0.233618，参考到观察0.878652。
+重评时：总分0.587500，两个方向0.254986/0.903794。
+正确window候选：总分0.462868，但观察到参考覆盖为1.0，参考到观察0.401306。
+累计参考点数可让局部匹配候选获得更高权重；候选分差变大不意味着观察身份得到独立验证。
+
+新增单因素诊断开关 `--deferred-association --balanced-coverage`，固定原pool>=0.25的准入，
+仅将候选排序与分差改为 `s_balanced=(c(P,Q)+c(Q,P))/2`。原始成员支持条件保持不变。
+新单元测试验证参考点均匀重复时等权分数不变、原评分变化，以及准入集合保持不变。
+维护镜像12项协调器测试通过，含固定检测器结果的导出重载。默认配置仍为pool排序。
+
+### 对照结果
+
+| 298观察方法 | TP/FP/FN | F1 | 混合UID | 最终暂缓 |
+|---|---|---:|---:|---:|
+| 原融合 | 650/116/657 | 0.627110 | 10 | 0 |
+| 首版协调器 | 621/116/686 | 0.607632 | 10 | 5 |
+| 等权准入+排序（混杂对照，未保留为入口） | 1058/204/249 | 0.823667 | 9 | 8 |
+| 固定原准入，仅等权排序 | 626/110/681 | 0.612824 | 9 | 5 |
+
+固定准入版本将具体window观察正确归回window457。9个消歧结果中最终组一致7项、未知2项、
+明确错误0项。GT支持集合保留100%。相比原融合FP仅减少5.17%，未达到25%门槛。
+19观察结果TP9/FP1/FN11，F1=0.6，仍有2项暂缓；该切片没有达到F1门槛。
+因此本例根因修正有效，但整体融合仍未验收，保持实验选项。
+
+第一次等权对照同时改变准入造成混杂，原始产物保留，不能把其F1提升归因于排序改进。
+新的诊断方向：检查19观察新增暂缓项和298观察残留混合的观察级空间支持，区分宽mask污染、
+实际相邻物体和合理部分视图；维持已冻结门槛，优先控制误合并而不全局收紧准入。
+
+产物：
+- `outputs/prior_diagnostics/matched13_wrong_resolution_trace.json`：决策时刻的候选及原始成员分数。
+- `matched13_wrong_resolution_audit.json`：运行结束后关联GT的独立审计。
+- `matched13_wrong_resolution_receipt.json` / `trace_prior_resolution.py`：输入及脚本身份。
+- `matched13_owned_balanced_rank.json` / `TEEsav_final_owned_balanced_rank.json`：最终单因素重放。
+- `owned_balanced_rank_evaluation.json`：最终评测。
+- `*_owned_balanced.json` / `owned_balanced_evaluation.json`：保留的准入+排序混杂对照。
+
+## 2026-11-01：修复暂缓状态版本超前，并定位残留chair混合
+
+### 确定性状态修复
+
+`add_frame`和`resolve_pending`在固定实例状态上评分，却曾在随后提交时由`_defer`读取最新版本。
+当同帧另一观察已先更新候选实例，待定项会把尚未评估的新证据标为已检查，漏掉重评。
+现改为显式传入评分时的版本快照。撤销使用撤销后的版本作为等待新证据的基线。
+
+新增测试先在旧实现稳定失败(None而非'a')，修复后通过；维护镜像13项关联测试全部通过。
+冻结重放保持balanced候选排序与原准入不变，只改变版本记录：
+
+| 输入 | TP/FP/FN | F1 | 最终暂缓 | 消歧最终组一致/错误/未知 |
+|---|---|---:|---:|---|
+| 298观察，修复前 | 626/110/681 | 0.612824 | 5 | 7/0/2 |
+| 298观察，修复后 | 630/110/677 | 0.615535 | 4 | 8/0/2 |
+| 19观察，修复后 | 9/1/11 | 0.600000 | 2 | 0/0/0 |
+
+这是漏触发修复，不能解读为身份判断问题已解决。有效支持对象集合仍全部保留，质量门槛仍未通过。
+产物：`matched13_owned_scoring_version.json`、`TEEsav_final_owned_scoring_version.json`、
+`owned_scoring_version_evaluation.json`，均位于`outputs/prior_diagnostics`。
+
+### 残留错误分解（基于版本修复前的110个FP）
+
+`matched13_remaining_mixed_decomposition.json`将错误对分解到9个混合UID：
+chair组40、bench/wall组20、wall/window组16、不同wall组12、cabinet/wall组7，其余共15。
+仅45个FP的两端mask均有超过80%同一GT像素支持；宽mask/边界混杂影响明显，但纯净mask间也有误关联。
+该80%统计仅作GT离线诊断，不作为运行时过滤条件。
+
+最大chair组`frame0:detection7`的初始mask本身GT416支持仅49.3%，GT415也占有大量像素。
+它作为实例种子，随后同一预测UID吸收两把椅子的多帧观察。已有实例的累计支持不能保证种子身份纯净。
+第11帧detection3(GT415,87.5%)与detection6(GT416,85.2%)的mask IoU仅0.0392，却归入同一历史UID；
+第12帧detection36与detection37的IoU仅0.00834，分别主导GT416/415。
+这给出了后续可用的同帧冲突证据，而非仅凭类别或相近位置猜测。
+
+当前帧选择在固定历史members上判断，尚未联合审查本帧多个拟提交观察间的冲突；同时“其他帧有支持”
+可能来自已经污染的成员。下一步应先补齐本帧拟提交组的冲突检测并记录观察级依据，
+再评估以独立原始观察支持局部拆分/撤销。禁止用已有混合实例的累计点云自证其身份。
+需保留同一对象局部视图的对照，避免把所有低IoU都当作不同实例。
+
+同帧掩码交并、包含率证据：`outputs/prior_diagnostics/matched13_chair_coview_overlap.json`。
+本轮未改默认建图或在线策略，未扩大到全场景，未启动外部图像模型。
+
+## 2026-11-01：同帧拟提交冲突审计及负例验证
+
+新增`PriorAssociation._record_coview_conflicts`，在当前帧提交和暂缓消歧提交前检查
+同一预测UID的同帧观察；暂缓消歧也包含该帧已提交成员。记录原始观察ID、mask IoU、
+双向包含率与提交阶段，仅作为证据，不改变接纳。
+维护镜像15项关联测试通过；298观察最终归属与上一轮逐项完全一致，F1仍0.615535。
+
+40对去重冲突中，26对GT相同、12对GT不同、2对GT支持不足无法确定。
+同GT的26对包括table15、flower vase6、window3、wall1、cabinet1。
+因此低IoU不能直接触发拆分或撤销；这种操作会误伤大量同一实例的局部视图。
+
+进一步对这些冲突的原始过滤点云计算几何（GT仅用于事后分组）：
+
+| 几何量 | 同GT中位数 | 不同GT中位数 | 边界 |
+|---|---:|---:|---|
+| 最小点间距/m | 0.02276 | 0.01952 | 两组都可为0，不能单独区分 |
+| 中心距离/m | 0.16763 | 0.51994 | 同GT最大0.45177、不同GT最小0.14473，有重叠 |
+| 第一方向0.1m覆盖 | 0.65152 | 0.33505 | 同GT也有0；方向取决于观察顺序 |
+| 第二方向0.1m覆盖 | 0.45833 | 0.13017 | 不同GT也可达1.0 |
+
+这些结果支持继续使用原始观察的多证据判定，否定“低IoU+最小距离”直接当作身份反证。
+中心距离和表面覆盖存在组间差异，但样本很小且范围重叠，尚不据此设新生产阈值。
+后续局部重建应先验证多视角稳定的分组证据，保留同一对象局部视图作为对照。
+当前默认算法与完整地图验收状态保持不变。
+
+产物（outputs/prior_diagnostics）：
+- `matched13_owned_conflict_audit.json`：运行时无GT冲突记录，重放20.029秒。
+- `matched13_coview_conflict_evaluation.json`：独立GT评测与40对完整记录。
+- `matched13_coview_conflict_geometry.json`：原始观察几何及分组统计。
+- `inspect_conflict_geometry.py`：冻结几何计算脚本。
+
+## 2026-11-01：原始观察强支持分组与跨位置验证
+
+新增 `scripts/diagnose_prior_support_groups.py`：对冻结预测实例内部所有原始观察对计算双向
+0.1m近邻覆盖；两向均>0.85才连边，阈值沿用既有目标融合的强覆盖数值。
+图构建不读取GT、不改变归属；连通分量仅作支持证据。记录帧数、相机位置数及源码/输入哈希。
+相机位置按0.0001m四舍五入计数，仅用于区分采集位置，不代表独立语义证据保证。
+
+### 13帧局部诊断
+
+779对、246条强边：239条同GT、1条跨GT、6条GT支持不足。
+158个分量中156个单GT、1个混合、1个未知；跨帧分量62个，但跨相机位置分量为0。
+原始两把椅子的观察分别形成两个跨3帧分量，对应GT416/415；仍有部分GT415观察形成单例。
+这13帧来自一个原地扫描位置；RGB文件哈希无完全重复，但80条强边的相机旋转差<1度，
+166条>15度。不能把多帧支持等同于跨位置验证。
+
+若将所有分量直接视为实例，TP252/FP2/FN1055，F1=0.322870，明显过度拆分。
+该反事实仅离线计算，未应用到地图。
+
+### 最小跨位置检查
+
+追加使用已有捕获的第13—21帧行走观察，共22帧533个观察；没有新增采集、检测或外部模型请求。
+协调器重放61.39秒，强支持图6.98秒。此检查用于验证位置变化这一缺失条件，不是完整场景扩测。
+
+3488对、953条强边：931条同GT、1条跨GT、21条GT支持不足。
+222个分量中218个单GT、1个混合、3个未知。
+跨相机位置分量30个，包含231个观察，独立审计均为单GT；单GT依然只指多数像素GT一致，
+不能据此声称mask完全纯净或对象类别正确。
+两把椅子的主要组分别跨4个和6个相机位置；同一GT415仍有另一个跨2位置的小分量。
+
+### 局部拆分反事实
+
+按无GT规则：只选择至少存在两个跨位置强支持分量的旧UID，将强分量成员分别赋新身份，
+其他观察暂留原身份。共涉及5个UID、131个观察。
+
+| 22帧指标 | 原协调器 | 局部强分量拆分反事实 |
+|---|---:|---:|
+| TP | 2922 | 1893 |
+| FP | 294 | 118 |
+| FN | 4283 | 5312 |
+| F1 | 0.560791 | 0.410807 |
+
+误合并明显减少，但弱支持观察与强分量之间的正确关联被切断，召回损失超过收益。
+因此强分量可作为局部重建的身份参考，不能直接作为最终实例划分。
+下一步应验证剩余观察向这些参考组的唯一归属：引用原始成员支持、保留竞争候选，
+无法确定者继续待定；必须连同漏关联一起验收，避免只汇报FP下降。
+当前未将拆分应用到地图，默认融合及完整地图验收状态保持不变。
+
+产物位于`outputs/prior_diagnostics`：
+- `matched13_raw_support_groups.json`、`matched13_raw_support_groups_audit.json`
+- `matched_capture_view_independence.json`
+- `matched13_support_component_assignment_diagnostic.json`
+- `matched22_owned_support_input.json`
+- `matched22_raw_support_groups.json`、`matched22_raw_support_groups_audit.json`
+- `matched22_local_component_split_diagnostic.json`
+
+## 2026-11-01：弱观察重归属对照与拆分损失根因修正
+
+新增 `scripts/diagnose_prior_group_assignment.py`，固定跨位置强支持组，不让新归属观察更新参考。
+只处理存在多个强支持组的5个旧UID。原始成员对pool>=0.25才进入候选，组分数为符合准入成员的
+双向等权覆盖最大值；前两组分差>=0.10才接纳，否则暂缓。构造过程不读GT，不修改地图。
+
+131项强组成员之外，实际只有7个弱观察，6项完成唯一归属、1项暂缓。
+离线指标：TP1970/FP118/FN5235，F1=0.423975；比直接拆分0.410807有所恢复，
+仍明显低于拆分前0.560791。最终待定11项（原10项加1项），质量门槛未通过。
+
+**修正上一轮原因判断：**此前将主要损失归因于弱观察与强组切断，证据不足。
+进一步分解剩余952对丢失的正确关联：913对发生在不同强支持组之间，仅39对涉及弱观察。
+主要原因是同一真实对象存在多个强支持组，缺少强边不能证明不同身份。
+因此继续调弱观察阈值无法解决主要召回损失，暂不将此方案接入地图更新。
+
+### 独立空间证据检查
+
+5个旧UID的跨位置支持组共有12个组对：独立GT审计10对同实例、2对不同实例（两把椅子）。
+三维AABB间距：不同椅子的两对均为0，同实例组对可为0至0.017m；边界盒相交无法可靠区分。
+中心距离：不同椅子0.345/0.397m，同实例0.074至0.298m。
+仅两对不同身份且范围间隔很小，不能据此选择新的通用距离阈值。
+
+下一步应寻找组间不同身份的正面证据（例如跨视角稳定的分割边界与不同表面占据），
+并保留同一物体不同局部的对照。强支持组可作为参考证据，不能自动提升为独立实例。
+本轮所有变体保持离线，原地图、默认融合和在线导航未改动。
+
+产物（outputs/prior_diagnostics）：
+- `matched22_weak_group_assignment.json`：候选分数、支持观察、反事实归属及源码/输入哈希。
+- `matched22_weak_group_assignment_evaluation.json`：完整指标及正确关联损失分解。
+- `matched22_support_group_extent_pairs.json`：无GT原始三维范围。
+- `matched22_support_group_extent_audit.json`：GT事后审计。
+- `inspect_support_group_extent.py`：范围计算脚本。
+新脚本在维护镜像中实际执行成功；py_compile和git diff --check通过。
+
+## 2026-11-01：部件粒度核对与先验查询实际用途检查
+
+查看frame0/frame11原始RGB并复核GT：检测器标为drawer的frame0:detection16/19/20
+位于桌子抽屉区域，GT均归table357，mask支持100%。不同部件存在分割边界是正常现象，
+不能将边界直接等价为不同物体。两把椅子仍是不同GT415/416，需要区分整体、部件及邻接物体。
+更正前文笔误：frame11:detection3的GT415支持为87.5%；97.2%属于frame1:detection3。
+
+为落实“导航够用”，本轮通过现有 `query_prior_bundle.py` 对已完成的80帧原地图执行
+chair/table/window/cabinet/piano/flower vase六项字面概念检索，GT只作事后审计。
+这补充功能验收，不替代已冻结的融合门槛。
+
+| 查询 | 首选候选的多数GT证据 | 结果边界 |
+|---|---|---|
+| chair | 13/13支持观察为chair | 具备正确类别证据 |
+| table | 6/8支持观察为table，其余chair | 候选存在混合 |
+| window | 9/15支持观察为window，其余wall | 候选存在混合 |
+| cabinet | 9项支持观察均为art frame/bookshelf | 字面类别检索缺乏正确证据 |
+| piano | 无候选 | 检索缺口 |
+| flower vase | 3项支持观察均为decorative plant | 存在语义粒度歧义，暂不判错 |
+
+没有将上述六个查询转换为导航成功率；完整任务语义和在线验证尚未执行。
+
+### baseline巡视视点适配修复
+
+发现 `resolve_habitat_viewpoints` 只接受coverage_scan/continuous_walk，拒绝已有baseline_patrol。
+核对collect_hm3d_patrol.py及保存的Habitat配置：RGB/Depth安装偏移均[0,0.88,0]、安装角为0；
+记录位姿采用相同OpenCV相机轴和map_z_up转换。
+新增明确支持 `(habitat_gt_camera_pose, baseline_patrol)`，该模式原网格哈希从capture_profile读取。
+带重建回执时继续校验场景与NavMesh哈希。其他采集类型保持拒绝；未修改运动准入或STOP条件。
+
+维护镜像实际PathFinder验证：针对5个有候选的查询，使用已哈希绑定的wcojb4TFT35-r010-h150
+重建NavMesh，从记录的起点查询。chair/table/window/cabinet/flower vase分别有6/6/11/3/3个
+可达历史视点，均无拒绝项。24项capture/query-binding回归测试通过。
+
+按现有最短路径选择的视点：chair具备chair证据；table同时含table/chair；window同时含window/wall；
+cabinet含art frame/bookshelf；flower vase对应decorative plant。可达不等于目标语义正确。
+本轮仅做路径查询，没有实际导航、外部VLM或机器人动作。
+
+后续应针对查询目标检查观察级语义证据与视点选择，避免混合UID的所有观察被当成同一个目标证据；
+也需区分对象缺失与类别/部件表示差异。保持当前最终验证和ranking_only权限边界。
+
+产物（outputs/prior_diagnostics）：
+- `matched80_*_retrieval.json`：6项实际查询回执。
+- `matched80_retrieval_evidence_audit.json`：字面类别证据审计。
+- `matched80_*_reachable_views.json`：5项真实PathFinder回执。
+- `matched80_retrieval_viewpoint_audit.json`：实际选中视点的独立GT审计。
+- `check_prior_retrieval_views.py`：只读路径检查脚本。
+
+## 2026-11-01：查询目标绑定到原始观察，再解析历史视点
+
+修复查询导航把同一融合UID的所有观察都当作目标证据的问题。
+`prior_map/query_binding.py::query_evidence_observation_ids` 先复用既有map_id/revision/hash校验，
+再从当前bundle读取所选UID的观察，使用原query服务的目标词提取、归一化和文本相关性规则
+筛选detector_label匹配的观察。没有新增语义模型或类别表，检测标签匹配仍然只是候选依据。
+无匹配证据时显式报错，保留地图中的全部原始观察及冲突证据。
+
+`resolve_habitat_viewpoints(..., observation_ids=...)` 增加观察级范围约束，
+拒绝引用所选实例之外的证据；结果记录实际绑定的历史观察ID。
+`check_prior_motion.py` 的query-receipt入口先计算该绑定，再解析视点。
+直接指定object_uid的诊断入口保持实例级范围。任务版本、运动准入和最终验证规则未改变。
+
+26项capture/query-binding测试通过，包含混合UID按目标分别选择chair/table观察、
+地图冲突证据仍保留，以及缺乏匹配证据时显式失败。py_compile及git diff --check通过。
+
+### 真实NavMesh只读对照
+
+使用同一80帧地图、同一起点、同一重建NavMesh和5个查询，实际PathFinder通过。
+
+| 查询 | 可达视点数：绑定前→后 | 绑定后的选中观察审计 |
+|---|---|---|
+| chair | 6→6 | 3项chair观察，保持 |
+| table | 6→6 | 仅保留frame0:detection0（GT table，65.3%） |
+| window | 11→9 | 仅保留frame0:detection1（GT window，91.2%） |
+| cabinet | 3→1 | frame56:detection17仍为GT bookshelf（85.1%） |
+| flower vase | 3→3 | decorative plant，语义粒度歧义保持 |
+
+table/window不再向下游传入同UID中的chair/wall观察。
+cabinet结果说明该修改只能消除证据混用，不能纠正检测器自身误识别；不得把绑定成功当作目标验证。
+本轮没有实际运动、VLM调用或融合重建，也没有宣称地图关联FP改善。
+
+产物（outputs/prior_diagnostics）：
+`matched80_*_bound_reachable_views.json`、`matched80_bound_retrieval_viewpoint_audit.json`、
+`check_bound_prior_views.py`。此前未绑定产物保留用于对照。
+
+## 2026-11-01：当前接近与最终验证的深度有效性统一
+
+审计现有链路：历史查询只决定观察位置；到达后重新检测当前候选，再接近、重新采集，
+最终通过FinalInstructionVerifier和TaskProgress reducer决定是否发送STOP。
+没有发现历史类别直接写入完成状态的路径。
+
+发现确定性几何口径差异：capture_builder调用metric_depth_validity排除已记录的传感器裁剪端点，
+prior_approach与arrival_verification此前仅检查depth<=max_depth，可能将量程端点作为近距离表面。
+两处现复用同一个有效性函数，保留原平面最近点距离公式：
+\[
+d=\min_{p\in P_{valid}}\|p_{xy}-x_{camera,xy}\|_2,
+\quad P_{valid}=\operatorname{Backproject}(M\land z_{min}<D<z_{max}).
+\]
+没有裁剪profile的原始深度仍使用原有正深度规则；不把历史传感器profile强加给新模拟器的原始深度。
+有效点为空时明确报告Current mask has no valid depth support，保留失败而非生成虚假近距离。
+
+新增两项测试先复现旧实现失败（8点误当有效、全裁剪未报错），修复后通过。
+共38项arrival、verification、capture、depth、query-binding回归通过；py_compile及diff检查通过。
+
+保存的TEEsav chair第51帧准备输入重算：原距离与新距离均0.6777199749643563m，
+点数均12038。此保存案例没有裁剪profile，故结果保持符合预期。
+新产物 `outputs/prior_diagnostics/TEEsav_chair_depth_policy_prepare/` 标明
+verification_performed=false、task_completed=false：仅重算输入，不是再次模型验证或导航成功。
+
+这项修复统一了测量事实，未解决错误类别或mask内部跨实例混杂。
+后续当前候选的多观察选择、类别错配和完整导航闭环仍需单独验收。
+
+## 2026-11-01：当前候选显式绑定原始观察
+
+当前接近入口此前假定每个候选UID只有一个观察，多观察实例会在解包时失败。
+新增current_concept_observation，复用现有目标文本相关性，再以检测置信度及观察ID排序，
+返回candidate_uid与observation_id。此选择仍是候选证据选择，不是类别验证。
+接近提案和最终验证接收显式观察ID；最终新帧独立选择，沿用当前运动回执绑定。
+验证中的对象中心由所选mask的有效深度点计算，证据记录观察ID、mask及深度SHA256，
+从而让图像、距离与中心引用同一条原始观察。
+
+41项query-binding、arrival、verification、capture及depth测试通过。
+使用保存的TEEsav第51帧及真实NavMesh完成只读接近提案检查：
+
+| 候选 | 绑定观察 | 提案数 | 选中提案路径距离 | 预测可见率 |
+|---|---|---:|---:|---:|
+| chair | frame51:detection0 | 2 | 0.365m | 0.241 |
+| table | frame51:detection1 | 4 | 0.862m | 0.065 |
+
+两者均生成满足现有停止距离准入的提案；table的预测可见率较低，不能将几何准入视为取证质量验收。
+产物为outputs/prior_diagnostics/TEEsav_{chair,table}_bound_current_approach.json。
+本轮没有运动或模型调用。检测误识别、mask内部混杂及融合质量门槛仍未解决，默认融合保持原配置。
+
+
+## 2026-11-01：必要交付2——接近评分使用目标俯仰姿态
+
+对保存的第51帧chair/table观察固定点云、内参、位置，仅改变俯仰，水平投影准确复现
+原visible_ratio 0.240738/0.064957；对准目标中心后均为1.0。此前低值由评分姿态与执行取证
+姿态差异造成，不能据此断言实际取证失败。
+
+`navigation_core/view_geometry.py::rotation_towards`增加默认0的pitch，
+`planning/viewpoint_policy.py`增加默认False的align_pitch；仅先验接近入口启用。
+公式为theta=atan2(z_target-z_camera, ||target_xy-camera_xy||)，R=R_yaw R_x(theta)。
+沿用mapper反射坐标轴，变换行列式为-1；原在线水平评分默认行为保持。
+
+维护镜像中实际NavMesh检查完成：chair候选2→2，table候选4→8，二者最终位置保持；
+路径距离分别0.364820m和0.862403m。51项相关回归通过。
+产物：outputs/prior_diagnostics/TEEsav_{chair,table}_pitched_current_approach.json。
+
+本轮无导航和模型调用。visible_ratio是已知表面点落入图像范围的比例，未检查新视角遮挡；
+评分采用连续目标姿态，执行使用10度离散俯仰、到达误差与实际相机位姿，仍需当前图像验证。
+融合质量、固定任务集、手机与实物交付仍未完成。
+
+## 2026-11-01：必要交付2——table接近实际运动与深度取证
+
+首次运动入口在启动simulator前报错：指定当前接近提案仍先调用历史视点解析，
+当前单帧motion-arrival包不属于历史采集模式。修复check_prior_motion.py：
+当前提案与历史视点分别选择目标，共享场景/网格哈希校验及建网机器人尺寸。
+不扩大历史采集模式白名单，不伪装当前观察来源。
+
+修复后维护镜像实际执行完成，产物outputs/prior_motion/TEEsav-table-pitched-approach001。
+22动作，0.750000m，零碰撞，reached，目标位置误差0.115613m；
+偏航误差3.364351度，俯仰误差-4.323074度，均在离散10度动作的半步范围内。
+最终图像rgb/000022.png中可见扶手椅旁边桌；本轮没有检测器或外部模型判断。
+
+将原frame51:detection1的1755个有效深度点投到实际第22帧：全部在画面内，
+全部具有有效当前深度，99.886%深度差不超过0.1m；绝对深度误差中位数0.001676m，
+被前景遮挡超过0.1m的比例为0。详细记录surface_reprojection.json。
+此为预测表面的空间取证验证，类别和指定实例身份仍需当前语义验证。
+
+这次只执行当前接近子过程，不计入完整新指令成功率；不替代固定任务集验收。
+
+## 2026-11-01：必要交付2——table当前检测与验证输入
+
+对TEEsav-table-pitched-approach001最终第22帧复用维护镜像、原SAM/GroundingDINO权重、
+原100类词表生成arrival_capture和arrival_bundle。当前table观察为frame22:detection1，
+实例d8da6099-bce7-4b94-9cf3-f9e3e65f1876:frame22:detection1。
+最终验证输入采用本帧重新检测的mask，3008有效点，平面最近距离0.716948906m。
+与上一轮源表面重投影不同，此处是实际新检测证据。
+
+check_prior_arrival.py补齐已有verify_arrival的--observation-id参数，命令行prepare-only实测通过：
+一条明确观察，verification_performed=false，completed=false，task_stop_sent=false。
+输入及任务分别保存在verification_prepare/、cli_prepare/、task_query.json。
+
+外部豆包调用在执行前被自动审批拒绝，理由是此前图像授权仅覆盖chair；已向用户请求
+本次table第22帧/框/派生证据的授权。尚无本次最终语义判断，未发出模型请求。
+后续批准后可使用现有check_prior_arrival.py入口，读取task_query.json与显式候选/观察ID。
+该入口验证保存证据，不发送STOP；完整任务结果必须使用同会话运动入口验收。
+
+真实手机交付：在当前Code工作空间未找到odometry.csv、camera_matrix.csv或.r3d样本，
+已请求真实采集目录及机器人连接/启动配置。不能据此推断其他磁盘不存在数据。
+
+## 2026-11-01：必要交付1/3——统一地图到baseline frontier的坐标绑定
+
+正式benchmark已有PriorMapSimulationRuntime及房间/frontier软排序接入；
+此前单例check_prior_motion的直接历史视点导航是另一入口，不能直接充当三组对照。
+核对发现统一采集map_z_up=(x_H,-z_H,y_H)与旧查询Habitat水平面(x_H,z_H)不一致。
+默认identity未标明新运行平面，可能把搜索偏置引到目标镜像侧。
+
+新增回归首先复现失败：目标(10,-10,1)对应Habitat(10,0,10)，旧实现选择(10,0,-10)。
+simulation默认对map_z_up声明同名运行平面，query对明确Habitat/mapper局部来源使用(x,-z)。
+已转换的map_z_up位置和实物原生快照继续使用xy；旧Habitat地图保持原投影。
+没有新增评分权重或运动控制路径。
+
+15项query/simulation/active-planner/real-robot相关测试通过，包含非零episode原点转换及
+原生统一地图点不重复翻转。此为固定任务集对照的接入修复，尚未产生新的导航成绩。
+对象加证据分支需要与对象先验共享导航执行器后再进行公平对照；现有直接视点诊断单列。
+
+## 2026-11-01：必要交付6——统一地图包进入共享运行时
+
+PriorMapLoader现接受完整地图包目录（auto或bundle），调用既有load_bundle验证坐标、身份和证据引用，
+返回相同PriorMapData。仿真与实物配置入口共享此能力，核心JSON路径继续支持。
+地图包引用检查不意味着历史图像已进入高层模型；对象加证据分支的消费链仍待接入验收。
+
+实际80帧地图通过两种运行时配置工厂加载，200对象、map_z_up，核心数据完全一致。
+期间发现实物工厂传入high_level_interval但构造器缺参数；补齐参数与成员，复用既有调度规则。
+22项capture、simulation、real-robot相关测试通过。产物outputs/prior_diagnostics/bundle_runtime_load.json。
+这是本地运行时初始化验证，不是实物执行验收。
+
+用户已明确实施顺序：先仿真，手机扫描及实物接入最后进行；当前无需等待实物输入。
+
+### table保存到达证据的真实豆包验证完成
+
+用户明确授权本次table第22帧/框/派生证据后，调用doubao-seed-2-0-pro-260215，
+使用既有关闭thinking的请求路径。返回accept、confidence=0.90、semantic_satisfied=true、
+view_sufficient_for_stop=true，认为框内边桌满足Find a table。
+当前mask平面距离0.716948906m通过1m约束，reducer completed=true。
+receipt位于outputs/prior_motion/TEEsav-table-pitched-approach001/final_verification/receipt.json。
+
+该验证在原simulator会话结束后运行，task_stop_sent=false。它证明这组当前证据和任务判断链路，
+不构成新的同会话完整导航成功率样本。此前本组外发授权阻塞已解除。
+
+## 2026-11-01：必要交付3——正式运行时消费历史对象证据
+
+仿真benchmark新增--enable_prior_object_evidence，要求已启用--enable_prior_map_vlm并指定完整地图包。
+PriorMapSimulationRuntime在既有高层选择时，取排名首位对象中与当前目标词匹配的原始观察，
+按文本相关性、检测置信度、观察ID确定一条参考，生成带框历史图像。
+无匹配观察时本次不附加历史图像；暂缓观察不属于已归属实例，不进入参考。
+
+高层选择器仍接收同一BEV、同一候选集合，额外图像被标记为历史检测假设。
+map_id/revision、core hash、对象UID、观察ID、mask hash与图像hash进入请求记录和缓存键。
+它只参与搜索排序，不写入当前实例身份或任务完成状态。
+模型选择、局部导航、当前感知和最终验证继续使用既有执行路径。
+
+30项query-binding、多模态请求和仿真集成测试通过。
+实际80帧地图在正式运行时构造请求，mock模型收到2张图（动态BEV＋历史chair框图），
+绑定frame11:detection1、对象matched-baseline-concepts100:frame0:detection4。
+产物outputs/prior_diagnostics/historical_evidence_runtime/request_wiring.json。
+此次仅本地请求构造，无外部图像发送、运动或导航成绩。
+
+对照入口：无先验保持--enable_prior_map关闭；对象先验启用--enable_prior_map与
+--enable_prior_map_vlm并指向统一包；对象加证据在相同配置上增加--enable_prior_object_evidence。
+后两组保持相同高层选择器，以隔离附加历史原始证据的影响。
+固定任务、起点、预算和实际评测仍待运行；不能把mock请求结果视为模型或导航能力验收。
+
+## 2026-11-01：必要交付3——首批三组任务与数据身份冻结
+
+outputs/prior_evaluation/wcojb-three-arm-001/manifest.json冻结三组命令、地图core哈希、
+数据哈希及起点/朝向。源为wcojb4TFT35 ObjectNav val，选取原索引0/2/12：
+TV、sofa、chair各一例，均为当前先验所在低层起点；每组500步，baseline_guided，
+模型doubao-seed-2-0-pro-260215，共9次运行。该批仅为普通目标先导验收，
+相似实例、属性消歧、历史对象当前不可见仍保留后续验收范围。
+
+维护镜像实际Habitat加载已通过。加载器from_json显式将episode_id重编号为str(i)，
+源ID为2/2/4，运行ID为0/1/2；类别、场景、位置和旋转逐项一致，完整身份互异。
+源/运行身份同时保存在manifest和dataset_load_receipt.json，加载器方法源码一并留存。
+不得仅按原episode_id判定重复或把运行重编号误当换样本。
+
+本批尚未启动导航。已请求针对9次运行当前图像、BEV及历史框图的豆包外发授权；
+已有明确授权覆盖指定chair/table图像，未扩展到本批全部图像。
+
+## 2026-11-01：必要交付3——高层frontier偏好进入当前房间策略
+
+审核baseline_guided调用链确认：select_observed_candidate刷新prior runtime；
+此前find_closest_nodes只消费geometry frontier_biases，不读取高层选择器返回的frontier。
+因此新增历史图像可能影响模型输出，却无法影响当前房间内选点，仅房间切换路径部分消费。
+
+在既有软排序中加入高层明确选择的frontier，使用与原房间偏好一致的单位分数：
+`d_adjusted = d_nav - bias_m * max(geometry_score, selected_frontier_score)`。
+现有导航距离、候选节点、偏置权重、可达性和运动所有者保持原实现。
+选择不存在于当前候选中的UID不产生分数；prior adapter关闭时保持baseline选择。
+
+新增测试先复现高层选择被忽略，修复后通过；25项planner/query/simulation/multimodal测试通过。
+三组正式运行前将当前Python/YAML/shell源文件哈希记录在
+outputs/prior_evaluation/wcojb-three-arm-001/source_hashes.json。
+没有启动导航或模型调用；本批外发授权仍待用户回复。
+
+## 2026-11-01：必要交付3——实际reset核验与完整任务身份选择
+
+实际Habitat环境发现NUM_EPISODE_SAMPLE会改变迭代器顺序，即使SHUFFLE=False；
+首个索引变为sofa，与冻结顺序TV/sofa/chair不同。原select_episode仅验证reset前后
+一致，不能证明跨组选择了同一预定任务。
+
+select_episode增加可选expected_identity，按完整身份匹配；benchmark新增--episode_manifest，
+读取runtime_episodes并传入。缺失或重复匹配显式报错，旧索引入口保持原行为。
+三项episode选择回归通过；三组命令已加入同一清单路径，并更新源码哈希。
+
+维护镜像真实reset完成：TV运行ID0、sofa ID1、chair ID2，身份与冻结清单逐项相同，
+起点均可导航；初始distance_to_goal分别11.537122m、3.310102m、4.000765m。
+回执outputs/prior_evaluation/wcojb-three-arm-001/environment_receipt.json。
+本轮仅reset和传感器初始化，未导航、未调用模型、未发送图像。
+
+## 2026-11-01：三组对照授权与正式启动
+
+用户已明确允许本批9次运行的当前图像、BEV和历史对象框图用于豆包。
+新增scripts/run_prior_comparison.py复用原Docker benchmark入口，按manifest运行单组，
+启动前后检查源码/数据/地图哈希；结果验证每例完整身份、metrics行数并保留进程退出码和耗时。
+旧输出目录明确拒绝复用，失败记录保留，不自动重跑baseline。
+
+当前源码哈希已冻结，无先验组于本次启动，输出
+logs/outputs/prior_evaluation/wcojb-three-arm-001/none，
+日志/进程回执outputs/prior_evaluation/wcojb-three-arm-001/execution-none。
+已实际进入场景和感知初始化，尚未产生完成指标。先验两组尚未启动。
+本条只记录启动事实，最终结果以execution receipt及metrics为准。
+
+## 2026-11-01：首例TV成功与多episode编码错误修复
+
+无先验首例TV已完成：success=1，SPL=0.5817417993，distance_to_goal=0.1508264691m。
+进入sofa后，AgentRuntime重新读取中文Skill时默认编码为ASCII，触发UnicodeDecodeError。
+该批进程退出码1，原记录保留在wcojb-three-arm-001/execution-none；不能将该组记为三例完成。
+
+根因修复为Skill markdown显式read_text(encoding='utf-8')，不修改Skill内容或导航策略。
+10项Agent测试通过，新增测试覆盖LC_CTYPE=C下的构造。
+运行器支持清单已有--start_episode范围，验证对应身份和该范围metrics数量。
+
+wcojb-three-arm-002保存续跑清单及新源码哈希，引用001中已完成TV指标，
+无先验组从索引1续跑sofa/chair；两组先验仍从索引0运行。未重跑TV。
+原输入数据、地图、模型和预算保持；仅编码与运行器范围处理改变，分析时保留版本差异。
+本条记录续跑启动事实，结果以002/execution-none及其metrics为准。
+
+### 无先验sofa正式失败记录（同批继续）
+
+sofa在第34步内部verifier返回accept/task_complete，但官方success=0、SPL=0，
+distance_to_goal=4.581057m。内部预测对象距离0.541902m，二者测量对象不同。
+豆包confidence=0.95，描述框内为木框软垫座椅；人工查看check_again/rgb_34.jpg，
+框内木质家具外观更像钢琴，附近对象记录包含piano。具体GT实例仍需独立标注核查，
+当前确认内部语义接受与官方目标成功不一致。
+
+该失败保留，不中途修改验证器。chair继续同配置运行，尚未完成。
+
+## 2026-11-01：冻结对照的运行异常与加载成本
+
+无先验续跑002的sofa已写入正式失败指标；chair在候选框分类时发生模型协议异常，
+进程退出1。原始记录为none/episode-2/lvlm_calls/0017_bbox_object_in_box.json：
+输出先出现损坏的JSON键引号，随后连续空白，finish_reason=length，输出4096token，
+reasoning_tokens=0，耗时75.14秒。当前证据支持输出退化，不能归因于thinking开启，
+也不能将本例记为正常导航失败。成功TV和已完成sofa继续保留。
+
+对象先验组已按002冻结清单启动；运行期间不修改源码和配置。对象加证据组待运行。
+维护入口（在STRIVE根目录执行；key-file为本机凭证路径，内容不写入回执）：
+
+```bash
+python scripts/run_prior_comparison.py outputs/prior_evaluation/wcojb-three-arm-002/manifest.json --arm objects --check-only
+python scripts/run_prior_comparison.py outputs/prior_evaluation/wcojb-three-arm-002/manifest.json --arm objects --key-file /path/to/local/key.txt
+python scripts/run_prior_comparison.py outputs/prior_evaluation/wcojb-three-arm-002/manifest.json --arm objects_evidence --key-file /path/to/local/key.txt
+```
+
+已有输出的组拒绝重复启动；新尝试须保留原始失败记录并使用新的清单目录。
+清单描述固定输入，执行状态以execution-<arm>/receipt.json和实际进程为准。
+
+同一冻结地图的加载成本记录在002/load_resource_receipt.json：
+80帧、200对象、2003观察；地图包124365097字节（118.60MiB），核心JSON94906字节。
+宿主UrbanNav环境单次完整引用校验加载0.333秒，含导入的进程峰值RSS约62.13MiB。
+这是已有文件缓存下、不解码图像的加载测量，不能代表冷启动、建图或导航峰值。
+原build_receipt记录建图337.33秒；原采集记录elapsed_seconds=111.14秒。
+建图峰值资源与完整在线成本尚缺实际记录，保持未验收。
+
+## 2026-11-01：模型输出诊断、动作域修复与003冻结续跑
+
+002对象先验组在首例TV的首次高层选择中断；两次响应均为损坏JSON，未产生指标。
+同图协议诊断保存在002/protocol_check，保持模型、图像、候选及thinking disabled：
+显式schema的json_schema首次可解析，json_object仍损坏。随后原始与显式schema
+两种请求在TV、chair各一次均可解析。因此错误具有波动性，当前证据不支持将
+增加提示词或更换json_object认定为根治；主路径保留原json_schema协议。
+官方文档将结构化输出标记为beta：
+https://console.volcengine.com/ark/region:cn-beijing/docs/structured-output-beta
+
+诊断中还发现可解析的decision="explore"：schema接受任意字符串，规划器只消费select。
+修复为ParsedHighLevelSelection明确select/uncertain及room/frontier/空类型，
+提示词声明对应含义，prompt版本更新v2。未知动词进入模型协议错误边界。
+另外，候选分类实际发生的LengthFinishReasonError现在与ValidationError共享一次
+重新生成预算。原始输出和错误均落盘，第二次失败继续传播；没有扩大token预算、
+补写JSON或返回默认识别标签。该变更恢复协议机会，不能保证模型服务始终成功。
+25项模型请求记录、先验多模态和规划集成测试通过。
+
+003清单保留001TV与002sofa，none仅从index2重新执行未完成chair；先验两组各三例
+尚需执行。440份源码哈希重新冻结，数据及地图保持不变，代码变化写入manifest。
+此次先启动none chair。运行状态以003/execution-none/receipt.json及实际进程为准。
+
+## 2026-11-01：无先验三例完成与正式入口边界
+
+003无先验chair正常退出0，74步、路径7.66318m、success=1、SPL=0.509553，
+官方distance_to_goal=0.036517m；内部当前对象距离0.331215m。episode驱动229.57秒，
+含启动的执行回执244.92秒。运行器核对完整任务身份及冻结源码/数据/地图通过。
+
+003/none_aggregate.json逐例校验身份并引用原始CSV及哈希：
+TV(001)成功/SPL0.581742/189步，sofa(002)失败/SPL0/35步，chair(003)成功/SPL0.509553/74步。
+三例SR=2/3，平均SPL=0.363765。保留三次版本差异，不重跑已完成baseline；这不是全量HM3D指标。
+003对象先验组三例已启动，尚未完成；对象加证据组待执行。
+
+入口审计确认：prior_map/arrival_verification.py和backends/habitat/prior_approach.py
+的当前mask/深度绑定用于独立到达入口；正式ObjectNav guided入口仍使用原验证链。
+当前三组对照检验先验搜索排序，不能证明新的当前观察几何已接入正式导航入口。
+必要交付2已补记这个集成缺口，保持未完成；复杂指令切片同样尚未验收。
+
+## 2026-11-01：003对象先验中断、协议改进004与sofa空间重放
+
+003对象先验TV首次高层选择通过一次重生成恢复；推进到66步后，又连续两次损坏JSON，
+进程退出1，未产生完整episode指标。失败回执和原文保留，不能计算该组SR/SPL。
+
+003/decoder_check固定已授权TV和chair输入、同一schema提示，对比服务端json_schema
+与text输出后本地校验，共四次均通过。因此尚不能把故障归因于服务端约束解码。
+此前无schema提示的高层选择多次失败，而显式schema复验可解析；现复用已有
+inject_json_schema为豆包补充同一字段合同，保留API json_schema、本地Pydantic校验、
+原始输入/输出及一次重生成边界。25项相关测试通过；完整运行稳定性尚待验证。
+004重新冻结源码，沿用数据、地图、模型及预算，保留已完成无先验三例；先启动
+对象先验组三例。此次变更属于协议改进候选，不能据局部复验宣称问题彻底修复。
+
+正式链审计：check_again的框来自累计点云投影，_estimate_distance_to_object_final
+取整个累计点云最近距离；当前可见区域与测距支持集合尚未统一。
+但对sofa失败的实际npz重放表明，最小距离0.541902m的点位于当前图像(311,430)，
+点深度0.541785m、传感器深度0.550884m，残差-0.009099m。
+回执003/sofa_geometry_audit.json。这排除了该最近点完全不可见这一具体解释；
+语义误接受仍待处理，不能声称统一mask/深度就会解决此例。
+
+## 2026-11-01：模型BEV的坐标与可读性根因修复
+
+004实际PNG检查发现文字全部缺失：原_RasterCanvas仅绘制几何，SVG标签未进入模型图像。
+同时markers显示robot_position_xy=[0,0]，frontier已是绝对先验坐标。memory.update_from_mapper
+直接保存current_position局部坐标，而canonical alignment将其解释为map_z_up。
+TV起点的正确平面坐标为[-1.88458,11.11461]，此缺口直接影响模型空间推理。
+
+主动停止004对象先验容器，退出137；原始回执保留，cancellation_reason.json说明原因，
+这次记录不计入导航失败或有效对照。无先验三例保持不变。
+
+修复：canonical mapper观察采用p_map=diag(1,-1,1)(p_local+p_initial)，声明map_z_up；
+机器人及历史轨迹使用同一坐标。PNG复用已有Pillow/DejaVuSans字体，补齐frontier UID、
+机器人、目标T编号及对应完整UID图例。维护镜像依赖现场检查通过，无新增下载。
+31项memory/query/multimodal/planner测试通过；真实保存输入重新渲染并视觉检查，
+位置与标签可读。重渲染证据为004/bev_corrected/corrected.png和markers。
+
+005冻结新源码并启动对象先验组三例；对象加证据组尚待执行。
+仍需完整运行确认先验效果；当前观察几何接入正式验证链及复杂任务切片继续未完成。
+
+## 2026-11-01：005输入生效、批次漏答与006协议边界
+
+005正式BEV确认机器人坐标[-1.884580,11.114610]，模型两次合法选择分别引用T3目标，
+证明修复进入真实输入。随后在66步后的概念匹配中断：首次JSON损坏，重生成可解析，
+但合并了两项字段，漏掉候选UID，领域检查抛ValueError。该例尚无完整指标。
+
+005/protocol_contract固定批次、选择器、候选框三份实际请求，对比相同schema提示下
+json_schema与text输出。text三项均通过本地schema校验，批次UID集合完整；json_schema
+在选择器失败，其余两项通过。这是小样本协议证据，不足以断言服务端根因或永久稳定。
+
+006豆包路径采用create(response_format=text)并显式注入已有schema，通过SDK同一个
+parse_chat_completion在本地严格解析；截断、schema错误与原文记录保留，一次重生成
+预算保持。其他provider维持原路径。结果trace记录structured_output=text_with_local_schema。
+28项相关测试通过，维护镜像OpenAI 1.102.0本地解析验证通过。006再次冻结源码、
+数据与地图并启动对象先验三例；对象加证据仍待运行。
+
+保留已完成baseline而不重跑，其provider协议与新先验组不同，manifest明确记录
+comparison_caveat；未来结果可作为工程对照，不能宣称分离出了先验地图的纯因果增益。
+
+## 2026-11-01：对象先验组三例完成及TV类别冲突证据
+
+006/execution-objects/receipt.json正常完成三例，完整身份及冻结哈希检查通过：
+TV success1/SPL0.446012/280步/25.67453m；sofa success0/SPL0/35步；
+chair success1/SPL0.509553/74步。SR=2/3，平均SPL=0.318522；
+保留baseline平均SPL=0.363765。chair/sofa核心指标相同，退化主要来自TV。
+TV首次明显路线分叉在34步，baseline选节点2，先验选节点3；调用数12→24。
+协议版本差异继续保留，不能宣称单因素因果结论。
+
+TV误导候选matched-baseline-concepts100:frame7:detection3有四条观察：
+frame7 monitor0.48503/mirror0.32236；frame9 monitor0.50739/mirror0.32144。
+同帧框区域高度重叠。原图右上为黑框反光墙面物体，外观支持mirror；
+具体semantic GT类别尚未加载，但官方唯一TV目标位置已确认在地图另一端。
+map_review图的1号对应模型BEV的T3。原始审计006/tv_candidate_semantic_audit.json。
+融合内部num_list/conf_list保留多类信息，capture_builder导出只保留胜出label；
+检索按该label产生概念匹配，冲突没有传给高层模型。这是当前可定位的信息损失。
+不要将此例直接解释为两个空间实例误合并，也不要将几何绑定当作语义修复。
+
+006对象加证据组三例已启动。首个真实请求仍选择靠近T3的frontier1，理由称其为
+historical monitor，说明首轮历史图像尚未纠正类别判断；完整任务结果仍待运行。
+
+
+## 2026-11-01：三组对照完成与共享地图设计更新
+
+9个有效运行已完成，三组均2/3成功；平均SPL：无先验0.3638、对象0.3185、对象加历史图像0.2965。完整任务指标与源文件哈希见[最终汇总](../outputs/prior_evaluation/wcojb-three-arm-006/comparison_summary.json)。baseline保留001/002/003已完成结果，协议版本变化限制因果解释；两个先验组共享006冻结实现。TV额外绕行，sofa三组同样误接受，chair核心结果一致。旧失败尝试不计作独立任务。
+
+现有共享图含200对象、0房间节点、0拓扑边。因此该实验覆盖对象先验偏置，尚未覆盖房间布局与共享地图维护方案。新版[设计第8—9节](prior_map_mode.md#8-共享地图区域决策与导航闭环2026-11-01更新)明确共享图文状态、区域决策、定位轨迹、人工初始化/修正、局部数学模型及参数校准边界。下一步必要工作是上述机制接入和当前验证一致性；实物后置。本轮仅更新设计及结果汇总，没有新增导航实验、修改运行源码或恢复已暂停的实施目标。
+
+
+## 2026-11-01：共享地图首轮实现与单区域验收
+
+- 维护入口：`docs/prior_map_todo_checklist.md`当前交付清单；历史阶段折叠保留。
+- 核心改动：simulation共享快照/区域候选，visualizer朝向与完整已观察轨迹，exploration_policy采用区域子目标并复用baseline局部距离。模型只处理多个可执行区域，单区域确定性执行。
+- 必要回归46项通过；新增2个契约用例放在已有测试文件，无新临时测试脚本。
+- `shared-map-001`冻结TV实际完成：success=1，SPL=0.5817417993，189步，19.717061m，模型12次，367.5秒。已校验episode身份和冻结源码；与保留baseline的该例核心指标一致。
+- 该例全程一个区域，仅证明单区域与导航闭环；多区域选择及先验区域布局绑定仍需继续。
+- 产物审计发现最终地图停在最后探索查询（158步），已增加finish_episode终态发布，清除活动选择，补充契约检查4项通过。此后源码与001冻结版本有该终态输出差异，不能把001作为此补充的端到端证明。
+- 手机采集、自动重定位、实物运行继续后置；整体六项交付保持未完成。
+
+
+## 2026-11-01：先验区域到在线frontier的绑定
+
+已将共享地图区域候选从仅在线room扩展到先验多边形：逐个可达frontier查询唯一包含区域，重叠保持在线归属；同一先验区域可以跨多个在线片段，执行只消费该快照绑定的节点。复用原NavMesh距离和局部探索排序。必要回归47项通过，未新增实验运行。
+
+当前用于导航的预测地图仍无区域几何。检查发现维护中的HM3D布局构建器使用GT语义区域与NavMesh；后续需要几何-only入口以产生明确标注unknown的导航区域，而非引入GT房间类型。还需补齐实际多区域选择与终态发布的端到端证据。
+
+
+## 2026-11-01：几何区域生成与轮廓修复
+
+现有HM3D布局脚本已增加geometry-only入口，仅查询NavMesh；在指定楼层以侵蚀种子和自由空间扩展形成导航区域，全部保留unknown类型。复用原区域/布局格式，增加canonical prior_map.json输出和导航--prior_map_layout组合加载。当前场景生成9个几何区域，scene_id与200对象包一致，标准frame_id=map_z_up。
+
+实际生成图暴露旧_boundary_from_cells使用浮点端点拼边的问题：0.1米栅格共享端点精度不一致，轮廓断开后输出包围矩形。现改用整数半格端点，闭环后统一转米制坐标；保留凹形轮廓，失败明确抛错。必要回归61项通过。
+
+`shared-map-regions-002`已冻结TV任务、对象包、区域布局哈希和源码并启动实际导航；仍需核验多区域LVLM选择和终态轨迹发布。此次几何布局使用仿真NavMesh先验，不能当作纯RGB-D重建或实物验收。
+
+
+## 2026-11-01：多区域端到端结果与观察语义修复
+
+002冻结运行已完成并校验身份/源码/地图：TV成功，280步、25.674530m、SPL 0.446012，模型21次（区域选择6次），整组536.8秒。第12/34步出现3/2个区域候选，结果实际驱动节点导航；终态280步地图保存280点轨迹，活动选择清空。效率仍低于保留baseline，不能据此宣称收益。
+
+原因审计：旧对象无parent_room_uid，区域候选objects为空；直接对象中心包含仅覆盖13/200，因导航区域表示自由地面而非家具所属房间。现按历史相机位置生成observed-from-region摘要，以唯一(frame,label)计数并保留示例观察ID及索引哈希，不改对象归属。真实摘要覆盖区域1/5/4，各23/53/4帧、38/41/18类；类别冲突保留。固定先验区域ID在frontier更新后保持决策，耗尽再重评。选区提示版本升级为2026-11-01，明确摘要为预测观察来源。
+
+修改后的必要检查60项通过；003冻结同一TV和观察索引哈希后启动，尚待结果。整体任务仍欠正式当前证据一致性、完整代表性验收及后置实物验证。
+
+
+## 2026-11-01：003观察语义驱动选区的单例结果
+
+`shared-map-semantics-003/execution-objects/receipt.json`正常完成：TV success=1，**149步、16.749999m、SPL=0.684163**，模型13次（选区2次），280.0秒。终态149步地图含149点轨迹，selection清空。
+
+选区依据已由距离转为观察语义：第12步3候选，引用区域1“monitor 8帧”；第71步2候选，引用区域5“monitor 23帧、tv 6帧”；第52、115步为持久区域沿用，未新增模型调用。002同任务依次按距离选区域0/6/6/6/6/5/5/0。单例结果，不作为性能结论；区域1的monitor是否即006审计中的mirror候选尚未核验。产物位于`logs/outputs/prior_evaluation/shared-map-semantics-003/objects/episode-0/prior_map/`。
+
+
+## 2026-11-01：正式入口取证与停止距离一致性
+
+审计`baseline_guided`调用链：视点评分→motion到达→`rotate_toward_object_for_recheck`→`check_again`→`final_instruction_check`→reducer。图像、bbox、实例与observation_identity原已同帧绑定；不一致点为STOP距离取实例累计点云平面最近点，可能来自当前帧不可见表面。现由同一次投影给出可见支撑集合V（光轴前方、图内、`z_cam-D(u,v)<0.2`）及`d=min_V||p_xy-c_xy||`，`check_again`与最终取证包不再用全点云覆写；投影回执增加`visible_point_index`，图像宽高取自当前深度，替代640×480常量。
+
+评分/执行差异：正式入口未设`arrival_radius_m`，全部视点由`ShortestPathFollower(goal_radius=0.15)`判定到达（旧`step_mod`路径仍以0.5m触发复核，非正式入口）；该判据是两端吸附到NavMesh后的测地距离，XY偏差可超过0.15m（见004记录）；朝向经30°离散转向，相对评分假设的正对目标残留≤15°。`verified`决策日志新增pose_gap，记录observation_id、评分视点、执行位置、位置偏差和光轴残余偏角。
+
+相关回归79项通过；`test_associated_instance_publishes_corresponding_new_image_and_box`两项失败只执行`mapping/object_fusion.py`代码（AST只提取`associate_object_entities`，缺少共享`score_object_candidates`），与本次修改无关，未改动。正式STOP距离变化影响全部臂，冻结baseline结果不可直接对比；sofa失败的最近点原本可见，其语义误接受仍待单独处理。下一步需一次仿真复核以查看实际pose_gap与距离来源。
+
+
+## 2026-11-01：004五例 none/objects 对照（取证一致性复核）
+
+`shared-map-semantics-004/execution-{none,objects}/receipt.json`均正常完成，wcojb4TFT35单场景5个任务，500步上限，维护镜像`strive-hm3d:local`，正式入口`baseline_guided`。
+
+| 臂 | SR | 平均SPL | 平均步数 | 平均行程 | 模型调用 | 耗时 |
+| --- | --- | --- | --- | --- | --- | --- |
+| none | 0.6 | 0.306 | 191.2 | 19.22m | 97 | 1914s |
+| objects | 0.8 | 0.327 | 274.4 | 32.61m | 168 | 2582s |
+
+| 任务 | none | objects | 分析 |
+| --- | --- | --- | --- |
+| TV | 189步 SPL 0.582 | 149步 SPL 0.705 | none与shared-map-001逐值一致；STOP距离改为可见支撑未改变该例 |
+| sofa(ep1) | 第34步误接受 | 152步成功 | 两臂第34步位姿与视图相同，verifier判定不同；差异来自判定波动，非先验 |
+| toilet | 500步超时 | 501步超时 | 先验地图无toilet；objects记录501步，超过上限1步，待查 |
+| chair | 74步 SPL 0.510 | 469步 SPL 0.068 | 至第36步相同；objects进入单选项recovery，verifier持续need_better_view，区域策略将机器人带离被暂缓候选约340步，第468步接受同一把椅子 |
+| sofa(ep4) | 158步 | 101步 | 历史语义选区缩短搜索 |
+
+取证复核：全部接受的`accepted_distance_source=check_again`；pose_gap朝向残余≤14.9°。位置偏差>0.15m共7次（agent_recovery 0.263–0.281m、baseline_view_feedback 0.317m），对应`motion_terminal`均为`reached`：到达判据是NavMesh吸附后的0.15m测地距离，XY偏差包含视点到NavMesh的吸附位移（推断，尚未逐点用`snap_point`测量）。
+
+结论范围：5例单场景试点，不作为性能结论。暴露的两项问题——先验区域策略与被暂缓候选的竞争、verifier对同一视图的判定波动——记录待处理；按2026-11-01优先级调整，固定任务集验收暂停，先推进手机建图（见checklist“下一阶段”）。
+
+## 2026-11-02：005–007 停止几何根因修复与五例复测
+
+**005**（继承004任务集与地图）：check_again按真实相机高度评分；接近视点取停止可行的最佳投影视点；recovery与search review恢复baseline frontier选项并附加先验区域分支。none臂完成：SR=0.6、平均SPL=0.371、182.0步、18.49m、模型86次、1750s；chair 74→30步，toilet仍501步失败，sofa(ep1)成功而ep4误接受。objects臂第1例崩溃：无词表框过阈值时`C_flag`长度为0，`cv_utils/image_perceiver.py:54`掩码索引越界；修复为保留目标掩码后冻结006，006未执行即由007取代。
+
+**toilet根因：** 视点规划以实例全部点判停止可行，最终verifier以当前帧可见支撑V判距离。马桶低矮，1m内平视时V只含马桶盖，测得约1.05m>1.0m被否决；规划认为可行的视点逐一耗尽后转入探索约290步。
+
+**修复（007）：**
+- 停止可行性统一：`planning/viewpoint_policy.py::score_object_view`用与verifier相同的光轴前方、图内点集计算 $d=\min_{p\in V}\|p_{xy}-c_{xy}\|$，停止可行当且仅当 $d+\epsilon_{arrive}\le d_{stop}$；规划阶段无当前深度，不做遮挡检测。
+- 俯仰维度：`navigation_core/view_geometry.py`中 $R=R_{yaw}R_x(\phi)$，当前俯仰 $\phi=\arcsin(-R_{22})$；视点和到达后复核在 $\{0,-\theta_{tilt}\}$ 中按（停止可行，投影质量）取最优，`tilt_camera`以 $n=\mathrm{round}((\phi-\phi_0)/\theta_{tilt})$ 执行LOOK_UP/LOOK_DOWN；验证未完成即回平视，避免俯视帧进入后续frontier决策。
+- 007冻结包含006之后已提交的手持采集改动（e960fe7、fa579f5、2359453），见manifest `concurrent_changes`。
+
+| 臂 | SR | 平均SPL | 平均步数 | 平均行程 | 模型调用 | 耗时 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 005 none | 0.6 | 0.371 | 182.0 | 18.49m | 86 | 1750s |
+| 007 none | 0.8 | 0.512 | 108.2 | 10.72m | 74 | 1278s |
+| 007 objects | 0.8 | 0.574 | 89.2 | 9.07m | 74 | 1154s |
+
+| 任务 | 007 none | 007 objects | 分析 |
+| --- | --- | --- | --- |
+| TV | 189步 SPL 0.582 | 152步 SPL 0.694 | none与001/004/005逐值一致；先验缩短37步 |
+| sofa(ep1) | 35步误接受 | 35步误接受 | 两臂与004 none逐值一致：接受0.54m处实例，距目标4.58m；可复现的verifier语义误接受 |
+| toilet | 126步 SPL 0.679 | 126步 SPL 0.679 | 接受时pitch=−30°、可见支撑0.86m，首次复核即通过；objects先验首选table，成功来自停止几何修复 |
+| chair | 31步 SPL 0.816 | 31步 SPL 0.816 | 004 objects的recovery绕行未再出现 |
+| sofa(ep4) | 160步 SPL 0.482 | 102步 SPL 0.683 | 历史语义选区缩短搜索 |
+
+结论范围：5例单场景试点，不作为性能结论；none臂SR提升仅toilet一例可归因于本次修复，ep1/ep4跨批次翻转属verifier判定波动。
+
+**俯仰能力改为平台声明（007运行后）：** 原`_tilt_step`以固定动作号5读取Habitat配置。现`navigation/goal_approach_controller.py::tilt_actions`按名字从`sim_config.agents[0].action_space`取look_up/look_down及其步长；`recheck_pitches`在声明look_down时返回 $(0,-\theta_{tilt})$，否则只返回当前安装俯仰 $\phi_0=\arcsin(-R_{22})$；`tilt_camera`按目标方向选动作，未声明俯仰时不执行动作。Habitat v0动作空间即可模拟固定相机轮式平台，用于“仅统一停止距离、无低头”的对照。实物SysNav回路（`real_robot/sysnav_runtime.py`，运动契约含`LOOK_AT_UNSUPPORTED`）不调用该路径，其视点与停止距离一致性留待部署阶段核对。`tests/test_prior_view_pitch.py`增加固定俯仰用例；维护镜像中`site-packages/tests`遮蔽项目tests包，需在`tests/`目录内以`PYTHONPATH=/workspace/STRIVE python -m unittest test_prior_view_pitch`运行（3项通过）。该文件修改后007冻结哈希不再匹配，007结果以已完成回执为准。
+
+### sofa(ep1) 可复现误接受的离线分析（007 none，仅读已有日志）
+
+- **物体实为立式钢琴。** 早期正面视图（`lvlm_calls/0001`、`0004`）逐框分类均为piano，实例`object:9877…`标签piano，中心(−0.016, 0.70)，尺寸2.10×0.65×0.92m。第30–34步从侧斜方向接近，网格纹理严重扭曲，检测器在同一钢琴上给出sofa（conf 0.80），生成新实例`object:20d9d8…`，中心(−0.099, 0.70)，尺寸1.36×0.65×0.73m，包围盒完全落在钢琴包围盒内。
+- **融合路径（推断）：** `mapping/object_fusion.py::associate_object_entities`对目标类有专门分支（150–179行）：与已有实例重叠≥0.25但三项重叠未全>0.85时，新建独立目标实例，不并入已有实例的类别投票。两包围盒包含关系说明表面重叠，<0.25的普通新建路径可能性低；未从保存产物重算重叠分数。
+- **语义链只看到同一失真视角：** 新实例的逐框分类（`0012`）、concept match（`0013`）和最终verifier（`0014`，单张0.54m近景，confidence 0.92）都基于第30–34步的扭曲视图，判为“木质带软垫长座椅”。verifier取证包`nearby_objects`已记录0.083m处的piano，但未进入模型请求；verifier按设计只依据当前图像判定类别。
+- **结论：** 不是停止几何或先验问题。同一物理表面已有清晰正面视图确认的非目标身份，目标类分支另起无历史的新实例，后续所有语义检查都失去这条反证。005 none与004 objects同例成功，说明模型对该失真视图的判断有波动，不能当作稳定修复依据。
+- **候选修复（待定，未实现）：** ①最终verifier附带与候选表面重叠（沿用`score_object_candidates`≥0.25判据）的其它实例的代表观察，作为同一表面的历史图像，由模型独立识别；不改融合和baseline召回。②目标类检测并入重叠实例、以类别投票表达冲突；改动STRIVE原有召回策略，影响全部任务。
+
+### 2026-11-02：008 修法①验证与仅水平视角（Habitat v0）消融
+
+**实现（修法①）：** `objnav_agent_with_process_obs.py::_overlapping_instance_observations`对其它存活实例Q按候选侧覆盖率 $c(P,Q)=|\{p\in P: d(p,Q)<0.1\}|/|P|\ge0.25$（`score_object_candidates`的`overlap_scores1`）筛选，写出Q的`rgb`/`bbox`（最新入图观察）；`check_again`与`_build_final_verifier_evidence`取证包增加`overlapping_instance_observations`。`instruction_adapter/verifier.py`在历史视图之后发送图像、bbox和覆盖率，不发Q的地图标签；`FINAL_VERIFIER_PROMPT`说明该图可能是同一物理物体的另一视角，需独立识别。测试：`tests/test_navigation_root_causes.py::test_final_evidence_views_instances_sharing_candidate_surface`、`tests/test_verification_images.py::test_overlapping_instance_view_is_sent_without_its_map_label`。
+
+**冻结：** `shared-map-semantics-008`（v1，含LOOK_UP/LOOK_DOWN）与`shared-map-semantics-008-level`（同一代码、任务、地图；运行目录内`habitat_lab/configs/tasks/objectnav_hm3d.yaml`改为`ACTION_SPACE_CONFIG: "v0"`、4个动作，经`HABITAT_LAB_PATH`选用并计入冻结哈希）。四臂回执均为complete，任务身份与冻结哈希复核通过。
+
+| 臂 | SR | 平均SPL | 平均步数 | 平均路径 | 模型调用 | 耗时 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 007 none | 0.8 | 0.512 | 108.2 | 10.72m | 74 | 1278s |
+| 007 objects | 0.8 | 0.574 | 89.2 | 9.07m | 74 | 1154s |
+| 008 none（v1） | 1.0 | 0.603 | 117.8 | 11.87m | 83 | 1393s |
+| 008 objects（v1） | 1.0 | 0.593 | 120.4 | 12.67m | 101 | 1456s |
+| 008-level none（v0） | 1.0 | 0.601 | 117.4 | 11.95m | 85 | 1327s |
+| 008-level objects（v0） | 0.8 | 0.546 | 96.0 | 9.82m | 80 | 1178s |
+
+| 任务 | 008 none | 008 objects | 008-level none | 008-level objects |
+| --- | --- | --- | --- | --- |
+| tv(ep0) | 189步 SPL 0.582 | 182步 0.581，verifier 5次 | 189步 0.582 | 182步 0.581，verifier 5次 |
+| sofa(ep1) | 第34步拒绝钢琴，83步成功 0.457 | 第34步拒绝钢琴，再拒两次扶手椅，161步成功 0.204 | 第34步拒绝钢琴，82步成功 0.457 | **第34步接受钢琴**，35步失败 |
+| toilet(ep2) | 126步 0.679 | 126步 0.679 | 127步 0.679 | 127步 0.679 |
+| chair(ep3) | 31步 0.816 | 31步 0.816 | 30步 0.816 | 30步 0.816 |
+| sofa(ep4) | 160步 0.482 | 102步 0.683 | 159步 0.471 | 106步 0.655 |
+
+**sofa(ep1)：修法①触发，但未提供独立视角。**
+- 六臂第34步当前图`check_again/rgb_34.jpg`逐字节相同；四个008臂的重叠实例图`overlap_34_*.jpg`也逐字节相同，c=1.0。
+- 该图就是第34步同一位姿的全景帧：Q在第34步刚被同一观察关联，`ObjectNode.rgb`作为“最新入图观察”已被覆盖为当前视图，早期确认piano的正面视图不在其中。
+- 相同输入下模型3次拒绝（理由引用“overlapping observation confirms the same wooden piano”）、1次接受（理由称重叠图“confirms the same instance”为sofa）。007两臂未附该图，均接受。
+- 结论：008 ep1的改善不能归因于新的视觉信息，可能来自额外的同视角重复或提示词措辞，属单样本波动范围。根因（失真近景之外缺少该表面的独立身份证据）未解决。修法①的代表观察应取不同于当前观察的视角（例如Q标签形成时的观察），需另行决定。
+
+**v0消融：本组任务未测到俯仰的贡献。**
+- none臂v0与v1逐例基本一致（SR 1.0/1.0，SPL 0.601/0.603）。objects臂差异仅来自上述ep1同输入的判定波动，与动作空间无关。
+- toilet在v0下同样成功：第121、125步verifier返回need_better_view（可见支撑距离1.49m、1.03m），第126步在0.861m接受，与v1接受距离相同，只多1步和2次verifier调用。可见005 toilet停滞由“规划与验证统一可见支撑”修复，而非LOOK_DOWN。
+- 对固定相机轮式平台：本5例上无俯仰不造成成功率损失。场景内无矮小目标，不能推广到需要俯视的物体。
+- tv(ep0) objects两组verifier均为5次（007为2次），步数182，属先验路径上的额外复查，未逐次分析。
+
+**5例单场景试点，不作为性能结论。**
+
+## 2026-11-01：A1 深度可通行栅格替代NavMesh（Habitat采集上复核）
+
+实现：`prior_map/hm3d_layout.py`的侵蚀种子+多源BFS分区抽为`build_free_cell_region_layout`，NavMesh与深度共用；NavMesh重建（`outputs/prior_layouts/wcojb-navigation-regions-a1`）与004使用的冻结布局在元数据、多边形、面积、质心、uid顺序上逐项一致。深度栅格`prior_map/capture_builder.py::capture_free_cells`：
+
+- 地面高度z_f：相机下方点高度按0.05m分箱，取众数箱中位数。
+- F(c)=1[∃p∈c: |p_z−z_f|<0.2] ∧ 1[∄p∈c: z_f+0.2≤p_z<z_f+h]；F_robot=F⊖Disk(r)；未观测格不属于F。
+- 可达性：只保留含相机轨迹投影格的4连通分量。手持采集者走过的地面可达；透过窗口观测到的孤立地面由此排除。
+
+产物：`outputs/prior_layouts/wcojb-rgbd-patrol002/`（`scripts/build_capture_layout.py`，采集`outputs/prior_patrol/matched-baseline-002/capture`，80帧，stride 4，max_depth 6m），`navmesh_overlay.png`中蓝=两者、红=仅深度、橙=仅NavMesh、黑=相机位置。
+
+| 参数 | precision | 已观测区recall | 已观测区IoU |
+| --- | --- | --- | --- |
+| h=0.88, r=0.18（004运行时机器人尺寸） | 0.872 | 0.848 | 0.754 |
+| h=1.5, r=0.10（场景自带NavMesh烘焙参数，`nav_mesh_settings`实测） | 0.867 | 0.889 | 0.782 |
+| h=1.5, r=0（不侵蚀） | 0.718 | 1.000 | 0.718 |
+
+对照对象为场景自带NavMesh（区域布局所用，r=0.10、h=1.5）；004运行时NavMesh按机器人尺寸r=0.18、h=0.88重建（`outputs/prior_patrol/matched-baseline-002/runtime_navmesh_receipt.json`），A2按运行时NavMesh对照。
+
+- 地面：估计0.0124m，NavMesh地面0.0164m，误差4mm。
+- 仅深度格（r=0.10时341格）：约80%与NavMesh相邻1格，属于格心采样与`round`离散化的沿墙描边；成块的一处（约58格，地图(1.93, 1.77)）位于玻璃推拉门外的室外平台（帧`rgb/000061.png`可见）。深度穿透玻璃，平台经门洞与室内地面连通，轨迹可达性无法排除，留给C6人工核对；手机LiDAR同样穿透玻璃。
+- 轨迹可达性移除了不连通的碎块：r=0.18时去掉9个分量共86格；早先12个区域中有8个≤0.1m²的碎块区域，推断来自这类分量（未逐个对应）。
+- 区域划分：r=0.10、clearance 0.35时深度布局为2个区域（3.67、22.26m²）；NavMesh布局覆盖整层（含采集未到的北侧），共9个。clearance取0.35/0.40/0.45/0.50/0.55时深度区域数为2/4/3/2/2，非单调：侵蚀种子在窄通道处对1格边界差异敏感。区域边界作为几何划分使用，在手机数据上由C6人工核对，本轮不调参。
+- 未解决：多楼层采集上全局众数会选到其他楼层（`wcojb4TFT35-all-islands-coverage`估计到−2.39m），手机扫描按单楼层采集（B2）。
+
+## 2026-11-01：A2 手持相机位姿→底盘候选点（Habitat采集上复核）
+
+实现：
+- `camera_to_base_pose`从`backends/habitat/prior_viewpoints.py`移入`prior_map/observations.py`，参数为相机离基座高度h：固定安装取安装高度，手持取逐帧h=z_cam−z_f。
+- 按物体/观察筛选证据抽为`prior_map/bundle.py::select_evidence_ids`，Habitat与手持两个解析器共用。
+- `prior_map/capture_builder.py::resolve_capture_viewpoints`：p_base=(x_cam, y_cam, z_f)，朝向取光轴水平投影；round(p_base,xy/s)∈F_reach才接受，F_reach即A1的轨迹连通、按机器人半径腐蚀的可通行格。bundle的`build_receipt.capture_manifest_sha256`须等于采集manifest哈希，不一致直接报错。候选记录`reachability_status=trajectory_connected_free_space`，`motion_admission`要求运行时核对机器人尺寸与当前路径；本函数不发运动指令、不改任务进度。
+- CLI：`scripts/resolve_capture_viewpoints.py`。契约测试：`tests/test_floorplan_layout.py::test_capture_viewpoints_drop_handheld_poses_onto_reachable_floor`（走过的地面接受；箱体上方、未走到的孤立地面拒绝；采集哈希不一致报错）。
+
+复核：bundle `matched-baseline-concepts100`（采集`matched-baseline-002`，80个observation_pose），栅格按004运行时机器人尺寸r=0.18、h=0.88、0.1m格；对照`runtime.navmesh`上`is_navigable(max_y_delta=0.05)`。产物`outputs/prior_layouts/wcojb-rgbd-patrol002/viewpoint_candidates.json`。
+
+| 栅格r | 两者接受 | 仅栅格接受 | 仅NavMesh接受 | 一致率 |
+| --- | --- | --- | --- | --- |
+| 0.18 | 76 | 0 | 4 | 0.950 |
+| 0.10 | 76 | 0 | 4 | 0.950 |
+| 0.25 | 58 | 0 | 22 | 0.725 |
+
+- 仅NavMesh接受的4个是同一位置(0.53, 3.58)的4个朝向：NavMesh障碍距离0.59m；该格在未腐蚀栅格中可通行，但5×5邻域有7格从未被观测（水平相机看不到脚下近处地面），腐蚀按“未观测不可通行”保守拒绝。原因是观测覆盖，判定规则保持不变；手机扫描按B2要求覆盖地面。
+- 没有仅栅格接受的视点：栅格没有把NavMesh不可通行处判为可通行。
+- 该采集的视点全部位于NavMesh上，拒绝方向的真实数据一致性未测，只由契约测试覆盖。
+- 基座高度：栅格候选z=z_f=0.0124；Habitat的z_cam−0.88在部分帧为0.195，而这些帧相机周围0.25m内的深度点都在z_f附近、无抬高表面。推断差异来自NavMesh多边形高度近似（未逐点测量）。
+
+## 2026-11-02：C 阶段——首份手机扫描 d655a5ce86
+
+输入：iPhone 17 Pro + Stray Scanner（App版本未记录），实验室单间约9×10m，57.5s、3447帧，竖握，轨迹9.0m只走中央通道。原始数据`Code/phone_scans/d655a5ce86/`（仓库外）。无卷尺真值（B3未提供）：绝对尺度与物体位置误差均未验收。手机地图尚未在机器人上使用。
+
+### C1 导入
+
+- 首次导入报“Video ended before odometry frame 3446”。根因在上游`DatasetEncoder.swift`：pts取自增前的ARFrame计数，首个保存帧pts=−1/60早于`startSession(.zero)`，被edit list裁掉；默认解码少1帧且RGB整体错位+1帧。改为`OPENCV_FFMPEG_CAPTURE_OPTIONS=ignore_editlist;1`按packet顺序解码：3447帧全部解出，25帧RGB/深度边缘相关峰值均在偏移0。pts间隙来自编码积压丢帧，不影响顺序对应。
+- 竖握：roll −95.6°至−83.5°，导入按roll众数整体顺时针转k=1次（RGB/深度/confidence与K、R同步），世界点集不变（5帧稠密核对最大差1.8e−15m）。manifest记`upright_quarter_turns_cw`。
+- 无畸变LUT；逐帧fx在1337–1360间变化（对焦）。采集`outputs/prior_capture/phone-d655a5ce86-every10`，every=10，345帧，256×192。
+
+### C2 几何（无卷尺）
+
+- 重力：地面法向与z轴夹角0.41°，平面RMS 1.08cm，相机离地1.41m。
+- 跨视角（stride 4，21677对）：短间隔conf2残差中位0.5–1.0cm、5cm内94–98%；conf1中位1.7–2.8cm；conf0中位8–16cm、5cm内仅25–36%。像素占比conf0/1/2=16%/24%/60%。
+- 相对尺度：VIO平移乘s≈1.02–1.03时3cm一致率由0.795升到0.89–0.90，与fx存在脊线（fx×0.98+s=1.03同为0.901）。即LiDAR深度与VIO平移约差2–3%，哪一方偏无真值无法判定。
+- 回访漂移：7对回访中只有2对高重叠（间隔约35s）ICP收敛，平移4.4–7.3cm、旋转0.5–1.6°；其余因重叠低发散，不计入。
+
+### C3 检测输入
+
+23帧、100类、同一检测器：
+
+| 输入 | 检出/帧 | 物体检出 | 类别数 | 分数中位 | 耗时 | 峰值显存 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 侧躺 256×192 | 13.2 | 278 | 33 | 0.256 | 49.7s | 6.9GB |
+| 竖正 256×192 | 16.0 | 346 | 36 | 0.271 | 49.5s | 6.9GB |
+| 竖正 1920×1440 | 17.4 | 382 | 36 | 0.285 | 52.5s | 6.9GB |
+
+方向比分辨率重要（侧躺时键盘判为tv、ironing board 17次）。导入器竖正、保持深度分辨率。
+
+### C4/C5 深度置信度与建图
+
+`metric_depth_validity`增加显式`min_confidence`（缺confidence直接报错），建图`--min-depth-confidence`、布局/视点`--min_depth_confidence`，receipt记`confidence_policy`。三臂同一采集、100类词表、融合参数不变；指标不依赖语义真值：同标签0.5m内成对对象、按证据重建对象点云（5cm体素）后邻域<2点的孤立点占比、2–98%分位跨度。
+
+| 深度 | 对象 | 观察 | 同标签近邻对象 | 孤立点中位/p90 | 跨度中位/p90 | 跨度>3m | 屏幕类(tv/monitor/computer) y<−3 | 全部深度臂≥10观察对象无对应 | 建图耗时 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 全部 | 308 | 5341 | 178 | 2.1%/10.2% | 1.38/3.17m | 36 | 25/79 | — | 1275s |
+| ≥1 | 202 | 4409 | 92 | 0.56%/8.8% | 0.97/2.27m | 14 | 3/28 | 7 | 1062s |
+| =2 | 140 | 3161 | 63 | 0.28%/6.0% | 0.84/1.87m | 9 | 0/16 | 21 | 904s |
+
+- 全部深度：深色屏幕边缘的conf0飞点使tv对象沿视线拖到(0.2, −6)一线（`phone-d655a5ce86-objects-concepts100.png`）。
+- =2：观察减少41%，按类别丢失率shelf 86%、cabinet 78%、speaker 66%、tv 63%、monitor 56%；丢失的21个对象中含(3.57, 1.96)的monitor、(−0.54, −2.02)的chair等真实物体，也含南墙外的疑似重影。
+- 选≥1作为C5地图：`outputs/prior_bundles/phone-d655a5ce86-concepts100-conf1`。4409观察证据文件齐全，位姿与采集一致，frame_id即扫描原始帧号。
+- 遗留：同标签近邻仍有92个对象，属于关联碎片化，深度过滤无法解决，本轮不改融合参数；显示器多被标为tv。
+
+### C6 区域布局
+
+r=0.10、h=1.5、0.1m格，`outputs/prior_diagnostics/phone-d655a5ce86-layout-conf1/`（`outputs/prior_layouts`为root所有，改写到用户目录）。
+
+| 深度 | 地面格 | 阻挡格 | 可达格 | 可达格中的多视角持续障碍格 |
+| --- | --- | --- | --- | --- |
+| 全部 | 2304 | 6007 | 342 | 0 |
+| ≥1 | 1808 | 2849 | 503 | 0 |
+| =2 | 1467 | 1771 | 570 | 5 |
+
+- 全部深度时被堵的格：其中地面点90%为conf2，阻挡点91%为conf0、距离1.4–2.1m，属近距飞点；多视角持续障碍格定义为障碍带点出现在≥5帧且占可见帧≥50%。=2会放开5个这类格，≥1不放开任何一个，故布局与建图同用≥1（`reach_confidence.png`）。
+- 区域：1个，clearance 0.25–0.55均为1，与单间一致；三处分支对应桌间过道；x≈1.2处窄颈为采集者走过。南侧y<−4的窗、柜不与轨迹连通，不在可达区，是否隔玻璃未核实。
+
+### C7 导出与查询
+
+- compact（每对象3视角）：202对象、697观察、78MB，2.5s。
+- 新进程`query_prior_bundle.py`：sofa 5、refrigerator 1、printer 3、monitor 6个命中，含重载0.3s。
+- 证据人工核对（`phone-d655a5ce86-query/evidence_grid.png`）：refrigerator两张证据均正确；sofa首个对象一张为卡座侧板、一张为红色坐垫；printer首个对象一张为图像边缘红色面板、一张为打印机；monitor首个命中是墙上红色标牌。说明碎片化之外还存在跨物体混合与标签错误，查询结果只能作为待现场核验的假设。
+- A2：refrigerator 2个候选落在conf≥1可达地面，距物体1.11/1.96m，朝向误差15.0°/29.2°；1个因底座不在可通行区被拒。位置误差无真值。
+
+### C8 成本
+
+| 项 | 值 |
+| --- | --- |
+| 采集 | 57.5s手持 |
+| 建图（≥1，345帧） | 1062s，3.1s/帧 |
+| GPU峰值 | 9.4GB（整卡读数，含其他进程约1.4GB） |
+| 布局 | 0.8s CPU |
+| 地图包 | 完整113MB，compact 78MB |
+| 重载+查询 | 0.3s |
+
+图：`outputs/prior_diagnostics/phone-d655a5ce86-bev.png`（点云与轨迹）、`phone-d655a5ce86-objects-concepts100{,-conf1,-conf2}.png`（对象+区域+轨迹）、`phone-d655a5ce86-layout-conf1/prior_map_bev.png`。
+
+### 测试
+
+新增`test_confidence_threshold_is_explicit_metric_support`、`test_low_confidence_depth_neither_blocks_nor_invents_floor`、`test_portrait_scan_is_turned_upright_without_moving_points`；主机489通过，2个失败为既有未提交`mapping/object_fusion.py`所致。
+
+### 边界
+
+无卷尺，绝对尺度、物体位置误差未验收；LiDAR/VIO 2–3%不一致未定位来源；关联碎片化与标签错误未处理；手机地图未在机器人上使用（D阶段）。
