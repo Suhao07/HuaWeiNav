@@ -2310,3 +2310,42 @@ r=0.10、h=1.5、0.1m格，`outputs/prior_diagnostics/phone-d655a5ce86-layout-co
 **剩余碎片**：主要为部件/整体与标注粒度、标签漂移，以及同类相邻物体；需要几何以外的身份证据，延续此前IoU、可见支持、外观、延迟消歧等负结果，不再调几何阈值。
 
 测试：新增`test_duplicate_surfaces_merge_but_contained_part_stays`（三倍重复点的同一表面合并、0.2m局部不合并）；容器内通过，其余7项为容器未设SAM_CHECKPOINT的环境错误；主机489通过、2个既有失败。产物：`outputs/prior_diagnostics/fragmentation_fix_evaluation.json`、`matched80_fusion_{legacy,dedup,consolidate}_replay.json`、`phone-d655a5ce86-fusion_{legacy,dedup,consolidate}_replay.json`。
+
+## 2026-11-02：类别后验与剩余碎片结论
+
+**用户决定：** C2绝对尺度、C7物体位置误差、LiDAR/VIO约2–3%尺度差不再做几何验收（无卷尺真值）；手机地图上机器人属D阶段。
+
+**显示器标为tv：根因与修改。** 检测器本身把多数显示器判为tv，融合只发布多数票标签，少数票证据在bundle中丢失，"monitor"查询因此召不回这些显示器。融合已有逐实例投票`num_list[l]`（累计点数n_l）与`conf_list[l]`（加权平均置信度c_l），标签判决比较w=c²n。改为同时发布类别后验：
+
+- `mapping/object_fusion.py::label_probabilities`：p(l)=c_l²n_l/Σ_k c_k²n_k，与判决同一权重；`PriorObject.label_probabilities`（和为1，空表示label确定）。
+- `merge_duplicate_instances`合并时带上被并实例的全部票（此前只并当前标签）；投票累计抽为`accumulate_label_vote`，判决行为不变。
+- `prior_map/query.py::_concept_relevance`：r=max(m({uid}), Σ_l p(l)·m(T_l))，T_label={label}∪aliases，其余T_l={l}；用于物体排序、支撑区域和目标几何。无后验时p={label:1}，与原行为一致。`PriorMapMemory`改用`replace`保留新增字段。
+
+**重建：** `outputs/prior_bundles/phone-d655a5ce86-concepts100-conf1-labels`（同采集manifest d7063c8f…，同词表，conf≥1）：197对象/4409观察，5对重复合并、全部标签与`-dedup`一致，位置差≤4.3µm（GPU浮点）；133个对象有多于一个标签的票；observations无悬空、无未观察对象；1070s，113MB。compact（每对象3视角）678观察、77MB。
+
+**C7重查（新进程）：** monitor 6→12、sofa 5→11、refrigerator 1→2、printer 3→5个候选，新增均为少数票候选，按后验排在多数票之后。monitor证据人工核对（`phone-d655a5ce86-labels-query/monitor_evidence_grid.png`）：
+
+| 排名 | 多数标签 | r | 内容 |
+| --- | --- | ---: | --- |
+| 0–4 | monitor | 1.00–0.59 | 墙上红色标牌、画框 |
+| 5 | monitor | 0.52 | 白色矩形（白板或屏幕，未能判定） |
+| 6、7、9、11 | tv | 0.36、0.26、0.11、0.08 | 真实显示器 |
+| 8、10 | tv | 0.21、0.11 | 标牌 |
+
+真实显示器从查不到变为进入候选，但排在检测器自己标为monitor的标牌之后：检测器对monitor的语义混淆无法由融合统计纠正，只能由现场核验排除。查询tv时真实显示器排在前列。先验仍只用于排序，不授予运动或成功判定。
+
+**剩余碎片：** 用几何以外的证据（同帧共视）检验，HM3D冻结80帧（GT仅用于离线审计），同标签、质心<0.5m的实例对：
+
+| 子集 | 对数 | 同GT | 异GT | 同GT占比 |
+| --- | ---: | ---: | ---: | ---: |
+| 全部 | 56 | 39 | 17 | 0.70 |
+| 从未同帧 | 18 | 14 | 4 | 0.78 |
+| 同帧出现 | 38 | 25 | 13 | 0.66 |
+| 同帧且掩码包含≥0.5 | 21 | 14 | 7 | 0.67 |
+| 同帧且掩码包含<0.1 | 17 | 11 | 6 | 0.65 |
+
+各子集同GT占比都在0.65–0.78，共视与掩码包含都分不开碎片和相邻同类物体：宽掩码常一次框住多把椅子、多个枕头或整组沙发。这与此前共视IoU、可见支持、外观、延迟关联、强支持拆分的负结果一致。按已知局限关闭，不再合并；多余候选由排序和现场核验消化。产物：`outputs/prior_diagnostics/matched80_fragment_coview.json`。
+
+测试：`test_minority_label_votes_rank_by_category_posterior`（后验round-trip、按期望匹配排序）；`test_duplicate_surfaces_merge_but_contained_part_stays`增补合并后保留被并实例少数票。主机490通过，2个既有失败（`test_navigation_root_causes`，`score_object_candidates`未注入，与本改动无关）。
+
+**手机地图阶段状态：** A1–A3、C1–C9完成（几何真值经用户豁免），选定地图`-conf1-labels`；剩余为D阶段实物部署。
