@@ -377,6 +377,15 @@ class FinalInstructionVerifier:
                     "bbox_xyxy_in_this_image": visual_packet.get("geometry", {}).get("bbox_xyxy"),
                 }, ensure_ascii=False)})
                 content.append(block)
+        # 与候选共享表面的其它实例：同一物理物体可能被拆成多个实例，只给图像不给其标签。
+        for item in evidence.get("overlapping_instance_observations", []) or []:
+            block = load_image(item["image_path"])
+            content.append({"type": "text", "text": json.dumps({
+                "role": "overlapping_instance_observation",
+                "candidate_surface_fraction_on_this_instance": item["candidate_surface_fraction"],
+                "bbox_xyxy_in_this_image": item["bbox_xyxy"],
+            }, ensure_ascii=False)})
+            content.append(block)
 
         # 请求异常交由运行时记录和处置，保留原始异常及调用栈。
         client, model = get_client_and_model(self.vlm)

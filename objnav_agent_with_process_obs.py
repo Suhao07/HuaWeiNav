@@ -17,6 +17,7 @@ from loguru import logger
 from cv_utils.gpt_utils import check_again_object_in_bbox
 from cv_utils.visualizer import visualize_mask
 from mapper_with_process_obs import Instruct_Mapper
+from mapping.object_fusion import score_object_candidates
 from instruction_adapter.verifier import (
     FinalInstructionVerifier,
     VerificationResult,
@@ -962,6 +963,8 @@ class HM3D_Objnav_Agent:
             "geometry": geometry_for_evidence,
             "view_quality_facts": self._view_quality_facts(geometry_for_evidence),
             "nearby_objects": self._nearby_objects_for_final_evidence(),
+            "overlapping_instance_observations": self._overlapping_instance_observations(
+                os.path.dirname(self.last_check_again_image_path)),
             "room_context": None,
             "relation_evidence_paths": [self.last_check_again_image_path] if flag else [],
             "check_again": {
@@ -1003,6 +1006,35 @@ class HM3D_Objnav_Agent:
                 })
         return sorted(nearby_objects, key=lambda x: x["distance_to_candidate"])[:8]
 
+    def _overlapping_instance_observations(self, out_dir):
+        r"""Write representative views of other instances sharing the candidate's surface.
+
+        与融合入图同一表面判据，按候选侧覆盖率筛选：
+
+        .. math::
+            c(P, Q) = \frac{|\{p \in P : d(p, Q) < 0.1\}|}{|P|} \ge 0.25
+
+        其中 P 为候选点云，Q 为其它实例点云。
+
+        Args:
+            out_dir: Episode final-verifier artifact directory.
+        Returns:
+            Image path, bbox in that image and c(P, Q) for each overlapping instance.
+        """
+        others = [obj for obj in self.mapper.objects
+                  if obj.uid != self.object_final.uid and obj.rgb is not None]
+        _, coverage, _ = score_object_candidates(self.object_final, others)
+        observations = []
+        for obj, fraction in zip(others, coverage):
+            if fraction < 0.25:
+                continue
+            bbox = [int(x) for x in np.asarray(obj.bbox).reshape(-1)[:4]]
+            path = os.path.join(out_dir, f'overlap_{self.episode_steps}_{obj.uid.split(":")[-1]}.jpg')
+            cv2.imwrite(path, visualize_mask(np.asarray(obj.rgb), torch.tensor([bbox])))
+            observations.append({"image_path": path, "bbox_xyxy": bbox,
+                                 "candidate_surface_fraction": round(float(fraction), 3)})
+        return observations
+
     def _build_final_verifier_evidence(self, candidate, bbox, geometry):
         """Persist the image and geometry packet consumed by the final verifier."""
 
@@ -1039,6 +1071,7 @@ class HM3D_Objnav_Agent:
             "geometry": geometry,
             "view_quality_facts": self._view_quality_facts(geometry),
             "nearby_objects": self._nearby_objects_for_final_evidence(),
+            "overlapping_instance_observations": self._overlapping_instance_observations(out_dir),
             "room_context": None,
             "relation_evidence_paths": [],
         }

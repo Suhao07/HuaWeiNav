@@ -146,7 +146,11 @@ view_sufficient_for_stop=true. Once the visual predicates are established,
 return accept; better framing alone adds no task requirement. Each historical
 image is an observation: independently identify its visible object and check
 correspondence with the current candidate. The current view must identify the
-same actual instance. Physical STOP authorization remains with the controller.
+same actual instance. An overlapping_instance_observation shows another mapped
+instance carrying the stated fraction of the candidate's 3D surface; it may be
+the same physical object seen from another viewpoint. Identify its object
+independently and weigh it as evidence of the candidate's identity.
+Physical STOP authorization remains with the controller.
 """
 
 ROOM_SEMANTIC_PROMPT = """

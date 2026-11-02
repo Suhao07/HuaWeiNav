@@ -80,6 +80,29 @@ def test_projection_receipt_preserves_metric_depth_and_actual_filter(tmp_path):
         assert json.loads(str(receipt["observation_identity"]))["candidate_uid"] == "candidate"
 
 
+def test_final_evidence_views_instances_sharing_candidate_surface(tmp_path):
+    """同一物理表面拆成多个实例时，取证包附带其它实例自己的代表图与框。"""
+    written = {}
+    coverage = {"piano": .9, "rug": .1}
+    ns = methods("objnav_agent_with_process_obs.py", {"_overlapping_instance_observations"}, {
+        "np": np, "os": os, "torch": NS(tensor=lambda value: value),
+        "visualize_mask": lambda image, boxes: (image, boxes),
+        "cv2": NS(imwrite=lambda path, image: written.setdefault(path, image)),
+        # 候选自身或无图实例进入评分会因缺键失败。
+        "score_object_candidates": lambda entity, refs: (
+            None, [coverage[ref.tag] for ref in refs], None)})
+    piano = NS(uid="object:piano", tag="piano", rgb=np.ones((4, 4, 3)), bbox=np.array([0., 1., 3., 4.]))
+    candidate = NS(uid="object:sofa", tag="sofa", rgb=np.zeros((4, 4, 3)), bbox=[0, 0, 1, 1])
+    agent = NS(episode_steps=34, object_final=candidate, mapper=NS(objects=[
+        candidate, piano, NS(uid="object:rug", tag="rug", rgb=np.zeros((4, 4, 3)), bbox=[0, 0, 2, 2]),
+        NS(uid="object:chair", tag="chair", rgb=None, bbox=None)]))
+    observations = ns["_overlapping_instance_observations"](agent, str(tmp_path))
+    path = str(tmp_path / "overlap_34_piano.jpg")
+    assert observations == [{"image_path": path, "bbox_xyxy": [0, 1, 3, 4],
+                             "candidate_surface_fraction": .9}]
+    assert written[path][0] is piano.rgb and written[path][1] == [[0, 1, 3, 4]]
+
+
 def test_new_candidate_without_projection_never_uses_previous_image(tmp_path):
     ledger = EvidenceStore(1)
     ns = methods("objnav_agent_with_process_obs.py", {

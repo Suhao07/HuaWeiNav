@@ -91,6 +91,34 @@ def test_each_image_uses_its_own_observed_box_and_identity(tmp_path, monkeypatch
     assert all("distance_to_object" not in str(text) and "nearby_objects" not in str(text) for text in texts)
 
 
+def test_overlapping_instance_view_is_sent_without_its_map_label(tmp_path, monkeypatch):
+    import json
+    import instruction_adapter.verifier as module
+    from prompting.schemas import ParsedVerification
+    current, overlap = tmp_path / "current.jpg", tmp_path / "overlap.jpg"
+    current.write_bytes(b"current")
+    overlap.write_bytes(b"front view")
+    requests = []
+    def parse(**kwargs):
+        requests.append(kwargs)
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
+            parsed=ParsedVerification(satisfied=False, decision="reject_candidate")))])
+    client = SimpleNamespace(beta=SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(parse=parse))))
+    monkeypatch.setenv("STRIVE_FINAL_VERIFIER", "on")
+    monkeypatch.setenv("LLM_OFFLINE", "0")
+    monkeypatch.setattr(module, "get_client_and_model", lambda vlm: (client, "test"))
+    result = module.FinalInstructionVerifier(evidence_dir=str(tmp_path / "blobs")).verify(
+        "find sofa", {}, CandidateInstance("u", "sofa"),
+        {"current_rgb_with_bbox_path": str(current), "overlapping_instance_observations": [
+            {"image_path": str(overlap), "bbox_xyxy": [1, 2, 3, 4], "candidate_surface_fraction": .9}]})
+    content = requests[0]["messages"][1]["content"]
+    texts = [json.loads(item["text"]) for item in content if item["type"] == "text"]
+    assert texts[-1] == {"role": "overlapping_instance_observation",
+                         "candidate_surface_fraction_on_this_instance": .9,
+                         "bbox_xyxy_in_this_image": [1, 2, 3, 4]}
+    assert content[-1]["type"] == "image_url" and len(result.evidence_ids) == 2
+
+
 def test_exact_visual_cache_rechecks_current_physical_stop(tmp_path, monkeypatch):
     import instruction_adapter.verifier as module
     from prompting.schemas import ParsedVerification
