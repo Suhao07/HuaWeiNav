@@ -29,6 +29,10 @@ LIO_IVOX_NEARBY_TYPE="${LIO_IVOX_NEARBY_TYPE:-6}"
 LIO_LOCATION_MODE="${LIO_LOCATION_MODE:-0}"
 LIO_CON_FRAME="${LIO_CON_FRAME:-1}"
 LIO_CON_FRAME_NUM="${LIO_CON_FRAME_NUM:-10}"
+# 建图：退出（SIGINT）时写 <point_lio 源码>/PCD/scans.pcd，用 save_orin_lio_map.sh 停止并取图。
+LIO_PCD_SAVE_EN="${LIO_PCD_SAVE_EN:-0}"
+# 定位：加载该 PCD 并 NDT+ICP 重定位，camera_init 即该地图坐标系，跨重启不变。
+LIO_MAP_PATH="${LIO_MAP_PATH:-}"
 
 ros_bool() {
   case "${1,,}" in
@@ -37,15 +41,6 @@ ros_bool() {
   esac
 }
 
-if [[ "${RESTART_EXISTING}" == "1" ]]; then
-  tmux kill-session -t "${TMUX_SESSION}" 2>/dev/null || true
-fi
-
-if tmux has-session -t "${TMUX_SESSION}" 2>/dev/null; then
-  echo "[start-orin-lio] tmux session already exists: ${TMUX_SESSION}" >&2
-  exit 2
-fi
-
 if [[ ! -f "${ROS_SETUP_BASH}" || ! -f "${LIVOX_SETUP_BASH}" || ! -f "${POINT_LIO_SETUP_BASH}" ]]; then
   echo "[start-orin-lio] missing ROS/Livox/Point-LIO bash setup file" >&2
   exit 3
@@ -53,6 +48,27 @@ fi
 if [[ ! -f "${POINT_LIO_CONFIG}" ]]; then
   echo "[start-orin-lio] missing Point-LIO config: ${POINT_LIO_CONFIG}" >&2
   exit 3
+fi
+if [[ "$(ros_bool "${LIO_LOCATION_MODE}")" == "true" ]]; then
+  if [[ "${LIO_MAP_PATH}" != /* || ! -f "${LIO_MAP_PATH}" ]]; then
+    echo "[start-orin-lio] LIO_LOCATION_MODE=1 requires absolute LIO_MAP_PATH to an existing PCD" >&2
+    exit 3
+  fi
+  if [[ "$(ros_bool "${LIO_PCD_SAVE_EN}")" == "true" ]]; then
+    # 定位模式不增量更新地图，同时存图得到的只是重复扫描。
+    echo "[start-orin-lio] LIO_PCD_SAVE_EN and LIO_LOCATION_MODE are mutually exclusive" >&2
+    exit 3
+  fi
+fi
+
+# 先校验再停旧会话，配置错误时不把正在运行的 LIO 杀掉。
+if [[ "${RESTART_EXISTING}" == "1" ]]; then
+  tmux kill-session -t "${TMUX_SESSION}" 2>/dev/null || true
+fi
+
+if tmux has-session -t "${TMUX_SESSION}" 2>/dev/null; then
+  echo "[start-orin-lio] tmux session already exists: ${TMUX_SESSION}" >&2
+  exit 2
 fi
 
 point_lio_params=(
@@ -73,7 +89,12 @@ point_lio_params=(
   -p common.con_frame_num:="${LIO_CON_FRAME_NUM}"
   -p publish.scan_publish_en:="$(ros_bool "${ENABLE_CLOUD_PUBLISH}")"
   -p publish.scan_bodyframe_pub_en:="$(ros_bool "${ENABLE_BODY_CLOUD_PUBLISH}")"
+  -p pcd_save.pcd_save_en:="$(ros_bool "${LIO_PCD_SAVE_EN}")"
+  -p pcd_save.interval:=-1
 )
+if [[ -n "${LIO_MAP_PATH}" ]]; then
+  point_lio_params+=(-p map_path:="${LIO_MAP_PATH}")
+fi
 
 tmux new-session -d -s "${TMUX_SESSION}" -n livox /bin/bash -lc "
 set -e
