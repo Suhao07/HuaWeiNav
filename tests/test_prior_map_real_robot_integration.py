@@ -193,6 +193,6 @@ def test_config_factory_builds_prompt_only_alignment(tmp_path):
     runtime = PriorMapRealRobotRuntime.from_config(PriorMapRealRobotConfig(
         prior_map_path=str(path), run_directory=str(tmp_path/'runtime'), prior_map_alignment='unavailable'))
     diagnostics = runtime.alignment.diagnostics_payload()
-    assert not runtime.alignment.can_rank_geometry
+    assert not runtime.alignment.can_rank_geometry()
     assert diagnostics['fallback'] == 'prompt_context_only'
     assert diagnostics['reason'] == 'prior_map_alignment=unavailable'
