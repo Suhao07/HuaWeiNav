@@ -104,10 +104,11 @@ bag replay、HIL 和影子 topic 不能替代真实底盘验收。
   每次 LIO 启动位姿），launch 默认值 `identity` 对该地图在几何上是错的；完成标定前必须用
   `STRIVE_PRIOR_MAP_ALIGNMENT=unavailable`（只作排序与提示上下文）。
 
-### 先验地图 ↔ Point-LIO 对齐流程（脚本已就绪，实物未执行）
+### 先验地图 ↔ Point-LIO 对齐流程（2026-11-03 已在车上走通一遍）
 
-`camera_init` 是 LIO 启动时重力对齐后的雷达位姿；定位模式（`location_mode`）下它是所载
-PCD 的坐标系，因此“固定起点标记”和“持久 LIO 地图”共用同一份标定。
+`camera_init` 是 LIO 启动时重力对齐后的车体（`aft_mapped`，MID-360 内置 IMU，距雷达约
+3 cm）位姿；定位模式（`location_mode`）下它是所载 PCD 的坐标系，因此“固定起点标记”和
+“持久 LIO 地图”共用同一份标定。
 
 1. 地面贴起点标记（车体位置 + 朝向），在手机地图（`map_z_up` 平面 x,y）上量出车体中心
    `base_xy` 和朝向（`--base-yaw-deg`，或车头正前方 ≥0.3 m 的一点 `--heading-xy`）。
@@ -120,9 +121,14 @@ PCD 的坐标系，因此“固定起点标记”和“持久 LIO 地图”共�
    --heading-xy x,y --lio-map <dir>/lio_map.json --output <dir>/prior_alignment.json`。
    外参默认取静态 TF `aft_mapped→base`（x=-0.2，yaw=-1.5708）；脚本自检标记点车体在
    runtime 系应为 (-0.2, 0)，并记录先验地图 sha256 与 LIO 地图 sha256。
-5. 之后每次启动：`LIO_LOCATION_MODE=1 LIO_MAP_PATH=<dir>/lio_map.pcd` 启动传感器（无初值时
-   NDT+ICP 以单位阵为初值，故在起点附近启动最稳；远离起点需 `/initialpose` 给初值，发布需
-   另行批准），`STRIVE_PRIOR_MAP_ALIGNMENT=<dir>/prior_alignment.json` 启动 `docker_en.sh`。
+5. 之后每次启动：`LIO_LOCATION_MODE=1 LIO_MAP_PATH=<dir>/lio_map.pcd` 启动传感器。
+   **定位模式必须收到一次 `/initialpose` 才会做 NDT+ICP 重定位**（`laserMapping.cpp`
+   `initial_pose()` 无初值直接返回，不会默认单位阵），在此之前不发 `/aft_mapped_to_init`，
+   `start_real_robot_sensors.sh` 的话题检查也因此不会 PASS。在标记上启动时发单位位姿：
+   `ros2 topic pub --once /initialpose geometry_msgs/msg/PoseWithCovarianceStamped
+   "{header: {frame_id: camera_init}, pose: {pose: {orientation: {w: 1.0}}}}"`（z 由回调取
+   附近地图点高度；发布需用户批准；唯一订阅者是 `laserMapping`）。随后
+   `STRIVE_PRIOR_MAP_ALIGNMENT=<dir>/prior_alignment.json` 启动 `docker_en.sh`。
    不用定位模式时，只要 LIO 在标记上启动，同一 JSON 也成立。
 
 约束与保护：
@@ -131,8 +137,36 @@ PCD 的坐标系，因此“固定起点标记”和“持久 LIO 地图”共�
 - runtime 的 `identity`/`unavailable` 标签改为 `camera_init`；affine 对齐若遇到观测
   `frame_id` 与标定的 runtime 坐标系不一致，自动降级为 `prompt_context_only`。
 - 无法自动发现的失效：LIO 不在标记上、且未用定位模式启动（坐标系名不变但原点变了）。
-- 待实物验收：标记量测精度、定位模式重定位成功率（ICP fitness ≤ 0.5）、对齐后先验物体
-  与 live 物体的位置残差。
+- 待实物验收：标记量测精度（真实手机地图）、远离起点时的重定位成功率、对齐后先验物体与
+  live 物体的同标签位置残差（本次两侧检测器标签不重合，未测到）。
+
+#### 2026-11-03 车上全流程试运行（静止车、D435i 当前视角建小图）
+
+部署 `~/HuaweiVLN_deployments/realworld_17fe73f`，镜像 `huawei-vln-realworld:orin-r36.5-agilex-17fe73f`；
+车全程静止，仅批准发布一次 `/initialpose`，无任何运动话题。
+
+1. 建图模式启动 LIO（`pcd_save_en:=true`），采 5 帧 D435i RGB-D 与 `/aft_mapped_to_init`
+   （位姿抖动 ≤1 cm，偏航 ≤0.08°）。先验坐标系取采集时 base 的水平位姿，
+   `camera_to_map = inv(T_ci_P)·T_ci_body·T_body_lidar·inv(T_camera_from_lidar)`；本机
+   Grounding DINO+SAM（`indoor_concepts`，max depth 4 m）建图得 5 个物体（staircase、
+   trash bag×2、door、table），产物 `output/prior_bundles/d435i-20261103T214230`。
+2. `save_orin_lio_map.sh output/lio_maps/20261103T214230`：79 万点，sha256 `1738e889…`。
+3. `build_prior_lio_alignment.py --base-xy 0,0 --base-yaw-deg 0`：工具假设的标记位姿与采集时
+   实测 base 位姿（(-0.195,-0.007)，-89.98°）相差 0.9 cm / 0.02°。
+4. 定位模式重启：发单位 `/initialpose` 后 ICP 得分 0.457（阈值 0.5，余量小——地图只有
+   静止一个视角，降采样后 6199 点），稳定后位姿 (0.004,-0.010) 与建图时相差约 0.3 cm。
+5. 整栈 dry-run（`semantic_snapshot`，“Find the staircase”）：51 步对齐始终为 `affine_2d`、
+   `runtime_frame_id=camera_init`、`alignment_mismatch=0`，未降级；top_object 为先验
+   staircase；runtime 无发布者，`/cmd_vel` 等运动话题均不存在。runtime 中机器人在先验系
+   (0.008,0.204)，与理论 (0.010,0.204) 一致。live YOLOE 只检出 shoe/cart，与先验标签不重合，
+   未发生 live→先验绑定。
+6. 几何残差（标签无关）：先验第 0 帧深度点经对齐变换后，对 10 s 在线 `/cloud_registered`
+   和 LIO 地图做最近邻。近处物体掩码点残差中位数 5.5–7 cm（staircase、trash bag），3.6 m
+   外的 door 35 cm；不对齐（直接当作 camera_init）时 48 cm。偏航网格搜索在 **-7°** 最优
+   （对 LIO 地图中位数 19.1→8.3 cm），图像空间 LiDAR 投影左移约 110 px（≈7°）深度一致性
+   最好，俯视图中先验墙面需转 -7° 才与 LIO 墙线平行。结论：标记→LIO 对齐链误差约 1 cm，
+   **主要残差来自 D435i–MID-360 外参（candidate_20260826）约 7° 的偏航不一致**；该外参同样
+   用于在线语义建图的 LiDAR→图像投影，需要用户确认安装是否变动/是否重标定。
 
 ### 2026-09-07 状态刷新
 

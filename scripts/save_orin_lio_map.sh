@@ -67,3 +67,5 @@ echo "[save-lio-map] saved ${out_dir}/lio_map.pcd sha256=${sha}"
 # 图已落盘；关掉残留的 livox 驱动窗格，否则 start_real_robot_sensors.sh 会复用旧会话而不进定位模式。
 tmux kill-session -t "${TMUX_SESSION}"
 echo "[save-lio-map] ${TMUX_SESSION} closed; restart with LIO_LOCATION_MODE=1 LIO_MAP_PATH=$(cd "${out_dir}" && pwd)/lio_map.pcd"
+# 定位模式收到 /initialpose 前不做重定位、不输出里程计（laserMapping.cpp initial_pose）。
+echo "[save-lio-map] location mode stays idle until one /initialpose (camera_init) is published; publishing needs approval"
