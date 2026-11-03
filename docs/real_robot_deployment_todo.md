@@ -78,6 +78,28 @@ bag replay、HIL 和影子 topic 不能替代真实底盘验收。
 
 ## 1. 当前结论
 
+### 2026-11-03 先验地图合并部署（只读，无运动）
+
+- 部署：`~/HuaweiVLN_deployments/realworld_7927a75`（HEAD `ce0fc8b`，工作区干净），镜像
+  `huawei-vln-realworld:orin-r36.5-agilex-7927a75`；`ce0fc8b` 只改宿主机侧 `docker_en.sh`，
+  镜像无需重建。旧目录 `realworld_2c0b783`、`~/HuaweiVLN` 与旧镜像 tag 未改动。
+- 先验地图：手机地图包 `outputs/prior_bundles/phone-d655a5ce86-concepts100-conf1-labels-compact`
+  （197 物体、0 房间）。容器内离线检查与本机逐字段一致：加载 0.6 s、初始化+4 次查询约
+  1.9 s、RSS 117 MB；点对拟合残差约 1e-16。
+- 正式入口：`docker_en.sh` 原先不挂载目录型地图包、也不透传
+  `STRIVE_PRIOR_MAP_SOURCE/ALIGNMENT` 与 `LLM_OFFLINE`，已修复。修复后实测：runtime 加载
+  场景 `d655a5ce86`，`alignment=unavailable → prompt_context_only`；detector 订阅 D435i、
+  发布 `/huawei_vln/d435i_detection_result`（0.5 Hz，即 profile 的 2.0 s 节流）；
+  `/way_point`、`/waypoint`、`/cmd_vel`、`/navflow_cmd_vel`、`/strive/test_way_point`、
+  `/run_management/virtual_joy` 均无 publisher，runtime 本身无 publisher。
+- 阻塞：Point-LIO（`livox_odom`，非本项目启动）自 2026-10-31 起无数据，雷达可 ping
+  通但 `/livox/lidar` 无消息；`REQUIRE_LIO_SAMPLE` 门控因此正确拒绝语义建图，runtime
+  停在 `WAIT(missing=object_nodes,pose)`。live 物体与先验的关联尚未在车上验证，需先由
+  `livox_odom` 所有者重启 LIO。
+- 几何：手机地图坐标系 `map_z_up` 与 Point-LIO `map` 之间没有配准，launch 默认值
+  `identity` 对该地图在几何上是错的；完成点对标定前必须用
+  `STRIVE_PRIOR_MAP_ALIGNMENT=unavailable`（只作排序与提示上下文）。
+
 ### 2026-09-07 状态刷新
 
 用户已确认 OCC 项目的 D435i--MID-360 外参与当前安装状态一致，并批准当前 candidate
