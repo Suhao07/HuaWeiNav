@@ -92,12 +92,16 @@ bag replay、HIL 和影子 topic 不能替代真实底盘验收。
   发布 `/huawei_vln/d435i_detection_result`（0.5 Hz，即 profile 的 2.0 s 节流）；
   `/way_point`、`/waypoint`、`/cmd_vel`、`/navflow_cmd_vel`、`/strive/test_way_point`、
   `/run_management/virtual_joy` 均无 publisher，runtime 本身无 publisher。
-- 阻塞：Point-LIO（`livox_odom`，非本项目启动）自 2026-10-31 起无数据，雷达可 ping
-  通但 `/livox/lidar` 无消息；`REQUIRE_LIO_SAMPLE` 门控因此正确拒绝语义建图，runtime
-  停在 `WAIT(missing=object_nodes,pose)`。live 物体与先验的关联尚未在车上验证，需先由
-  `livox_odom` 所有者重启 LIO。
-- 几何：手机地图坐标系 `map_z_up` 与 Point-LIO `map` 之间没有配准，launch 默认值
-  `identity` 对该地图在几何上是错的；完成点对标定前必须用
+- LIO：开机自启的 `livox_odom` 在 NTP 校时跳变后不再输出（`/livox/lidar` 无消息）。经用户
+  批准，用 `start_real_robot_sensors.sh orin26_livox_mid360_d435i start` 重启（项目脚本
+  `start_orin_lio_for_strive.sh`），传感器检查 PASS。
+- 整栈只读实测（`docker_en.sh`，语义建图 + runtime）：readiness 通过；语义建图融合出
+  `cart` 并以 `frame_id=camera_init` 送达 runtime；先验 printer 排序分 1.098（语义 0.998 +
+  exact 0.1，geometry 0），房间与 frontier 偏置为空，`alignment_mismatch=1`、无冲突；先验
+  无 `cart`，不绑定（正确）；无 printer 在视野，决策 `WAIT`。live→先验的正向绑定尚未验证，
+  需视野内出现先验中唯一标签的物体。
+- 几何：手机地图坐标系 `map_z_up` 与 Point-LIO `camera_init` 之间没有配准（后者原点为
+  每次 LIO 启动位姿），launch 默认值 `identity` 对该地图在几何上是错的；完成标定前必须用
   `STRIVE_PRIOR_MAP_ALIGNMENT=unavailable`（只作排序与提示上下文）。
 
 ### 2026-09-07 状态刷新
