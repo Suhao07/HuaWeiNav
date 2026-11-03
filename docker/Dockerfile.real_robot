@@ -70,6 +70,10 @@ RUN if [[ "${SKIP_BASE_DEPS}" != "1" && "${INSTALL_ML_DEPS}" == "1" ]]; then \
         "opencv-python==4.11.0.86" supervision ultralytics open3d "rerun-sdk==0.18.2" ; \
     fi
 
+# ultralytics 跟踪器依赖 lap，缺失时只在运行时联网自动安装，联网检测失败则检测节点直接崩溃；
+# 现有基础镜像（SKIP_BASE_DEPS=1、INSTALL_ML_DEPS=0 构建）也缺它，所以无条件补装。
+RUN python3 -c "import lap" 2>/dev/null || python3 -m pip install --no-cache-dir "lap>=0.5.12"
+
 WORKDIR ${STRIVE_WS}
 
 # Copy the full STRIVE source tree for single-container real-robot deployment.
