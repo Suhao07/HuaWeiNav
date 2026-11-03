@@ -184,3 +184,15 @@ def test_config_factory_preserves_high_level_interval(tmp_path):
         prior_map_path=str(path), run_directory=str(tmp_path/'runtime'), high_level_interval=7))
     assert runtime.high_level_interval == 7
     assert runtime.high_level_selector is None
+
+
+def test_config_factory_builds_prompt_only_alignment(tmp_path):
+    from prior_map.real_robot import PriorMapRealRobotConfig
+    path = tmp_path / 'prior.json'
+    path.write_text(json.dumps(_base_map().to_dict()))
+    runtime = PriorMapRealRobotRuntime.from_config(PriorMapRealRobotConfig(
+        prior_map_path=str(path), run_directory=str(tmp_path/'runtime'), prior_map_alignment='unavailable'))
+    diagnostics = runtime.alignment.diagnostics_payload()
+    assert not runtime.alignment.can_rank_geometry
+    assert diagnostics['fallback'] == 'prompt_context_only'
+    assert diagnostics['reason'] == 'prior_map_alignment=unavailable'
