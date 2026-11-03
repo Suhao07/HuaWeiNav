@@ -267,6 +267,55 @@ class PriorMapAlignment:
         )
 
     @classmethod
+    def from_runtime_origin_pose(
+        cls,
+        origin_xy_prior: Vector2,
+        origin_yaw_rad: float,
+        prior_frame_id: str,
+        runtime_frame_id: str,
+        confidence: float = 1.0,
+        diagnostics: Optional[Dict[str, Any]] = None,
+    ) -> "PriorMapAlignment":
+        """Create a metric rigid alignment from the runtime origin pose.
+
+        Given the runtime frame origin pose ``(o, \\psi)`` measured in the prior
+        frame, ``p_prior = R_\\psi p_runtime + o`` and therefore
+        ``p_runtime = R_{-\\psi} (p_prior - o)``.
+
+        Args:
+            origin_xy_prior: Runtime-frame origin in prior-frame coordinates.
+            origin_yaw_rad: Runtime-frame x-axis heading in the prior frame.
+            prior_frame_id: Source prior-map frame.
+            runtime_frame_id: Target runtime frame.
+            confidence: Alignment confidence in ``[0, 1]``.
+            diagnostics: Extra JSON-friendly diagnostics.
+
+        Returns:
+            Affine ``PriorMapAlignment`` with unit scale.
+        """
+
+        origin = _vector2(origin_xy_prior)
+        rotation_rad = -_number(origin_yaw_rad)
+        rotated_origin = _apply_similarity_xy(origin, 1.0, rotation_rad, (0.0, 0.0, 0.0))
+        diag = dict(diagnostics or {})
+        diag.update(
+            {
+                "estimated_from_runtime_origin_pose": True,
+                "runtime_origin_xy_prior": list(origin),
+                "runtime_origin_yaw_rad_prior": _number(origin_yaw_rad),
+            }
+        )
+        return cls.affine_2d(
+            scale=1.0,
+            rotation_rad=rotation_rad,
+            translation_xyz=(-rotated_origin[0], -rotated_origin[1], 0.0),
+            prior_frame_id=prior_frame_id,
+            runtime_frame_id=runtime_frame_id,
+            confidence=confidence,
+            diagnostics=diag,
+        )
+
+    @classmethod
     def unavailable(
         cls,
         reason: str,

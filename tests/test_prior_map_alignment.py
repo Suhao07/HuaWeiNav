@@ -117,3 +117,20 @@ def test_point_pair_estimation_rejects_degenerate_inputs() -> None:
 
     with pytest.raises(PriorMapAlignmentError):
         PriorMapAlignment.from_point_pairs(((0.0, 0.0), (0.0, 0.0)), ((1.0, 1.0), (2.0, 2.0)))
+
+
+def test_runtime_origin_pose_alignment_maps_origin_and_axis() -> None:
+    alignment = PriorMapAlignment.from_runtime_origin_pose(
+        origin_xy_prior=(2.0, 1.0),
+        origin_yaw_rad=math.pi / 2.0,
+        prior_frame_id="map_z_up",
+        runtime_frame_id="camera_init",
+    )
+
+    # runtime 原点与 +x 轴在 prior 中分别是 (2,1) 和 +y 方向。
+    assert alignment.prior_to_runtime((2.0, 1.0)) == pytest.approx((0.0, 0.0, 0.0))
+    assert alignment.prior_to_runtime((2.0, 2.0)) == pytest.approx((1.0, 0.0, 0.0))
+    assert alignment.runtime_to_prior((1.0, 0.0, 0.0)) == pytest.approx((2.0, 2.0))
+    assert alignment.can_rank_geometry() is True
+    assert alignment.runtime_frame_id == "camera_init"
+    assert alignment.diagnostics["estimated_from_runtime_origin_pose"] is True

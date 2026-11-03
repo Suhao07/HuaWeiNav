@@ -171,6 +171,7 @@ class PriorMapRealRobotRuntime:
         if self.last_step == int(step) and self.last_query_result is not None:
             return self._context_payload()
 
+        self._reject_alignment_on_frame_mismatch(snapshot)
         self.last_observation = self.memory.update_from_snapshot(snapshot)
         self.last_room_semantics = self._classify_runtime_rooms(snapshot, step=int(step))
         result = self.query_service.query(plan, snapshot, self.memory)
@@ -245,6 +246,23 @@ class PriorMapRealRobotRuntime:
             output[evidence.room_uid] = self.room_semantic_classifier.classify(evidence).to_dict()
         self.last_room_semantic_step = int(step)
         return output
+
+    def _reject_alignment_on_frame_mismatch(self, snapshot: Any) -> None:
+        """Fall back to prompt-only context when observations leave the calibrated frame."""
+
+        # 标定只对其声明的 runtime 坐标系成立；identity 不声明独立坐标系，不在此检查。
+        if self.alignment.alignment_type != "affine_2d":
+            return
+        frame = str(getattr(getattr(snapshot, "robot_pose", None), "frame_id", "") or "")
+        if not frame or frame == self.alignment.runtime_frame_id:
+            return
+        self.alignment = PriorMapAlignment.unavailable(
+            reason=f"observation frame {frame!r} != calibrated frame {self.alignment.runtime_frame_id!r}",
+            prior_frame_id=self.alignment.prior_frame_id,
+            runtime_frame_id=frame,
+            diagnostics={"rejected_alignment": self.alignment.to_dict()},
+        )
+        self.memory.alignment = self.alignment
 
     def select_high_level(
         self,
@@ -537,14 +555,15 @@ def build_prior_map_real_robot_runtime(config: PriorMapRealRobotConfig) -> Optio
 
 
 def _load_alignment(value: str, base_map: PriorMapData) -> PriorMapAlignment:
+    # 实物 live 位姿与物体来自 Point-LIO 世界系 camera_init。
     normalized = str(value or "identity").strip()
     if normalized in {"", "identity", "auto"}:
-        return PriorMapAlignment.identity(prior_frame_id=base_map.frame_id, runtime_frame_id="map")
+        return PriorMapAlignment.identity(prior_frame_id=base_map.frame_id, runtime_frame_id="camera_init")
     if normalized in {"unavailable", "disabled", "prompt_context_only"}:
         return PriorMapAlignment.unavailable(
             reason=f"prior_map_alignment={normalized}",
             prior_frame_id=base_map.frame_id,
-            runtime_frame_id="map",
+            runtime_frame_id="camera_init",
         )
     return PriorMapAlignment.load(normalized)
 

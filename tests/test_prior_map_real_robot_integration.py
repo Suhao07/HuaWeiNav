@@ -196,3 +196,25 @@ def test_config_factory_builds_prompt_only_alignment(tmp_path):
     assert not runtime.alignment.can_rank_geometry()
     assert diagnostics['fallback'] == 'prompt_context_only'
     assert diagnostics['reason'] == 'prior_map_alignment=unavailable'
+
+
+def test_affine_alignment_falls_back_when_observation_frame_differs(tmp_path):
+    calibrated = PriorMapAlignment.from_runtime_origin_pose(
+        origin_xy_prior=(0.0, 0.0), origin_yaw_rad=0.0,
+        prior_frame_id="map_z_up", runtime_frame_id="camera_init")
+    plan = types.SimpleNamespace(
+        raw_instruction="find the cup", dataset_target="mug",
+        target_detector_prompts=("mug",), target_match_terms=("mug", "cup"),
+        search_priors=types.SimpleNamespace(room_hints=(), support_objects=(), affordances=()))
+
+    same = PriorMapRealRobotRuntime(base_map=_base_map(), alignment=calibrated, run_directory=tmp_path / "a")
+    same.update_and_query(snapshot=SemanticMapSnapshot(
+        timestamp=1.0, robot_pose=Pose3D(position=(0.0, 0.0, 0.0), frame_id="camera_init")), plan=plan, step=1)
+    assert same.alignment.can_rank_geometry() is True
+
+    other = PriorMapRealRobotRuntime(base_map=_base_map(), alignment=calibrated, run_directory=tmp_path / "b")
+    other.update_and_query(snapshot=_snapshot(), plan=plan, step=1)
+    assert other.alignment.can_rank_geometry() is False
+    assert other.memory.alignment is other.alignment
+    assert other.alignment.diagnostics_payload()["fallback"] == "prompt_context_only"
+    assert "camera_init" in other.alignment.diagnostics_payload()["reason"]
