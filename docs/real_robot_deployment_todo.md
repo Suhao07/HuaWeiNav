@@ -104,6 +104,36 @@ bag replay、HIL 和影子 topic 不能替代真实底盘验收。
   每次 LIO 启动位姿），launch 默认值 `identity` 对该地图在几何上是错的；完成标定前必须用
   `STRIVE_PRIOR_MAP_ALIGNMENT=unavailable`（只作排序与提示上下文）。
 
+### 先验地图 ↔ Point-LIO 对齐流程（脚本已就绪，实物未执行）
+
+`camera_init` 是 LIO 启动时重力对齐后的雷达位姿；定位模式（`location_mode`）下它是所载
+PCD 的坐标系，因此“固定起点标记”和“持久 LIO 地图”共用同一份标定。
+
+1. 地面贴起点标记（车体位置 + 朝向），在手机地图（`map_z_up` 平面 x,y）上量出车体中心
+   `base_xy` 和朝向（`--base-yaw-deg`，或车头正前方 ≥0.3 m 的一点 `--heading-xy`）。
+2. 车放在标记上建图：`LIO_PCD_SAVE_EN=1 bash scripts/start_real_robot_sensors.sh
+   orin26_livox_mid360_d435i start`，由人推车或底盘所有者遥控覆盖场景（本项目不发运动指令）。
+3. `bash scripts/save_orin_lio_map.sh <dir>`：向 Point-LIO 窗格发 Ctrl-C（SIGINT 才会写
+   `scans.pcd`；`kill-session` 会丢图），等新图写完后拷为 `<dir>/lio_map.pcd` 并写
+   `lio_map.json`（sha256、建图会话时间），最后关闭 `livox_odom`，避免后续启动复用旧会话。
+4. 生成对齐：`python3 scripts/build_prior_lio_alignment.py <prior_bundle> --base-xy x,y
+   --heading-xy x,y --lio-map <dir>/lio_map.json --output <dir>/prior_alignment.json`。
+   外参默认取静态 TF `aft_mapped→base`（x=-0.2，yaw=-1.5708）；脚本自检标记点车体在
+   runtime 系应为 (-0.2, 0)，并记录先验地图 sha256 与 LIO 地图 sha256。
+5. 之后每次启动：`LIO_LOCATION_MODE=1 LIO_MAP_PATH=<dir>/lio_map.pcd` 启动传感器（无初值时
+   NDT+ICP 以单位阵为初值，故在起点附近启动最稳；远离起点需 `/initialpose` 给初值，发布需
+   另行批准），`STRIVE_PRIOR_MAP_ALIGNMENT=<dir>/prior_alignment.json` 启动 `docker_en.sh`。
+   不用定位模式时，只要 LIO 在标记上启动，同一 JSON 也成立。
+
+约束与保护：
+- `start_orin_lio_for_strive.sh` 定位模式要求 `LIO_MAP_PATH` 为已存在的绝对路径，且与
+  `LIO_PCD_SAVE_EN` 互斥；配置校验先于停旧会话，配置错误时不会把运行中的 LIO 杀掉。
+- runtime 的 `identity`/`unavailable` 标签改为 `camera_init`；affine 对齐若遇到观测
+  `frame_id` 与标定的 runtime 坐标系不一致，自动降级为 `prompt_context_only`。
+- 无法自动发现的失效：LIO 不在标记上、且未用定位模式启动（坐标系名不变但原点变了）。
+- 待实物验收：标记量测精度、定位模式重定位成功率（ICP fitness ≤ 0.5）、对齐后先验物体
+  与 live 物体的位置残差。
+
 ### 2026-09-07 状态刷新
 
 用户已确认 OCC 项目的 D435i--MID-360 外参与当前安装状态一致，并批准当前 candidate
@@ -188,7 +218,7 @@ SemanticMapSnapshot
 | Waypoint adapter | 真机影子验证 | `PointStamped -> Float32MultiArray`、world-to-ego、过期丢弃在影子 topic 验证 | 外部 `/waypoint` 已接收或底盘已执行 |
 | SysNav 原生下层 | 代码迁移、离线/HIL 覆盖 | `localPlanner`、`pathFollower`、motion action、安全 mux 的软件链存在 | 它已成为 Orin 底盘的生产控制器 |
 | 外部机器人控制器 | 只读接口审计 | 已观察 `/waypoint` 和 `/topoplan/reached_goal` 的历史接口 | blocked/timeout/cancel、急停和所有权已确认 |
-| 真实先验地图 | 接口存在，实物未验收 | `PriorMapData`、alignment 和 runtime context 可接入 | 已有与真机坐标对齐的语义先验地图 |
+| 真实先验地图 | 手机地图已部署（unavailable 对齐），几何对齐工具就绪、实物未标定 | `PriorMapData`、alignment 和 runtime context 可接入；起点标记/LIO 地图对齐流程见 §1 | 已有与真机坐标对齐的语义先验地图 |
 | 房间节点 | adapter 已实现，producer 未确认 | `/room_nodes_list` 可选消费接口存在 | 当前 semantic mapping 会发布真实房间图 |
 
 ## 3. 与 SysNav 的边界
