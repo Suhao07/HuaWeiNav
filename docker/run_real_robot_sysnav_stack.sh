@@ -130,8 +130,13 @@ for path_var in SYSNAV_DETECTOR_MODEL_PATH SYSNAV_SAM2_CHECKPOINT; do
     fi
   fi
 done
-if [[ -n "${STRIVE_PRIOR_MAP_PATH:-}" && -f "${STRIVE_PRIOR_MAP_PATH}" ]]; then
-  prior_map_dir="$(cd "$(dirname "${STRIVE_PRIOR_MAP_PATH}")" && pwd)"
+if [[ -n "${STRIVE_PRIOR_MAP_PATH:-}" && -e "${STRIVE_PRIOR_MAP_PATH}" ]]; then
+  # 地图包本身是目录，整体挂载；单文件地图挂载其所在目录。
+  if [[ -d "${STRIVE_PRIOR_MAP_PATH}" ]]; then
+    prior_map_dir="$(cd "${STRIVE_PRIOR_MAP_PATH}" && pwd)"
+  else
+    prior_map_dir="$(cd "$(dirname "${STRIVE_PRIOR_MAP_PATH}")" && pwd)"
+  fi
   if [[ -z "${_mounted_dirs[${prior_map_dir}]:-}" ]]; then
     VOLUME_ARGS+=(-v "${prior_map_dir}:${prior_map_dir}:ro")
     _mounted_dirs["${prior_map_dir}"]=1
