@@ -49,14 +49,19 @@ def triplet_indices(index: int, total_views: int = 12) -> tuple[int, int, int]:
     return prev, index, nxt
 
 
-def build_triplet(images: list[np.ndarray], depths: list[np.ndarray], index: int, camera_intrinsic: Any) -> PanoramaTriplet:
+def build_triplet(images: list[np.ndarray], depths: list[np.ndarray], index: int, camera_intrinsic: Any, *, circular: bool = True) -> PanoramaTriplet:
     """Stitch one previous/current/next panorama triplet for detection."""
 
     from cv_utils.stitch import combine_image
 
     prev, cur, nxt = triplet_indices(index, total_views=len(images))
-    comb_img = combine_image(images[prev], images[cur], images[nxt], camera_intrinsic)
-    comb_depth = combine_image(depths[prev], depths[cur], depths[nxt], camera_intrinsic)
+    # 有限扫描的两端不相邻。空白侧板保持原检测器中心面板坐标合同。
+    left_image = images[prev] if circular or index > 0 else np.zeros_like(images[cur])
+    right_image = images[nxt] if circular or index + 1 < len(images) else np.zeros_like(images[cur])
+    left_depth = depths[prev] if circular or index > 0 else np.zeros_like(depths[cur])
+    right_depth = depths[nxt] if circular or index + 1 < len(images) else np.zeros_like(depths[cur])
+    comb_img = combine_image(left_image, images[cur], right_image, camera_intrinsic)
+    comb_depth = combine_image(left_depth, depths[cur], right_depth, camera_intrinsic)
     depth_vis = np.clip((comb_depth / 5.0 * 255.0), 0, 255).astype(np.uint8)
     return PanoramaTriplet(
         index=index,

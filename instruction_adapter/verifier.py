@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import base64
 import hashlib
 import json
 import os
-from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from verification.images import image_input
 from typing import Any
 
 import numpy as np
@@ -15,68 +15,8 @@ from prompting.schemas import HAS_PYDANTIC, ParsedVerification
 from prompting.templates import FINAL_VERIFIER_PROMPT
 
 from .ontology import normalize_term
-
-
-@dataclass
-class CandidateInstance:
-    """A concrete mapped object candidate.
-
-    The detector label is intentionally separate from uid.  For instructions
-    such as "find the red chair", rejecting one blue chair must not reject every
-    chair in the scene.
-    """
-
-    uid: str
-    detector_label: str
-    canonical_label: str = ""
-    centroid: list[float] = field(default_factory=list)
-    bbox_2d: list[float] = field(default_factory=list)
-    confidence: float = 0.0
-    step: int | None = None
-
-    def as_dict(self) -> dict[str, Any]:
-        return asdict(self)
-
-
-@dataclass
-class VerificationRecord:
-    instruction_hash: str
-    candidate_uid: str
-    status: str
-    confidence: float = 0.0
-    decision: str = ""
-    failed_constraints: list[str] = field(default_factory=list)
-    reason: str = ""
-    step: int | None = None
-    evidence_paths: list[str] = field(default_factory=list)
-
-    def as_dict(self) -> dict[str, Any]:
-        return asdict(self)
-
-
-@dataclass
-class VerificationResult:
-    satisfied: bool
-    decision: str
-    confidence: float = 0.0
-    semantic_satisfied: bool = False
-    view_sufficient_for_stop: bool = True
-    hard_constraints: dict[str, Any] = field(default_factory=dict)
-    satisfied_constraints: list[str] = field(default_factory=list)
-    failed_constraints: list[str] = field(default_factory=list)
-    view_feedback: str = ""
-    preferred_view_goal: str = ""
-    view_objective: dict[str, Any] = field(default_factory=dict)
-    reason: str = ""
-    diagnostics: dict[str, Any] = field(default_factory=dict)
-
-    def as_dict(self) -> dict[str, Any]:
-        return asdict(self)
-
-
-def instruction_hash(raw_instruction: str) -> str:
-    raw = str(raw_instruction or "").strip().lower()
-    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
+from verification.contracts import CandidateInstance, VerificationResult
+from verification.store import EvidenceStore, instruction_hash
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -91,15 +31,15 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
 
 
 def candidate_uid_from_object(obj: Any, label: str = "") -> str:
-    """Build a stable-enough instance key from geometry.
+    """Return native instance identity, with a geometry key for legacy inputs.
 
-    VLN's mapped ObjectNode does not expose a permanent object id.  We use a
-    quantized geometry signature so the same physical object is skipped after a
-    hard verifier rejection, while another object of the same detector class can
-    still be considered.
+    Native map objects expose a stable instance uid. Legacy inputs without that
+    field use the quantized geometry signature for compatibility.
     """
 
-    detector_label = normalize_term(label or getattr(obj, "tag", "object")) or "object"
+    if getattr(obj, "uid", None):
+        return str(obj.uid)
+    detector_label = normalize_term(label or getattr(obj, "tag", getattr(obj, "label", "object"))) or "object"
     center = np.array(getattr(obj, "position", [0.0, 0.0, 0.0]), dtype=float).reshape(-1)[:3]
     if center.size < 3:
         center = np.pad(center, (0, 3 - center.size))
@@ -123,10 +63,13 @@ def candidate_from_object(
     canonical_label: str = "",
     step: int | None = None,
 ) -> CandidateInstance:
-    label = normalize_term(getattr(obj, "tag", canonical_label)) or normalize_term(canonical_label)
+    label = normalize_term(getattr(obj, "label", getattr(obj, "tag", canonical_label))) or normalize_term(canonical_label)
     uid = candidate_uid_from_object(obj, label)
-    centroid = np.array(getattr(obj, "position", []), dtype=float).reshape(-1)[:3].tolist()
-    bbox = getattr(obj, "bbox", None)
+    position = getattr(obj, "position", None)
+    if position is None:
+        position = getattr(obj, "bbox3d_center", None)
+    centroid = np.array(position if position is not None else [], dtype=float).reshape(-1)[:3].tolist()
+    bbox = getattr(obj, "bbox2d_xyxy", getattr(obj, "bbox", None))
     try:
         bbox = np.array(bbox, dtype=float).reshape(-1).tolist()
     except Exception:
@@ -141,71 +84,6 @@ def candidate_from_object(
         step=step,
     )
 
-
-class VerificationLedger:
-    """Instruction-scoped verifier memory.
-
-    ledger 只屏蔽“某条指令下的某个对象实例”，不屏蔽 detector
-    类别。这样找红色椅子时，蓝色椅子被拒绝后不会反复回来，但其它 chair
-    实例仍然可以继续参与验证。
-    """
-
-    def __init__(self):
-        self.records: dict[tuple[str, str], VerificationRecord] = {}
-
-    def reset(self):
-        self.records.clear()
-
-    def get(self, raw_instruction: str, candidate_uid: str) -> VerificationRecord | None:
-        return self.records.get((instruction_hash(raw_instruction), candidate_uid))
-
-    def is_hard_rejected(self, raw_instruction: str, candidate_uid: str) -> bool:
-        record = self.get(raw_instruction, candidate_uid)
-        return bool(record and record.status == "rejected_hard")
-
-    def put(
-        self,
-        raw_instruction: str,
-        candidate_uid: str,
-        result: VerificationResult,
-        step: int | None = None,
-        evidence_paths: list[str] | None = None,
-    ) -> VerificationRecord:
-        if result.satisfied or result.decision == "accept":
-            status = "accepted"
-        elif result.decision == "reject_candidate":
-            status = "rejected_hard"
-        elif result.decision == "need_better_view":
-            status = "needs_better_view"
-        else:
-            status = "rejected_soft"
-        record = VerificationRecord(
-            instruction_hash=instruction_hash(raw_instruction),
-            candidate_uid=candidate_uid,
-            status=status,
-            confidence=float(result.confidence or 0.0),
-            decision=result.decision,
-            failed_constraints=list(result.failed_constraints or []),
-            reason=result.reason,
-            step=step,
-            evidence_paths=list(evidence_paths or []),
-        )
-        self.records[(record.instruction_hash, candidate_uid)] = record
-        return record
-
-    def as_dict(self) -> dict[str, Any]:
-        return {
-            f"{inst}:{uid}": record.as_dict()
-            for (inst, uid), record in self.records.items()
-        }
-
-
-def _image_block(path: str) -> dict[str, Any] | None:
-    if not path or not os.path.exists(path):
-        return None
-    with open(path, "rb") as f:
-        data = base64.b64encode(f.read()).decode("utf-8")
-    return {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{data}"}}
 
 
 def _nested_image_path(payload: dict[str, Any], *keys: str) -> str:
@@ -314,8 +192,11 @@ def _planner_hard_constraint_infeasible(hard_constraints: dict[str, Any]) -> tup
 class FinalInstructionVerifier:
     """VLM verifier for original-instruction stop decisions."""
 
-    def __init__(self, vlm: str = "cognav"):
+    def __init__(self, vlm: str = "cognav", evidence_dir: str = "outputs/evidence"):
         self.vlm = vlm
+        self.evidence_dir = Path(evidence_dir)
+        from verification.store import EvidenceStore
+        self.evidence_store = EvidenceStore()
 
     @staticmethod
     def _view_guidance(evidence: dict[str, Any]) -> tuple[list[str], str]:
@@ -329,7 +210,6 @@ class FinalInstructionVerifier:
 
         geometry = dict((evidence or {}).get("geometry") or {})
         facts = dict((evidence or {}).get("view_quality_facts") or {})
-        view_control = dict((evidence or {}).get("view_control") or {})
         guidance: list[str] = []
         if bool(facts.get("projection_failed", False)):
             guidance.append("current target projection failed; compare against pinned/best evidence")
@@ -348,32 +228,65 @@ class FinalInstructionVerifier:
             if distance_to_object is not None and required_stop_distance is not None:
                 guidance.append(
                     f"current_distance_to_object={float(distance_to_object):.3f}m; "
-                    f"benchmark_success_distance={float(required_stop_distance):.3f}m"
+                    f"predicted_instance_stop_distance={float(required_stop_distance):.3f}m"
                 )
         except Exception:
             pass
-        if view_control:
-            guidance.append(
-                "view_control_budget_exhausted="
-                f"{bool(view_control.get('budget_exhausted', view_control.get('exhausted')))}"
-            )
-        preferred = (
-            "Prefer the closest executable stop view that still keeps the candidate and any "
-            "required relation anchor clearly visible, not clipped, and easy to verify."
-        )
+        preferred = "Resolve the remaining task predicate or stop-distance requirement with a new observation of the candidate."
         return guidance, preferred
 
     def _fallback(self, reason: str) -> VerificationResult:
-        # When LLM is intentionally unavailable, preserve baseline behavior.
+        # Missing validation is unknown, never positive or negative evidence.
         return VerificationResult(
-            satisfied=True,
-            decision="accept",
+            satisfied=False,
+            decision="uncertain",
             confidence=0.0,
-            semantic_satisfied=True,
-            view_sufficient_for_stop=True,
-            reason=f"final verifier fallback accepted: {reason}",
-            diagnostics={"fallback": reason},
+            semantic_satisfied=False,
+            view_sufficient_for_stop=False,
+            reason=f"final verifier unavailable: {reason}",
+            diagnostics={"unavailable": reason, "verdict": "unknown"},
         )
+
+    @staticmethod
+    def _visual_task(plan, evidence):
+        """Project active user semantics while excluding grounding and execution."""
+        semantic = plan.get("diagnostics", {}).get("task_spec", plan)
+        targets = semantic.get("targets", [])
+        terminal = [target for target in targets if target.get("terminal", True)]
+        if not terminal:
+            return {}
+        target_id = evidence.get("target_id")
+        if target_id is None:
+            if len(terminal) != 1:
+                raise ValueError("Visual verification of multiple targets requires an explicit target_id")
+            active = terminal[0]
+        else:
+            active = next(target for target in terminal if target["id"] == target_id)
+        predicates = [condition for condition in semantic.get("constraints", [])
+                      if condition.get("subject", "") in ("", active["id"], active["name"])]
+        # 默认 verifier=planner 不代表最终执行归属：ConstraintEvaluator 会
+        # 显式把 room/attribute 等约束委派到 declared_*。沿用该委派事实。
+        delegated = (list(evidence.get("declared_room_constraints", []))
+                     + list(evidence.get("declared_attribute_constraints", [])))
+        visual, domain = [], []
+        for condition in predicates:
+            projected = {key: condition[key] for key in (
+                "type", "subject", "relation", "object", "value", "hardness", "verifier") if key in condition}
+            projected.setdefault("verifier", "planner")
+            is_delegated = any(all(condition.get(key) == item.get(key) for key in (
+                "type", "subject", "relation", "object", "value")) for item in delegated)
+            if projected["verifier"] == "vlm" or is_delegated:
+                visual.append(projected)
+            else:
+                domain.append(projected)
+        anchors = {condition.get("object") for condition in visual}
+        return {
+            "active_target": {key: active[key] for key in ("id", "name", "attributes") if key in active},
+            "visual_predicates": visual,
+            "domain_predicates": domain,
+            "referenced_targets": [{key: target[key] for key in ("id", "name", "attributes") if key in target}
+                                   for target in targets if target.get("id") in anchors or target.get("name") in anchors],
+        }
 
     def verify(
         self,
@@ -395,29 +308,52 @@ class FinalInstructionVerifier:
         plan_dict = instruction_plan.as_dict() if hasattr(instruction_plan, "as_dict") else instruction_plan
         evidence = dict(evidence or {})
         evidence.setdefault("hard_stop_constraints", hard_stop_constraints_from_evidence(evidence))
-        payload = {
-            "raw_instruction": raw_instruction,
-            "instruction_plan": plan_dict or {},
-            "candidate": candidate.as_dict(),
-            "evidence": {k: v for k, v in evidence.items() if not str(k).endswith("_path")},
-        }
+        # V(I, task) 与 G(pose, map) 独立求值；预测标签和接近距离不参与视觉判定。
+        payload = {"raw_instruction": raw_instruction,
+                   "task": self._visual_task(plan_dict or {}, evidence),
+                   "candidate": {"uid": candidate.uid}}
         content: list[dict[str, Any]] = [
             {"type": "text", "text": json.dumps(payload, ensure_ascii=False, indent=2)},
         ]
         seen_image_paths: set[str] = set()
+        image_refs = {}
+        image_dependencies = {}
+
+        def load_image(path):
+            if not path:
+                return None
+            block, reference, digest = image_input(path, self.evidence_dir)
+            image_refs[path] = reference
+            image_dependencies["image:" + reference] = digest
+            return block
+
         for key in ("current_rgb_with_bbox_path", "object_crop_path", "centered_view_path"):
-            block = _image_block(str(evidence.get(key) or ""))
+            path = str(evidence.get(key) or "")
+            if path in seen_image_paths:
+                continue
+            block = load_image(path)
             if block is not None:
-                seen_image_paths.add(str(evidence.get(key) or ""))
-                content.append({"type": "text", "text": key})
+                seen_image_paths.add(path)
+                bbox = (evidence.get("object_crop_bbox_xyxy") if key == "object_crop_path"
+                        else evidence.get("geometry", {}).get("bbox_xyxy"))
+                content.append({"type": "text", "text": json.dumps({
+                    "role": "current_candidate_observation", "image_kind": key,
+                    "observation_identity": evidence.get("observation_identity", {}),
+                    "bbox_xyxy_in_this_image": bbox,
+                }, ensure_ascii=False)})
                 content.append(block)
         for item in evidence.get("relation_evidence_paths", []) or []:
-            block = _image_block(str(item))
+            path = str(item)
+            if path in seen_image_paths:
+                continue
+            block = load_image(path)
             if block is not None:
-                seen_image_paths.add(str(item))
-                content.append({"type": "text", "text": "relation_evidence"})
+                seen_image_paths.add(path)
+                content.append({"type": "text", "text": "relation observation; identify visible entities from this image"})
                 content.append(block)
         view_control = dict(evidence.get("view_control") or {})
+        excluded_history = []
+        current_identity = evidence.get("observation_identity", {})
         for label in ("pinned_visual_evidence", "latest_visual_evidence", "best_visual_evidence"):
             visual_packet = dict(view_control.get(label) or {})
             image_path = (
@@ -426,51 +362,69 @@ class FinalInstructionVerifier:
             )
             if not image_path or image_path in seen_image_paths:
                 continue
-            block = _image_block(image_path)
+            identity = visual_packet.get("observation_identity", {})
+            if (not {"candidate_uid", "task_revision", "observation_id"}.issubset(identity)
+                    or identity["candidate_uid"] != candidate.uid
+                    or identity["task_revision"] != current_identity.get("task_revision")):
+                excluded_history.append({"image_path": image_path, "reason": "observation_binding_mismatch"})
+                continue
+            block = load_image(image_path)
             if block is not None:
                 seen_image_paths.add(image_path)
-                content.append({
-                    "type": "text",
-                    "text": (
-                        f"{label}: previous VLM-confirmed visual target reference; "
-                        "compare target identity and view quality, but do not treat it as current stop evidence."
-                    ),
-                })
+                content.append({"type": "text", "text": json.dumps({
+                    "role": "earlier_candidate_observation",
+                    "observation_identity": identity,
+                    "bbox_xyxy_in_this_image": visual_packet.get("geometry", {}).get("bbox_xyxy"),
+                }, ensure_ascii=False)})
                 content.append(block)
+        # 与候选共享表面的其它实例：同一物理物体可能被拆成多个实例，只给图像不给其标签。
+        for item in evidence.get("overlapping_instance_observations", []) or []:
+            block = load_image(item["image_path"])
+            content.append({"type": "text", "text": json.dumps({
+                "role": "overlapping_instance_observation",
+                "candidate_surface_fraction_on_this_instance": item["candidate_surface_fraction"],
+                "bbox_xyxy_in_this_image": item["bbox_xyxy"],
+            }, ensure_ascii=False)})
+            content.append(block)
 
-        try:
-            client, model = get_client_and_model(self.vlm)
+        # 请求异常交由运行时记录和处置，保留原始异常及调用栈。
+        client, model = get_client_and_model(self.vlm)
+        from llm_utils.structured_output import request_fingerprint
+        from llm_utils.lvlm_call_tracker import record_cache_hit
+        messages = [{"role": "system", "content": FINAL_VERIFIER_PROMPT},
+                    {"role": "user", "content": content}]
+        # 缓存只复用视觉判断 V(E,r)，当前 G_t 与任务进度继续由下方代码求值。
+        revision = plan_dict.get("diagnostics", {}).get("task_spec", {}).get("revision", 1)
+        key = request_fingerprint(model, [messages, revision, evidence.get("observation_identity"),
+            evidence.get("dependencies", {})], ParsedVerification, provider=self.vlm)
+        reuse = os.getenv("STRIVE_EVIDENCE_REUSE", "0") == "1"
+        parsed = self.evidence_store.visual_judgments.get(key) if reuse else None
+        if parsed is None:
             completion = client.beta.chat.completions.parse(
-                model=model,
-                messages=[
-                    {"role": "system", "content": FINAL_VERIFIER_PROMPT},
-                    {"role": "user", "content": content},
-                ],
-                response_format=ParsedVerification,
-                trace_label=FINAL_VERIFY.trace_label,
-            )
+                model=model, messages=messages, response_format=ParsedVerification,
+                trace_label=FINAL_VERIFY.trace_label)
             parsed = completion.choices[0].message.parsed
-        except Exception as exc:
-            return self._fallback(f"vlm_failed: {exc}")
+            if parsed is None:
+                raise ValueError("Final verifier response has no structured judgment")
+            if reuse:
+                self.evidence_store.visual_judgments[key] = parsed
+        else:
+            record_cache_hit("final_visual_judgment")
 
         decision = normalize_term(getattr(parsed, "decision", "")).replace(" ", "_")
         allowed = {"accept", "reject_candidate", "need_better_view", "need_relation_check", "uncertain"}
         if decision not in allowed:
-            decision = "accept" if bool(getattr(parsed, "satisfied", False)) else "uncertain"
+            raise ValueError(f"Unsupported final verifier decision: {decision!r}")
         confidence = max(0.0, min(1.0, _safe_float(getattr(parsed, "confidence", 0.0))))
         semantic_satisfied = bool(getattr(parsed, "semantic_satisfied", False))
         view_sufficient = bool(getattr(parsed, "view_sufficient_for_stop", True))
         parsed_satisfied = bool(getattr(parsed, "satisfied", False))
-        parsed_hard_constraints = dict(getattr(parsed, "hard_constraints", {}) or {})
         hard_constraints = dict(evidence.get("hard_stop_constraints") or hard_stop_constraints_from_evidence(evidence))
         planner_infeasible, planner_infeasible_reason = _planner_hard_constraint_infeasible(hard_constraints)
-        if parsed_satisfied:
-            semantic_satisfied = True
-        if decision == "accept" and not view_sufficient:
+        if decision == "accept" and not (semantic_satisfied and view_sufficient):
             decision = "need_better_view"
-        if decision == "accept" and not bool(hard_constraints.get("satisfied", True)) and not planner_infeasible:
+        if decision == "accept" and not bool(hard_constraints.get("satisfied", True)):
             decision = "need_better_view"
-            view_sufficient = False
             parsed_satisfied = False
         view_guidance, view_guidance_goal = self._view_guidance(evidence)
         failed_constraints = list(getattr(parsed, "failed_constraints", []) or [])
@@ -486,16 +440,12 @@ class FinalInstructionVerifier:
             view_feedback = "; ".join(view_guidance)
         if view_guidance_goal and not preferred_view_goal and decision == "need_better_view":
             preferred_view_goal = view_guidance_goal
-        view_objective = dict(getattr(parsed, "view_objective", {}) or {})
+        view_objective = parsed.view_objective.model_dump(exclude_defaults=True)
         if decision == "need_better_view" and not view_objective:
             view_objective = {
                 "keep_visible_roles": ["candidate"],
                 "improve_goals": [
-                    "move closer when executable",
-                    "keep target visible",
-                    "keep relation anchor visible if required",
-                    "avoid clipping",
-                    "improve clarity",
+                    "resolve the unverified target or relation predicate",
                 ],
                 "minimum_expected_improvement": "moderate",
                 "accept_if_no_better_view": False,
@@ -513,7 +463,7 @@ class FinalInstructionVerifier:
                 current_distance = float(geometry.get("distance_to_object"))
             except Exception:
                 current_distance = 0.0
-            if required_stop_distance > 0:
+            if required_stop_distance > 0 and current_distance > required_stop_distance:
                 view_objective["required_stop_distance"] = required_stop_distance
                 view_objective["current_distance_to_object"] = current_distance
                 goals = list(view_objective.get("improve_goals") or [])
@@ -525,14 +475,18 @@ class FinalInstructionVerifier:
             if not view_feedback:
                 view_feedback = "Hard final-stop constraints are not yet satisfied; continue the view/approach objective."
         return VerificationResult(
-            satisfied=parsed_satisfied and decision == "accept" and view_sufficient,
+            satisfied=parsed_satisfied and decision == "accept" and semantic_satisfied and view_sufficient,
+            target_uid=candidate.uid,
+            evidence_ids=sorted(set(image_refs.values())),
+            dependencies={**evidence.get("dependencies", {}), **image_dependencies,
+                          "observation_identity": json.dumps(evidence.get("observation_identity"), sort_keys=True)},
+            task_revision=plan_dict.get("diagnostics", {}).get("task_spec", {}).get("revision", 1),
             decision=decision,
             confidence=confidence,
             semantic_satisfied=semantic_satisfied,
             view_sufficient_for_stop=view_sufficient,
             hard_constraints={
                 **hard_constraints,
-                "vlm_report": parsed_hard_constraints,
                 "planner_infeasible": planner_infeasible,
                 "planner_infeasible_reason": planner_infeasible_reason,
             },
@@ -544,6 +498,8 @@ class FinalInstructionVerifier:
             reason=reason,
             diagnostics={
                 "source": "vlm",
+                "image_sources": image_refs,
+                "excluded_history": excluded_history,
                 "model_provider": self.vlm,
                 "view_guidance": {
                     "facts": view_guidance,
@@ -552,7 +508,6 @@ class FinalInstructionVerifier:
                 },
                 "hard_stop_constraints": {
                     **hard_constraints,
-                    "vlm_report": parsed_hard_constraints,
                     "planner_infeasible": planner_infeasible,
                     "planner_infeasible_reason": planner_infeasible_reason,
                 },

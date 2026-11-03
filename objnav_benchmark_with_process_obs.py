@@ -10,6 +10,7 @@ from loguru import logger
 from tqdm import tqdm
 
 from benchmark import available_benchmarks, get_provider
+from benchmark.episode_selection import select_episode, episode_identity
 from constants import *
 #指令解析模块
 from instruction_adapter import (
@@ -36,24 +37,6 @@ def write_metrics(metrics, path="objnav_hm3d.csv"):
         writer.writeheader()
         writer.writerows(metrics)
 
-
-def _set_next_episode_by_index(env, index):
-    # 新版 Habitat iterator 提供 set_next_episode_by_index；
-    # 旧版没有该方法，只能重排 episodes 并重建内部 iterator。
-    iterator = env.episode_iterator
-    if hasattr(iterator, "set_next_episode_by_index"):
-        iterator.set_next_episode_by_index(index)
-        return
-
-    episodes = list(iterator.episodes)
-    if not episodes:
-        raise IndexError("No episodes are available in the Habitat iterator.")
-    index = index % len(episodes)
-    iterator.episodes = episodes[index:] + episodes[:index]
-    if hasattr(iterator, "_iterator"):
-        iterator._iterator = iter(iterator.episodes)
-    if hasattr(iterator, "_prev_scene_id"):
-        iterator._prev_scene_id = None
 
 
 def _filter_episodes(env, scene_id_contains=None, object_category=None):
@@ -112,6 +95,8 @@ def get_args():
     parser.add_argument("--success_distance", type=float, default=None)
     parser.add_argument("--eval_episodes", type=int, default=1000)
     parser.add_argument("--start_episode", type=int, default=0)
+    parser.add_argument("--episode_manifest", type=str, default="",
+                        help="Frozen runtime_episodes identities for paired evaluation.")
     parser.add_argument("--dataset_episodes", type=int, default=None)
     parser.add_argument("--scene_id", type=str, default=None)
     parser.add_argument("--scene_id_contains", type=str, default=None)
@@ -131,12 +116,15 @@ def get_args():
     parser.add_argument("--relocate", default=False, action="store_true")
     parser.add_argument("--no_gpt_relocate", default=False, action="store_true")
     parser.add_argument("--vlm", type=str, default=DEFAULT_VLM)
+    parser.add_argument("--decision_owner", choices=("legacy", "agent", "baseline_guided"), default="baseline_guided")
+    parser.add_argument("--agent_max_model_calls", type=int, default=100)
     parser.add_argument("--custom_instruction", type=str, default="")
     parser.add_argument("--enable_instruction_adapter", default=False, action="store_true")
     parser.add_argument("--instruction_adapter_backend", type=str, default="llm")
     parser.add_argument("--instruction_adapter_strict_classes", default=False, action="store_true")
     parser.add_argument("--enable_prior_map", default=False, action="store_true")
     parser.add_argument("--prior_map_path", type=str, default="")
+    parser.add_argument("--prior_map_layout", type=str, default="", help="Canonical region map sharing the object map scene and frame.")
     parser.add_argument("--prior_map_source", type=str, default="auto")
     parser.add_argument("--prior_map_alignment", type=str, default="identity")
     parser.add_argument(
@@ -145,6 +133,8 @@ def get_args():
         action="store_true",
         help="Send dynamic prior-map BEV to the optional high-level room selector.",
     )
+    parser.add_argument("--enable_prior_object_evidence", action="store_true",
+                        help="Add a bound historical detection image to prior-map high-level selection.")
     parser.add_argument("--prior_map_vlm_interval", type=int, default=10)
     parser.add_argument("--room_semantic_interval", type=int, default=10)
     parser.add_argument("--enable_room_semantics", default=False, action="store_true")
@@ -170,20 +160,36 @@ def _install_instruction_plan(
     user instruction or dataset metadata.
     """
 
-    instruction_plan = instruction_parser.parse_plan(
-        raw_instruction=raw_instruction,
-        dataset_target=dataset_target,
-        available_classes=habitat_mapper.object_perceiver.classes,
-        episode_info=episode_info,
-    )
+    if source == "benchmark_object_goal":
+        from backends.habitat.task_input import adapt_objectnav_task
+        from instruction_adapter.task_compat import runtime_plan
+        from perception.detector_adapter import ground_plan
+
+        task = adapt_objectnav_task(dataset_target)
+        instruction_plan = ground_plan(
+            runtime_plan(task),
+            available_classes=habitat_mapper.object_perceiver.classes,
+            vlm=instruction_parser.vlm,
+            strict_available_classes=instruction_parser.strict_available_classes,
+            use_legacy_similarity_fallback=False,
+        )
+    else:
+        instruction_plan = instruction_parser.parse_plan(
+            raw_instruction=raw_instruction,
+            dataset_target=dataset_target,
+            available_classes=habitat_mapper.object_perceiver.classes,
+            episode_info=episode_info,
+        )
     instruction_plan.diagnostics.setdefault("source", [])
     instruction_plan.diagnostics["runtime_source"] = source
     instruction_spec = instruction_plan.to_legacy_spec()
 
-    habitat_mapper.instruction_plan = instruction_plan
-    habitat_mapper.instruction_spec = instruction_spec
-    habitat_mapper.instruction_execution_state = None
-    habitat_mapper.instruction_constraint_evaluator.ensure_state(habitat_mapper, instruction_plan)
+    from backends.habitat.scene import snapshot_from_mapper
+    from task.session import TaskSession
+
+    snapshot, _ = snapshot_from_mapper(habitat_mapper)
+    habitat_agent.task = TaskSession(snapshot=snapshot, plan=instruction_plan,
+                                     vlm=instruction_parser.vlm, save_dir=habitat_agent.save_dir)
 
     # Perception can use both terminal detector terms and non-terminal concept
     # detector terms. Stop remains controlled by terminal target + verifier.
@@ -201,6 +207,9 @@ def _install_instruction_plan(
 
     instruction_dir = os.path.join(episode_dir, "instruction_adapter")
     os.makedirs(instruction_dir, exist_ok=True)
+    if "task_spec" in instruction_plan.diagnostics:
+        with open(os.path.join(instruction_dir, "task_spec.json"), "w", encoding="utf-8") as f:
+            json.dump(instruction_plan.diagnostics["task_spec"], f, ensure_ascii=False, indent=2)
     with open(os.path.join(instruction_dir, "plan.json"), "w", encoding="utf-8") as f:
         json.dump(instruction_plan.as_dict(), f, ensure_ascii=False, indent=2, sort_keys=True)
     with open(os.path.join(instruction_dir, "spec.json"), "w", encoding="utf-8") as f:
@@ -285,10 +294,11 @@ if __name__ == "__main__":
             prior_map_runtime.alignment.diagnostics_payload(),
         )
 
+    frozen_episodes = None
+    if args.episode_manifest:
+        with open(args.episode_manifest) as stream:
+            frozen_episodes = json.load(stream)["runtime_episodes"]
     start_idx = args.start_episode
-    if hasattr(habitat_agent.env.episode_iterator, "set_next_episode_by_index"):
-        # 新版 iterator 需要先 reset 一次完成内部状态初始化。
-        habitat_agent.env.reset()
 
     for i in tqdm(range(start_idx, args.eval_episodes)):
         # try:
@@ -296,9 +306,16 @@ if __name__ == "__main__":
         # logger.add(logger_path, mode="w")
         logger.info(f"Processing episode: i = {i}")
 
-        _set_next_episode_by_index(habitat_agent.env, i)
+        expected_episode = select_episode(habitat_agent.env, i,
+            expected_identity=frozen_episodes[i] if frozen_episodes is not None else None)
         habitat_agent.reset(i)
+        actual_episode = episode_identity(habitat_agent.env.current_episode)
+        if actual_episode != expected_episode:
+            raise RuntimeError("Habitat reset selected a different episode")
         episode_dir = os.path.join(args.save_dir, f"episode-{i}")
+        os.makedirs(episode_dir, exist_ok=True)
+        with open(os.path.join(episode_dir, "episode_identity.json"), "w") as stream:
+            json.dump(actual_episode, stream, indent=2)
         if prior_map_runtime is not None:
             prior_map_runtime.begin_episode(episode_dir, i)
         reset_counts()
@@ -338,20 +355,31 @@ if __name__ == "__main__":
 
         logger.info(f"Target: {habitat_mapper.target}")
         logger.info(f"Target list: {habitat_mapper.target_list}")
-        if habitat_mapper.instruction_spec is not None:
-            logger.info(f"Instruction spec: {habitat_mapper.instruction_spec.as_dict()}")
+        if instruction_spec is not None:
+            logger.info(f"Instruction spec: {instruction_spec.as_dict()}")
 
         habitat_mapper.object_perceiver.sam.initialize(habitat_mapper.target)
 
-        if args.relocate:
-            habitat_agent.make_plan_mod_relocate(idx=i)
+        if args.decision_owner == "baseline_guided":
+            from backends.habitat.guided_runtime import run_guided_episode
+            run_guided_episode(habitat_agent, episode_idx=i, max_steps=args.max_steps,
+                               max_model_calls=args.agent_max_model_calls)
+        elif args.decision_owner == "agent":
+            from backends.habitat.agent_runtime import run_agent_episode
+            run_agent_episode(habitat_agent, episode_idx=i, max_steps=args.max_steps,
+                              max_model_calls=args.agent_max_model_calls)
         else:
-            habitat_agent.make_plan_mod_no_relocate(idx=i)
+            if args.relocate:
+                habitat_agent.make_plan_mod_relocate(idx=i)
+            else:
+                habitat_agent.make_plan_mod_no_relocate(idx=i)
+            flag = True
+            while flag and not habitat_env.episode_over and habitat_agent.episode_steps < args.max_steps:
+                flag = habitat_agent.step_mod(idx=i)
 
-        flag = True
-        while flag and not habitat_env.episode_over and habitat_agent.episode_steps < args.max_steps:
-            flag = habitat_agent.step_mod(idx=i)
-
+        if prior_map_runtime is not None:
+            prior_map_runtime.finish_episode(mapper=habitat_mapper,
+                plan=habitat_agent.task.plan, step=habitat_agent.episode_steps)
         habitat_agent.save_trajectory(f"./{args.save_dir}/episode-{i}/")
         prior_map_summary = (
             prior_map_runtime.metrics_summary()
@@ -393,7 +421,7 @@ if __name__ == "__main__":
             'lvml_call_count_by_type': counts_compact(),
             'End': 1,
             'object_goal': (
-                getattr(getattr(habitat_mapper, "instruction_plan", None), "raw_instruction", "")
+                getattr(getattr(habitat_agent.task, "plan", None), "raw_instruction", "")
                 or habitat_agent.instruct_goal
             ),
         })

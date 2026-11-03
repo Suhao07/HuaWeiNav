@@ -1,0 +1,12 @@
+chair
+table
+cabinet
+door
+window
+stairs
+lamp
+plant
+sofa
+bed
+toilet
+shelf

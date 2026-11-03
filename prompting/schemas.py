@@ -6,7 +6,7 @@ inside a minimal container.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 try:
     from pydantic import BaseModel, Field
@@ -59,6 +59,9 @@ class ParsedInstruction(BaseModel):
     support_objects: list[str] = Field(default_factory=list)
     affordances: list[str] = Field(default_factory=list)
     requires_runtime_relation: bool = False
+    unresolved: list[str] = Field(default_factory=list)
+    ordered: bool = False
+    exhaustive: bool = False
 
 
 class GroundingResult(BaseModel):
@@ -102,18 +105,27 @@ class ParsedRelationResult(BaseModel):
     reason: str = ""
 
 
+class ParsedViewObjective(BaseModel):
+    """Observation request for unresolved predicates, with an explicit schema."""
+    keep_visible_roles: list[str] = Field(default_factory=list)
+    improve_goals: list[str] = Field(default_factory=list)
+    minimum_expected_improvement: str = ""
+    accept_if_no_better_view: bool = False
+    reason: str = ""
+
+
 class ParsedVerification(BaseModel):
+    """Visual judgment with closed, typed nested objects for strict generation."""
     satisfied: bool = False
     semantic_satisfied: bool = False
     view_sufficient_for_stop: bool = True
-    hard_constraints: dict[str, Any] = Field(default_factory=dict)
     decision: str = "uncertain"
     confidence: float = 0.0
     satisfied_constraints: list[str] = Field(default_factory=list)
     failed_constraints: list[str] = Field(default_factory=list)
     view_feedback: str = ""
     preferred_view_goal: str = ""
-    view_objective: dict[str, Any] = Field(default_factory=dict)
+    view_objective: ParsedViewObjective = Field(default_factory=ParsedViewObjective)
     reason: str = ""
 
 
@@ -132,8 +144,9 @@ class ParsedHighLevelSelection(BaseModel):
     """Room/frontier selection returned from a dynamic prior-map BEV."""
 
     selected_uid: str = ""
-    selected_type: str = ""
-    decision: str = "uncertain"
+    selected_type: Literal["", "room", "frontier"] = ""
+    # 与规划器消费的动作域一致，未知动词在模型协议边界显式报错。
+    decision: Literal["select", "uncertain"] = "uncertain"
     confidence: float = 0.0
     reason: str = ""
     alternatives: list[str] = Field(default_factory=list)

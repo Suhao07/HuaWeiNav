@@ -8,6 +8,7 @@ import numpy as np
 from loguru import logger
 
 from instruction_adapter.verifier import candidate_from_object
+from navigation.goal_approach_controller import recheck_pitches
 from planning.viewpoint_policy import build_check_again_viewpoints
 
 
@@ -30,7 +31,7 @@ def select_check_again_viewpoint(agent: Any) -> None:
     path_request.requested_start = current_position
     target_waypoint = _target_waypoint_for_view_objective(agent)
     pid_waypoint = _habitat_point(agent, target_waypoint)
-    path_request.requested_end = pid_waypoint
+    path_request.requested_end = pathfinder.snap_point(pid_waypoint) if getattr(agent, "adaptive_observation", False) else pid_waypoint
 
     found_path = pathfinder.find_path(path_request)
     if not found_path and getattr(agent, "confirmed_target_waypoint", None) is not None:
@@ -46,12 +47,31 @@ def select_check_again_viewpoint(agent: Any) -> None:
         camera_intrinsic=agent.mapper.camera_intrinsic,
         mapper_initial_position=agent.mapper.initial_position,
         habitat_path_points=points,
-        target_height=agent.found_goal_position[2] + 0.88,
-        success_distance=agent.success_distance,
+        # 建图坐标原点是初始 RGB 传感器，current_position[2] 已是相机高度。
+        target_height=agent.mapper.current_position[2],
+        success_distance=agent._augment_final_stop_geometry({})["required_stop_distance"],
         stop_criterion=agent.stop_criterion,
+        arrival_tolerance=agent.planner._goal_radius,
+        image_width=agent.rgb_trajectory[-1].shape[1],
+        image_height=agent.rgb_trajectory[-1].shape[0],
+        # 视点评分只用复核时可执行的俯仰角，由 rotate_toward_object_for_recheck 执行。
+        pitches=recheck_pitches(agent),
     )
     logger.info(f"Interpolated_path: {interpolated_path}")
 
+    # 到达容差是几何预算：d_object(v) + rho <= d_stop。
+    # 可完成的视点先按实际路径代价选；中间取证视点保留质量排序。
+    from navigation.action_controller import geodesic_distance_to_waypoint
+    for proposal in proposals:
+        proposal["travel_distance"] = geodesic_distance_to_waypoint(agent, proposal["position"])
+    proposals = [p for p in proposals if np.isfinite(p["travel_distance"])]
+    # 接近视点取停止半径内投影质量最高者；没有可见且可停的视点时不提供接近选项。
+    feasible = [p for p in proposals if p["stop_feasible"]]
+    agent.approach_viewpoint = max(feasible, key=lambda p: p["score"])["position"] if feasible else None
+    if agent.view_control_state.active:
+        # 已取得当前视角的判定后，补拍要求可执行位移：d_nav(x,v) > rho。
+        # 到达容差内的提案会立即返回 reached，不能提供新的观察位置。
+        proposals = [p for p in proposals if p["travel_distance"] > agent.planner._goal_radius]
     best_candidate = _log_and_pick_best_proposal(proposals)
     current_candidate = candidate_from_object(
         agent.object_final,
@@ -80,6 +100,13 @@ def select_check_again_viewpoint(agent: Any) -> None:
         agent.check_again_postion = agent.mapper.current_position
 
 
+def _proposal_rank(candidate):
+    """Rank feasible terminal views by travel cost, intermediate views by quality."""
+    if candidate.get("stop_feasible", False):
+        return (1, -candidate["travel_distance"], candidate["score"])
+    return (0, candidate["score"], -candidate.get("travel_distance", 0.0))
+
+
 def _log_and_pick_best_proposal(proposals: list[dict[str, Any]]) -> dict[str, Any] | None:
     best_candidate = None
     for candidate in proposals:
@@ -93,13 +120,13 @@ def _log_and_pick_best_proposal(proposals: list[dict[str, Any]]) -> dict[str, An
             candidate["area_ratio"],
             candidate["distance_to_target"],
         )
-        if best_candidate is None or candidate["score"] > best_candidate["score"]:
+        if best_candidate is None or _proposal_rank(candidate) > _proposal_rank(best_candidate):
             best_candidate = candidate
     return best_candidate
 
 
 def _try_view_control_proposal(agent: Any, proposals: list[dict[str, Any]], current_candidate: Any) -> bool:
-    state = getattr(agent.mapper, "instruction_execution_state", None)
+    state = getattr(getattr(agent, "task", None), "progress", None)
     pending_pair_active = (
         getattr(state, "mode", "") == "better_view_for_verified_pair"
         and bool(getattr(state, "pending_verified_pair", {}) or {})
@@ -147,6 +174,9 @@ def _target_waypoint_for_view_objective(agent: Any) -> np.ndarray:
     currently pinned object instance.  Reusing a stale discovery waypoint can keep
     all proposals far away and make `budget_exhausted` meaningless.
     """
+
+    if getattr(agent, "adaptive_observation", False):
+        return np.asarray(agent.object_final.find_closest(agent.mapper.current_position), dtype=float)
 
     if getattr(agent.view_control_state, "active", False):
         objective = dict(getattr(agent.view_control_state, "objective", {}) or {})

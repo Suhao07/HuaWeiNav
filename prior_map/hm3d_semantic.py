@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .alignment import PriorMapAlignment
-from .contracts import PriorMapData, PriorObject, PriorRoom, PriorTopologyEdge
+from .contracts import STRUCTURAL_LABELS, PriorMapData, PriorObject, PriorRoom, PriorTopologyEdge
 
 
 @dataclass(frozen=True)
@@ -227,7 +227,7 @@ def _keep_instance(inst: HM3DSemanticInstance, *, include_unknown: bool, include
     label = _norm(inst.label)
     if not include_unknown and label in {"unknown", "misc", "miscellaneous"}:
         return False
-    if not include_structural and label in _STRUCTURAL_LABELS:
+    if not include_structural and label in STRUCTURAL_LABELS:
         return False
     return True
 
@@ -279,19 +279,6 @@ def _safe_uid(value: str) -> str:
 
 def _norm(value: Any) -> str:
     return str(value or "").strip().lower().replace("_", " ").replace("-", " ")
-
-
-_STRUCTURAL_LABELS = {
-    "ceiling",
-    "door",
-    "door frame",
-    "floor",
-    "railing",
-    "stairs",
-    "wall",
-    "window",
-    "window frame",
-}
 
 
 __all__ = [

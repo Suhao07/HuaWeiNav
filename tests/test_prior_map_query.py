@@ -179,3 +179,43 @@ def test_query_result_is_ranking_only_and_has_no_motion_goal() -> None:
         "no_runtime_frontier_world_position",
         "frontier_bias_empty",
     }
+
+
+def test_canonical_capture_prior_ranks_actual_habitat_side():
+    """Canonical (x,-z,y) maps must not attract frontiers across the Z mirror."""
+    from prior_map.simulation import _load_alignment
+    base = PriorMapData(scene_id='scene', frame_id='map_z_up', objects=(
+        PriorObject(uid='mug', label='mug', position_xyz=(10., -10., 1.), confidence=.9),))
+    memory = PriorMapMemory(base_map=base, alignment=_load_alignment('identity', base))
+    for frontiers, initial in [
+        ((SimpleNamespace(uid='actual', habitat_world_position=(10., 0., 10.)),
+          SimpleNamespace(uid='mirror', habitat_world_position=(10., 0., -10.))), None),
+        ((SimpleNamespace(uid='actual', position=(7., 6., 0.)),
+          SimpleNamespace(uid='mirror', position=(7., -14., 0.))), (3., 4., .88)),
+    ]:
+        context = SimpleNamespace(objects=(), rooms=(), frontiers=frontiers)
+        if initial is not None:
+            context.initial_position = initial
+        result = PriorMapQueryService().query(_plan_without_room_hint(), context, memory)
+        assert result.frontier_biases[0].frontier_uid == 'actual'
+
+
+def test_canonical_native_position_preserves_y_sign():
+    from prior_map.query import _plane_xy_from_xyz
+    assert _plane_xy_from_xyz((10., -10., 1.), 'map_z_up', 'position_xyz') == (10., -10.)
+
+
+def test_minority_label_votes_rank_by_category_posterior():
+    """p(monitor) is the concept relevance; a canonical roundtrip keeps it."""
+    def obj(uid, label, probabilities):
+        return PriorObject(uid=uid, label=label, exact=True, confidence=.5, label_probabilities=probabilities)
+    base = PriorMapData.from_dict(PriorMapData(scene_id='scene', objects=(
+        obj('screen', 'tv', {'tv': .62, 'monitor': .38}), obj('sign', 'monitor', {'monitor': .58, 'picture frame': .42}),
+        obj('fan', 'fan', {'fan': 1.}), PriorObject(uid='plain', label='monitor', exact=True))).to_dict())
+    plan = _plan_without_room_hint()
+    plan.targets = [TargetQuery(id='target', name='monitor', detector_terms=['monitor'], terminal=True)]
+    memory = PriorMapMemory(base_map=base, alignment=PriorMapAlignment.identity())
+    result = PriorMapQueryService().query(plan, SimpleNamespace(objects=(), rooms=(), frontiers=()), memory)
+    relevance = {p.object_uid: p.metadata['score_components']['concept_relevance'] for p in result.object_rankings}
+    assert relevance == {'plain': 1., 'sign': .58, 'screen': .38, 'fan': 0.}
+    assert [p.object_uid for p in result.object_rankings][:3] == ['plain', 'sign', 'screen']

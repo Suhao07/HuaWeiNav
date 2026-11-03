@@ -1,0 +1,410 @@
+<?xml version='1.0' encoding='utf-8'?>
+<mxfile host="app.diagrams.net" agent="STRIVE architecture" version="24.7.17">
+  <diagram id="0" name="01 实物系统框架">
+    <mxGraphModel dx="1920" dy="1380" grid="1" gridSize="10" page="1" pageScale="1" pageWidth="1920" pageHeight="1380" math="1" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="title" value="STRIVE-Nav 实物系统｜主要模块与输入输出&lt;br&gt;依据当前 ROS2 入口与接口代码绘制 · 2026-10-27 · 表示代码连接关系，设备状态需现场验收" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e0ebf5;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=28;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="30" y="20" width="1860" height="105" as="geometry" />
+        </mxCell>
+        <mxCell id="sensor" value="传感器与标定&lt;br&gt;RGB / CameraInfo / LiDAR / IMU&lt;br&gt;输出：带时间戳的传感器消息" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e6f1fa;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=20;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="30" y="160" width="340" height="175" as="geometry" />
+        </mxCell>
+        <mxCell id="lio" value="定位与点云注册 / Point-LIO&lt;br&gt;输入：LiDAR + IMU&lt;br&gt;输出：注册点云、Odometry" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e6f1fa;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=20;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="410" y="160" width="340" height="175" as="geometry" />
+        </mxCell>
+        <mxCell id="det" value="检测 / 分割 / 跟踪&lt;br&gt;输入：RGB + 检测词表&lt;br&gt;输出：/detection_result" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e6f1fa;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=20;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="790" y="160" width="340" height="175" as="geometry" />
+        </mxCell>
+        <mxCell id="map" value="SysNav 语义建图&lt;br&gt;输入：检测 + 点云 + 位姿&lt;br&gt;输出：对象节点；房间为可选" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e6f1fa;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=20;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="1170" y="160" width="340" height="175" as="geometry" />
+        </mxCell>
+        <mxCell id="snap" value="ROS adapters / MapBridge&lt;br&gt;输入：对象、房间、位姿、视点&lt;br&gt;输出：SemanticMapSnapshot" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e6f1fa;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=20;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="1550" y="160" width="340" height="175" as="geometry" />
+        </mxCell>
+        <mxCell id="user" value="用户指令&lt;br&gt;输入：自然语言任务&lt;br&gt;输出：instruction 字符串" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e8f3ef;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=20;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="30" y="470" width="340" height="175" as="geometry" />
+        </mxCell>
+        <mxCell id="compile" value="指令编译 / 任务合同&lt;br&gt;输入：instruction&lt;br&gt;输出：InstructionPlan / TaskSpec" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e8f3ef;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=20;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="410" y="470" width="340" height="175" as="geometry" />
+        </mxCell>
+        <mxCell id="runtime" value="实物高层编排&lt;br&gt;SysNavInstructionRuntime&lt;br&gt;策略：SemanticMapSnapshot&lt;br&gt;输出：NavigationIntent" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e8f3ef;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=20;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="790" y="470" width="340" height="175" as="geometry" />
+        </mxCell>
+        <mxCell id="resolve" value="SysNavGoalResolver&lt;br&gt;输入：target / anchor + 视点&lt;br&gt;输出：MotionGoal / ViewpointGoal" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e8f3ef;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=20;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="1170" y="470" width="340" height="175" as="geometry" />
+        </mxCell>
+        <mxCell id="motion" value="MotionSupervisor / ROS 后端&lt;br&gt;输入：唯一活动 MotionGoal&lt;br&gt;输出：提交、取消、HOLD" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e8f3ef;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=20;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="1550" y="470" width="340" height="175" as="geometry" />
+        </mxCell>
+        <mxCell id="cache" value="RosObservationCache&lt;br&gt;输入：RGB / 深度或点云 / 位姿&lt;br&gt;输出：可追溯观测记录" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2df;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=20;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="30" y="800" width="340" height="175" as="geometry" />
+        </mxCell>
+        <mxCell id="evidence" value="EvidenceProvider / 取证&lt;br&gt;输入：到达事件 + 新鲜观测&lt;br&gt;输出：ViewEvidence / crop / pose" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2df;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=20;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="410" y="800" width="340" height="175" as="geometry" />
+        </mxCell>
+        <mxCell id="verify" value="关系 / 最终视觉验证&lt;br&gt;输入：任务 + 证据 + 几何&lt;br&gt;输出：accept / reject / 补拍" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2df;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=20;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="790" y="800" width="340" height="175" as="geometry" />
+        </mxCell>
+        <mxCell id="status" value="NavigationStatusProvider&lt;br&gt;输入：odom / path / 控制状态&lt;br&gt;输出：RUNNING / REACHED&lt;br&gt;BLOCKED / CANCELLED 等" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2df;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=20;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="1170" y="800" width="340" height="175" as="geometry" />
+        </mxCell>
+        <mxCell id="lower" value="SysNav 下层规划与跟踪&lt;br&gt;输入：/way_point 或 Action 服务&lt;br&gt;输出：路径 / 跟踪速度&lt;br&gt;安全 mux → /cmd_vel → 底盘" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2df;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=20;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="1550" y="800" width="340" height="175" as="geometry" />
+        </mxCell>
+        <mxCell id="vlm" value="外部 VLM 服务&lt;br&gt;输入：指令 / 图像 / 结构化上下文&lt;br&gt;输出：解析 / 匹配 / 视觉判断" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#eeeaf6;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=20;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="30" y="1110" width="340" height="175" as="geometry" />
+        </mxCell>
+        <mxCell id="prior" value="可选：先验 / 历史记忆&lt;br&gt;输入：已加载地图 + 坐标对齐&lt;br&gt;输出：候选与搜索上下文" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#eeeaf6;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=20;align=left;verticalAlign=middle;spacing=15;dashed=1;" vertex="1" parent="1">
+          <mxGeometry x="410" y="1110" width="340" height="175" as="geometry" />
+        </mxCell>
+        <mxCell id="task" value="任务进度与日志&lt;br&gt;输入：验证结果 / 运动事实&lt;br&gt;输出：进度、完成状态、trace" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#eeeaf6;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=20;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="790" y="1110" width="340" height="175" as="geometry" />
+        </mxCell>
+        <mxCell id="safety" value="安全与人工接管&lt;br&gt;输入：急停 / 定位 / 控制状态&lt;br&gt;输出：HOLD / 速度许可" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#eeeaf6;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=20;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="1170" y="1110" width="340" height="175" as="geometry" />
+        </mxCell>
+        <mxCell id="note" value="实施边界&lt;br&gt;默认 policy=wait / dry_run&lt;br&gt;实物 Agent/Skills 循环未默认接入&lt;br&gt;历史记忆整链与实物运动待验收" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#eeeaf6;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=20;align=left;verticalAlign=middle;spacing=15;dashed=1;" vertex="1" parent="1">
+          <mxGeometry x="1550" y="1110" width="340" height="175" as="geometry" />
+        </mxCell>
+        <mxCell id="edge23" value="LiDAR / IMU" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#4b718e;strokeWidth=2;fontSize=15;labelBackgroundColor=#f3f6fa;exitX=1.0;exitY=0.4857142857142857;entryX=0.0;entryY=0.4857142857142857;" edge="1" parent="1" source="sensor" target="lio">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="edge24" value="RGB" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#4b718e;strokeWidth=2;fontSize=15;labelBackgroundColor=#f3f6fa;exitX=0.5;exitY=0.0;entryX=0.5;entryY=0.0;" edge="1" parent="1" source="sensor" target="det">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="200" y="140" />
+              <mxPoint x="960" y="140" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="edge25" value="点云 / 位姿" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#4b718e;strokeWidth=2;fontSize=15;labelBackgroundColor=#f3f6fa;exitX=0.5;exitY=1.0;entryX=0.5;entryY=1.0;" edge="1" parent="1" source="lio" target="map">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="580" y="360" />
+              <mxPoint x="1340" y="360" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="edge26" value="检测结果" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#4b718e;strokeWidth=2;fontSize=15;labelBackgroundColor=#f3f6fa;exitX=1.0;exitY=0.4857142857142857;entryX=0.0;entryY=0.4857142857142857;" edge="1" parent="1" source="det" target="map">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="edge27" value="节点" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#4b718e;strokeWidth=2;fontSize=15;labelBackgroundColor=#f3f6fa;exitX=1.0;exitY=0.4857142857142857;entryX=0.0;entryY=0.4857142857142857;" edge="1" parent="1" source="map" target="snap">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="edge28" value="instruction" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#4b718e;strokeWidth=2;fontSize=15;labelBackgroundColor=#f3f6fa;exitX=1.0;exitY=0.4857142857142857;entryX=0.0;entryY=0.4857142857142857;" edge="1" parent="1" source="user" target="compile">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="edge29" value="任务合同" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#4b718e;strokeWidth=2;fontSize=15;labelBackgroundColor=#f3f6fa;exitX=1.0;exitY=0.4857142857142857;entryX=0.0;entryY=0.4857142857142857;" edge="1" parent="1" source="compile" target="runtime">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="edge30" value="snapshot" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#4b718e;strokeWidth=2;fontSize=15;labelBackgroundColor=#f3f6fa;exitX=0.5;exitY=1.0;entryX=0.5;entryY=0.0;" edge="1" parent="1" source="snap" target="runtime">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1720" y="405" />
+              <mxPoint x="960" y="405" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="edge31" value="intent" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#4b718e;strokeWidth=2;fontSize=15;labelBackgroundColor=#f3f6fa;exitX=1.0;exitY=0.4857142857142857;entryX=0.0;entryY=0.4857142857142857;" edge="1" parent="1" source="runtime" target="resolve">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="edge32" value="goal" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#4b718e;strokeWidth=2;fontSize=15;labelBackgroundColor=#f3f6fa;exitX=1.0;exitY=0.4857142857142857;entryX=0.0;entryY=0.4857142857142857;" edge="1" parent="1" source="resolve" target="motion">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="edge33" value="waypoint / action" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#4b718e;strokeWidth=2;fontSize=15;labelBackgroundColor=#f3f6fa;exitX=0.5;exitY=1.0;entryX=0.5;entryY=0.0;" edge="1" parent="1" source="motion" target="lower">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="edge34" value="观测" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#4b718e;strokeWidth=2;fontSize=15;labelBackgroundColor=#f3f6fa;exitX=0.10294117647058823;exitY=1.0;entryX=0.5;entryY=0.0;" edge="1" parent="1" source="sensor" target="cache">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="65" y="390" />
+              <mxPoint x="15" y="390" />
+              <mxPoint x="15" y="760" />
+              <mxPoint x="200" y="760" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="edge35" value="新鲜帧" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#4b718e;strokeWidth=2;fontSize=15;labelBackgroundColor=#f3f6fa;exitX=1.0;exitY=0.4857142857142857;entryX=0.0;entryY=0.4857142857142857;" edge="1" parent="1" source="cache" target="evidence">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="edge36" value="ViewEvidence" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#4b718e;strokeWidth=2;fontSize=15;labelBackgroundColor=#f3f6fa;exitX=1.0;exitY=0.4857142857142857;entryX=0.0;entryY=0.4857142857142857;" edge="1" parent="1" source="evidence" target="verify">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="edge37" value="验证事件" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#4b718e;strokeWidth=2;fontSize=15;labelBackgroundColor=#f3f6fa;exitX=0.5;exitY=1.0;entryX=0.5;entryY=0.0;" edge="1" parent="1" source="verify" target="task">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="edge38" value="路径 / 状态" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#4b718e;strokeWidth=2;fontSize=15;labelBackgroundColor=#f3f6fa;exitX=0.0;exitY=0.4857142857142857;entryX=1.0;entryY=0.4857142857142857;" edge="1" parent="1" source="lower" target="status">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="edge39" value="执行回执" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#4b718e;strokeWidth=2;fontSize=15;labelBackgroundColor=#f3f6fa;exitX=0.5;exitY=0.0;entryX=0.7647058823529411;entryY=1.0;" edge="1" parent="1" source="status" target="runtime">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1340" y="715" />
+              <mxPoint x="1050" y="715" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="edge40" value="REACHED" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#4b718e;strokeWidth=2;fontSize=15;labelBackgroundColor=#f3f6fa;exitX=0.5;exitY=1.0;entryX=0.5;entryY=1.0;" edge="1" parent="1" source="status" target="evidence">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1340" y="1020" />
+              <mxPoint x="580" y="1020" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="edge41" value="控制许可" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#4b718e;strokeWidth=2;fontSize=15;labelBackgroundColor=#f3f6fa;exitX=1.0;exitY=0.45714285714285713;entryX=0.5;entryY=1.0;" edge="1" parent="1" source="safety" target="lower">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1530" y="1190" />
+              <mxPoint x="1530" y="1055" />
+              <mxPoint x="1720" y="1055" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="edge42" value="进度 / 补拍" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#9671ac;strokeWidth=2;fontSize=15;labelBackgroundColor=#f3f6fa;exitX=1.0;exitY=0.5142857142857142;entryX=0.9117647058823529;entryY=1.0;dashed=1;" edge="1" parent="1" source="task" target="runtime">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1150" y="1200" />
+              <mxPoint x="1150" y="685" />
+              <mxPoint x="1100" y="685" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="edge43" value="模型判断" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#9671ac;strokeWidth=2;fontSize=15;labelBackgroundColor=#f3f6fa;exitX=0.5;exitY=0.0;entryX=0.17647058823529413;entryY=1.0;dashed=1;" edge="1" parent="1" source="vlm" target="verify">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="200" y="1060" />
+              <mxPoint x="850" y="1060" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="edge44" value="可选先验" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#9671ac;strokeWidth=2;fontSize=15;labelBackgroundColor=#f3f6fa;exitX=0.0;exitY=0.5142857142857142;entryX=0.17647058823529413;entryY=1.0;dashed=1;" edge="1" parent="1" source="prior" target="runtime">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="390" y="1200" />
+              <mxPoint x="390" y="690" />
+              <mxPoint x="850" y="690" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+  <diagram id="1" name="02 模块输入输出与代码依据">
+    <mxGraphModel dx="2100" dy="1550" grid="1" gridSize="10" page="1" pageScale="1" pageWidth="2100" pageHeight="1550" math="1" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="header" value="实物模块接口表｜数据、控制与验收边界&lt;br&gt;输入输出以代码契约为准；主题名称采用默认配置，具体设备使用 launch 参数映射。" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e0ebf5;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=28;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="25" y="20" width="2050" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="th0" value="模块" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#cbddec;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=20;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="25" y="140" width="310" height="55" as="geometry" />
+        </mxCell>
+        <mxCell id="th1" value="主要输入" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#cbddec;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=20;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="335" y="140" width="570" height="55" as="geometry" />
+        </mxCell>
+        <mxCell id="th2" value="主要输出" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#cbddec;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=20;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="905" y="140" width="600" height="55" as="geometry" />
+        </mxCell>
+        <mxCell id="th3" value="代码依据 / 状态" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#cbddec;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=20;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="1505" y="140" width="560" height="55" as="geometry" />
+        </mxCell>
+        <mxCell id="r0c0" value="传感器 / 标定" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=18;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="25" y="195" width="310" height="88" as="geometry" />
+        </mxCell>
+        <mxCell id="r0c1" value="RGB、CameraInfo、LiDAR、IMU；内外参与时间戳" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=18;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="335" y="195" width="570" height="88" as="geometry" />
+        </mxCell>
+        <mxCell id="r0c2" value="Image / PointCloud2 / Imu；明确 frame_id" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=18;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="905" y="195" width="600" height="88" as="geometry" />
+        </mxCell>
+        <mxCell id="r0c3" value="驱动与标定；机型依现场配置" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=18;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="1505" y="195" width="560" height="88" as="geometry" />
+        </mxCell>
+        <mxCell id="r1c0" value="Point-LIO / 定位" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f0f5f9;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=18;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="25" y="283" width="310" height="88" as="geometry" />
+        </mxCell>
+        <mxCell id="r1c1" value="LiDAR + IMU" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f0f5f9;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=18;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="335" y="283" width="570" height="88" as="geometry" />
+        </mxCell>
+        <mxCell id="r1c2" value="/cloud_registered；/aft_mapped_to_init" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f0f5f9;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=18;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="905" y="283" width="600" height="88" as="geometry" />
+        </mxCell>
+        <mxCell id="r1c3" value="外部定位节点；TF/标定需现场核验" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f0f5f9;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=18;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="1505" y="283" width="560" height="88" as="geometry" />
+        </mxCell>
+        <mxCell id="r2c0" value="Detection / Semantic Mapping" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=18;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="25" y="371" width="310" height="88" as="geometry" />
+        </mxCell>
+        <mxCell id="r2c1" value="RGB、检测词表；注册点云、位姿" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=18;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="335" y="371" width="570" height="88" as="geometry" />
+        </mxCell>
+        <mxCell id="r2c2" value="/detection_result；/object_nodes_list" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=18;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="905" y="371" width="600" height="88" as="geometry" />
+        </mxCell>
+        <mxCell id="r2c3" value="real_robot/ros2_ws/src/semantic_mapping" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=18;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="1505" y="371" width="560" height="88" as="geometry" />
+        </mxCell>
+        <mxCell id="r3c0" value="房间 / 视点输入" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f0f5f9;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=18;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="25" y="459" width="310" height="88" as="geometry" />
+        </mxCell>
+        <mxCell id="r3c1" value="房间节点、下层规划器可执行视点" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f0f5f9;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=18;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="335" y="459" width="570" height="88" as="geometry" />
+        </mxCell>
+        <mxCell id="r3c2" value="/room_nodes_list（可选）；/strive/sysnav/viewpoint_pose" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f0f5f9;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=18;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="905" y="459" width="600" height="88" as="geometry" />
+        </mxCell>
+        <mxCell id="r3c3" value="房间源可选；目标位姿由 viewpoint provider 提供" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f0f5f9;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=18;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="1505" y="459" width="560" height="88" as="geometry" />
+        </mxCell>
+        <mxCell id="r4c0" value="ROS adapters / MapBridge" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=18;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="25" y="547" width="310" height="88" as="geometry" />
+        </mxCell>
+        <mxCell id="r4c1" value="对象/房间/视点消息 + Odometry" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=18;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="335" y="547" width="570" height="88" as="geometry" />
+        </mxCell>
+        <mxCell id="r4c2" value="SemanticMapSnapshot：objects / rooms / viewpoints / pose" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=18;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="905" y="547" width="600" height="88" as="geometry" />
+        </mxCell>
+        <mxCell id="r4c3" value="real_robot/sysnav_ros_adapters.py；backends/ros/scene.py" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=18;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="1505" y="547" width="560" height="88" as="geometry" />
+        </mxCell>
+        <mxCell id="r5c0" value="Instruction compiler / Policy" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f0f5f9;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=18;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="25" y="635" width="310" height="88" as="geometry" />
+        </mxCell>
+        <mxCell id="r5c1" value="自然语言；SemanticMapSnapshot；可选先验" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f0f5f9;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=18;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="335" y="635" width="570" height="88" as="geometry" />
+        </mxCell>
+        <mxCell id="r5c2" value="任务合同；NavigationIntent（target / anchor 身份）" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f0f5f9;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=18;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="905" y="635" width="600" height="88" as="geometry" />
+        </mxCell>
+        <mxCell id="r5c3" value="instruction_runtime_node.py::_build_policy" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f0f5f9;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=18;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="1505" y="635" width="560" height="88" as="geometry" />
+        </mxCell>
+        <mxCell id="r6c0" value="SysNavInstructionRuntime" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=18;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="25" y="723" width="310" height="88" as="geometry" />
+        </mxCell>
+        <mxCell id="r6c1" value="snapshot、policy、controller、evidence、verifier" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=18;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="335" y="723" width="570" height="88" as="geometry" />
+        </mxCell>
+        <mxCell id="r6c2" value="目标调度、活动状态、到达取证、任务完成判断" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=18;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="905" y="723" width="600" height="88" as="geometry" />
+        </mxCell>
+        <mxCell id="r6c3" value="real_robot/sysnav_runtime.py" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=18;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="1505" y="723" width="560" height="88" as="geometry" />
+        </mxCell>
+        <mxCell id="r7c0" value="GoalResolver / MotionSupervisor" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f0f5f9;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=18;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="25" y="811" width="310" height="88" as="geometry" />
+        </mxCell>
+        <mxCell id="r7c1" value="NavigationIntent + snapshot 中的可执行视点" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f0f5f9;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=18;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="335" y="811" width="570" height="88" as="geometry" />
+        </mxCell>
+        <mxCell id="r7c2" value="MotionGoal；send / poll / cancel / hold" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f0f5f9;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=18;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="905" y="811" width="600" height="88" as="geometry" />
+        </mxCell>
+        <mxCell id="r7c3" value="sysnav_goal_resolver.py；motion/supervisor.py" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f0f5f9;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=18;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="1505" y="811" width="560" height="88" as="geometry" />
+        </mxCell>
+        <mxCell id="r8c0" value="ROS Motion backend" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=18;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="25" y="899" width="310" height="88" as="geometry" />
+        </mxCell>
+        <mxCell id="r8c1" value="MotionGoal；配置的 waypoint 或 Action 模式" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=18;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="335" y="899" width="570" height="88" as="geometry" />
+        </mxCell>
+        <mxCell id="r8c2" value="/way_point：PointStamped；或运动 Action 请求" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=18;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="905" y="899" width="600" height="88" as="geometry" />
+        </mxCell>
+        <mxCell id="r8c3" value="Action 模式由服务端拥有 waypoint 发布" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=18;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="1505" y="899" width="560" height="88" as="geometry" />
+        </mxCell>
+        <mxCell id="r9c0" value="下层规划 / pathFollower / safety &lt;br&gt;mux" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f0f5f9;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=18;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="25" y="987" width="310" height="88" as="geometry" />
+        </mxCell>
+        <mxCell id="r9c1" value="waypoint、实时几何、odom、安全状态" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f0f5f9;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=18;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="335" y="987" width="570" height="88" as="geometry" />
+        </mxCell>
+        <mxCell id="r9c2" value="/path；控制速度；/cmd_vel；底盘动作" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f0f5f9;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=18;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="905" y="987" width="600" height="88" as="geometry" />
+        </mxCell>
+        <mxCell id="r9c3" value="复用 SysNav；底盘协议与急停链需设备验收" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f0f5f9;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=18;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="1505" y="987" width="560" height="88" as="geometry" />
+        </mxCell>
+        <mxCell id="r10c0" value="NavigationStatusProvider" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=18;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="25" y="1075" width="310" height="88" as="geometry" />
+        </mxCell>
+        <mxCell id="r10c1" value="odom + path；可选 planner / safety 状态" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=18;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="335" y="1075" width="570" height="88" as="geometry" />
+        </mxCell>
+        <mxCell id="r10c2" value="NavigationStatus：进度、到达、阻塞、取消等" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=18;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="905" y="1075" width="600" height="88" as="geometry" />
+        </mxCell>
+        <mxCell id="r10c3" value="real_robot/sysnav_ros_adapters.py" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=18;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="1505" y="1075" width="560" height="88" as="geometry" />
+        </mxCell>
+        <mxCell id="r11c0" value="ObservationCache / EvidenceProvi&lt;br&gt;der" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f0f5f9;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=18;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="25" y="1163" width="310" height="88" as="geometry" />
+        </mxCell>
+        <mxCell id="r11c1" value="RGB、检测、深度或点云、位姿；到达后新鲜观测" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f0f5f9;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=18;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="335" y="1163" width="570" height="88" as="geometry" />
+        </mxCell>
+        <mxCell id="r11c2" value="ViewEvidence：图像、目标区域、位姿、来源身份" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f0f5f9;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=18;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="905" y="1163" width="600" height="88" as="geometry" />
+        </mxCell>
+        <mxCell id="r11c3" value="real_robot/observation_cache.py；sysnav_runtime.py" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f0f5f9;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=18;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="1505" y="1163" width="560" height="88" as="geometry" />
+        </mxCell>
+        <mxCell id="r12c0" value="Final verifier / 任务进度" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=18;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="25" y="1251" width="310" height="88" as="geometry" />
+        </mxCell>
+        <mxCell id="r12c1" value="任务合同 + ViewEvidence + 几何约束" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=18;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="335" y="1251" width="570" height="88" as="geometry" />
+        </mxCell>
+        <mxCell id="r12c2" value="accept / reject_candidate / need_better_view；进度" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=18;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="905" y="1251" width="600" height="88" as="geometry" />
+        </mxCell>
+        <mxCell id="r12c3" value="模型判断与运动到达分开；到达不直接等于任务成功" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=18;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="1505" y="1251" width="560" height="88" as="geometry" />
+        </mxCell>
+        <mxCell id="r13c0" value="外部 VLM / 可选 prior_map" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f0f5f9;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=18;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="25" y="1339" width="310" height="88" as="geometry" />
+        </mxCell>
+        <mxCell id="r13c1" value="模型：指令+图像；先验：地图+坐标对齐" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f0f5f9;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=18;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="335" y="1339" width="570" height="88" as="geometry" />
+        </mxCell>
+        <mxCell id="r13c2" value="结构化语义判断；候选排序和查询上下文" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f0f5f9;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=18;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="905" y="1339" width="600" height="88" as="geometry" />
+        </mxCell>
+        <mxCell id="r13c3" value="HTTP 模型服务；prior_map/；历史记忆新方案尚待接入" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f0f5f9;strokeColor=#8ca0b4;fontColor=#19344a;fontSize=18;align=left;verticalAlign=middle;spacing=15;" vertex="1" parent="1">
+          <mxGeometry x="1505" y="1339" width="560" height="88" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

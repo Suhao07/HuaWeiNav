@@ -148,6 +148,7 @@ class PriorMapHighLevelSelector:
         candidates: Iterable[HighLevelCandidate],
         runtime_state: Optional[Mapping[str, Any]] = None,
         force: bool = False,
+        evidence_contexts: tuple[PriorMapMultimodalContext, ...] = (),
     ) -> HighLevelSelectionResult:
         """Select an existing candidate using the dynamic BEV.
 
@@ -159,7 +160,7 @@ class PriorMapHighLevelSelector:
         if not candidate_list:
             return HighLevelSelectionResult(decision="uncertain", reason="no candidates")
         candidate_uids = {candidate.uid for candidate in candidate_list if candidate.uid}
-        key = self.cache_key(instruction, instruction_plan, context, candidate_list, runtime_state)
+        key = self.cache_key(instruction, instruction_plan, context, candidate_list, runtime_state, evidence_contexts)
         cached = None if force else self.cache.get(key)
         if cached is not None:
             record_cache_hit(HIGH_LEVEL_PRIOR_SELECTION.trace_label)
@@ -180,6 +181,7 @@ class PriorMapHighLevelSelector:
             "candidates": [candidate.to_dict() for candidate in candidate_list],
             "prior_map_context": context.text_context,
             "candidate_uid_contract": sorted(candidate_uids),
+            "historical_evidence": [item.to_dict() for item in evidence_contexts],
         }
         image = context.as_image_content()
         assert image is not None
@@ -192,6 +194,7 @@ class PriorMapHighLevelSelector:
             "bev_sha256": context.image_sha256,
             "candidate_uids": sorted(candidate_uids),
             "candidate_count": len(candidate_list),
+            "historical_evidence": [item.to_dict() for item in evidence_contexts],
         }
         started = time.perf_counter()
         completion = client.beta.chat.completions.parse(
@@ -203,6 +206,7 @@ class PriorMapHighLevelSelector:
                     "content": [
                         {"type": "text", "text": json.dumps(payload, ensure_ascii=False, sort_keys=True)},
                         image,
+                        *[item.as_image_content() for item in evidence_contexts],
                     ],
                 },
             ],
@@ -252,6 +256,7 @@ class PriorMapHighLevelSelector:
         context: PriorMapMultimodalContext,
         candidates: Iterable[HighLevelCandidate],
         runtime_state: Optional[Mapping[str, Any]],
+        evidence_contexts: tuple[PriorMapMultimodalContext, ...] = (),
     ) -> str:
         """Build the evidence-version cache key."""
 
@@ -261,6 +266,7 @@ class PriorMapHighLevelSelector:
                 "instruction": instruction,
                 "instruction_plan": _json_ready(instruction_plan),
                 "bev_sha256": context.image_sha256,
+                "historical_evidence": [item.to_dict() for item in evidence_contexts],
                 "candidates": [candidate.to_dict() for candidate in candidates],
                 "runtime_state": dict(runtime_state or {}),
                 "model": self.vlm,

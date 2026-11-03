@@ -90,6 +90,7 @@ class PriorMapRealRobotRuntime:
         prompt_builder: Optional[PriorMapPromptContextBuilder] = None,
         policy_adapter: Optional[PriorMapPolicyAdapter] = None,
         high_level_selector: Optional[PriorMapHighLevelSelector] = None,
+        high_level_interval: int = 10,
         room_semantic_interval: int = 10,
         room_semantic_classifier: Optional[RoomSemanticClassifier] = None,
     ) -> None:
@@ -104,6 +105,7 @@ class PriorMapRealRobotRuntime:
         self.prompt_builder = prompt_builder or PriorMapPromptContextBuilder(max_chars=4000)
         self.policy_adapter = policy_adapter or PriorMapPolicyAdapter(enabled=True)
         self.high_level_selector = high_level_selector
+        self.high_level_interval = max(1, int(high_level_interval))
         self.room_semantic_interval = max(1, int(room_semantic_interval))
         self.last_observation: Any = None
         self.last_query_result: Optional[SearchPriorResult] = None

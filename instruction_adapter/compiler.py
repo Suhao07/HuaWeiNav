@@ -1,36 +1,26 @@
+"""Compatibility entry point: strict semantic compilation then detector mapping.
+
+The domain compiler never sees detector vocabulary or benchmark hidden state.
+This adapter is retired when all consumers use TaskSpec and SceneQuery directly.
+"""
 from __future__ import annotations
 
 from typing import Any, Iterable
 
-from .contracts import InstructionPlan, TargetQuery
-from .grounding import ground_plan
+from instruction.compiler import compile_instruction, task_from_parsed_plan
+from instruction.parser import parse_instruction_with_llm
+from backends.habitat.task_input import plan_from_episode_info
+from perception.detector_adapter import ground_plan
+from .contracts import InstructionPlan
 from .ontology import normalize_term
-from .parser_llm import parse_instruction_with_llm
-from .parser_metadata import plan_from_episode_info
+from .task_compat import runtime_plan
 
-
-def _fallback_plan(raw_instruction: str, dataset_target: str) -> InstructionPlan:
-    dataset = normalize_term(dataset_target)
-    target_name = dataset or normalize_term(raw_instruction)
-    targets = []
-    if target_name:
-        targets.append(
-            TargetQuery(
-                id=f"t0_{target_name.replace(' ', '_')}",
-                name=target_name,
-                detector_terms=[target_name],
-                aliases=[target_name],
-                terminal=True,
-                source="dataset_fallback",
-            )
-        )
-    return InstructionPlan(
-        raw_instruction=str(raw_instruction or ""),
-        dataset_target=dataset,
-        targets=targets,
-        valid=bool(targets),
-        diagnostics={"source": ["dataset_fallback"]},
-    )
+# Predicate families handled by the current task/verification consumers.
+# Path exclusions are deliberately absent until an enforcing backend exists.
+RUNTIME_CONSTRAINT_TYPES = frozenset({
+    "spatial", "relation", "object relation", "co occurrence", "room",
+    "attribute", "color", "material", "state", "sequence", "count",
+})
 
 
 def compile_instruction_plan(
@@ -42,32 +32,28 @@ def compile_instruction_plan(
     vlm: str = "cognav",
     strict_available_classes: bool = False,
 ) -> InstructionPlan:
-    """Compile instruction text/metadata into a grounded InstructionPlan.
+    """Adapt explicit task inputs, rejecting unavailable language compilation.
 
-    Source priority:
-    1. CogNav episode.info metadata, when available.
-    2. Prompt-first LLM structured parsing.
-    3. Dataset target fallback.
+    Only the explicitly selected legacy backend permits dataset fallback.
+    Metadata is used only when supplied by the benchmark input boundary.
     """
-
-    info_plan = plan_from_episode_info(raw_instruction, dataset_target, episode_info)
-    if info_plan is not None:
-        plan = info_plan
-    elif normalize_term(backend) in ("llm", "cognav", "prompt", "prompt_first"):
+    mode = normalize_term(backend)
+    if mode in {"legacy", "rules"}:
         plan = parse_instruction_with_llm(raw_instruction, dataset_target, vlm=vlm)
     else:
-        # "rules" is kept as a compatibility backend name, but no target
-        # ontology rules are used anymore.
-        plan = _fallback_plan(raw_instruction, dataset_target)
-
-    if not plan.targets:
-        plan = _fallback_plan(raw_instruction, dataset_target)
-
-    plan = ground_plan(
-        plan,
-        available_classes=available_classes,
-        vlm=vlm,
-        strict_available_classes=strict_available_classes,
-    )
-    plan.valid = bool(plan.terminal_targets and plan.target_detector_prompts)
-    return plan
+        metadata = plan_from_episode_info(raw_instruction, dataset_target, episode_info)
+        if metadata is not None:
+            task = task_from_parsed_plan(metadata, source="benchmark_metadata")
+            unsupported = [c.type for c in task.constraints
+                           if c.hardness == "hard" and c.type not in RUNTIME_CONSTRAINT_TYPES]
+            if unsupported:
+                raise ValueError(f"unsupported constraints: {unsupported}")
+        else:
+            result = compile_instruction(raw_instruction, RUNTIME_CONSTRAINT_TYPES, vlm=vlm)
+            if result.task is None:
+                raise ValueError(f"{result.status}: {'; '.join(result.diagnostics)}")
+            task = result.task
+        plan = runtime_plan(task)
+    return ground_plan(plan, available_classes=available_classes, vlm=vlm,
+                       strict_available_classes=strict_available_classes,
+                       use_legacy_similarity_fallback=mode in {"legacy", "rules"})

@@ -1,4 +1,7 @@
 from types import SimpleNamespace
+from concurrent.futures import Future, ThreadPoolExecutor
+from threading import Event
+import pytest
 
 from real_robot.contracts import (
     CameraFrame,
@@ -73,6 +76,9 @@ def _room_list_msg():
 
 
 class FakePolicy:
+    def task_complete(self):
+        return True
+
     def __init__(self):
         self.calls = []
 
@@ -87,6 +93,9 @@ class FakePolicy:
 
 
 class FakeMotionController:
+    def hold(self):
+        self.held = True
+
     def __init__(self, statuses=None):
         self.goals = []
         self.statuses = list(statuses or [NavigationStatus(NavigationStatusCode.REACHED)])
@@ -236,10 +245,12 @@ def test_instruction_runtime_suppresses_reached_goal_until_policy_state_advances
     assert len(policy.calls) == 2
 
 
-def test_instruction_runtime_verifies_reached_goal_and_emits_stop() -> None:
+@pytest.mark.parametrize("task_complete", [True, False])
+def test_instruction_runtime_verifies_reached_goal_and_emits_stop(task_complete) -> None:
     bridge = SysNavSemanticMapBridge(robot_pose_provider=lambda: Pose3D(position=(0.0, 0.0, 0.0)))
     bridge.update_object_nodes(_object_list_msg())
     policy = FakePolicy()
+    policy.task_complete = lambda: task_complete
     controller = FakeMotionController(
         [
             NavigationStatus(NavigationStatusCode.RUNNING, goal_id="goal-1", message="accepted"),
@@ -269,7 +280,7 @@ def test_instruction_runtime_verifies_reached_goal_and_emits_stop() -> None:
     second = runtime.step("find a book")
 
     assert first.navigation_status.status == NavigationStatusCode.RUNNING
-    assert second.intent.mode == MotionGoalMode.STOP
+    assert (second.intent.mode == MotionGoalMode.STOP) == task_complete
     assert second.navigation_status.status == NavigationStatusCode.REACHED
     assert second.verifier_decision["decision"] == "accept"
     assert evidence_provider.calls
@@ -439,7 +450,8 @@ class FakeVerifier:
 
     def verify(self, evidence, context):
         self.calls.append((evidence, context))
-        return {"decision": "accept", "reason": "current view satisfies instruction"}
+        return {"decision": "accept", "satisfied": True, "semantic_satisfied": True,
+                "view_sufficient_for_stop": True, "reason": "current view satisfies instruction"}
 
 
 def test_viewpoint_evidence_loop_waits_reached_then_runs_verifier() -> None:
@@ -525,3 +537,130 @@ def test_latest_observation_evidence_provider_uses_current_rgb_and_crop_payload(
     assert evidence.camera_model == CameraModel.PINHOLE
     assert evidence.bbox_xyxy == (1.0, 2.0, 30.0, 40.0)
     assert evidence.metadata["crop_source"] == "object_node"
+
+
+def test_background_policy_keeps_timer_available_and_discards_old_control_epoch():
+    started, release = Event(), Event()
+
+    class SlowPolicy(FakePolicy):
+        def decide(self, snapshot, instruction=None):
+            started.set()
+            assert release.wait(2), "test must release the model worker"
+            return super().decide(snapshot, instruction)
+
+    bridge = SysNavSemanticMapBridge(robot_pose_provider=lambda: Pose3D((0.0, 0.0, 0.0)))
+    bridge.update_object_nodes(_object_list_msg())
+    controller = FakeMotionController([NavigationStatus(NavigationStatusCode.RUNNING)])
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        runtime = SysNavInstructionRuntime(bridge, SlowPolicy(), controller, inference_executor=executor)
+        try:
+            first = runtime.step("find a book")
+            assert first.intent.mode == MotionGoalMode.WAIT
+            assert started.wait(1)
+            assert not release.is_set()
+            assert runtime.step("find a book").intent.mode == MotionGoalMode.WAIT
+            assert controller.goals == []
+            runtime.motion.hold()
+            release.set()
+            runtime._decision_future.result(timeout=2)
+            runtime.clear_hold()
+            assert runtime.step("find a book").intent.mode == MotionGoalMode.WAIT
+            assert controller.goals == []
+        finally:
+            release.set()
+
+
+class DeferredExecutor:
+    """Resolve queued calls explicitly to test event ordering without sleeps."""
+    def __init__(self):
+        self.pending = []
+
+    def submit(self, function, *args, **kwargs):
+        future = Future()
+        self.pending.append((future, function, args, kwargs))
+        return future
+
+    def resolve(self):
+        future, function, args, kwargs = self.pending.pop(0)
+        future.set_result(function(*args, **kwargs))
+
+
+def test_background_verification_returns_to_timer_before_task_completion():
+    bridge = SysNavSemanticMapBridge(robot_pose_provider=lambda: Pose3D((0.0, 0.0, 0.0)))
+    bridge.update_object_nodes(_object_list_msg())
+    controller = FakeMotionController([
+        NavigationStatus(NavigationStatusCode.RUNNING, goal_id="goal-1"),
+        NavigationStatus(NavigationStatusCode.REACHED, goal_id="goal-1"),
+    ])
+    executor = DeferredExecutor()
+    verifier = FakeVerifier()
+    runtime = SysNavInstructionRuntime(
+        bridge, FakePolicy(), controller, inference_executor=executor,
+        viewpoint_evidence_loop=ViewpointEvidenceLoop(controller, FakeEvidenceProvider(), verifier),
+    )
+    assert runtime.step("book").intent.mode == MotionGoalMode.WAIT
+    executor.resolve()
+    assert runtime.step("book").navigation_status.status == NavigationStatusCode.RUNNING
+    waiting = runtime.step("book")
+    assert waiting.intent.mode == MotionGoalMode.WAIT
+    assert waiting.lower_planner_state["runtime_state"] == "VERIFYING"
+    assert verifier.calls == []
+    runtime.step("book")
+    assert len(executor.pending) == 1
+    executor.resolve()
+    assert runtime.step("book").intent.mode == MotionGoalMode.STOP
+    assert len(controller.goals) == 1
+
+
+def test_background_decision_is_recomputed_after_target_geometry_changes():
+    bridge = SysNavSemanticMapBridge(robot_pose_provider=lambda: Pose3D((0.0, 0.0, 0.0)))
+    bridge.update_object_nodes(_object_list_msg())
+    controller = FakeMotionController()
+    executor = DeferredExecutor()
+    runtime = SysNavInstructionRuntime(bridge, FakePolicy(), controller, inference_executor=executor)
+    runtime.step("book")
+    executor.resolve()
+    changed = _object_list_msg()
+    changed.nodes[0].position = _point(9.0, 2.0, 0.0)
+    bridge.update_object_nodes(changed)
+    assert runtime.step("book").intent.mode == MotionGoalMode.WAIT
+    assert controller.goals == []
+
+
+def test_background_decision_tracks_instruction_edits_even_when_text_returns():
+    bridge = SysNavSemanticMapBridge(robot_pose_provider=lambda: Pose3D((0.0, 0.0, 0.0)))
+    bridge.update_object_nodes(_object_list_msg())
+    controller = FakeMotionController()
+    executor = DeferredExecutor()
+    runtime = SysNavInstructionRuntime(bridge, FakePolicy(), controller, inference_executor=executor)
+    runtime.step("book")
+    runtime.step("cup")
+    executor.resolve()
+    assert runtime.step("book").intent.mode == MotionGoalMode.WAIT
+    assert controller.goals == []
+
+
+def test_changed_geometry_discards_background_verification_before_stop():
+    bridge = SysNavSemanticMapBridge(robot_pose_provider=lambda: Pose3D((0.0, 0.0, 0.0)))
+    bridge.update_object_nodes(_object_list_msg())
+    controller = FakeMotionController([
+        NavigationStatus(NavigationStatusCode.RUNNING, goal_id="goal-1"),
+        NavigationStatus(NavigationStatusCode.REACHED, goal_id="goal-1"),
+    ])
+    executor = DeferredExecutor()
+    runtime = SysNavInstructionRuntime(
+        bridge, FakePolicy(), controller, inference_executor=executor,
+        viewpoint_evidence_loop=ViewpointEvidenceLoop(controller, FakeEvidenceProvider(), FakeVerifier()),
+    )
+    runtime.step("book")
+    executor.resolve()
+    runtime.step("book")
+    runtime.step("book")
+    executor.resolve()
+    changed = _object_list_msg()
+    changed.nodes[0].position = _point(9.0, 2.0, 0.0)
+    bridge.update_object_nodes(changed)
+    decision = runtime.step("book")
+    assert decision.intent.mode == MotionGoalMode.WAIT
+    assert decision.verifier_decision == {}
+    assert decision.metadata["viewpoint_result"]["metadata"]["stale_inference"]

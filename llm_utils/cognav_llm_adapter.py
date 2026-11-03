@@ -1,10 +1,11 @@
 import os
+import json
 import sys
 import time
 from types import SimpleNamespace
 
 from constants import COGNAV_MODEL_NAME, DEFAULT_VLM, GEMINI_MODEL_NAME, require_gemini_key
-from llm_utils.lvlm_call_tracker import record_call
+from llm_utils.lvlm_call_tracker import record_call, record_request, record_parse_error
 from llm_utils.structured_output import (
     extract_json_object as _extract_json_object,
     fallback_payload as _fallback_payload,
@@ -51,6 +52,11 @@ class _CogNavParsedChat:
         if self._client is None:
             raise RuntimeError("CogNav LLM client is unavailable; use LLM_OFFLINE=1 or --vlm ark/openai/gemini")
 
+        trace_label = kwargs.get("trace_label") or getattr(response_format, "__name__", None) or "parse"
+        request_id = record_request(str(trace_label), model=model, messages=normalized,
+                                    response_format=response_format,
+                                    parameters={"temperature": kwargs.get("temperature", 0.0),
+                                                "max_tokens": kwargs.get("max_tokens")})
         started = time.perf_counter()
         completion = self._client.chat_completion(
             messages=normalized,
@@ -65,6 +71,7 @@ class _CogNavParsedChat:
             raw_response=str(content or ""),
             metadata={
                 "model": model,
+                "request_id": request_id,
                 "response_format": getattr(response_format, "__name__", str(response_format)),
                 "latency_ms": (time.perf_counter() - started) * 1000.0,
             },
@@ -72,9 +79,9 @@ class _CogNavParsedChat:
         try:
             parsed_payload = _extract_json_object(content)
         except Exception:
-            # 生产运行中 VLM 偶发 JSON-like 格式错误不能中断整条导航链。
-            # 默认对 parse error 做保守 fallback；如需调试原始异常，可显式关闭。
-            if os.getenv("STRIVE_LLM_PARSE_FALLBACK", "1").lower() in ("0", "false", "no", "off"):
+            # 解析失败保留原始异常和对应请求记录。
+            # 默认传播解析错误；历史兼容实验可显式开启 fallback。
+            if os.getenv("STRIVE_LLM_PARSE_FALLBACK", "0").lower() in ("0", "false", "no", "off"):
                 raise
             print(
                 "[CogNavLLMAdapter] JSON parse failed; using conservative fallback. "
@@ -107,22 +114,72 @@ class _TracingParsedCompletions:
         self._inner = inner
 
     def parse(self, *args, **kwargs):
+        """Save raw content before SDK validation; regenerate one invalid output.
+
+        重新生成只恢复请求协议，输入观测保持不变。两次校验失败后传播
+        原始异常。截断与损坏JSON共享这一次预算；超时、鉴权和拒绝直接传播。
+        """
+        from pydantic import ValidationError
+        from openai import LengthFinishReasonError
+        from openai.lib._parsing import parse_chat_completion
+
         trace_label = kwargs.pop("trace_label", "parse")
-        started = time.perf_counter()
-        completion = self._inner.parse(*args, **kwargs)
-        try:
-            content = completion.choices[0].message.content
-        except Exception:
-            content = ""
-        record_call(
-            str(trace_label),
-            raw_response=str(content or ""),
-            metadata={
-                "client": "openai_compatible",
-                "latency_ms": (time.perf_counter() - started) * 1000.0,
-            },
-        )
-        return completion
+        local_schema = kwargs["model"].startswith("doubao-")
+        if local_schema:
+            # 导航默认采用直接回答；显式请求仍可为复杂任务开启思考。
+            kwargs["extra_body"] = {"thinking": {"type": "disabled"},
+                                    **kwargs.get("extra_body", {})}
+            # 豆包服务端约束解码在冻结请求中产生损坏JSON；提示词携带合同，
+            # 本地继续调用SDK同一个严格解析器，保留截断、拒绝与schema错误语义。
+            kwargs["messages"] = inject_json_schema(kwargs["messages"], kwargs["response_format"])
+        original_messages = list(kwargs["messages"])
+        retry_of = None
+        for attempt in range(2):
+            request_id = record_request(
+                str(trace_label), model=kwargs["model"], messages=kwargs["messages"],
+                response_format=kwargs["response_format"],
+                parameters={key: value for key, value in kwargs.items()
+                            if key not in {"model", "messages", "response_format"}},
+            )
+            started = time.perf_counter()
+            if local_schema:
+                response = self._inner.with_raw_response.create(
+                    *args, **{**kwargs, "response_format": {"type": "text"}})
+            else:
+                response = self._inner.with_raw_response.parse(*args, **kwargs)
+            payload = json.loads(response.text)
+            choice = payload["choices"][0]
+            record_call(str(trace_label), raw_response=choice["message"].get("content") or "",
+                        metadata={"client": "openai_compatible", "request_id": request_id,
+                                  "provider_request_id": payload.get("id"),
+                                  "finish_reason": choice.get("finish_reason"),
+                                  "usage": payload.get("usage"),
+                                  "attempt": attempt, "retry_of": retry_of,
+                                  "structured_output": "text_with_local_schema" if local_schema else "json_schema",
+                                  "latency_ms": (time.perf_counter() - started) * 1000.0})
+            try:
+                if local_schema:
+                    return parse_chat_completion(response_format=kwargs["response_format"],
+                                                 input_tools=[], chat_completion=response.parse())
+                return response.parse()
+            except (ValidationError, LengthFinishReasonError) as error:
+                record_parse_error(request_id, error, attempt=attempt)
+                if attempt == 1:
+                    raise
+                retry_of = request_id
+                details = (
+                    json.dumps(error.errors(include_input=False, include_context=False), ensure_ascii=False)
+                    if isinstance(error, ValidationError)
+                    else "Output reached the token limit. Keep explanations concise and complete the JSON object."
+                )
+                kwargs["messages"] = original_messages + [{
+                    "role": "user", "content": (
+                        "The previous response failed JSON/schema validation. Regenerate one valid "
+                        "JSON object matching the supplied schema using the same observation. "
+                        "Preserve uncertainty where evidence is insufficient. Validation details: "
+                        + details
+                    ),
+                }]
 
 
 class _TracingChat:

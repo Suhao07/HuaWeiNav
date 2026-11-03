@@ -33,7 +33,7 @@ def interpolate_polyline(points: np.ndarray, spacing: float = 0.25) -> list[np.n
         point1 = np.asarray(points[idx], dtype=float)
         point2 = np.asarray(points[idx + 1], dtype=float)
         distance = float(np.linalg.norm(point1 - point2))
-        num_points = max(1, int(distance / spacing))
+        num_points = max(2, int(np.ceil(distance / spacing)) + 1)
         out.extend([(1.0 - t) * point1 + t * point2 for t in np.linspace(0.0, 1.0, num_points)])
     return out
 
@@ -62,13 +62,20 @@ def truncate_at_stop_radius(
     return path[: stop_idx + 1]
 
 
-def rotation_towards(stop_pos_xy: np.ndarray, target_pos_xy: np.ndarray) -> np.ndarray | None:
+def rotation_towards(stop_pos_xy: np.ndarray, target_pos_xy: np.ndarray, *,
+                     pitch: float = 0.0) -> np.ndarray | None:
+    """Camera-to-mapper rotation; positive pitch raises the optical forward axis.
+
+    R = R_yaw @ R_x(pitch). The optical forward direction is camera -Z;
+    pitch is in radians. Mapper axes (x, z, y) include the existing reflection;
+    this basis transform has determinant -1. Zero pitch preserves baseline views.
+    """
     orient = np.asarray(target_pos_xy, dtype=float) - np.asarray(stop_pos_xy, dtype=float)
     orient_norm = float(np.linalg.norm(orient))
     if orient_norm < 1e-6:
         return None
     orient = orient / orient_norm
-    return np.array(
+    yaw_rotation = np.array(
         [
             [-orient[1], 0.0, -orient[0]],
             [orient[0], 0.0, -orient[1]],
@@ -76,6 +83,37 @@ def rotation_towards(stop_pos_xy: np.ndarray, target_pos_xy: np.ndarray) -> np.n
         ],
         dtype=float,
     )
+    return yaw_rotation @ pitch_rotation(pitch)
+
+
+def pitch_rotation(pitch: float) -> np.ndarray:
+    r"""Camera-local rotation about the right axis; positive pitch looks up.
+
+    .. math::
+        R_x(\phi) = \begin{bmatrix}1&0&0\\0&\cos\phi&-\sin\phi\\0&\sin\phi&\cos\phi\end{bmatrix}
+
+    右乘作用于相机局部系，与 Habitat LOOK_UP/LOOK_DOWN 的传感器旋转一致。
+
+    Args:
+        pitch: Rotation angle in radians.
+    Returns:
+        The 3x3 rotation matrix.
+    """
+    c, s = np.cos(pitch), np.sin(pitch)
+    return np.array([[1., 0., 0.], [0., c, -s], [0., s, c]])
+
+
+def camera_pitch(rotation: np.ndarray) -> float:
+    r"""Return the optical-axis elevation of a camera-to-mapper rotation.
+
+    光轴 f = -R_{:,2}，建图系第三轴竖直向上：\phi = \arcsin(f_z) = \arcsin(-R_{2,2})。
+
+    Args:
+        rotation: Camera-to-mapper rotation.
+    Returns:
+        Pitch in radians; positive above the horizon.
+    """
+    return float(np.arcsin(np.clip(-rotation[2, 2], -1.0, 1.0)))
 
 
 def score_projection(

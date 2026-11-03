@@ -97,3 +97,16 @@ def test_room_policy_records_baseline_and_prior_adjusted_distance(tmp_path) -> N
     assert selection.prior_changed_selection is True
     assert selection.selected_prior_score > 0.0
     assert selection.adjusted_distances[1] < selection.distances[1]
+
+
+def test_high_level_frontier_choice_affects_current_room_soft_ranking(tmp_path):
+    mapper = _mapper(tmp_path)
+    mapper.prior_map_high_level_selection = dict(decision='select', selected_type='frontier', selected_uid='2')
+    nodes = [_node(1, (1., 0., 0.)), _node(2, (1.5, 0., 0.))]
+    assert find_closest_nodes(mapper, nodes).idx == 2
+    assert mapper.prior_map_last_chosen_frontier['prior_changed_selection'] is True
+    mapper.prior_map_high_level_selection['selected_uid'] = 'missing'
+    assert find_closest_nodes(mapper, nodes).idx == 1
+    mapper.prior_map_high_level_selection['selected_uid'] = '2'
+    mapper.prior_map_policy_adapter.enabled = False
+    assert find_closest_nodes(mapper, nodes).idx == 1

@@ -8,7 +8,6 @@ from typing import Any
 import numpy as np
 
 from .contracts import Constraint, InstructionPlan, TargetQuery
-from .execution import InstructionExecutionState
 from .ontology import normalize_term
 from .relation_verifier import DynamicRelationService
 from .semantic_edges import SemanticEdge, normalize_relation
@@ -96,7 +95,13 @@ def _pcd_bounds(obj: Any) -> tuple[list[float], list[float]]:
             )
     except Exception:
         pass
-    center = np.array(getattr(obj, "position", [0.0, 0.0, 0.0]), dtype=float).reshape(-1)[:3]
+    center_value = getattr(obj, "bbox3d_center", None)
+    extent_value = getattr(obj, "bbox3d_extent", None)
+    if center_value is not None and extent_value is not None:
+        center, extent = np.asarray(center_value), np.asarray(extent_value)
+        return (center - extent / 2).tolist(), (center + extent / 2).tolist()
+    position = getattr(obj, "position", None)
+    center = np.array(position if position is not None else [0.0, 0.0, 0.0], dtype=float).reshape(-1)[:3]
     if center.size < 3:
         center = np.pad(center, (0, 3 - center.size))
     return center.tolist(), center.tolist()
@@ -107,8 +112,8 @@ def object_record_from_mapper_object(obj: Any, canonical_label: str = "", step: 
     min_bound, max_bound = _pcd_bounds(obj)
     return {
         "id": candidate.uid,
-        "name": normalize_term(getattr(obj, "tag", canonical_label)),
-        "tag": normalize_term(getattr(obj, "tag", canonical_label)),
+        "name": normalize_term(getattr(obj, "label", getattr(obj, "tag", canonical_label))),
+        "tag": normalize_term(getattr(obj, "label", getattr(obj, "tag", canonical_label))),
         "canonical_label": normalize_term(canonical_label),
         "center": list(candidate.centroid or []),
         "centroid": list(candidate.centroid or []),
@@ -141,15 +146,6 @@ class ConstraintEvaluator:
         self.relation_service = relation_service or DynamicRelationService()
         self.save_dir = save_dir
 
-    def ensure_state(self, mapper: Any, plan: InstructionPlan) -> InstructionExecutionState:
-        state = getattr(mapper, "instruction_execution_state", None)
-        if state is None:
-            state = InstructionExecutionState(plan)
-            mapper.instruction_execution_state = state
-        else:
-            state.bind_plan(plan)
-        return state
-
     def register_mapper_objects(
         self,
         *,
@@ -175,15 +171,6 @@ class ConstraintEvaluator:
                 position=position,
             )
 
-    def target_for_candidate(
-        self,
-        mapper: Any,
-        plan: InstructionPlan,
-        candidate: CandidateInstance,
-    ) -> TargetQuery | None:
-        state = self.ensure_state(mapper, plan)
-        return state.target_for_candidate(plan, candidate.detector_label or candidate.canonical_label)
-
     def evaluate_before_final_verifier(
         self,
         *,
@@ -197,7 +184,6 @@ class ConstraintEvaluator:
     ) -> ConstraintEvaluation:
         """Evaluate hard runtime constraints before final stop acceptance."""
 
-        self.ensure_state(mapper, plan)
         relation_edges: list[SemanticEdge] = []
         failed: list[str] = []
         satisfied: list[str] = []
@@ -250,41 +236,6 @@ class ConstraintEvaluator:
             evidence=evidence,
             reason="Runtime constraints passed or were deferred to final verifier.",
         )
-
-    def apply_final_result(
-        self,
-        *,
-        mapper: Any,
-        plan: InstructionPlan,
-        target: TargetQuery | None,
-        candidate: CandidateInstance,
-        result: VerificationResult,
-        evidence: dict[str, Any] | None = None,
-    ) -> bool:
-        state = self.ensure_state(mapper, plan)
-        if target is None:
-            target = state.target_for_candidate(plan, candidate.detector_label or candidate.canonical_label)
-        if target is None:
-            return bool(result.satisfied and result.decision == "accept")
-        if not (result.satisfied and result.decision == "accept"):
-            if result.decision == "need_better_view" and bool(result.semantic_satisfied):
-                state.start_better_view_for_verified_pair(
-                    target=target,
-                    candidate_uid=candidate.uid,
-                    candidate_record=candidate.as_dict(),
-                    relation_context=(evidence or {}).get("verified_relation_context") or {},
-                    result=result,
-                    evidence=evidence,
-                )
-                return False
-            if state.pending_pair_candidate_uid() == candidate.uid and result.decision in (
-                "reject_candidate",
-                "reject_relation",
-            ):
-                state.clear_pending_verified_pair()
-            state.mark_candidate_rejected(target, candidate.uid)
-            return False
-        return state.mark_candidate_accepted(plan, target, candidate.uid)
 
     def _evaluate_relation_constraint(
         self,
@@ -360,9 +311,9 @@ class ConstraintEvaluator:
             )
             concept_records = {record.object_uid: record for record in records}
         for obj in mapper_objects:
-            if obj is candidate_obj:
+            if candidate_from_object(obj, step=step).uid == candidate.uid:
                 continue
-            label = normalize_term(getattr(obj, "tag", ""))
+            label = normalize_term(getattr(obj, "label", getattr(obj, "tag", "")))
             concept_match = None
             if anchor_concept is not None and concept_records:
                 obj_uid = candidate_from_object(obj, canonical_label=getattr(anchor_concept, "name", ""), step=step).uid
@@ -525,7 +476,7 @@ class ConstraintEvaluator:
             return
         out_dir = os.path.join(self.save_dir, f"episode-{episode_idx}", "instruction_adapter")
         os.makedirs(out_dir, exist_ok=True)
-        state = getattr(mapper, "instruction_execution_state", None)
+        state = getattr(mapper, "progress", None)
         payload = {
             "execution_state": state.as_dict() if state is not None else None,
             "spatial_graph": self.spatial_graph.as_dict(),

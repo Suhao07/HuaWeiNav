@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import pytest
+from pydantic import ValidationError
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -17,6 +19,14 @@ from prior_map.visualizer import FloorPlanOverlay, build_floorplan_overlay
 from prior_map.contracts import PriorMapData, PriorRoom
 from prior_map.alignment import PriorMapAlignment
 from prompting.schemas import ParsedHighLevelSelection, ParsedRoomSemantic
+
+
+def test_high_level_decision_rejects_unconsumed_model_verb():
+    """真实回执中的 explore 曾通过解析，却无法进入 frontier 选择分支。"""
+    with pytest.raises(ValidationError):
+        ParsedHighLevelSelection(selected_uid="1", selected_type="frontier", decision="explore")
+    selected = ParsedHighLevelSelection(selected_uid="1", selected_type="frontier", decision="select")
+    assert selected.decision == "select"
 
 
 class _FakeCompletions:
@@ -262,3 +272,45 @@ def test_dynamic_overlay_does_not_fabricate_runtime_position_without_alignment()
 
     assert overlay.robot_position_xy is None
     assert overlay.trajectory_xy == ()
+
+
+def test_historical_image_is_sent_and_versions_selection_cache(tmp_path, monkeypatch):
+    monkeypatch.delenv('LLM_OFFLINE', raising=False)
+    image = tmp_path/'bev.png'
+    image.write_bytes(b'bev')
+    reference = tmp_path/'reference.png'
+    reference.write_bytes(b'historical')
+    context = PriorMapMultimodalContext(image_path=str(image))
+    evidence = PriorMapMultimodalContext(image_path=str(reference),
+        image_role='historical_object_reference', metadata={'observation_id':'o1'})
+    fake = _FakeClient(ParsedHighLevelSelection(selected_uid='f1', selected_type='frontier',
+        decision='select', confidence=.8), '{}')
+    selector = PriorMapHighLevelSelector(vlm='mock', client=fake, model='mock')
+    candidates = (HighLevelCandidate(uid='f1', candidate_type='frontier'),)
+    args = dict(instruction='find chair', instruction_plan={}, context=context, candidates=candidates)
+    result = selector.select(**args, evidence_contexts=(evidence,))
+    content = fake.completions.messages[1]['content']
+    assert len(content) == 3
+    assert json.loads(content[0]['text'])['historical_evidence'][0]['metadata']['observation_id']=='o1'
+    assert result.request_metadata['historical_evidence'][0]['image_sha256']==evidence.image_sha256
+    assert selector.select(**args, evidence_contexts=(evidence,)).source == 'cache'
+    changed = PriorMapMultimodalContext(image_path=str(reference), metadata={'observation_id':'o2'})
+    assert selector.select(**args, evidence_contexts=(changed,)).source != 'cache'
+
+
+def test_model_bev_png_contains_readable_identity_labels():
+    """真实PNG必须带文字，SVG或markers存在标签不能替代模型输入。"""
+    from io import BytesIO
+    from PIL import Image
+    from prior_map.visualizer import PriorMapFloorPlanVisualizer, FloorPlanOverlayPoint, _CanvasTransform
+    visualizer = PriorMapFloorPlanVisualizer()
+    overlay = FloorPlanOverlay(frontiers=(FloorPlanOverlayPoint(uid='42', label='frontier 42',
+        xy=(2., 2.), point_type='frontier'),), robot_position_xy=(0., 0.))
+    view = visualizer.render_global_view(PriorMapData(scene_id='labels'), overlay=overlay)
+    image = Image.open(BytesIO(visualizer._render_png(view))).convert('RGB')
+    transform = _CanvasTransform(bounds=view.view_box, width=visualizer.width,
+        height=visualizer.height, margin=visualizer.margin)
+    x, y = transform.to_canvas((2., 2.))
+    # 标记在(x,y)，文字从(x+12,y+4)开始；只检查独立文字区域。
+    pixels = list(image.crop((int(x+12), int(y+4), int(x+115), int(y+24))).getdata())
+    assert sum(max(pixel) - min(pixel) > 30 and min(pixel) < 160 for pixel in pixels) > 25

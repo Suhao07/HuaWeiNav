@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import base64
 from dataclasses import asdict, dataclass, field
@@ -25,14 +26,17 @@ class ConceptMatchRecord:
     concept_id: str
     object_uid: str
     observed_label: str
-    matches_concept: bool = False
+    matches_concept: bool | None = None
     confidence: float = 0.0
     terminal_eligible: bool = False
     source: str = "unknown"
     reason: str = ""
 
     def as_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        return {**asdict(self), "verdict": (
+            "unknown" if self.matches_concept is None else
+            "true" if self.matches_concept else "false"
+        )}
 
 
 class RuntimeConceptMatcher:
@@ -44,7 +48,7 @@ class RuntimeConceptMatcher:
 
     def __init__(self, vlm: str = "cognav"):
         self.vlm = vlm
-        self.records: dict[tuple[str, str, str], ConceptMatchRecord] = {}
+        self.records: dict[tuple[str, ...], ConceptMatchRecord] = {}
         self.label_cache: dict[tuple[str, str, str], ConceptMatchRecord] = {}
         self.stats = {
             "single_llm_calls": 0,
@@ -71,29 +75,15 @@ class RuntimeConceptMatcher:
         candidate = candidate_from_object(obj, canonical_label=concept.name, step=step)
         observed_label = normalize_term(getattr(obj, "tag", candidate.detector_label))
         inst_hash = instruction_hash(raw_instruction)
-        key = (inst_hash, concept.id, candidate.uid)
+        # 单对象接口包含视觉输入；缓存依赖每个实际请求字段和图像内容。
+        visual = _object_image_blocks(obj)
+        dependency = json.dumps([_safe_confidence(getattr(obj, "confidence", 0.0)),
+                                 _safe_list(getattr(obj, "position", [])), _safe_size(obj), visual], sort_keys=True)
+        key = (inst_hash, _concept_signature(concept), candidate.uid, observed_label, hashlib.sha256(dependency.encode()).hexdigest())
         cached = self.records.get(key)
-        if cached is not None:
+        if cached is not None and cached.matches_concept is not None:
             self.stats["cache_hits"] += 1
             return cached
-
-        label_key = (inst_hash, concept.id, observed_label)
-        label_cached = self.label_cache.get(label_key)
-        if label_cached is not None:
-            self.stats["cache_hits"] += 1
-            record = ConceptMatchRecord(
-                instruction_hash=inst_hash,
-                concept_id=concept.id,
-                object_uid=candidate.uid,
-                observed_label=observed_label,
-                matches_concept=label_cached.matches_concept,
-                confidence=label_cached.confidence,
-                terminal_eligible=label_cached.terminal_eligible,
-                source=label_cached.source,
-                reason=label_cached.reason,
-            )
-            self.records[key] = record
-            return record
 
         record = self._compute_match(
             raw_instruction=raw_instruction,
@@ -103,8 +93,6 @@ class RuntimeConceptMatcher:
             obj=obj,
         )
         self.records[key] = record
-        if _should_cache_label_match(record):
-            self.label_cache[label_key] = record
         return record
 
     def match_many(
@@ -128,13 +116,13 @@ class RuntimeConceptMatcher:
         for obj in objects or []:
             candidate = candidate_from_object(obj, canonical_label=concept.name, step=step)
             observed_label = normalize_term(getattr(obj, "tag", candidate.detector_label))
-            key = (inst_hash, concept.id, candidate.uid)
+            key = (inst_hash, _concept_signature(concept), candidate.uid, observed_label)
             cached = self.records.get(key)
-            if cached is not None:
+            if cached is not None and cached.matches_concept is not None:
                 self.stats["cache_hits"] += 1
                 out.append(cached)
                 continue
-            label_key = (inst_hash, concept.id, observed_label)
+            label_key = (inst_hash, _concept_signature(concept), observed_label)
             label_cached = self.label_cache.get(label_key)
             if label_cached is not None:
                 self.stats["cache_hits"] += 1
@@ -190,7 +178,7 @@ class RuntimeConceptMatcher:
                         "can be reconsidered after map updates."
                     ),
                 )
-                self.records[(inst_hash, concept.id, object_uid)] = record
+                self.records[(inst_hash, _concept_signature(concept), object_uid, observed_label)] = record
                 out.append(record)
             pending = selected
         if os.getenv("LLM_OFFLINE", "0").lower() in ("1", "true", "yes", "on") or not HAS_PYDANTIC:
@@ -203,7 +191,7 @@ class RuntimeConceptMatcher:
                     source="offline",
                     reason="LLM matcher unavailable and no exact match.",
                 )
-                self.records[(inst_hash, concept.id, object_uid)] = record
+                self.records[(inst_hash, _concept_signature(concept), object_uid, observed_label)] = record
                 out.append(record)
             return out
 
@@ -245,55 +233,47 @@ class RuntimeConceptMatcher:
                 reason="LLM matcher unavailable and no exact match.",
             )
 
-        try:
-            client, model = get_client_and_model(self.vlm)
-            self.stats["single_llm_calls"] += 1
-            payload = {
-                "instruction": raw_instruction,
-                "concept": concept.as_dict(),
-                "observed_object": {
-                    "uid": object_uid,
-                    "label": observed_label,
-                    "confidence": _safe_confidence(getattr(obj, "confidence", 0.0)),
-                    "position": _safe_list(getattr(obj, "position", [])),
-                    "size_hint": _safe_size(obj),
-                },
-            }
-            content: list[dict[str, Any]] = [
-                {"type": "text", "text": json.dumps(payload, ensure_ascii=False, indent=2)}
-            ]
-            for block in _object_image_blocks(obj):
-                content.append(block)
-            completion = client.beta.chat.completions.parse(
-                model=model,
-                messages=[
-                    {"role": "system", "content": CONCEPT_MATCH_PROMPT},
-                    {"role": "user", "content": content},
-                ],
-                response_format=ParsedConceptMatch,
-                trace_label=CONCEPT_MATCH_SINGLE.trace_label,
-            )
-            parsed = completion.choices[0].message.parsed or ParsedConceptMatch()
-            return ConceptMatchRecord(
-                instruction_hash=inst_hash,
-                concept_id=concept.id,
-                object_uid=object_uid,
-                observed_label=observed_label,
-                matches_concept=bool(parsed.matches_concept),
-                confidence=max(0.0, min(1.0, float(parsed.confidence or 0.0))),
-                terminal_eligible=bool(parsed.terminal_eligible and concept.terminal),
-                source="llm",
-                reason=str(parsed.reason or ""),
-            )
-        except Exception as exc:
-            return ConceptMatchRecord(
-                instruction_hash=inst_hash,
-                concept_id=concept.id,
-                object_uid=object_uid,
-                observed_label=observed_label,
-                source="error",
-                reason=f"concept matcher failed: {exc}",
-            )
+        client, model = get_client_and_model(self.vlm)
+        self.stats["single_llm_calls"] += 1
+        payload = {
+            "instruction": raw_instruction,
+            "concept": concept.as_dict(),
+            "observed_object": {
+                "uid": object_uid,
+                "label": observed_label,
+                "confidence": _safe_confidence(getattr(obj, "confidence", 0.0)),
+                "position": _safe_list(getattr(obj, "position", [])),
+                "size_hint": _safe_size(obj),
+            },
+        }
+        content: list[dict[str, Any]] = [
+            {"type": "text", "text": json.dumps(payload, ensure_ascii=False, indent=2)}
+        ]
+        for block in _object_image_blocks(obj):
+            content.append(block)
+        completion = client.beta.chat.completions.parse(
+            model=model,
+            messages=[
+                {"role": "system", "content": CONCEPT_MATCH_PROMPT},
+                {"role": "user", "content": content},
+            ],
+            response_format=ParsedConceptMatch,
+            trace_label=CONCEPT_MATCH_SINGLE.trace_label,
+        )
+        parsed = completion.choices[0].message.parsed
+        if parsed is None:
+            raise ValueError("Concept matcher returned no structured judgment")
+        return ConceptMatchRecord(
+            instruction_hash=inst_hash,
+            concept_id=concept.id,
+            object_uid=object_uid,
+            observed_label=observed_label,
+            matches_concept=bool(parsed.matches_concept),
+            confidence=max(0.0, min(1.0, float(parsed.confidence or 0.0))),
+            terminal_eligible=bool(parsed.terminal_eligible and concept.terminal),
+            source="llm",
+            reason=str(parsed.reason or ""),
+        )
 
     def as_dict(self) -> dict[str, Any]:
         return {"|".join(key): value.as_dict() for key, value in self.records.items()}
@@ -333,82 +313,56 @@ class RuntimeConceptMatcher:
         pending: list[tuple[Any, Any, str, str]],
     ) -> list[ConceptMatchRecord]:
         inst_hash = instruction_hash(raw_instruction)
-        try:
-            client, model = get_client_and_model(self.vlm)
-            self.stats["batch_llm_calls"] += 1
-            self.stats["batch_items_requested"] += len(pending)
-            objects_payload = []
-            for obj, _candidate, observed_label, object_uid in pending:
-                objects_payload.append({
-                    "uid": object_uid,
-                    "label": observed_label,
-                    "confidence": _safe_confidence(getattr(obj, "confidence", 0.0)),
-                    "position": _safe_list(getattr(obj, "position", [])),
-                    "size_hint": _safe_size(obj),
-                })
-            payload = {
-                "instruction": raw_instruction,
-                "concept": concept.as_dict(),
-                "observed_objects": objects_payload,
-                "task": (
-                    "For each observed object, decide whether it satisfies the concept "
-                    "for the requested role. Return one item per uid."
-                ),
-            }
-            completion = client.beta.chat.completions.parse(
-                model=model,
-                messages=[
-                    {"role": "system", "content": CONCEPT_MATCH_PROMPT},
-                    {"role": "user", "content": [{"type": "text", "text": json.dumps(payload, ensure_ascii=False, indent=2)}]},
-                ],
-                response_format=ParsedBatchConceptMatch,
-                trace_label=CONCEPT_MATCH_BATCH.trace_label,
+        client, model = get_client_and_model(self.vlm)
+        self.stats["batch_llm_calls"] += 1
+        self.stats["batch_items_requested"] += len(pending)
+        # 此批处理只判定类别词与任务概念是否相容。实例视觉/属性由最终验证负责，
+        # 因而标签缓存的依赖恰为 instruction + 完整 concept + observed_label。
+        objects_payload = [{"uid": uid, "label": label}
+                           for _obj, _candidate, label, uid in pending]
+        payload = {
+            "instruction": raw_instruction,
+            "concept": concept.as_dict(),
+            "observed_objects": objects_payload,
+            "task": (
+                "For each observed object, decide whether it satisfies the concept "
+                "for the requested role. Return one item per uid."
+            ),
+        }
+        completion = client.beta.chat.completions.parse(
+            model=model,
+            messages=[
+                {"role": "system", "content": CONCEPT_MATCH_PROMPT},
+                {"role": "user", "content": [{"type": "text", "text": json.dumps(payload, ensure_ascii=False, indent=2)}]},
+            ],
+            response_format=ParsedBatchConceptMatch,
+            trace_label=CONCEPT_MATCH_BATCH.trace_label,
+        )
+        parsed = completion.choices[0].message.parsed
+        if parsed is None:
+            raise ValueError("Batch concept matcher returned no structured judgments")
+        by_uid = {str(item.uid): item for item in list(getattr(parsed, "matches", []) or [])}
+        records = []
+        for _obj, _candidate, observed_label, object_uid in pending:
+            item = by_uid.get(object_uid)
+            if item is None:
+                raise ValueError(f"Batch concept matcher omitted candidate {object_uid}")
+            record = ConceptMatchRecord(
+                instruction_hash=inst_hash,
+                concept_id=concept.id,
+                object_uid=object_uid,
+                observed_label=observed_label,
+                matches_concept=bool(item.matches_concept),
+                confidence=max(0.0, min(1.0, float(item.confidence or 0.0))),
+                terminal_eligible=bool(item.terminal_eligible and concept.terminal),
+                source="llm_batch",
+                reason=str(item.reason or ""),
             )
-            parsed = completion.choices[0].message.parsed or ParsedBatchConceptMatch()
-            by_uid = {str(item.uid): item for item in list(getattr(parsed, "matches", []) or [])}
-            records = []
-            for _obj, _candidate, observed_label, object_uid in pending:
-                item = by_uid.get(object_uid)
-                if item is None:
-                    record = ConceptMatchRecord(
-                        instruction_hash=inst_hash,
-                        concept_id=concept.id,
-                        object_uid=object_uid,
-                        observed_label=observed_label,
-                        source="llm_batch",
-                        reason="Batch matcher returned no item for this uid.",
-                    )
-                else:
-                    record = ConceptMatchRecord(
-                        instruction_hash=inst_hash,
-                        concept_id=concept.id,
-                        object_uid=object_uid,
-                        observed_label=observed_label,
-                        matches_concept=bool(item.matches_concept),
-                        confidence=max(0.0, min(1.0, float(item.confidence or 0.0))),
-                        terminal_eligible=bool(item.terminal_eligible and concept.terminal),
-                        source="llm_batch",
-                        reason=str(item.reason or ""),
-                    )
-                self.records[(inst_hash, concept.id, object_uid)] = record
-                if _should_cache_label_match(record):
-                    self.label_cache[(inst_hash, concept.id, observed_label)] = record
-                records.append(record)
-            return records
-        except Exception as exc:
-            records = []
-            for _obj, _candidate, observed_label, object_uid in pending:
-                record = ConceptMatchRecord(
-                    instruction_hash=inst_hash,
-                    concept_id=concept.id,
-                    object_uid=object_uid,
-                    observed_label=observed_label,
-                    source="error",
-                    reason=f"batch concept matcher failed: {exc}",
-                )
-                self.records[(inst_hash, concept.id, object_uid)] = record
-                records.append(record)
-            return records
+            self.records[(inst_hash, _concept_signature(concept), object_uid, observed_label)] = record
+            if _should_cache_label_match(record):
+                self.label_cache[(inst_hash, _concept_signature(concept), observed_label)] = record
+            records.append(record)
+        return records
 
 
 @dataclass
@@ -526,7 +480,7 @@ def _should_cache_label_match(record: ConceptMatchRecord) -> bool:
         threshold = float(os.getenv("STRIVE_CONCEPT_LABEL_CACHE_CONF", "0.75"))
     except Exception:
         threshold = 0.75
-    if record.source not in ("llm", "llm_batch", "exact"):
+    if record.source not in ("llm_batch", "exact"):
         return False
     return float(record.confidence or 0.0) >= threshold
 
@@ -593,3 +547,8 @@ def _ensure_min_image_size(img: np.ndarray, min_size: int = 32) -> np.ndarray:
     new_w = max(min_size, int(round(w * scale)))
     new_h = max(min_size, int(round(h * scale)))
     return cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+
+
+def _concept_signature(concept: ConceptQuery) -> str:
+    """Include semantic revisions even when the concept retains its public ID."""
+    return json.dumps(concept.as_dict(), sort_keys=True, ensure_ascii=False)

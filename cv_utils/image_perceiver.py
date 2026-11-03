@@ -25,29 +25,33 @@ class ImagePerceiver:
                  save_dir="",
                  episode_idx=-1,
                  episode_step=-1):
+        """Filter detector masks by area while preserving empty detections.
+
+        ``target=None`` keeps vocabulary detections and an empty target group.
+        Detector contract violations propagate to the collection driver.
+        """
         B_boxes, B_confidences, B_classes, B_masks, C_boxes, C_confidences, C_masks = \
             self.segment(img, target, target_list, save_dir, episode_idx, episode_step)
 
-        try:
-            mask_area = torch.tensor([mask.sum() for mask in B_masks])
-            areas = torch.tensor([(box[2] - box[0]) * (box[3] - box[1]) for box in B_boxes
-                                 ])
-            too_large_flag = (areas < 0.8 * img.shape[0] * img.shape[1])
-            B_flag = (mask_area > area_threshold) & too_large_flag
-            B_classes = B_classes[B_flag.cpu().numpy()]
+        # 空检测由零长度张量表示；维度或索引错误直接向上传播，
+        # 保留失败帧的异常栈，避免将感知失败记成“当前区域没有对象”。
+        mask_area = torch.tensor([mask.sum() for mask in B_masks])
+        areas = torch.tensor([(box[2] - box[0]) * (box[3] - box[1]) for box in B_boxes
+                             ])
+        too_large_flag = (areas < 0.8 * img.shape[0] * img.shape[1])
+        B_flag = (mask_area > area_threshold) & too_large_flag
+        B_classes = B_classes[B_flag.cpu().numpy()]
 
-            C_classes = np.array([target] * C_boxes.shape[0])
-            mask_area = torch.tensor([mask.sum() for mask in C_masks])
-            areas = torch.tensor([(box[2] - box[0]) * (box[3] - box[1]) for box in C_boxes
-                                 ])
-            too_large_flag = (areas < 0.8 * img.shape[0] * img.shape[1])
-            C_flag = (mask_area > area_threshold) & too_large_flag
-            C_classes = C_classes[C_flag.cpu().numpy()]
+        C_classes = np.array([target] * C_boxes.shape[0])
+        mask_area = torch.tensor([mask.sum() for mask in C_masks])
+        areas = torch.tensor([(box[2] - box[0]) * (box[3] - box[1]) for box in C_boxes
+                             ])
+        too_large_flag = (areas < 0.8 * img.shape[0] * img.shape[1])
+        C_flag = (mask_area > area_threshold) & too_large_flag
+        C_classes = C_classes[C_flag.cpu().numpy()]
 
-            return B_classes, B_boxes[B_flag], B_masks[B_flag], B_confidences[B_flag], \
-                    C_classes, C_boxes[C_flag], C_masks[C_flag], C_confidences[C_flag]
-        except:
-            return None, None, None, None, None, None, None, None
+        return B_classes, B_boxes[B_flag], B_masks[B_flag], B_confidences[B_flag], \
+                C_classes, C_boxes[C_flag], C_masks[C_flag], C_confidences[C_flag]
 
 
 class MMDINOSAM_Perceiver(ImagePerceiver):

@@ -46,6 +46,8 @@ def find_closest_nodes(mapper: Any, nodes: list[Any]) -> Any | None:
     prior_enabled = _prior_frontier_bias_enabled(mapper) and bool(np.any(prior_scores > 0.0))
     adjusted_distance = distance - bias_m * prior_scores if prior_enabled else distance.copy()
     selected_idx = int(np.argmin(adjusted_distance))
+    if getattr(mapper, "coverage_guided_exploration", False):
+        selected_idx = select_coverage_frontier(nodes, adjusted_distance, mapper.frontier_distance_tie_m)
     _record_frontier_choice(
         mapper=mapper,
         nodes=nodes,
@@ -171,11 +173,15 @@ def _geodesic_distances_to_nodes(mapper: Any, nodes: list[Any]) -> np.ndarray:
 def _prior_frontier_bias_enabled(mapper: Any) -> bool:
     """Return whether frontier bias may affect active planning."""
 
+    runtime = getattr(mapper, "prior_map_runtime", None)
+    if runtime is not None and runtime.region_candidates and runtime.high_level_selector is not None:
+        # 高层只决定区域；区域内完整复用baseline路径代价，避免重复叠加对象奖励。
+        return False
     adapter = getattr(mapper, "prior_map_policy_adapter", None)
     if adapter is not None and not bool(getattr(adapter, "enabled", True)):
         return False
     prior_result = getattr(mapper, "search_prior_result", None)
-    return bool(getattr(prior_result, "frontier_biases", ()) or ())
+    return bool(getattr(prior_result, "frontier_biases", ()) or _selected_prior_frontier(mapper))
 
 
 def _frontier_prior_score(mapper: Any, node: Any) -> float:
@@ -191,11 +197,11 @@ def _frontier_prior_score(mapper: Any, node: Any) -> float:
 
     prior_result = getattr(mapper, "search_prior_result", None)
     priors = tuple(getattr(prior_result, "frontier_biases", ()) or ())
-    if not priors:
-        return 0.0
     node_uid = _node_uid(node)
     room_terms = _node_room_terms(mapper, node)
-    best = 0.0
+    # d_adjusted = d_nav - bias_m * max(geometry_score, selected_frontier_score).
+    # 高层偏好沿用房间选择的单位软分数；不创建节点，也不替代路径距离。
+    best = 1.0 if node_uid == _selected_prior_frontier(mapper) else 0.0
     for prior in priors:
         prior_uid = _norm(getattr(prior, "frontier_uid", ""))
         direct_match = prior_uid and prior_uid == _norm(node_uid)
@@ -207,6 +213,14 @@ def _frontier_prior_score(mapper: Any, node: Any) -> float:
         if direct_match or room_match:
             best = max(best, float(getattr(prior, "score_delta", 0.0) or 0.0))
     return best
+
+
+def _selected_prior_frontier(mapper: Any) -> str:
+    """Read the explicit frontier choice published by the prior-map runtime."""
+    selection = getattr(mapper, "prior_map_high_level_selection", None)
+    if selection is None or selection["decision"] != "select" or selection["selected_type"] != "frontier":
+        return ""
+    return selection["selected_uid"]
 
 
 def _node_room_terms(mapper: Any, node: Any) -> set[str]:
@@ -339,3 +353,83 @@ def _open3d() -> Any:
     import open3d as o3d  # type: ignore
 
     return o3d
+
+
+def select_exploration_node(agent, *, episode_idx, step, relocate=None, use_gpt_relocate=None):
+    """Select the prior-region branch if one is active, else the baseline branch."""
+    node = select_prior_region_node(agent)
+    if node is not None:
+        return node, "prior_region_policy"
+    return select_baseline_exploration_node(agent, episode_idx=episode_idx, step=step,
+                                            relocate=relocate, use_gpt_relocate=use_gpt_relocate)
+
+
+def select_prior_region_node(agent):
+    """Return the nearest open frontier inside the VLM-selected prior region.
+
+    n* = argmin_{n in R} d_nav(x, n)，R 为选中区域冻结的节点集合中仍有 frontier 的节点。
+    """
+    mapper = agent.mapper
+    runtime = getattr(mapper, "prior_map_runtime", None)
+    selection = getattr(mapper, "prior_map_high_level_selection", None)
+    if runtime is None or not isinstance(selection, dict) or selection.get("decision") != "select":
+        return None
+    selected = next((r for r in runtime.region_candidates if r.uid == selection["selected_uid"]), None)
+    if selected is None:
+        return None
+    # 区域可能由多个在线room片段组成，执行同一快照中已绑定的节点集合。
+    members = set(selected.metadata["node_ids"])
+    nodes = [n for n in mapper.nodes if n.idx in members and n.has_frontier and n.state == 0]
+    return find_closest_nodes(mapper, nodes)
+
+
+def select_baseline_exploration_node(agent, *, episode_idx, step, relocate=None, use_gpt_relocate=None):
+    """Select the original room-first exploration goal without prior regions.
+
+    n* = argmin d_nav(x, n) within the current room.
+    Room relocation runs only after its local policy returns no candidate.
+    This cycle operation retains the legacy buffer reset; callers invoke it
+    once per planning cycle, never as a read-only model tool.
+    """
+    mapper = agent.mapper
+    relocate = agent.relocate if relocate is None else relocate
+    use_gpt_relocate = agent.gpt_relocate if use_gpt_relocate is None else use_gpt_relocate
+    room = mapper.room_nodes[mapper.nodes[agent.current_node_idx].room_idx]
+    node = (mapper.explore_in_room_relocate(room) if relocate else mapper.explore_in_room(room))
+    if node is not None:
+        return node, "current_room"
+    if all(room.state != 0 for room in mapper.room_nodes):
+        return mapper.explore_after_fully_explored(), "remaining_nodes"
+    if relocate or use_gpt_relocate:
+        room = mapper.get_candidate_room_fully_explored(agent.instruct_goal, idx=episode_idx, step=step)
+        source = "room_semantic_policy"
+    else:
+        # 无指令巡视复用距离策略；None 表示没有任务合同，而非伪造空目标。
+        plan = agent.task.plan if agent.task is not None else None
+        room = mapper.get_candidate_room_fully_explored_by_distance(
+            agent.instruct_goal, idx=episode_idx, step=step, plan=plan)
+        source = "room_distance_policy"
+    return (mapper.find_closet_viewpoint_in_room(room) if room is not None else None), source
+
+
+def select_coverage_frontier(nodes, distances, tie_distance):
+    """Deduplicate identical frontier cell sets and rank near-cost options by coverage.
+
+    C = {n: d(n) <= min(d) + delta}; n* = argmax_C |F(n)|.
+    delta 使用一个仿真前进步长；代价相近时才以覆盖收益改变原排序。
+    同一 frontier cell 集合保留最近节点，稳定 ID 打破完全并列。
+    """
+    representatives = {}
+    for i, node in enumerate(nodes):
+        if not np.isfinite(distances[i]):
+            continue
+        cells = frozenset(tuple(int(v) for v in cell) for cell in node.frontier_idxs)
+        key = cells if cells else ("node", node.idx)
+        old = representatives.get(key)
+        if old is None or (distances[i], node.idx) < (distances[old], nodes[old].idx):
+            representatives[key] = i
+    if not representatives:
+        return int(np.argmin(distances))
+    minimum = min(distances[i] for i in representatives.values())
+    choices = [i for i in representatives.values() if distances[i] <= minimum + tie_distance]
+    return min(choices, key=lambda i: (-len(set(map(tuple, nodes[i].frontier_idxs))), distances[i], nodes[i].idx))

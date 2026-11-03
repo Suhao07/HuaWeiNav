@@ -1,8 +1,16 @@
 import sys
 import types
 
+import pytest
+
 
 sys.modules.setdefault("cv2", types.SimpleNamespace())
+
+
+@pytest.fixture(autouse=True)
+def _offline_concept_matcher(monkeypatch):
+    # 本文件只测快照选择策略；非精确标签对（如 table 对 book 概念）不应触发在线 LLM。
+    monkeypatch.setenv("LLM_OFFLINE", "1")
 
 from instruction_adapter.contracts import (
     ConceptQuery,
@@ -109,7 +117,7 @@ def test_snapshot_context_reuses_existing_target_selection_policy() -> None:
     assert selection.result.found is True
     assert selection.selected_snapshot_uid == "book-1"
     assert selection.selected_pose.position == (1.0, 2.0, 0.0)
-    assert selection.result.obj.tag == "book"
+    assert selection.result.obj.label == "book"
 
 
 def test_snapshot_context_selects_anchor_through_existing_anchor_policy() -> None:
@@ -122,7 +130,7 @@ def test_snapshot_context_selects_anchor_through_existing_anchor_policy() -> Non
     assert selection.result.found is True
     assert selection.is_anchor_reference is True
     assert selection.selected_snapshot_uid == "table-1"
-    assert selection.result.obj._instruction_reference_role == "anchor"
+    assert selection.result.selection_role == "anchor"
 
 
 def test_snapshot_context_hard_reject_is_instance_scoped() -> None:
@@ -139,7 +147,8 @@ def test_snapshot_context_hard_reject_is_instance_scoped() -> None:
     context.verification_ledger.put(
         plan.raw_instruction,
         rejected_candidate.uid,
-        VerificationResult(satisfied=False, decision="reject_candidate", reason="wrong instance"),
+        VerificationResult(satisfied=False, decision="reject_candidate", reason="wrong instance",
+                           task_revision=1, target_uid=rejected_candidate.uid),
     )
 
     selection = select_target_candidate_from_snapshot(snapshot, plan=plan, context=context)
@@ -187,6 +196,8 @@ def test_snapshot_intent_adapter_records_reject_candidate_feedback() -> None:
             "verifier_decision": {
                 "satisfied": False,
                 "decision": "reject_candidate",
+                "task_revision": 1,
+                "target_uid": "book-1",
                 "reason": "wrong instance",
             }
         },
@@ -211,6 +222,10 @@ def test_snapshot_intent_adapter_records_accept_and_then_stops() -> None:
             "verifier_decision": {
                 "satisfied": True,
                 "decision": "accept",
+                "task_revision": 1,
+                "target_uid": "book-1",
+                "semantic_satisfied": True,
+                "view_sufficient_for_stop": True,
                 "reason": "target verified",
             }
         },

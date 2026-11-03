@@ -18,7 +18,8 @@ from contextlib import contextmanager
 from typing import Any, Iterable, Iterator, Optional, Sequence
 
 from .alignment import PriorMapAlignment
-from .contracts import BoundaryXY, PriorMapData, PriorObject, PriorRoom, PriorTopologyEdge, Vector2, Vector3
+from .contracts import (STRUCTURAL_LABELS, BoundaryXY, PriorMapData, PriorObject, PriorRoom,
+                        PriorTopologyEdge, Vector2, Vector3)
 
 _GridCell = tuple[int, int, int]
 _TEXTURE_COLOR_TOLERANCE_SQUARED = 20 * 20 * 3
@@ -607,7 +608,7 @@ def _extract_objects(
     seen_ids: dict[str, int] = {}
     for index, obj in enumerate(getattr(semantic_scene, "objects", ()) or ()):
         label = _category_name(obj, fallback=f"object_{index}")
-        if not include_structural and _norm(label) in _STRUCTURAL_LABELS:
+        if not include_structural and _norm(label) in STRUCTURAL_LABELS:
             continue
         aabb = _read_aabb(obj)
         center = _vector3_or_default(aabb.get("center"), (0.0, 0.0, 0.0))
@@ -1558,21 +1559,24 @@ def _boundary_from_cells(cells: Iterable[_GridCell], resolution: float) -> Bound
         resolution: Cell size in meters.
 
     Returns:
-        A counter-clockwise polygon in the Habitat ``(x, z)`` plane. If the
-        component cannot be polygonized, its conservative bounding rectangle
-        is returned as a deterministic fallback.
+        The outer polygon in the Habitat ``(x, z)`` plane.
+
+    Raises:
+        ValueError: Nonempty cells fail to form a closed grid contour.
     """
 
     cell_tuple = tuple(cells)
     if not cell_tuple:
         return ()
     cell_set = set(cell_tuple)
-    edges: set[tuple[tuple[float, float], tuple[float, float]]] = set()
+    edges: set[tuple[tuple[int, int], tuple[int, int]]] = set()
     half = resolution / 2.0
 
     for ix, iz, iy in cell_tuple:
-        left, right = ix * resolution - half, ix * resolution + half
-        bottom, top = iz * resolution - half, iz * resolution + half
+        # 顶点用半格整数坐标表示：v=(2*i±1)。共享边端点严格相等，
+        # 避免0.1米浮点累加误差切断轮廓；最终p=v*resolution/2。
+        left, right = 2 * ix - 1, 2 * ix + 1
+        bottom, top = 2 * iz - 1, 2 * iz + 1
         # 中文：只保留没有同层邻居的四条边，得到自由空间连通域的真实轮廓。
         if (ix - 1, iz, iy) not in cell_set:
             edges.add(((left, bottom), (left, top)))
@@ -1583,8 +1587,8 @@ def _boundary_from_cells(cells: Iterable[_GridCell], resolution: float) -> Bound
         if (ix, iz + 1, iy) not in cell_set:
             edges.add(((left, top), (right, top)))
 
-    loops: list[list[tuple[float, float]]] = []
-    outgoing: dict[tuple[float, float], list[tuple[float, float]]] = {}
+    loops: list[list[tuple[int, int]]] = []
+    outgoing: dict[tuple[int, int], list[tuple[int, int]]] = {}
     for start, end in edges:
         outgoing.setdefault(start, []).append(end)
     for key in outgoing:
@@ -1606,24 +1610,16 @@ def _boundary_from_cells(cells: Iterable[_GridCell], resolution: float) -> Bound
             loops.append(loop[:-1])
 
     if loops:
-        def area(loop: list[tuple[float, float]]) -> float:
+        def area(loop: list[tuple[int, int]]) -> float:
             return abs(sum(
                 loop[index][0] * loop[(index + 1) % len(loop)][1]
                 - loop[(index + 1) % len(loop)][0] * loop[index][1]
                 for index in range(len(loop))
             ) / 2.0)
 
-        return tuple(max(loops, key=area))
+        return tuple((x * half, z * half) for x, z in max(loops, key=area))
 
-    min_ix = min(cell[0] for cell in cell_tuple)
-    max_ix = max(cell[0] for cell in cell_tuple)
-    min_iz = min(cell[1] for cell in cell_tuple)
-    max_iz = max(cell[1] for cell in cell_tuple)
-    min_x = min_ix * resolution - half
-    max_x = max_ix * resolution + half
-    min_z = min_iz * resolution - half
-    max_z = max_iz * resolution + half
-    return ((min_x, min_z), (max_x, min_z), (max_x, max_z), (min_x, max_z))
+    raise ValueError("Nonempty grid cells did not form a closed boundary")
 
 
 def _centroid_from_cells(cells: Iterable[_GridCell], resolution: float) -> Vector2:
@@ -1743,19 +1739,6 @@ def _safe_uid(value: Any) -> str:
 
 def _norm(value: Any) -> str:
     return str(value or "").strip().lower().replace("_", " ").replace("-", " ")
-
-
-_STRUCTURAL_LABELS = {
-    "ceiling",
-    "door",
-    "door frame",
-    "floor",
-    "railing",
-    "stairs",
-    "wall",
-    "window",
-    "window frame",
-}
 
 
 __all__ = [

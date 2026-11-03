@@ -164,10 +164,10 @@ def gpu_merge_pointcloud(pcdA, pcdB, merge_color=True):
     if pcdA is None and pcdB is None:
         # return empty pointcloud
         empty_pc = o3d.t.geometry.PointCloud(device)
-        empty_pc.point.positions = o3d.core.Tensor([],
+        empty_pc.point.positions = o3d.core.Tensor(np.empty((0, 3)),
                                                    dtype=o3d.core.Dtype.Float32,
                                                    device=device)
-        empty_pc.point.colors = o3d.core.Tensor([],
+        empty_pc.point.colors = o3d.core.Tensor(np.empty((0, 3)),
                                                 dtype=o3d.core.Dtype.Float32,
                                                 device=device)
         return empty_pc

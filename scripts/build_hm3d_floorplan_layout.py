@@ -16,6 +16,8 @@ from prior_map.hm3d_groundtruth import HM3DGroundTruthBuildConfig  # noqa: E402
 from prior_map.hm3d_layout import (  # noqa: E402
     build_hm3d_floorplan_layout_from_scene_dir,
     write_hm3d_floorplan_layout,
+    build_navigation_region_layout,
+    open_hm3d_simulator,
 )
 
 
@@ -29,6 +31,9 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument("scene_dir", help="HM3D scene directory containing basis/semantic/navmesh assets.")
+    parser.add_argument("--geometry_only", action="store_true", help="Build unknown navigation regions from NavMesh; no semantic labels.")
+    parser.add_argument("--floor_height", type=float, help="Habitat y slice; required for geometry-only mode.")
+    parser.add_argument("--region_clearance", type=float, default=0.35, help="Additional seed erosion radius in metres.")
     parser.add_argument("--scene_id", default="", help="Optional scene id override.")
     parser.add_argument("--output", required=True, help="FloorPlan-compatible JSON output path.")
     parser.add_argument("--quality_output", default="", help="Optional build-quality JSON output path.")
@@ -59,11 +64,16 @@ def main() -> int:
         max_grid_cells=args.max_grid_cells,
     )
     try:
-        result = build_hm3d_floorplan_layout_from_scene_dir(
-            args.scene_dir,
-            scene_id=args.scene_id,
-            config=config,
-        )
+        if args.geometry_only:
+            if args.floor_height is None:
+                raise ValueError('--geometry_only requires --floor_height')
+            with open_hm3d_simulator(args.scene_dir) as (simulator, _assets):
+                result = build_navigation_region_layout(simulator,
+                    args.scene_id or Path(args.scene_dir).name.split('-', maxsplit=1)[-1],
+                    floor_height=args.floor_height, clearance_m=args.region_clearance, config=config)
+        else:
+            result = build_hm3d_floorplan_layout_from_scene_dir(
+                args.scene_dir, scene_id=args.scene_id, config=config)
         paths = write_hm3d_floorplan_layout(
             result,
             args.output,

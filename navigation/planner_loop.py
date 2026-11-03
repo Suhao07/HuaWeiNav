@@ -27,7 +27,13 @@ def run_observation_mapping_cycle(agent: Any, *, node: Any, episode_idx: int | N
     room relocation、stop 判断都留在调用方，避免把策略状态机过早搬进工具层。
     """
 
-    agent.rotate_panoramic()
+    if getattr(agent, "adaptive_observation", False):
+        from navigation.observation_pipeline import collect_adaptive_observations
+        collect_adaptive_observations(agent)
+        if not agent.temporary_pcd:
+            return PlanningCycleResult(step=agent.episode_steps, episode_over=agent.env.episode_over)
+    else:
+        agent.rotate_panoramic()
     if agent.env.episode_over:
         return PlanningCycleResult(step=agent.episode_steps, episode_over=True)
 

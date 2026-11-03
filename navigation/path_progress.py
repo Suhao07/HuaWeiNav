@@ -44,13 +44,13 @@ def action_after_replan(agent: Any, *, episode_idx: int) -> tuple[int, bool]:
                 return act, False
 
             if not flag and not agent.env.episode_over:
-                agent.obs = agent.env.step(act)
+                agent.obs = agent.execution.step(act)
                 agent.update_trajectory(agent.on_node_flag)
                 logger.info(agent.env.episode_over)
                 return act, False
         else:
             logger.info('!!!!!!!!!!!!!!!!Bug: enter make_plan_mod_process')
-            agent.obs = agent.env.step(0)
+            agent.obs = agent.execution.step(0)
             agent.update_trajectory(agent.on_node_flag)
             logger.info(agent.env.episode_over)
             return 0, False

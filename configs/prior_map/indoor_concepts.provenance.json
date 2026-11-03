@@ -1,0 +1,10 @@
+{
+  "source_repository": "https://github.com/Eku127/DualMap",
+  "source_commit": "157235ec49e6a1f439babbc571c4c02ad1f06aa9",
+  "source_path": "config/class_list/gpt_indoor_general.txt",
+  "source_sha256": "98a10d2fffbb9136a2913a8f6b9f7c1f636e7ffe0b36dd9d30e547c9c75aa358",
+  "transformation": "Remove terminal unknown state; preserve all concrete concepts and ordering",
+  "concept_count": 100,
+  "concepts_sha256": "d2338b69ddba24d3b53aa9144717664e63e2c30c5092a929d86536562b7165ce",
+  "scene_annotations_used": false
+}

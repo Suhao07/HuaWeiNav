@@ -10,7 +10,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+from motion.contracts import (MotionGoalMode, NavigationStatusCode, MotionReasonCode,
+                              NavigationIntent, MotionGoal, NavigationStatus)
 from typing import Any, Dict, Optional, Tuple
+
+
+from scene.contracts import (
+    CameraFrame, CameraModel, DetectionFrame, FrontierSnapshot, ObjectNodeSnapshot, Pose3D, RealObservation, RoomSnapshot, SemanticMapSnapshot, ViewpointSnapshot, _validate_bbox_xyxy,
+)
 
 
 Vector3 = Tuple[float, float, float]
@@ -18,65 +25,12 @@ QuaternionXYZW = Tuple[float, float, float, float]
 BBox2D = Tuple[float, float, float, float]
 
 
-class CameraModel(str, Enum):
-    """Camera projection model consumed by real-robot adapters."""
-
-    PANORAMA = "panorama"
-    PINHOLE = "pinhole"
-    UNKNOWN = "unknown"
 
 
-class MotionGoalMode(str, Enum):
-    """High-level motion intent independent of a concrete robot API."""
-
-    EXPLORE = "explore"
-    GO_TO_FRONTIER = "go_to_frontier"
-    GO_TO_OBJECT = "go_to_object"
-    GO_TO_ANCHOR = "go_to_anchor"
-    IMPROVE_VIEW = "improve_view"
-    VERIFY_TARGET = "verify_target"
-    VERIFY_RELATION = "verify_relation"
-    WAIT = "wait"
-    STOP = "stop"
 
 
-class NavigationStatusCode(str, Enum):
-    """Status reported by a lower-level navigation controller."""
-
-    IDLE = "idle"
-    QUEUED = "queued"
-    RUNNING = "running"
-    REACHED = "reached"
-    BLOCKED = "blocked"
-    TIMEOUT = "timeout"
-    PREEMPTED = "preempted"
-    FAILED = "failed"
-    SAFETY_STOP = "safety_stop"
-    MANUAL_TAKEOVER = "manual_takeover"
-    LOCALIZATION_LOST = "localization_lost"
 
 
-class MotionReasonCode(str, Enum):
-    """Stable reason codes for motion-task results and safety transitions."""
-
-    NONE = "none"
-    GOAL_REACHED = "goal_reached"
-    NO_FEASIBLE_PATH = "no_feasible_path"
-    NO_PROGRESS = "no_progress"
-    GOAL_TIMEOUT = "goal_timeout"
-    ODOMETRY_STALE = "odometry_stale"
-    POINTCLOUD_STALE = "pointcloud_stale"
-    LOCALIZATION_LOST = "localization_lost"
-    MANUAL_TAKEOVER = "manual_takeover"
-    ESTOP_ACTIVE = "estop_active"
-    CONTROLLER_FAULT = "controller_fault"
-    COMMAND_STALE = "command_stale"
-    CANCELLED = "cancelled"
-    UNKNOWN_GOAL = "unknown_goal"
-    INVALID_GOAL = "invalid_goal"
-    LOOK_AT_UNSUPPORTED = "look_at_unsupported"
-    VIEW_ALIGNMENT_UNAVAILABLE = "view_alignment_unavailable"
-    VIEW_ALIGNMENT_FAILED = "view_alignment_failed"
 
 
 class EvidenceSource(str, Enum):
@@ -89,260 +43,26 @@ class EvidenceSource(str, Enum):
     EXTERNAL = "external"
 
 
-@dataclass(frozen=True)
-class Pose3D:
-    """Rigid pose in a named coordinate frame."""
-
-    position: Vector3
-    orientation_xyzw: QuaternionXYZW = (0.0, 0.0, 0.0, 1.0)
-    frame_id: str = "map"
-    stamp: Optional[float] = None
-
-    def as_dict(self) -> Dict[str, Any]:
-        """Return a JSON-friendly pose representation."""
-
-        return {
-            "position": list(self.position),
-            "orientation_xyzw": list(self.orientation_xyzw),
-            "frame_id": self.frame_id,
-            "stamp": self.stamp,
-        }
 
 
-@dataclass(frozen=True)
-class CameraFrame:
-    """RGB/RGB-D camera evidence without binding to a concrete image type."""
-
-    # 核心：contract 层只保存引用和标定信息，图像数组由 adapter/runtime 缓存管理。
-    image_ref: str
-    camera_model: CameraModel = CameraModel.UNKNOWN
-    timestamp: Optional[float] = None
-    frame_id: str = "camera"
-    rgb_shape: Optional[Tuple[int, int, int]] = None
-    depth_ref: Optional[str] = None
-    depth_valid_mask_ref: Optional[str] = None
-    intrinsics: Dict[str, Any] = field(default_factory=dict)
-    extrinsics: Optional[Pose3D] = None
-    fov: Dict[str, float] = field(default_factory=dict)
-    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
-@dataclass(frozen=True)
-class RealObservation:
-    """Synchronized sensor snapshot delivered to VLN real-robot runtime."""
-
-    # 核心：一次 observation 必须绑定同一个 robot_pose，避免 RGB/LiDAR/odom 时序漂移。
-    timestamp: float
-    robot_pose: Pose3D
-    camera_frames: Tuple[CameraFrame, ...] = ()
-    pointcloud_ref: Optional[str] = None
-    pointcloud_frame_id: Optional[str] = None
-    odom_frame_id: Optional[str] = None
-    metadata: Dict[str, Any] = field(default_factory=dict)
-
-    def primary_camera(self) -> Optional[CameraFrame]:
-        """Return the first camera frame, if the adapter produced one."""
-
-        return self.camera_frames[0] if self.camera_frames else None
 
 
-@dataclass(frozen=True)
-class DetectionFrame:
-    """Detector output aligned with one camera frame."""
-
-    timestamp: float
-    image_ref: str
-    boxes_xyxy: Tuple[BBox2D, ...] = ()
-    labels: Tuple[str, ...] = ()
-    confidences: Tuple[float, ...] = ()
-    track_ids: Tuple[str, ...] = ()
-    masks_ref: Tuple[str, ...] = ()
-    source: str = "detector"
-    metadata: Dict[str, Any] = field(default_factory=dict)
-
-    def __post_init__(self) -> None:
-        """Validate parallel detector arrays early."""
-
-        # 检测输出进入 mapper 前先做结构校验，避免后续 bbox/label 错位污染对象图。
-        n = len(self.boxes_xyxy)
-        if len(self.labels) != n or len(self.confidences) != n:
-            raise ValueError("boxes_xyxy, labels, and confidences must have the same length")
-        if self.track_ids and len(self.track_ids) != n:
-            raise ValueError("track_ids must be empty or match boxes_xyxy length")
-        if self.masks_ref and len(self.masks_ref) != n:
-            raise ValueError("masks_ref must be empty or match boxes_xyxy length")
-        for box in self.boxes_xyxy:
-            _validate_bbox_xyxy(box)
-
-    def is_empty(self) -> bool:
-        """Return whether this frame contains no detections."""
-
-        return not self.boxes_xyxy
 
 
-@dataclass(frozen=True)
-class ObjectNodeSnapshot:
-    """Stable object node snapshot exposed by mapping or detection adapters."""
-
-    uid: str
-    label: str
-    position: Optional[Vector3] = None
-    confidence: float = 0.0
-    bbox2d_xyxy: Optional[BBox2D] = None
-    bbox3d_center: Optional[Vector3] = None
-    bbox3d_extent: Optional[Vector3] = None
-    room_id: Optional[str] = None
-    image_ref: Optional[str] = None
-    pointcloud_ref: Optional[str] = None
-    visible_viewpoints: Tuple[str, ...] = ()
-    track_ids: Tuple[str, ...] = ()
-    verified_state: str = "unverified"
-    metadata: Dict[str, Any] = field(default_factory=dict)
-
-    def __post_init__(self) -> None:
-        """Validate optional 2-D evidence."""
-
-        if self.bbox2d_xyxy is not None:
-            _validate_bbox_xyxy(self.bbox2d_xyxy)
-
-    def stable_key(self) -> str:
-        """Return the strongest available identity key for cache lookup."""
-
-        # 核心：真实机器人上的 detector track 会漂移，优先使用 mapper uid。
-        if self.uid:
-            return self.uid
-        if self.track_ids:
-            return ":".join(self.track_ids)
-        return f"{self.label}:{self.position}"
-
-    def concept_payload(self) -> Dict[str, Any]:
-        """Return a compact payload for concept grounding prompts."""
-
-        # 只给 concept matcher 必要字段；大图、点云等重证据通过 image_ref/pointcloud_ref 查取。
-        return {
-            "uid": self.uid,
-            "label": self.label,
-            "position": self.position,
-            "confidence": self.confidence,
-            "room_id": self.room_id,
-            "bbox2d_xyxy": self.bbox2d_xyxy,
-            "visible_viewpoints": list(self.visible_viewpoints),
-            "verified_state": self.verified_state,
-            "metadata": self.metadata,
-        }
 
 
-@dataclass(frozen=True)
-class ViewpointSnapshot:
-    """Discrete candidate viewpoint maintained by the high-level map."""
-
-    uid: str
-    pose: Pose3D
-    room_id: Optional[str] = None
-    visible_objects: Tuple[str, ...] = ()
-    image_ref: Optional[str] = None
-    explored: bool = False
-    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
-@dataclass(frozen=True)
-class FrontierSnapshot:
-    """Exploration frontier candidate represented in robot coordinates."""
-
-    uid: str
-    position: Vector3
-    room_id: Optional[str] = None
-    score: Optional[float] = None
-    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
-@dataclass(frozen=True)
-class RoomSnapshot:
-    """Room-level semantic and topological summary."""
-
-    uid: str
-    label: Optional[str] = None
-    centroid: Optional[Vector3] = None
-    neighbors: Tuple[str, ...] = ()
-    objects: Tuple[str, ...] = ()
-    frontiers: Tuple[str, ...] = ()
-    image_ref: Optional[str] = None
-    explored: bool = False
-    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
-@dataclass(frozen=True)
-class SemanticMapSnapshot:
-    """Map snapshot consumed by high-level planning and verification."""
-
-    timestamp: float
-    robot_pose: Pose3D
-    objects: Tuple[ObjectNodeSnapshot, ...] = ()
-    rooms: Tuple[RoomSnapshot, ...] = ()
-    viewpoints: Tuple[ViewpointSnapshot, ...] = ()
-    frontiers: Tuple[FrontierSnapshot, ...] = ()
-    source: str = "real_robot"
-    metadata: Dict[str, Any] = field(default_factory=dict)
-
-    def object_by_uid(self, uid: str) -> Optional[ObjectNodeSnapshot]:
-        """Return one object snapshot by uid."""
-
-        return next((obj for obj in self.objects if obj.uid == uid), None)
-
-    def room_by_uid(self, uid: str) -> Optional[RoomSnapshot]:
-        """Return one room snapshot by uid."""
-
-        return next((room for room in self.rooms if room.uid == uid), None)
 
 
-@dataclass(frozen=True)
-class NavigationIntent:
-    """Planner-owned intent before it is translated to a robot motion goal."""
-
-    mode: MotionGoalMode
-    goal_pose: Optional[Pose3D] = None
-    target_object_uid: Optional[str] = None
-    anchor_object_uid: Optional[str] = None
-    relation_edge_id: Optional[str] = None
-    stop_allowed: bool = False
-    priority: float = 0.0
-    reason: str = ""
-    metadata: Dict[str, Any] = field(default_factory=dict)
-
-    def to_motion_goal(self) -> "MotionGoal":
-        """Convert the high-level intent to a lower-level motion request."""
-
-        # 核心：planner 输出的是语义意图，bridge 才负责翻译成具体平台可执行的 motion goal。
-        return MotionGoal(
-            mode=self.mode,
-            goal_pose=self.goal_pose,
-            target_object_uid=self.target_object_uid,
-            anchor_object_uid=self.anchor_object_uid,
-            relation_edge_id=self.relation_edge_id,
-            reason=self.reason,
-            metadata=dict(self.metadata),
-        )
 
 
-@dataclass(frozen=True)
-class MotionGoal:
-    """Motion request consumed by a NavigationBridge or MotionController."""
-
-    mode: MotionGoalMode
-    goal_pose: Optional[Pose3D] = None
-    look_at: Optional[Vector3] = None
-    target_object_uid: Optional[str] = None
-    anchor_object_uid: Optional[str] = None
-    relation_edge_id: Optional[str] = None
-    tolerance: Dict[str, float] = field(default_factory=dict)
-    reason: str = ""
-    metadata: Dict[str, Any] = field(default_factory=dict)
-
-    def requires_motion(self) -> bool:
-        """Return whether this goal should be sent to the motion layer."""
-
-        # STOP/WAIT 是高层控制状态，不应该被误发布成底层 waypoint。
-        return self.mode not in {MotionGoalMode.STOP, MotionGoalMode.WAIT} and self.goal_pose is not None
 
 
 @dataclass(frozen=True)
@@ -380,42 +100,6 @@ class ViewpointGoal:
         )
 
 
-@dataclass(frozen=True)
-class NavigationStatus:
-    """Asynchronous execution status from the platform motion layer."""
-
-    status: NavigationStatusCode
-    goal_id: Optional[str] = None
-    current_pose: Optional[Pose3D] = None
-    distance_to_goal: Optional[float] = None
-    path_length_remaining: Optional[float] = None
-    progress: Optional[float] = None
-    stamp: Optional[float] = None
-    message: str = ""
-    metadata: Dict[str, Any] = field(default_factory=dict)
-    reason_code: MotionReasonCode = MotionReasonCode.NONE
-    safety_state: str = "unknown"
-    current_velocity: Optional[Vector3] = None
-
-    def is_terminal(self) -> bool:
-        """Return whether the controller finished this goal attempt."""
-
-        # 真实机器人是异步执行；terminal 表示这次 motion attempt 已有明确结果。
-        return self.status in {
-            NavigationStatusCode.REACHED,
-            NavigationStatusCode.BLOCKED,
-            NavigationStatusCode.TIMEOUT,
-            NavigationStatusCode.PREEMPTED,
-            NavigationStatusCode.FAILED,
-            NavigationStatusCode.SAFETY_STOP,
-            NavigationStatusCode.MANUAL_TAKEOVER,
-            NavigationStatusCode.LOCALIZATION_LOST,
-        }
-
-    def succeeded(self) -> bool:
-        """Return whether the controller reports goal reachability success."""
-
-        return self.status == NavigationStatusCode.REACHED
 
 
 @dataclass(frozen=True)
@@ -488,13 +172,3 @@ class RuntimeDecision:
     lower_planner_state: Dict[str, Any] = field(default_factory=dict)
     reason: str = ""
     metadata: Dict[str, Any] = field(default_factory=dict)
-
-
-def _validate_bbox_xyxy(box: BBox2D) -> None:
-    """Validate a 2-D bounding box in ``x1, y1, x2, y2`` format."""
-
-    if len(box) != 4:
-        raise ValueError("bbox must contain exactly four values")
-    x1, y1, x2, y2 = box
-    if x2 < x1 or y2 < y1:
-        raise ValueError("bbox must satisfy x2 >= x1 and y2 >= y1")

@@ -16,6 +16,12 @@ Vector2 = Tuple[float, float]
 Vector3 = Tuple[float, float, float]
 BoundaryXY = Tuple[Vector2, ...]
 
+# 建筑构件与场所类别：不是可搜索的物体，不进入对象先验与区域语义摘要。
+STRUCTURAL_LABELS = frozenset({
+    "ceiling", "door", "door frame", "floor", "railing", "stairs", "staircase",
+    "wall", "window", "window frame", "hallway", "entryway",
+})
+
 
 @dataclass(frozen=True)
 class PriorRoom:
@@ -103,6 +109,8 @@ class PriorObject:
         confidence: Source confidence in ``[0, 1]``.
         source: Source component or file that produced this object.
         aliases: Alternative labels used for concept matching.
+        label_probabilities: Observed category posterior p(l) over detector
+            labels, sum_l p(l)=1. Empty means ``label`` is certain.
         metadata: JSON-friendly extension fields.
     """
 
@@ -114,14 +122,15 @@ class PriorObject:
     confidence: float = 0.5
     source: str = ""
     aliases: Tuple[str, ...] = ()
+    label_probabilities: Dict[str, float] = field(default_factory=dict)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         """Validate object identity, label, geometry, and confidence.
 
         Raises:
-            ValueError: If required identifiers, labels, vector lengths, or
-                confidence values are invalid.
+            ValueError: If required identifiers, labels, vector lengths,
+                confidence values or label probabilities are invalid.
         """
 
         _require_uid(self.uid, "PriorObject.uid")
@@ -130,6 +139,10 @@ class PriorObject:
         if self.position_xyz is not None:
             _validate_vector(self.position_xyz, 3, "PriorObject.position_xyz")
         _validate_confidence(self.confidence, "PriorObject.confidence")
+        for value in self.label_probabilities.values():
+            _validate_confidence(value, "PriorObject.label_probabilities")
+        if self.label_probabilities and abs(sum(self.label_probabilities.values()) - 1.0) > 1e-6:
+            raise ValueError("PriorObject.label_probabilities must sum to 1")
 
     @property
     def exactness(self) -> str:

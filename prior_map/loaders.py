@@ -41,6 +41,7 @@ class PriorMapLoader:
 
     SUPPORTED_FORMATS = {
         "auto",
+        "bundle",
         "json",
         "canonical_json",
         "floorplan_json",
@@ -69,7 +70,7 @@ class PriorMapLoader:
         """Load a prior-map file.
 
         Args:
-            path: JSON, OSM, or XML map file path.
+            path: JSON/OSM/XML core file or a portable map bundle directory.
             source_format: Explicit source format, or ``"auto"`` to infer from
                 file extension and top-level fields.
 
@@ -88,6 +89,12 @@ class PriorMapLoader:
         normalized = _normalize_format(source_format)
         if normalized not in self.SUPPORTED_FORMATS:
             raise PriorMapLoaderError(f"Unsupported prior map source_format: {source_format}")
+
+        if normalized == "bundle" or (normalized == "auto" and map_path.is_dir()):
+            # 统一地图包复用完整的身份、坐标和证据引用校验；两种后端共享此入口。
+            # load_bundle读取核心JSON时显式使用canonical_json，不递归加载目录。
+            from .bundle import load_bundle
+            return load_bundle(map_path)["prior_map"]
 
         if normalized == "auto":
             normalized = self._infer_format(map_path)
