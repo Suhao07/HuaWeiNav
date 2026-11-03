@@ -195,9 +195,14 @@ append_unique_dir_mount() {
   local -n args_ref=$1
   local -n mounted_ref=$2
   local path="$3"
-  [[ -n "${path}" && -f "${path}" ]] || return 0
+  [[ -n "${path}" && -e "${path}" ]] || return 0
   local dir
-  dir="$(cd "$(dirname "${path}")" && pwd)"
+  # 地图包本身是目录，整体挂载；单文件挂载其所在目录。
+  if [[ -d "${path}" ]]; then
+    dir="$(cd "${path}" && pwd)"
+  else
+    dir="$(cd "$(dirname "${path}")" && pwd)"
+  fi
   if [[ -z "${mounted_ref[${dir}]:-}" ]]; then
     args_ref+=(-v "${dir}:${dir}:ro")
     mounted_ref["${dir}"]=1
@@ -355,6 +360,8 @@ docker_args() {
   append_unique_dir_mount DOCKER_RUN_ARGS mounted_dirs "${SYSNAV_DETECTOR_MODEL_PATH}"
   append_unique_dir_mount DOCKER_RUN_ARGS mounted_dirs "${SYSNAV_SAM2_CHECKPOINT}"
   append_unique_dir_mount DOCKER_RUN_ARGS mounted_dirs "${STRIVE_PRIOR_MAP_PATH:-}"
+  # 对齐既可是模式名也可是标定 JSON（须为绝对路径）；只有文件才会被挂载。
+  append_unique_dir_mount DOCKER_RUN_ARGS mounted_dirs "${STRIVE_PRIOR_MAP_ALIGNMENT:-}"
   DOCKER_RUN_ARGS+=(
     -v "${SYSNAV_MOBILECLIP_BLT_PATH}:/workspace/STRIVE/mobileclip_blt.pt:ro"
     -v "${SYSNAV_MOBILECLIP_BLT_TS_PATH}:/workspace/STRIVE/mobileclip_blt.ts:ro"
@@ -367,6 +374,7 @@ docker_args() {
     STRIVE_LLM_CLIENT COGNAV_OBJNAV_PATH \
     STRIVE_INSTRUCTION STRIVE_DATASET_TARGET STRIVE_VLM \
     STRIVE_ENABLE_FINAL_VERIFIER STRIVE_EVIDENCE_MODE STRIVE_PRIOR_MAP_PATH \
+    STRIVE_PRIOR_MAP_SOURCE STRIVE_PRIOR_MAP_ALIGNMENT LLM_OFFLINE \
     STRIVE_DRY_RUN_STATUS STRIVE_WAYPOINT_TOPIC STRIVE_TEST_WAYPOINT_TOPIC \
     STRIVE_HOLD_TOPIC STRIVE_CANCEL_TOPIC STRIVE_EMERGENCY_STOP_TOPIC \
     STRIVE_ALLOW_EMERGENCY_STOP_PUBLISH \
