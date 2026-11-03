@@ -541,7 +541,11 @@ def _load_alignment(value: str, base_map: PriorMapData) -> PriorMapAlignment:
     if normalized in {"", "identity", "auto"}:
         return PriorMapAlignment.identity(prior_frame_id=base_map.frame_id, runtime_frame_id="map")
     if normalized in {"unavailable", "disabled", "prompt_context_only"}:
-        return PriorMapAlignment.unavailable(prior_frame_id=base_map.frame_id, runtime_frame_id="map")
+        return PriorMapAlignment.unavailable(
+            reason=f"prior_map_alignment={normalized}",
+            prior_frame_id=base_map.frame_id,
+            runtime_frame_id="map",
+        )
     return PriorMapAlignment.load(normalized)
 
 
