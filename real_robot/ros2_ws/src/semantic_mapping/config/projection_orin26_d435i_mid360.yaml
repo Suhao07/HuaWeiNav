@@ -3,9 +3,11 @@
 # p_camera = R_lidar_to_camera @ p_lidar + t.
 camera_projection:
   calibration_status: calibrated
-  calibration_version: 2
+  calibration_version: 3
   sensor_model: intel_realsense_d435i
-  extrinsics_source: real_robot/calibration/orin26_d435i_mid360_candidate_20260826.json
+  # v2 candidate_20260826 偏航 +6.25°（绕雷达 z 轴、过相机光心）的修正；回退时改回 v2 的
+  # extrinsics_source 与 lidar_to_camera 数值。
+  extrinsics_source: real_robot/calibration/orin26_d435i_mid360_yawfix_20261103.json
   sensor_topics:
     rgb: /camera/d435i/d435i_camera/color/image_raw
     camera_info: /camera/d435i/d435i_camera/color/camera_info
@@ -39,9 +41,11 @@ camera_projection:
     model: plumb_bob
     coefficients: [0.0, 0.0, 0.0, 0.0, 0.0]
   lidar_to_camera:
-    # Imported T_camera_from_lidar from the user-provided D435i calibration.
-    translation_m: [0.169513011520, 0.636538843184, 0.262327046828]
-    rotation_rpy_rad: [-1.9190623783, 0.0412255019, -3.1088462893]
+    # T_camera_from_lidar from extrinsics_source.
+    # v2 was translation_m [0.169513011520, 0.636538843184, 0.262327046828],
+    # rotation_rpy_rad [-1.9190623783, 0.0412255019, -3.1088462893].
+    translation_m: [0.165136844517, 0.628975269978, 0.282580558060]
+    rotation_rpy_rad: [-1.9225343774, 0.1437071890, 3.1367903988]
     rotation_convention: zyx_euler_roll_pitch_yaw
   # Point-LIO's /cloud_registered_body publishes IMU/body-frame points.  Its
   # configured R_imu_from_lidar is identity and t_imu_from_lidar is
@@ -63,3 +67,7 @@ camera_projection:
     depth_inlier_ratio: 0.7911
     pixel_p90_px: 11.27
     validation_note: "User-approved provisional calibration; dynamic time offset remains unvalidated."
+    # 以下为 v3 偏航修正的验收（单一静止视角）；上面各项是 v2 标定板数据的结果。
+    yawfix_date: "2026-11-03"
+    yawfix_depth_inlier_ratio_lt_5pct: {before: 0.3139, after: 0.646}
+    yawfix_median_relative_depth_error: {before: 0.0838, after: 0.0318}

@@ -7,3 +7,4 @@
 # explicitly vendors one.
 *.json
 !orin26_d435i_mid360_candidate_20260826.json
+!orin26_d435i_mid360_yawfix_20261103.json

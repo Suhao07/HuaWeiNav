@@ -1,0 +1,39 @@
+{
+  "schema": "huawei_vln.real_robot.extrinsics.v1",
+  "calibration_status": "calibrated",
+  "calibration_id": "d435i-mid360-yawfix-20261103",
+  "source": {
+    "project": "STRIVE-realworld",
+    "method": "candidate_20260826 with a single yaw correction about the LiDAR z axis through the camera centre; pitch, roll and camera position unchanged",
+    "derived_from": "orin26_d435i_mid360_candidate_20260826.json",
+    "read_only_import": false
+  },
+  "camera_frame": "d435i_color_optical_frame",
+  "lidar_frame": "livox_frame",
+  "T_camera_from_lidar": [
+    [-0.989680468366, 0.136097855286, 0.044832402578, 0.165136844517],
+    [0.004752734329, 0.343880357179, -0.939001443802, 0.628975269978],
+    [-0.143213065224, -0.9290983122, -0.340978509903, 0.28258055806],
+    [0.0, 0.0, 0.0, 1.0]
+  ],
+  "correction": {
+    "T_true_equals": "T_candidate_20260826 @ Rz_lidar(+6.25 deg)",
+    "lidar_frame_delta_yaw_deg": 6.25,
+    "camera_position_in_lidar_m": [0.20091, 0.02378, 0.67956]
+  },
+  "validation": {
+    "data": "stationary robot, 5 aligned-depth D435i frames (per-pixel median) + Point-LIO mapping-mode map, 2026-11-03 20261103T214230",
+    "metric": "8x8 px blocks: z-buffered projected LIO depth vs D435i depth median, relative error < 5%",
+    "inlier_ratio": {"candidate_20260826": 0.3139, "yawfix": 0.646},
+    "median_relative_error": {"candidate_20260826": 0.0838, "yawfix": 0.0318},
+    "best_yaw_deg_by_image_half": {"left": 6.75, "right": 5.75},
+    "rejected_alternatives": {
+      "three_axis_rotation_icp_inlier": 0.6405,
+      "six_dof_icp_inlier": 0.5794,
+      "reason": "wall/floor-dominated view does not constrain pitch or translation; halves disagree on pitch by 12.6 deg"
+    },
+    "limitations": "single viewpoint and scene; pitch/roll/translation and time offset not re-estimated",
+    "time_offset_s": 0.0,
+    "time_offset_status": "unvalidated"
+  }
+}
