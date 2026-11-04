@@ -26,7 +26,9 @@ class SysNavSemanticMapBridge:
     latest_object_list_msg: Optional[Any] = None
     latest_room_list_msg: Optional[Any] = None
     latest_viewpoints: Dict[str, Any] = field(default_factory=dict)
-    object_viewpoint_history: Dict[str, set[str]] = field(default_factory=dict)
+    # 中文：按 SysNav 原子 object_id 记历史；对象合并后 uid 由多个 id 拼成会变化，
+    # 以 uid 为键会丢失合并前的 viewpoint 观测。
+    object_viewpoint_history: Dict[int, set[str]] = field(default_factory=dict)
 
     def update_object_nodes(self, msg: Any) -> None:
         """Store the latest SysNav ``/object_nodes_list`` message."""
@@ -36,7 +38,8 @@ class SysNavSemanticMapBridge:
         for obj in self.object_adapter.from_list_msg(msg):
             if not obj.visible_viewpoints:
                 continue
-            self.object_viewpoint_history.setdefault(obj.uid, set()).update(obj.visible_viewpoints)
+            for object_id in obj.metadata.get("sysnav_object_ids", ()):
+                self.object_viewpoint_history.setdefault(int(object_id), set()).update(obj.visible_viewpoints)
             for viewpoint_uid in obj.visible_viewpoints:
                 viewpoint = self.latest_viewpoints.get(viewpoint_uid)
                 if viewpoint is None or obj.uid in viewpoint.visible_objects:
@@ -66,8 +69,8 @@ class SysNavSemanticMapBridge:
 
         viewpoint = self.viewpoint_adapter.from_msg(msg)
         self.latest_viewpoints[viewpoint.uid] = viewpoint
-        for object_uid in viewpoint.visible_objects:
-            self.object_viewpoint_history.setdefault(object_uid, set()).add(viewpoint.uid)
+        for object_id in viewpoint.metadata.get("observed_object_ids", ()):
+            self.object_viewpoint_history.setdefault(int(object_id), set()).add(viewpoint.uid)
 
     def has_object_snapshot(self) -> bool:
         """Return whether at least one object list message has arrived."""
@@ -94,8 +97,12 @@ class SysNavSemanticMapBridge:
                 obj,
                 visible_viewpoints=tuple(
                     sorted(
-                        set(obj.visible_viewpoints)
-                        | self.object_viewpoint_history.get(obj.uid, set())
+                        set(obj.visible_viewpoints).union(
+                            *(
+                                self.object_viewpoint_history.get(int(object_id), set())
+                                for object_id in obj.metadata.get("sysnav_object_ids", ())
+                            )
+                        )
                     )
                 ),
             )

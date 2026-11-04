@@ -272,6 +272,26 @@ def test_semantic_snapshot_bridge_accumulates_object_viewpoint_history() -> None
     assert snapshot.object_by_uid("sysnav_object:42").visible_viewpoints == ("7",)
 
 
+def test_viewpoint_history_survives_sysnav_object_merge() -> None:
+    from real_robot.sysnav_runtime import SysNavSemanticMapBridge
+
+    def nodes(object_id: list[int], viewpoint_id: int) -> SimpleNamespace:
+        node = SimpleNamespace(
+            header=_header(sec=4), object_id=object_id, label="cart", position=_point(1.0, 0.0, 0.0),
+            bbox3d=[], cloud=None, status=True, img_path="", is_asked_vlm=False, viewpoint_id=viewpoint_id,
+        )
+        return SimpleNamespace(header=_header(sec=4), nodes=[node])
+
+    bridge = SysNavSemanticMapBridge(robot_pose_provider=lambda: Pose3D(position=(0.0, 0.0, 0.0)))
+    bridge.update_object_nodes(nodes([1], 0))
+    # SysNav 合并后对象携带多个 id，uid 随之变化，但合并前的 viewpoint 观测必须保留。
+    bridge.update_object_nodes(nodes([1, 3], -1))
+
+    snapshot = bridge.build_snapshot(timestamp=5.0)
+
+    assert snapshot.object_by_uid("sysnav_object:1:3").visible_viewpoints == ("0",)
+
+
 def test_sysnav_viewpoint_bridge_reaches_goal_resolver() -> None:
     """Verify the raw SysNav viewpoint path through the executable goal boundary."""
 
