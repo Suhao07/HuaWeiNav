@@ -217,6 +217,9 @@ bag replay、HIL 和影子 topic 不能替代真实底盘验收。
       车转向先验系约 (-1.0,-0.25) 的椅子。
     - 运动前置修复（d673298）：runtime/MotionServer/provider/bridge 的 `world_frame` 与 terrain
       输出 frame 原默认 `map`，profile 改为 `camera_init` 并由入口透传。
+    - 新部署复测时视点 0 再次丢失：provider 收 5 帧点云（约 0.5 s）即建视点，早于 DDS 匹配
+      mapping/bridge 订阅，volatile 事件丢失后静止车不再建新视点。provider 改为订阅数达
+      `min_viewpoint_subscribers`（默认 2）后才建视点；车上 dry-run 复测 cart 再次解析成功。
     - 当前 LIO 会话非存图模式，完整 LIO 建图需在同一位置以 `LIO_PCD_SAVE_EN=1` 重启后推车。
 
 ### 2026-09-07 状态刷新

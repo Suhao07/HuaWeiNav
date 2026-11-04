@@ -28,6 +28,8 @@ class ViewpointProvider : public rclcpp::Node {
     declare_parameter("object_topic", "/object_nodes_list");
     declare_parameter("viewpoint_topic", "/viewpoint_rep_header");
     declare_parameter("max_odom_offset_s", 0.25);
+    // viewpoint 是一次性 volatile 事件：mapping 与 bridge 都匹配上之前不建视点，否则视点 0 会在发现完成前丢失。
+    declare_parameter("min_viewpoint_subscribers", 2);
     // Defaults follow SensorCoveragePlanner3D::ReadParameters.
     declare_parameter("kKeyposeCloudDwzFilterLeafSize", 0.2);
     declare_parameter("kSurfaceCloudDwzLeafSize", 0.2);
@@ -169,6 +171,10 @@ class ViewpointProvider : public rclcpp::Node {
   void on_cloud(const sensor_msgs::msg::PointCloud2& msg) {
     require_frame(msg.header.frame_id);
     if (!odom_) return;
+    if (publisher_->get_subscription_count() < size_t(get_parameter("min_viewpoint_subscribers").as_int())) {
+      RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000, "viewpoint waits for subscribers to match");
+      return;
+    }
     if (std::abs((rclcpp::Time(msg.header.stamp) - rclcpp::Time(odom_->header.stamp)).seconds()) >
         get_parameter("max_odom_offset_s").as_double()) {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "viewpoint waits for timestamp-aligned odometry");
