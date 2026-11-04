@@ -176,6 +176,19 @@ bag replay、HIL 和影子 topic 不能替代真实底盘验收。
    偏航。新外参 `real_robot/calibration/orin26_d435i_mid360_yawfix_20261103.json`，投影配置
    `projection_orin26_d435i_mid360.yaml` 升为 `calibration_version: 3`（注释里保留 v2 数值
    便于回退）。待验收：换朝向/场景静止采样做交叉检验；车上部署后看在线物体位置残差。
+8. 车上复核（同日，部署 `realworld_7906fc9`，车未动、同一朝向）：用**实时**
+   `/cloud_registered_body` 累积 5 s（37 帧、10.3 万点，位姿抖动 ≤1.1 cm）+ 5 帧对齐深度，
+   直接调用运行时 `load_projection_config(..., require_calibrated=True)` 与 `project()`，
+   指标同上：v2 一致率 31.7%（左/右 11.0%/45.8%）、中位数 7.8%；v3 69.3%（85.3%/57.9%）、
+   中位数 2.9%。点云与修正所用的累计 LIO 地图相互独立，结论一致；但视角相同，换朝向交叉
+   检验仍待做。先验链路（`camera_to_map` 回投深度点对 LIO 地图）残差中位数 19.1→9.1 cm，
+   偏航最优点由 -6.5° 收到 -1.5°（8.4 cm，曲线平坦）。容器内确认加载 v3，整栈 dry-run 语义
+   建图正常出 shoe 物体（框底 -0.05 m，邻近地面 -0.02 m），无运动话题。
+   同时发现镜像缺 `lap`：ultralytics 仅在首次 `track()` 且联网检测通过时运行时 pip 安装，
+   当次检测失败，`detection_node` 启动即崩；Dockerfile 已改为构建时补装（ab2b462）。车上
+   `realworld_ab2b462` / 镜像 `huawei-vln-realworld:orin-r36.5-agilex-ab2b462` 已构建，镜像内
+   `import lap` 为 0.5.14。注意：Orin 开机时钟停在旧时间，开机自启的 Point-LIO 在 NTP 校时
+   跳变后停止输出（话题在、无消息，2026-11-04 再次复现），需重启 LIO 才恢复。
 
 ### 2026-09-07 状态刷新
 
