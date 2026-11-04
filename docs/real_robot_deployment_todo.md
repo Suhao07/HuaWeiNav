@@ -197,6 +197,27 @@ bag replay、HIL 和影子 topic 不能替代真实底盘验收。
    唯一楼梯是下行梯（低于地面 0.24 m）。结论：车当前不在手机扫描区域内（大概率在其下一层
    楼梯间），墙带高重合是矩形几何的假匹配，候选对齐已删除。手机图起点标定与静止绑定复测
    需先把车放到手机扫描的楼层，或在车所在区域重新手机扫描。
+10. 车周重扫 fbb15f81e4 → dry-run 目标规划（2026-11-04，车静止，无运动话题）：
+    - 先验：`outputs/prior_bundles/phone-fbb15f81e4-concepts100-conf1-compact`（214 物体）。LIO
+      在车当前位姿重启（会话 14:47:52，非存图模式），累积实时点云与手机点云配准：墙带候选
+      106.4°/95.9° 由 3D 全点云区分，取 yaw 105.206°、t=(-1.679, 0.942)（5 cm 内 25%，中位
+      23 cm——手机图远大于 LIO 局部图，比例仅作区分用）；LIO 原点附近手机点高度符合底盘，
+      手机画面目视确认原点落在底盘。车体在先验系 (-1.626, 0.749)、yaw 15.2°，以此作起点标记
+      生成 `alignment_camera_init_20261104T1447.json`。
+    - 视点链三处缺陷已修：dry-run 路径不启动 viewpoint provider/bridge；首个视点早于语义建图
+      就绪被丢；SysNav 物体合并后 uid 变化，视点可见性历史随之丢失（d00b8bb、cf8d331）。修后
+      “Go to the cart” 解析出 cart（exact、terminal，中心 (-0.32,-1.39) `camera_init`），目标
+      视点即车当前位姿（唯一看到 cart 的视点）。
+    - 下层规划：隔离 domain 77 回放本会话 LIO 录包（`run_lower_planner_bag_replay.sh`，不启
+      pathFollower）。目标距车 0.7 m 时只得单点停车路径（`goalBehindRange=0.8` 内目标在车后侧
+      先停）；改为 1.0 m 接近点（离 cart 中心约 0.42 m）3.4 s 得有效路径（101 点、约 1 m），
+      主路径偏约 50° 绕开直线上约 1.2 m 处、离地约 0.2 m 的 cart 边缘。
+    - 先验绑定：先验词表无 cart（该处标为 staircase），matched=false 正确；在线 YOLOE 词表与先验
+      标签交集仅 cabinet/chair/desk/keyboard/mouse/plant，当前视野无这些物体。正向绑定复测需
+      车转向先验系约 (-1.0,-0.25) 的椅子。
+    - 运动前置修复（d673298）：runtime/MotionServer/provider/bridge 的 `world_frame` 与 terrain
+      输出 frame 原默认 `map`，profile 改为 `camera_init` 并由入口透传。
+    - 当前 LIO 会话非存图模式，完整 LIO 建图需在同一位置以 `LIO_PCD_SAVE_EN=1` 重启后推车。
 
 ### 2026-09-07 状态刷新
 
