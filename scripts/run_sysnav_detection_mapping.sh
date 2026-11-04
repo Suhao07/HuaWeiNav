@@ -150,6 +150,8 @@ runtime_args() {
   append_runtime_arg RUNTIME_ARGS "observation_image_directory" "${STRIVE_OBSERVATION_IMAGE_DIRECTORY:-}"
   append_runtime_arg RUNTIME_ARGS "decision_period_s" "${STRIVE_DECISION_PERIOD_S:-1.0}"
   append_runtime_arg RUNTIME_ARGS "use_sim_time" "${STRIVE_USE_SIM_TIME:-false}"
+  # 中文：runtime/MotionServer/provider 共用同一世界系；waypoint 适配器按它校验目标 frame。
+  append_runtime_arg RUNTIME_ARGS "world_frame" "${SYSNAV_WORLD_FRAME:-map}"
 }
 
 mapping_args() {
