@@ -224,6 +224,13 @@ bag replay、HIL 和影子 topic 不能替代真实底盘验收。
       localPlanner `useTerrainAnalysis=true`（无 pathFollower）：`/terrain_map` frame 为
       `camera_init`，1.0 m 接近点 6.3 s 得有效路径（101 点）。顺带修回放脚本 `timeout_s`
       默认值须为浮点（原 `30` 会被 probe 拒绝）。
+    - 同一隔离方式跑完整 `sysnav_lower_stack.launch.py`（terrain/world frame=`camera_init`，含
+      pathFollower、MotionServer、SafetyVelocityMux）并循环回放录包，发 `camera_init` 动作目标：
+      目标被接受，`/way_point` frame `camera_init`，`path_valid=true`；mux 全程 HOLD
+      （autonomy 未使能），551 条 `/cmd_vel` 全为零，目标以 `goal_timeout`（“safety mux
+      remained in hold”）结束。低速实车验收只差放行 autonomy 与控制合约文件。
+    - 16:26:43 在原位以存图模式重启 LIO（重启前位姿 (-0.005,0.010)，偏航差约 0.3°），
+      对齐 JSON 继续适用。
     - 当前 LIO 会话非存图模式，完整 LIO 建图需在同一位置以 `LIO_PCD_SAVE_EN=1` 重启后推车。
 
 ### 2026-09-07 状态刷新
