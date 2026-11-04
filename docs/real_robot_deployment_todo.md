@@ -230,7 +230,8 @@ bag replay、HIL 和影子 topic 不能替代真实底盘验收。
       （autonomy 未使能），551 条 `/cmd_vel` 全为零，目标以 `goal_timeout`（“safety mux
       remained in hold”）结束。低速实车验收只差放行 autonomy 与控制合约文件。
     - 16:26:43 在原位以存图模式重启 LIO（重启前位姿 (-0.005,0.010)，偏航差约 0.3°），
-      对齐 JSON 继续适用。
+      对齐 JSON 继续适用。当日推车推迟；存图模式静止时内存约 +1.4 GB/h，16:45:29 原位恢复
+      非存图会话（车未动）。推车前需原位再以 `LIO_PCD_SAVE_EN=1` 重启。
     - 当前 LIO 会话非存图模式，完整 LIO 建图需在同一位置以 `LIO_PCD_SAVE_EN=1` 重启后推车。
 
 ### 2026-09-07 状态刷新
