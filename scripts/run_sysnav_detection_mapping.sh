@@ -253,6 +253,24 @@ ros2 launch strive_sysnav_bringup sysnav_detection_mapping.launch.py "${MODEL_AR
 PIDS+=("$!")
 ros2 launch strive_sysnav_bringup strive_instruction_runtime.launch.py "${RUNTIME_ARGS[@]}" &
 PIDS+=("$!")
+# 中文：语义 runtime 只从 SysNav viewpoint 解析目标，dry-run 也需 provider+bridge；
+# provider 严格校验输入坐标系，LIO 下须为 camera_init。viewpoint 是一次性事件，
+# mapping 只接收落在其检测缓冲内的时间戳，故等首帧 object nodes 后再启动 provider。
+(
+  ros2 topic echo --once "${OBJECT_NODES_TOPIC}" tare_planner/msg/ObjectNodeList >/dev/null
+  exec ros2 run strive_sysnav_viewpoints sysnav_viewpoint_provider --ros-args \
+    -p "world_frame:=${SYSNAV_WORLD_FRAME:-map}" \
+    -p "odom_topic:=${ODOM_TOPIC:-/aft_mapped_to_init}" \
+    -p "cloud_topic:=${LOWER_CLOUD_TOPIC:-/cloud_registered}" \
+    -p "object_topic:=${OBJECT_NODES_TOPIC}" \
+    -p "viewpoint_topic:=${VIEWPOINT_TOPIC:-/viewpoint_rep_header}"
+) &
+PIDS+=("$!")
+ros2 launch strive_sysnav_bringup sysnav_viewpoint_bridge.launch.py \
+  "viewpoint_topic:=${VIEWPOINT_TOPIC:-/viewpoint_rep_header}" \
+  "object_topic:=${OBJECT_NODES_TOPIC}" \
+  "odom_topic:=${ODOM_TOPIC:-/aft_mapped_to_init}" &
+PIDS+=("$!")
 
 set +e
 wait -n "${PIDS[@]}"

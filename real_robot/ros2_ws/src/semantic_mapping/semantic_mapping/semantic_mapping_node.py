@@ -864,8 +864,8 @@ class MappingNode(Node):
             # camera_odom['angular_velocity'] = angular_odom['angular_velocity']
             camera_odom['angular_velocity'] = np.array(right_linear_odom['angular_velocity']) * linear_left_ratio + np.array(left_linear_odom['angular_velocity']) * (1 - linear_left_ratio)
         
-        # save the image for viewpoint timestamp
-        if viewpoint_stamp_to_process is not None:
+        # viewpoint 调试图像目录仅在 annotate_image 开启时创建，关闭时不落盘。
+        if self.ANNOTATE and viewpoint_stamp_to_process is not None:
             # create a 3*4 matrix to save the position and orientation
             R_b2w = Rotation.from_quat(camera_odom['orientation']).as_matrix()
             t_b2w = np.array(camera_odom['position'])
