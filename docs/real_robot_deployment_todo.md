@@ -220,6 +220,10 @@ bag replay、HIL 和影子 topic 不能替代真实底盘验收。
     - 新部署复测时视点 0 再次丢失：provider 收 5 帧点云（约 0.5 s）即建视点，早于 DDS 匹配
       mapping/bridge 订阅，volatile 事件丢失后静止车不再建新视点。provider 改为订阅数达
       `min_viewpoint_subscribers`（默认 2）后才建视点；车上 dry-run 复测 cart 再次解析成功。
+    - 隔离容器（`--network none`）回放同一录包，terrainAnalysis `terrainFrame=camera_init` +
+      localPlanner `useTerrainAnalysis=true`（无 pathFollower）：`/terrain_map` frame 为
+      `camera_init`，1.0 m 接近点 6.3 s 得有效路径（101 点）。顺带修回放脚本 `timeout_s`
+      默认值须为浮点（原 `30` 会被 probe 拒绝）。
     - 当前 LIO 会话非存图模式，完整 LIO 建图需在同一位置以 `LIO_PCD_SAVE_EN=1` 重启后推车。
 
 ### 2026-09-07 状态刷新

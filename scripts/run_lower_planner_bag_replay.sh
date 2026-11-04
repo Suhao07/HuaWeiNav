@@ -22,7 +22,7 @@ Environment:
   LOWER_BAG_REQUIRED_TOPICS=/aft_mapped_to_init,/cloud_registered
   LOWER_BAG_GOAL_X=2.0
   LOWER_BAG_GOAL_Y=0.0
-  LOWER_BAG_TIMEOUT_S=30
+  LOWER_BAG_TIMEOUT_S=30.0
   LOWER_BAG_RUN_DIRECTORY=/tmp/strive_lower_planner_bag_replay
 EOF
 }
@@ -133,7 +133,7 @@ ros2 run strive_sysnav_motion lower_bag_probe \
   -p planner_status_topic:="${STATUS_TOPIC}" \
   -p goal_x:="${LOWER_BAG_GOAL_X:-2.0}" \
   -p goal_y:="${LOWER_BAG_GOAL_Y:-0.0}" \
-  -p timeout_s:="${LOWER_BAG_TIMEOUT_S:-30}" \
+  -p timeout_s:="${LOWER_BAG_TIMEOUT_S:-30.0}" \
   -p artifact_path:="${ARTIFACT_PATH}" \
   > "${RUN_DIRECTORY}/lower_bag_probe.log" 2>&1 &
 PROBE_PID=$!
