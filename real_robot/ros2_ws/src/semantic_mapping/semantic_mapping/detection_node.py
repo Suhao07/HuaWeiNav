@@ -116,6 +116,9 @@ class DetectNode(Node):
             self.grounding_model = YOLO(detector_model_path, task='detect')
         else:
             self.grounding_model = YOLOE(detector_model_path, task="segment")
+        # Both open-vocabulary backends must use the same prompt ordering as
+        # inference's class-index decoder. YOLO-World otherwise keeps COCO ids.
+        if detector_model_type not in ("yolo", "detect"):
             if detector_model_path.suffix.lower() in (".pt", ".pth") and hasattr(self.grounding_model, "set_classes"):
                 self.grounding_model.set_classes(self.text_prompt_list.tolist())
 
@@ -176,8 +179,9 @@ class DetectNode(Node):
 
         cv_image: np.ndarray, shape (H, W, 3), BGR format
         """
-        image = cv_image[:, :, ::-1]  # BGR to RGB
-        # image = image.copy()
+        # Ultralytics accepts BGR numpy arrays and converts them to RGB itself.
+        # CvBridge already supplies BGR; swapping here would reverse channels twice.
+        image = cv_image
         start_time = time.time()
         results = self.grounding_model.track(
             image,

@@ -147,7 +147,9 @@ class ObjMapper():
         target_object = None,
         cloud_already_in_body: bool = False,
         mask_erosion_iterations: int = 2,
+        world_frame: str = "map",
     ):
+        self.world_frame = world_frame
         self.single_obj_list: list[SingleObject] = []
         self.background_obj_list = []
 
@@ -543,7 +545,7 @@ class ObjMapper():
 
         delete_msg = ObjectNode()
         delete_msg.header.stamp = Time(seconds=seconds, nanoseconds=nanoseconds).to_msg()
-        delete_msg.header.frame_id = 'map'
+        delete_msg.header.frame_id = self.world_frame
         delete_msg.object_id = _to_ros_int32_sequence(single_obj.obj_id)
         delete_msg.label = single_obj.get_dominant_label()
         delete_msg.status = False
@@ -559,7 +561,7 @@ class ObjMapper():
 
         for obj_id in single_obj.obj_id:
             marker_bbox = Marker()
-            marker_bbox.header.frame_id = 'map'
+            marker_bbox.header.frame_id = self.world_frame
             marker_bbox.type = Marker.LINE_LIST
             marker_bbox.action = Marker.DELETE
             marker_bbox.id = int(obj_id)
@@ -568,7 +570,7 @@ class ObjMapper():
             self.delete_bbox_list.append(marker_bbox)
 
             marker_text = Marker()
-            marker_text.header.frame_id = 'map'
+            marker_text.header.frame_id = self.world_frame
             marker_text.type = Marker.TEXT_VIEW_FACING
             marker_text.action = Marker.DELETE
             marker_text.id = int(obj_id)
@@ -587,7 +589,7 @@ class ObjMapper():
         # Create and publish ObjectNodeList with deleted objects
         deleted_list_msg = ObjectNodeList()
         deleted_list_msg.header.stamp = Time(seconds=seconds, nanoseconds=nanoseconds).to_msg()
-        deleted_list_msg.header.frame_id = 'map'
+        deleted_list_msg.header.frame_id = self.world_frame
         deleted_list_msg.nodes = self.deleted_objects_batch
         
         self.object_node_pub.publish(deleted_list_msg)
@@ -670,7 +672,7 @@ class ObjMapper():
                 color=color,
                 seconds=seconds,
                 nanoseconds=nanoseconds,
-                frame_id='map'
+                frame_id=self.world_frame
             )
 
             # if bbox3d_corners is None:
@@ -682,7 +684,7 @@ class ObjMapper():
             #     color=color,
             #     seconds=seconds,
             #     nanoseconds=nanoseconds,
-            #     frame_id='map'
+            #     frame_id=self.world_frame
             # )
 
 
@@ -696,7 +698,7 @@ class ObjMapper():
                 text_height=0.4,
                 seconds=seconds,
                 nanoseconds=nanoseconds,
-                frame_id='map'
+                frame_id=self.world_frame
             )
 
             bbox_msg_list.append(obj_marker)
@@ -715,7 +717,7 @@ class ObjMapper():
             # create ObjectNode message
             object_node_msg = ObjectNode()
             object_node_msg.header.stamp = Time(seconds=seconds, nanoseconds=nanoseconds).to_msg()
-            object_node_msg.header.frame_id = 'map'
+            object_node_msg.header.frame_id = self.world_frame
             
             # Get the dominant id
             object_node_msg.object_id = _to_ros_int32_sequence(single_obj.obj_id)
@@ -740,10 +742,12 @@ class ObjMapper():
 
             # create point cloud - use the simplest method
             ros_pcd = ros2_bag_utils.create_point_cloud(
-                obj_points, seconds, nanoseconds, frame_id='map'
+                obj_points, seconds, nanoseconds, frame_id=self.world_frame
             )
             object_node_msg.cloud = ros_pcd
-            object_node_msg.img_path = single_obj.best_image_path
+            # No image is available when image saving is disabled or pending.
+            # ROS string fields cannot serialize None.
+            object_node_msg.img_path = single_obj.best_image_path or ""
             object_node_msg.is_asked_vlm = single_obj.is_asked_vlm
             object_node_msg.viewpoint_id = viewpoint_id if not single_obj.updated_by_vlm else -1
             
@@ -758,7 +762,7 @@ class ObjMapper():
         if self.object_node_pub is not None and len(object_nodes_list) > 0:
             object_node_list_msg = ObjectNodeList()
             object_node_list_msg.header.stamp = Time(seconds=seconds, nanoseconds=nanoseconds).to_msg()
-            object_node_list_msg.header.frame_id = 'map'
+            object_node_list_msg.header.frame_id = self.world_frame
             object_node_list_msg.nodes = object_nodes_list
             self.object_node_pub.publish(object_node_list_msg)
 
@@ -770,7 +774,7 @@ class ObjMapper():
                 colors=colors,
                 seconds=seconds,
                 nanoseconds=nanoseconds,
-                frame_id='map'
+                frame_id=self.world_frame
             )
         else:
             ros_pcd = None

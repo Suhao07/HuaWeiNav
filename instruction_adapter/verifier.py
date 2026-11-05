@@ -71,8 +71,14 @@ def candidate_from_object(
     centroid = np.array(position if position is not None else [], dtype=float).reshape(-1)[:3].tolist()
     bbox = getattr(obj, "bbox2d_xyxy", getattr(obj, "bbox", None))
     try:
-        bbox = np.array(bbox, dtype=float).reshape(-1).tolist()
-    except Exception:
+        values = np.asarray(bbox, dtype=float).reshape(-1) if bbox is not None else np.empty(0)
+        # A missing ROS object box is unknown, not a one-element NaN box.
+        # Keep only finite, non-degenerate xyxy geometry; fresh capture evidence
+        # remains authoritative for final visual verification.
+        valid = (values.size == 4 and np.isfinite(values).all()
+                 and values[2] > values[0] and values[3] > values[1])
+        bbox = values.tolist() if valid else []
+    except (TypeError, ValueError):
         bbox = []
     return CandidateInstance(
         uid=uid,

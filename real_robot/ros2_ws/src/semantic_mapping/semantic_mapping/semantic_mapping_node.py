@@ -122,6 +122,8 @@ class MappingNode(Node):
     def __init__(self, mask_predictor):
         super().__init__('semantic_mapping_node')
 
+        self.declare_parameter("world_frame", os.getenv("SYSNAV_WORLD_FRAME", "map"))
+        self.world_frame = self.get_parameter("world_frame").value
         self.declare_parameter("device", "auto")
         self.declare_parameter("target_object", "refrigerator")  # New parameter for target object
         self.declare_parameter("platform", "mecanum_sim")
@@ -386,6 +388,7 @@ class MappingNode(Node):
         self.object_node_pub = self.create_publisher(ObjectNodeList, '/object_nodes_list', 200)
 
         self.obj_mapper = ObjMapper(
+            world_frame=self.world_frame,
                                     cloud_image_fusion=self.cloud_img_fusion, 
                                     label_template=self.label_template, 
                                     log_info=self.log_info,
@@ -498,6 +501,9 @@ class MappingNode(Node):
                 self.rgb_stack.pop(0)
 
     def odom_callback(self, msg):
+        if msg.header.frame_id != self.world_frame:
+            self.get_logger().error(f"odometry frame {msg.header.frame_id!r} differs from world_frame {self.world_frame!r}")
+            return
         with self.odom_cbk_lock:
             position = np.asarray(
                 [msg.pose.pose.position.x, msg.pose.pose.position.y, msg.pose.pose.position.z],
@@ -576,7 +582,8 @@ class MappingNode(Node):
             # sam2
             sam2_start = time.time()
             with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
-                self.mask_predictor.set_image(image)
+                # ROS/OpenCV images are BGR; SAM2's numpy input contract is RGB.
+                self.mask_predictor.set_image(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
 
                 if len(detections_tracked['bboxes']) > 0:
                     masks, _, _ = self.mask_predictor.predict(

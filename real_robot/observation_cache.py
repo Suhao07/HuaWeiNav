@@ -9,6 +9,8 @@ message objects or image arrays.
 from __future__ import annotations
 
 import json
+import copy
+from collections import deque
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -129,6 +131,8 @@ class RosObservationCache:
         self.detection_adapter = detection_adapter or RosDetectionResultAdapter()
         self.now_fn = now_fn
 
+        self._pose_history = deque(maxlen=4000)
+        self._detection_image: Optional[_CachedImageRecord] = None
         self.latest_pose: Optional[Pose3D] = None
         self.latest_rgb: Optional[_CachedImageRecord] = None
         self.latest_depth_ref: Optional[str] = None
@@ -147,6 +151,7 @@ class RosObservationCache:
         """Cache the latest robot pose."""
 
         self.latest_pose = pose
+        self._pose_history.append(pose)
 
     def update_rgb_image(self, msg: Any, topic: Optional[str] = None) -> _CachedImageRecord:
         """Cache the latest RGB image and return its lightweight record."""
@@ -183,13 +188,50 @@ class RosObservationCache:
     def update_detection_result(self, msg: Any, image_ref: Optional[str] = None) -> DetectionFrame:
         """Convert and cache a SysNav `DetectionResult` message."""
 
-        # detection frame 要绑定当前 RGB 引用，后续 evidence 才能追溯 bbox 来自哪一帧。
+        stamp = _stamp_from_header(getattr(msg, "header", None), default=0.0)
+        record = None
+        inline = getattr(msg, "image", None)
+        if inline is not None and getattr(inline, "data", None):
+            # The detector transports its exact input image. Older publishers
+            # leave the embedded header unset; the envelope owns its timestamp.
+            inline_stamp = _stamp_from_header(getattr(inline, "header", None), default=0.0)
+            if inline_stamp == 0.0 or abs(inline_stamp - stamp) <= 1e-6:
+                image = copy.copy(inline)
+                image.header = copy.copy(msg.header)
+                image.header.frame_id = (getattr(getattr(inline, "header", None), "frame_id", "")
+                                         or (self.latest_rgb.frame_id if self.latest_rgb else "camera"))
+                record = self._cache_image(image, self.detection_adapter.topic, prefix="detection")
+        if record is None:
+            record = next((item for item in reversed(self.image_records)
+                           if abs(item.timestamp - stamp) <= 1e-6), None)
+        self._detection_image = record
         frame = self.detection_adapter.from_msg(
-            msg,
-            image_ref=image_ref or (self.latest_rgb.image_ref if self.latest_rgb is not None else None),
+            msg, image_ref=image_ref or (record.image_ref if record else None),
         )
         self.latest_detection_frame = frame
         return frame
+
+    def observation_for_detection(self, detection: DetectionFrame) -> Optional[RealObservation]:
+        """Return the detector's input image with a nearby measured pose.
+
+        Missing image pairing or pose history returns None; a newer camera
+        image is never relabelled as the input of a delayed detection.
+        """
+        record = self._detection_image
+        if record is None or abs(record.timestamp - detection.timestamp) > 1e-6:
+            return None
+        poses = [pose for pose in self._pose_history if pose.stamp is not None]
+        if not poses:
+            return None
+        pose = min(poses, key=lambda item: abs(item.stamp - detection.timestamp))
+        if abs(pose.stamp - detection.timestamp) > 0.25:
+            return None
+        return RealObservation(
+            timestamp=record.timestamp, robot_pose=pose,
+            camera_frames=(record.as_camera_frame(self.camera_model),),
+            odom_frame_id=pose.frame_id,
+            metadata={"image_pairing": "detector_input", "pose_time_offset_s": pose.stamp - record.timestamp},
+        )
 
     def has_rgb_image(self) -> bool:
         """Return whether an RGB image has arrived."""
@@ -386,6 +428,7 @@ class ObjectCropEvidenceProvider:
         mode: str = "auto",
         default_camera_model: CameraModel = CameraModel.UNKNOWN,
         now_fn: Callable[[], float] = time.time,
+        detection_observation_provider: Optional[Callable[[DetectionFrame], Optional[RealObservation]]] = None,
     ) -> None:
         """Initialize the evidence provider.
 
@@ -399,11 +442,14 @@ class ObjectCropEvidenceProvider:
             mode: `auto`, `full_image`, or `bbox_crop`.
             default_camera_model: Camera model used when no camera frame exists.
             now_fn: Time source used if observation/status stamps are missing.
+            detection_observation_provider: Optional lookup of the exact detector
+                input image and its measured pose for post-motion evidence.
         """
 
         normalized = mode.strip().lower()
         if normalized not in {"auto", "full_image", "bbox_crop"}:
             raise ValueError("mode must be one of: auto, full_image, bbox_crop")
+        self.detection_observation_provider = detection_observation_provider
         self.observation_provider = observation_provider
         self.object_provider = object_provider
         self.detection_provider = detection_provider
@@ -416,13 +462,13 @@ class ObjectCropEvidenceProvider:
     def capture(self, goal: ViewpointGoal, status: NavigationStatus) -> ViewEvidence:
         """Capture the latest available evidence for a reached viewpoint goal."""
 
-        return self._capture(
-            goal,
-            status,
-            self.observation_provider(),
-            self.detection_provider() if self.detection_provider else None,
-            allow_object_bbox=True,
-        )
+        observation = self.observation_provider()
+        detection = self.detection_provider() if self.detection_provider else None
+        if detection is not None and self.detection_observation_provider is not None:
+            paired = self.detection_observation_provider(detection)
+            if paired is not None:
+                observation = paired
+        return self._capture(goal, status, observation, detection, allow_object_bbox=True)
 
     def capture_after(self, goal: ViewpointGoal, status: NavigationStatus) -> Optional[ViewEvidence]:
         """Capture evidence only after the lower layer reports a timestamp."""
@@ -443,6 +489,12 @@ class ObjectCropEvidenceProvider:
         )
         if detection is not None and detection.timestamp <= float(status.stamp):
             detection = None
+        if detection is not None and self.detection_observation_provider is not None:
+            paired = self.detection_observation_provider(detection)
+            if (paired is not None and paired.timestamp > float(status.stamp)
+                    and paired.robot_pose.stamp is not None
+                    and paired.robot_pose.stamp > float(status.stamp)):
+                observation = paired
         # 中文核心边界：带 REACHED 时间屏障时，mapper 的历史 bbox 不能和新 RGB 混用；
         # 没有同步 detection 就只提交当前整帧和对象 UID，让 verifier 自己判断证据是否足够。
         allow_object_bbox = self.detection_provider is None and self.detection_after_provider is None
@@ -469,6 +521,13 @@ class ObjectCropEvidenceProvider:
         target_uid = goal.target_object_uid or goal.anchor_object_uid
         # target uid 可以来自 terminal target，也可以来自 anchor-first 的 anchor 视点。
         target_object = _find_object(objects, target_uid)
+        # A matching track is insufficient if its box belongs to another image.
+        image_pair_matches = (camera is not None and detection is not None
+                              and camera.timestamp is not None
+                              and abs(camera.timestamp - detection.timestamp) <= 1e-6)
+        if detection is not None and not image_pair_matches:
+            detection = None
+            allow_object_bbox = False
         bbox, bbox_source = _select_bbox(target_object, detection, allow_object_bbox=allow_object_bbox)
         image_ref, image_source = _select_image_ref(self.mode, camera, target_object, bbox)
         quality = _evidence_quality(
@@ -549,6 +608,10 @@ def _select_bbox(
                 if str(track_id) in track_ids and idx < len(detection.boxes_xyxy):
                     # track id 次优先，能把 detector bbox 和 SysNav object uid 对齐。
                     return detection.boxes_xyxy[idx], "detection_track"
+        if track_ids and detection is not None:
+            # No matching tracked instance in this frame: same-label detections
+            # are different/unknown identities, not substitute evidence.
+            return None, None
         if detection is not None:
             for idx, label in enumerate(detection.labels):
                 if label == target_object.label and idx < len(detection.boxes_xyxy):

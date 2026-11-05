@@ -88,8 +88,8 @@ def test_object_crop_evidence_provider_uses_detection_bbox_and_quality_facts() -
     observation_cache.update_pose(Pose3D(position=(0.0, 0.0, 0.0), stamp=2.0))
     observation_cache.update_rgb_image(_image_msg(sec=2))
     detection = DetectionFrame(
-        timestamp=2.0,
-        image_ref="ros:///camera/image/image/2.000000000",
+        timestamp=2.25,
+        image_ref="ros:///camera/image/image/2.250000000",
         boxes_xyxy=((100.0, 120.0, 220.0, 260.0),),
         labels=("book",),
         confidences=(0.8,),
@@ -259,3 +259,79 @@ def test_evidence_uses_encoded_capture_and_its_pose_after_motion_receipt(tmp_pat
     assert evidence.image_ref == record.visual_path
     assert evidence.pose == pose
     assert evidence.timestamp == cache.latest_observation().timestamp
+
+
+def test_delayed_detection_uses_its_input_image_and_pose_after_barrier(tmp_path):
+    cache = RosObservationCache(image_directory=tmp_path, persist_images=True)
+    cache.update_pose(Pose3D(position=(1, 0, 0), stamp=3.25))
+    cache.update_rgb_image(_image_msg(sec=4, width=1, height=2, data=b"newnew"))
+    msg = _detection_msg()
+    msg.image = _image_msg(sec=3, width=1, height=2, data=b"oldold")
+    frame = cache.update_detection_result(msg)
+    cache.update_pose(Pose3D(position=(2, 0, 0), stamp=4.25))
+    target = ObjectNodeSnapshot(uid="sysnav_object:7", label="book", track_ids=("7",))
+    provider = ObjectCropEvidenceProvider(
+        cache.latest_observation, lambda: (target,),
+        detection_provider=lambda: cache.latest_detection_frame,
+        observation_after_provider=cache.latest_observation_after,
+        detection_after_provider=cache.latest_detection_after,
+        detection_observation_provider=cache.observation_for_detection)
+    goal = ViewpointGoal(pose=cache.latest_pose, target_object_uid=target.uid)
+    evidence = provider.capture_after(goal, NavigationStatus(NavigationStatusCode.REACHED, stamp=3.0))
+    assert evidence.pose.position == (1, 0, 0)
+    assert evidence.timestamp == 3.25
+    assert evidence.bbox_xyxy == (100., 120., 220., 260.)
+    assert "detection_3_250000000.png" in evidence.image_ref
+    assert (tmp_path / "detection_3_250000000.bin").read_bytes() == b"oldold"
+    assert frame.image_ref != cache.latest_rgb.image_ref
+    # Once the terminal barrier is newer than the detection, retain the fresh
+    # full image without borrowing a stale box or declaring another arrival.
+    later = provider.capture_after(goal, NavigationStatus(NavigationStatusCode.REACHED, stamp=3.5))
+    assert later.bbox_xyxy is None
+    assert "rgb_4_250000000.png" in later.image_ref
+
+
+def test_unpaired_post_reach_detection_does_not_crop_newer_image():
+    cache = RosObservationCache()
+    cache.update_pose(Pose3D(position=(0, 0, 0), stamp=4.25))
+    cache.update_rgb_image(_image_msg(sec=4))
+    cache.update_detection_result(_detection_msg())  # no embedded image at t=3.25
+    assert cache.latest_detection_frame.image_ref != cache.latest_rgb.image_ref
+    obj = ObjectNodeSnapshot(uid="sysnav_object:7", label="book", track_ids=("7",))
+    provider = ObjectCropEvidenceProvider(cache.latest_observation, lambda: (obj,),
+        detection_provider=lambda: cache.latest_detection_frame,
+        observation_after_provider=cache.latest_observation_after,
+        detection_after_provider=cache.latest_detection_after)
+    evidence = provider.capture_after(ViewpointGoal(pose=cache.latest_pose, target_object_uid=obj.uid),
+                                     NavigationStatus(NavigationStatusCode.REACHED, stamp=3.0))
+    assert evidence.bbox_xyxy is None
+
+
+def test_same_label_different_track_cannot_supply_target_box():
+    cache = RosObservationCache()
+    cache.update_pose(Pose3D(position=(0, 0, 0), stamp=3.25))
+    cache.update_rgb_image(_image_msg(sec=3))
+    cache.update_detection_result(_detection_msg())
+    obj = ObjectNodeSnapshot(uid="sysnav_object:8", label="book", track_ids=("8",))
+    provider = ObjectCropEvidenceProvider(cache.latest_observation, lambda: (obj,),
+        detection_provider=lambda: cache.latest_detection_frame)
+    evidence = provider.capture(ViewpointGoal(pose=cache.latest_pose, target_object_uid=obj.uid),
+                                NavigationStatus(NavigationStatusCode.IDLE))
+    assert evidence.bbox_xyxy is None
+
+
+def test_detection_pairing_rejects_inconsistent_image_stamp_and_missing_pose():
+    cache = RosObservationCache()
+    cache.update_pose(Pose3D(position=(0, 0, 0), stamp=3.25))
+    cache.update_rgb_image(_image_msg(sec=4))
+    msg = _detection_msg()
+    msg.image = _image_msg(sec=4)  # envelope is t=3.25, pixels claim t=4.25
+    frame = cache.update_detection_result(msg)
+    assert cache.observation_for_detection(frame) is None
+    msg.image = _image_msg(sec=3)
+    frame = cache.update_detection_result(msg)
+    assert cache.observation_for_detection(frame).robot_pose.stamp == 3.25
+    other = RosObservationCache()
+    other.update_pose(Pose3D(position=(0, 0, 0), stamp=5.25))
+    frame = other.update_detection_result(msg)
+    assert other.observation_for_detection(frame) is None

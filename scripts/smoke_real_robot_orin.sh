@@ -163,6 +163,7 @@ append_model_asset_args() {
     if [[ -f "${SYSNAV_CLIP_VIT_B32_PATH}" ]]; then
       args_ref+=(-e "SYSNAV_CLIP_VIT_B32_PATH=${SYSNAV_CLIP_VIT_B32_PATH}")
       args_ref+=(-v "${SYSNAV_CLIP_VIT_B32_PATH}:/root/.cache/clip/ViT-B-32.pt:ro")
+      args_ref+=(-v "${SYSNAV_CLIP_VIT_B32_PATH}:/workspace/STRIVE/weights/clip/ViT-B-32.pt:ro")
     else
       echo "SYSNAV_CLIP_VIT_B32_PATH does not exist: ${SYSNAV_CLIP_VIT_B32_PATH}" >&2
     fi

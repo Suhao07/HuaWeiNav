@@ -28,6 +28,99 @@ def methods(path, names, namespace):
     return namespace
 
 
+def test_real_detector_passes_bgr_to_ultralytics_without_double_swap():
+    """A red/blue asymmetric camera image must reach the BGR backend unchanged."""
+    import time
+    namespace = methods(
+        "real_robot/ros2_ws/src/semantic_mapping/semantic_mapping/detection_node.py",
+        {"inference"}, {"np": np, "time": time})
+    image = np.array([[[11, 37, 241], [220, 42, 9]]], dtype=np.uint8)
+    before = image.copy()
+    backend = Mock()
+    backend.track.return_value = [NS(boxes=NS(id=None))]
+    node = NS(grounding_model=backend, detector_imgsz=320, device="cpu",
+              grounding_score_thresh=.35, CONFIG_DIR=Path("/config"), log_info=Mock())
+    result = namespace["inference"](node, image)
+    delivered = backend.track.call_args.args[0]
+    np.testing.assert_array_equal(delivered, before)
+    np.testing.assert_array_equal(image, before)
+    assert delivered.flags.c_contiguous
+    assert backend.track.call_args.kwargs["conf"] == .35
+    assert result["labels"].size == 0
+
+
+def test_real_mapper_converts_bgr_for_sam2_without_mutating_observation():
+    """SAM2 receives RGB while the observation used by mapping remains BGR."""
+    import cv2
+    import time
+    from contextlib import nullcontext
+
+    class CapturedInput(Exception):
+        pass
+
+    predictor = Mock()
+    predictor.set_image.side_effect = CapturedInput
+    namespace = methods(
+        "real_robot/ros2_ws/src/semantic_mapping/semantic_mapping/semantic_mapping_node.py",
+        {"mapping_processing"}, {
+            "profile": lambda method: method, "time": time, "cv2": cv2,
+            "torch": NS(inference_mode=nullcontext, bfloat16=None,
+                        autocast=lambda *args, **kwargs: nullcontext())})
+    node = NS(mapping_processing_lock=nullcontext(), mask_predictor=predictor)
+    image = np.array([[[11, 37, 241], [220, 42, 9]]], dtype=np.uint8)
+    before = image.copy()
+    detections = {"labels": [], "bboxes": [], "confidences": []}
+    with pytest.raises(CapturedInput):
+        namespace["mapping_processing"](node, image, None, detections, 1., None)
+    rgb = predictor.set_image.call_args.args[0]
+    np.testing.assert_array_equal(rgb, before[:, :, ::-1])
+    np.testing.assert_array_equal(image, before)
+    assert rgb.flags.c_contiguous
+
+
+@pytest.mark.parametrize("backend", ["yoloe", "yolo_world"])
+def test_open_vocabulary_initialization_matches_decoder_prompt_order(tmp_path, backend):
+    """Both real detector backends must initialize the decoder's exact vocabulary."""
+    import time
+    import yaml
+    from collections import deque
+
+    config = tmp_path / "objects.yaml"
+    config.write_text("prompts:\n  chair:\n    prompts: [chair, office chair]\n  desk:\n    prompts: [desk]\n")
+    checkpoint = tmp_path / "model.pt"
+    checkpoint.touch()
+    overrides = {"object_file": str(config), "detector_model_path": str(checkpoint),
+                 "detector_model_type": backend, "annotate_image": False}
+
+    class FakeNode:
+        def __init__(self, name):
+            self.parameters = {}
+
+        def declare_parameter(self, name, default):
+            self.parameters[name] = overrides.get(name, default)
+
+        def get_parameter(self, name):
+            value = self.parameters[name]
+            return NS(get_parameter_value=lambda: NS(
+                string_value=value, double_value=value, integer_value=value, bool_value=value))
+
+        def __getattr__(self, name):
+            return Mock()
+
+    path = ROOT / "real_robot/ros2_ws/src/semantic_mapping/semantic_mapping/detection_node.py"
+    nodes = [node for node in ast.parse(path.read_text()).body
+             if isinstance(node, (ast.ClassDef, ast.FunctionDef))
+             and node.name in {"DetectNode", "resolve_package_path"}]
+    factories = {name: Mock() for name in ("YOLO", "YOLOWorld", "YOLOE")}
+    namespace = dict(factories, Node=FakeNode, Path=Path, np=np, yaml=yaml,
+                     time=time, deque=deque, __file__=str(path), CvBridge=Mock(),
+                     Image=object, DetectionResult=object, qos_profile_sensor_data=None)
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"), namespace)
+    detector = namespace["DetectNode"]()
+    detector.grounding_model.set_classes.assert_called_once_with(["chair", "office chair", "desk"])
+    assert detector.text_prompt_list.tolist() == ["chair", "office chair", "desk"]
+
+
 def test_traversability_preserves_both_input_poses():
     paths = []
     ns = methods("mapper_with_process_obs.py", {"check_traversability"}, {
@@ -358,7 +451,8 @@ def test_associated_instance_publishes_corresponding_new_image_and_box(target):
     # 融合算法已抽到共享模块；测试真实函数，几何计算仍使用固定输入。
     path = ROOT / "mapping/object_fusion.py"
     nodes = [node for node in ast.parse(path.read_text()).body
-             if isinstance(node, ast.FunctionDef) and node.name == "associate_object_entities"]
+             if isinstance(node, ast.FunctionDef) and node.name in {"associate_object_entities",
+                 "score_object_candidates", "merge_object_observation", "accumulate_label_vote"}]
     namespace = {"np": np, "torch": torch, "nearest_distances": lambda *args: torch.zeros(4),
                  "clouds_may_overlap": lambda *args: True,
                  "gpu_merge_pointcloud": lambda *args: cloud}
