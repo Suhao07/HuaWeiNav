@@ -110,8 +110,9 @@ class CogNavOpenAICompatibleClient:
 
 
 class _TracingParsedCompletions:
-    def __init__(self, inner) -> None:
+    def __init__(self, inner, create_inner=None) -> None:
         self._inner = inner
+        self._create_inner = create_inner if create_inner is not None else inner
 
     def parse(self, *args, **kwargs):
         """Save raw content before SDK validation; regenerate one invalid output.
@@ -143,7 +144,7 @@ class _TracingParsedCompletions:
             )
             started = time.perf_counter()
             if local_schema:
-                response = self._inner.with_raw_response.create(
+                response = self._create_inner.with_raw_response.create(
                     *args, **{**kwargs, "response_format": {"type": "text"}})
             else:
                 response = self._inner.with_raw_response.parse(*args, **kwargs)
@@ -183,19 +184,22 @@ class _TracingParsedCompletions:
 
 
 class _TracingChat:
-    def __init__(self, inner) -> None:
-        self.completions = _TracingParsedCompletions(inner.completions)
+    def __init__(self, inner, create_chat=None) -> None:
+        self.completions = _TracingParsedCompletions(
+            inner.completions, create_chat.completions if create_chat is not None else None)
 
 
 class _TracingBeta:
-    def __init__(self, inner) -> None:
-        self.chat = _TracingChat(inner.chat)
+    def __init__(self, inner, create_chat=None) -> None:
+        self.chat = _TracingChat(inner.chat, create_chat)
 
 
 class TracingOpenAICompatibleClient:
     def __init__(self, inner) -> None:
         self._inner = inner
-        self.beta = _TracingBeta(inner.beta)
+        # Older SDKs expose create only on chat.completions, while the beta
+        # namespace provides parse. Preserve both routes explicitly.
+        self.beta = _TracingBeta(inner.beta, inner.chat)
 
 
 def get_client_and_model(vlm: str):

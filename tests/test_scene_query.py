@@ -40,3 +40,22 @@ def test_habitat_export_and_native_input_select_same_object(monkeypatch):
     assert a.selected_snapshot_uid == b.selected_snapshot_uid == "cup-a"
     assert lookup[a.selected_snapshot_uid] is mapper.objects[0]
     assert mapper.objects[0].tag == "cup"
+
+
+def test_candidate_without_ros_bbox_serializes_as_unknown_not_nan():
+    import json
+    from dataclasses import asdict
+
+    obj = ObjectNodeSnapshot("sysnav_object:2", "chair", (1., 2., 0.), 0.8)
+    candidate = candidate_from_object(obj)
+    assert candidate.bbox_2d == []
+    assert json.loads(json.dumps(asdict(candidate), allow_nan=False))["uid"] == obj.uid
+
+
+def test_candidate_rejects_invalid_box_and_preserves_valid_xyxy():
+    for box in (None, [], [float("nan")], [0, 0, float("inf"), 2],
+                [0, 0, 0, 2], [3, 0, 1, 2], [1, 2, 3]):
+        obj = SimpleNamespace(uid="chair", label="chair", bbox=box)
+        assert candidate_from_object(obj).bbox_2d == []
+    obj = SimpleNamespace(uid="chair", label="chair", bbox=[1, 2, 3, 4])
+    assert candidate_from_object(obj).bbox_2d == [1., 2., 3., 4.]

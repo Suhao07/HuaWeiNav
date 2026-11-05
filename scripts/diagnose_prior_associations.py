@@ -8,14 +8,32 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import numpy as np
 from PIL import Image
-import open3d as o3d
 
-from prior_map.observations import load_depth
+from prior_map.observations import load_depth, load_fusion_observation, metric_depth_validity
 from prior_map.bundle import load_bundle
-from prior_map.observations import backproject, write_json
-from mapping_utils.geometry import gpu_pointcloud_from_array, gpu_cluster_filter
-from mapping_utils.representation import ObjectNode
-from mapping.object_fusion import associate_object_entities, clouds_may_overlap, nearest_distances
+from prior_map.observations import write_json
+from mapping.object_fusion import associate_object_entities, clouds_may_overlap, nearest_distances, merge_duplicate_instances
+
+
+def replay_geometry(receipt):
+    """Recover the builder's depth policy; selected evidence cannot replay fusion.
+
+    Unknown policies are errors rather than silently changing geometry. Older
+    receipts without a confidence policy predate confidence filtering.
+    """
+    if receipt.get('compaction_receipt'):
+        raise ValueError('Association replay requires the complete source bundle, not compact evidence')
+    policy = receipt.get('confidence_policy', 'preserved_not_filtered')
+    if policy == 'preserved_not_filtered':
+        confidence = None
+    elif policy.startswith('fused_depth_requires_confidence_ge_'):
+        confidence = int(policy.removeprefix('fused_depth_requires_confidence_ge_'))
+        if confidence < 0:
+            raise ValueError('Invalid depth confidence threshold')
+    else:
+        raise ValueError(f'Unknown depth confidence policy: {policy}')
+    return dict(voxel_m=receipt['voxel_m'], max_depth_m=receipt['max_depth_m'],
+                profile=receipt['capture_manifest'].get('capture_profile'), min_confidence=confidence)
 
 
 def coview_bridge_candidates(scores, coview_masks, min_iou):
@@ -66,23 +84,22 @@ def main():
     root = Path(args.bundle)
     bundle = load_bundle(root)
     receipt = json.loads((root / "build_receipt.json").read_text())
+    geometry = replay_geometry(receipt)
     frame_ids = sorted({o["frame_id"] for o in bundle["observations"]})[:args.max_frames]
     if args.deferred_association:
         import time
         import hashlib
         from prior_map.association import PriorAssociation, AssociationConfig
-        from prior_map.observations import load_fusion_observation
         records = {o['observation_id']: o for o in bundle['observations'] if o['frame_id'] in frame_ids}
         def load(oid):
-            return load_fusion_observation(root, records[oid], voxel_m=receipt['voxel_m'],
-                max_depth_m=receipt['max_depth_m'], profile=receipt['capture_manifest'].get('capture_profile'))
+            return load_fusion_observation(root, records[oid], **geometry)
         started = time.monotonic()
         coordinator = PriorAssociation(load, AssociationConfig(balanced_coverage=args.balanced_coverage))
         for frame_id in frame_ids:
             coordinator.add_frame(frame_id, [oid for oid, o in records.items() if o['frame_id'] == frame_id])
         coordinator.resolve_pending()
         result = coordinator.trace()
-        result.update(scope='experimental_observation_owned_fusion', elapsed_s=time.monotonic()-started,
+        result.update(scope='experimental_observation_owned_fusion', geometry=geometry, elapsed_s=time.monotonic()-started,
                       object_count=len(coordinator.entities), frame_ids=frame_ids,
                       source_sha256={str(path): hashlib.sha256(path.read_bytes()).hexdigest()
                         for path in (root/'observations.jsonl', root/'build_receipt.json',
@@ -100,17 +117,13 @@ def main():
         mask = np.asarray(Image.open(root / obs["mask_ref"])) > 0
         if obs["frame_id"] != current_frame:
             current_frame, coview_masks = obs["frame_id"], {}
-        valid = (depth > 0) & (depth <= receipt["max_depth_m"])
-        if profile is not None:
-            valid &= (depth > profile["depth_min_m"]) & (depth < profile["depth_max_m"])
-        points = backproject(np.where(mask & valid, depth, 0),
-                            np.asarray(obs["intrinsics"]), np.asarray(obs["camera_to_map"]))
-        cloud = gpu_pointcloud_from_array(points, np.full(points.shape, 160), o3d.core.Device("CPU:0"))
-        cloud = gpu_cluster_filter(cloud.voxel_down_sample(receipt["voxel_m"]))
+        confidence = (np.asarray(Image.open(root / obs['confidence_ref']))
+                      if obs.get('confidence_ref') else None)
+        valid = metric_depth_validity(depth, profile, confidence, geometry['min_confidence'])
+        valid &= depth <= receipt['max_depth_m']
+        entity, mask = load_fusion_observation(root, obs, **geometry)
+        cloud = entity.pcd
         xyz = cloud.point.positions.numpy()
-        entity = ObjectNode(cloud, cloud, obs["detector_label"], obs["detector_score"],
-                            xyz.mean(axis=0), len(xyz), None, obs["bbox_xyxy"])
-        entity.uid = obs["observation_id"]
         scores = []
         eligible = entities
         excluded = []
@@ -179,7 +192,29 @@ def main():
             "deferred_candidate_uids": deferred,
             "projection_support": projected,
             "candidates": sorted(scores, key=lambda item: item["overlap"], reverse=True)[:3]})
+    baseline = (args.min_coview_iou is None and args.min_visible_mask_overlap is None
+                and not args.defer_coview_bridges)
+    complete = len(trace) == len(bundle['observations'])
+    merges = {}
+    final_parity = None
+    final_geometry = []
+    if baseline and complete:
+        entities, merges = merge_duplicate_instances(entities, receipt['voxel_m'])
+        for row in trace:
+            row['final_uid'] = merges.get(row['assigned_uid'], row['assigned_uid'])
+            row['final_assignment_matches'] = row['final_uid'] == row['saved_uid']
+        final_parity = all(row['final_assignment_matches'] for row in trace)
+        saved = {o.uid.split(':', 1)[1]: o for o in bundle['prior_map'].objects}
+        for entity in entities:
+            expected = saved.get(entity.uid)
+            final_geometry.append(dict(uid=entity.uid, points=len(entity.pcd.point.positions),
+                expected_points=expected.metadata.get('point_count') if expected else None,
+                centroid_error_m=float(np.linalg.norm(entity.position - np.asarray(expected.position_xyz)))
+                if expected and expected.position_xyz is not None else None))
     write_json(args.output, {"scope": "frozen_accepted_mask_fusion_trace", "device": "CPU:0",
+        "geometry": geometry, "complete_source_replayed": complete,
+        "final_assignment_parity": final_parity, "duplicate_instance_merges": merges,
+        "final_geometry": final_geometry,
         "experimental_min_coview_iou": args.min_coview_iou, "object_count": len(entities),
         "experimental_min_visible_mask_overlap": args.min_visible_mask_overlap,
         "experimental_defer_coview_bridges": args.defer_coview_bridges,

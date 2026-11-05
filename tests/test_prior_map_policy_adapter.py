@@ -114,6 +114,38 @@ def test_disabled_adapter_preserves_existing_policy_behavior() -> None:
     assert annotations[0].metadata["prior_map"] == {"enabled": False, "matched": False}
 
 
+def test_same_label_does_not_bind_a_concrete_historical_instance() -> None:
+    result = SearchPriorResult(object_rankings=(
+        ObjectPrior(object_uid="historical_chair", label="chair", score=9.,
+                    reason="historical observation", exact=True),))
+    annotation = annotate_target_candidates(
+        [SimpleNamespace(uid="live_chair", label="chair")], result)[0]
+    assert annotation.prior is None
+    assert annotation.metadata["prior_map"]["matched"] is False
+
+
+def test_ambiguous_category_hypotheses_do_not_choose_first_by_label() -> None:
+    result = SearchPriorResult(object_rankings=tuple(
+        ObjectPrior(object_uid=uid, label="chair", score=score,
+                    reason="category hypothesis", exact=False)
+        for uid, score in (("chair_a", 9.), ("chair_b", 1.))))
+    annotation = annotate_target_candidates(
+        [SimpleNamespace(uid="live_chair", label="chair")], result)[0]
+    assert annotation.prior is None
+
+
+def test_established_runtime_correspondence_selects_the_correct_instance() -> None:
+    result = SearchPriorResult(object_rankings=(
+        ObjectPrior(object_uid="wrong_chair", label="chair", score=9.,
+                    reason="same label", exact=True),
+        ObjectPrior(object_uid="right_chair", label="chair", score=1.,
+                    reason="established identity", exact=True, matched_runtime_uid="live_chair")))
+    annotation = annotate_target_candidates(
+        [SimpleNamespace(uid="live_chair", label="chair")], result)[0]
+    assert annotation.prior.object_uid == "right_chair"
+    assert annotation.metadata["prior_map"]["match_scope"] == "historical_instance"
+
+
 def test_policy_adapter_stays_platform_neutral_and_ranking_only() -> None:
     source = Path("prior_map/policy_adapter.py").read_text(encoding="utf-8")
     forbidden_imports = ("rclpy", "habitat", "cv2", "open3d", "geometry_msgs")

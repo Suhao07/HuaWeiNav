@@ -156,3 +156,28 @@ def test_doubao_text_keeps_strict_local_validation(tmp_path, monkeypatch, recove
     assert len(calls) == 2
     assert all(call['response_format'] == {'type':'text'} for call in calls)
     assert len(list(tmp_path.glob('error_*.json'))) == (1 if recover else 2)
+
+
+def test_real_sdk_doubao_uses_standard_create_route(tmp_path, monkeypatch):
+    import httpx
+    from openai import OpenAI
+    from prompting.schemas import ParsedInstanceCorrespondence
+    from llm_utils.cognav_llm_adapter import TracingOpenAICompatibleClient
+    monkeypatch.setenv('STRIVE_LVLM_TRACE_DIR', str(tmp_path))
+    calls = []
+    def handle(request):
+        body = json.loads(request.content)
+        calls.append(body)
+        assert request.url.path == '/v1/chat/completions'
+        assert body['response_format'] == {'type': 'text'}
+        return httpx.Response(200, json=dict(id='fixture', model=body['model'], created=0,
+            object='chat.completion', choices=[dict(index=0, finish_reason='stop',
+            message=dict(role='assistant', content=json.dumps(dict(outcome='fragments',
+                evidence_summary='controlled SDK fixture'))))]))
+    with OpenAI(api_key='fixture-only', base_url='https://fixture.invalid/v1', max_retries=0,
+                http_client=httpx.Client(transport=httpx.MockTransport(handle))) as sdk:
+        result = TracingOpenAICompatibleClient(sdk).beta.chat.completions.parse(
+            model='doubao-seed-2-0-pro-260215', messages=[{'role':'user','content':'fixture'}],
+            response_format=ParsedInstanceCorrespondence)
+    assert result.choices[0].message.parsed.outcome == 'fragments'
+    assert len(calls) == 1

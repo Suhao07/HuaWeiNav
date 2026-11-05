@@ -9,6 +9,7 @@ adapter layer.
 from __future__ import annotations
 
 import json
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -93,6 +94,8 @@ class PriorMapRealRobotRuntime:
         high_level_interval: int = 10,
         room_semantic_interval: int = 10,
         room_semantic_classifier: Optional[RoomSemanticClassifier] = None,
+        map_identity: Optional[dict[str, str]] = None,
+        correspondence_vlm: str = 'ark',
     ) -> None:
         """Create a real-robot prior-map runtime."""
 
@@ -118,7 +121,14 @@ class PriorMapRealRobotRuntime:
         self.room_semantic_classifier = room_semantic_classifier
         self.last_room_semantics: dict[str, Any] = {}
         self.last_chosen_frontier: Optional[dict[str, Any]] = None
+        self.map_identity = dict(map_identity or {})
+        self.session_id = str(uuid.uuid4())
+        self.correspondence_vlm = correspondence_vlm
+        self._correspondence_reports: dict[str, dict] = {}
         self._write_static_artifacts()
+        (self.artifact_dir / 'correspondence_session.json').write_text(json.dumps({
+            **self.map_identity, 'runtime_session': {'session_id': self.session_id},
+        }, indent=2) + '\n')
 
     @classmethod
     def from_config(cls, config: PriorMapRealRobotConfig) -> Optional["PriorMapRealRobotRuntime"]:
@@ -145,6 +155,13 @@ class PriorMapRealRobotRuntime:
             if config.enable_room_semantics
             else None
         )
+        map_identity = {}
+        root = Path(config.prior_map_path)
+        if root.is_dir() and (root / 'manifest.json').is_file():
+            from .multimodal import sha256_file
+            manifest = json.loads((root / 'manifest.json').read_text())
+            map_identity = {key: manifest[key] for key in ('map_id', 'map_revision')}
+            map_identity['prior_map_sha256'] = sha256_file(root / 'prior_map.json')
         return cls(
             base_map=base_map,
             alignment=alignment,
@@ -153,7 +170,70 @@ class PriorMapRealRobotRuntime:
             high_level_interval=config.high_level_interval,
             room_semantic_interval=config.room_semantic_interval,
             room_semantic_classifier=room_classifier,
+            map_identity=map_identity,
+            correspondence_vlm=config.vlm,
         )
+
+    def process_correspondence_package(self, directory, *, snapshot, step, verifier=None,
+                                       latest_snapshot_provider=None):
+        """Verify one prepared evidence package and admit a session-scoped binding.
+
+        The ROS adapter invokes this in its inference worker before querying.
+        A package must name the runtime session emitted by this instance, the
+        loaded map revision, and a currently present track. Each package is
+        consumed once; correction or recapture creates a different content hash.
+        No navigation acceptance or STOP state is changed here.
+        """
+        from .instance_correspondence import load_correspondence_package, PriorInstanceCorrespondenceVerifier
+
+        payload, digest, _ = load_correspondence_package(directory)
+        if digest in self._correspondence_reports:
+            return dict(self._correspondence_reports[digest])
+        for key in ('map_id', 'map_revision', 'prior_map_sha256'):
+            if not self.map_identity.get(key) or payload[key] != self.map_identity[key]:
+                raise ValueError(f'Correspondence map identity mismatch: {key}')
+        if payload['runtime_session'] != {'session_id': self.session_id}:
+            raise ValueError('Correspondence belongs to another runtime session')
+        current = payload['current_evidence']
+        live = next((o for o in snapshot.objects if o.uid == current['target_object_uid']), None)
+        tracks = set(str(t) for t in current.get('target_tracks', ()))
+        if live is None or not tracks or not tracks <= set(str(t) for t in live.track_ids):
+            raise ValueError('Correspondence target is not the current tracked object')
+        age = float(snapshot.timestamp) - float(current['timestamp'])
+        if not 0 <= age <= 120:
+            raise ValueError('Correspondence evidence must be within 120 seconds of the snapshot')
+        known = {o.uid for o in self.base_map.objects if o.exact}
+        if not {c['prior_uid'] for c in payload['historical_candidates']} <= known:
+            raise ValueError('Correspondence candidate is not a loaded exact prior')
+        verifier = verifier or PriorInstanceCorrespondenceVerifier(vlm=self.correspondence_vlm)
+        report = verifier.verify(directory)
+        if report.get('package_hash') != digest:
+            raise ValueError('Correspondence evidence changed during verification')
+        report['binding_written'] = False
+        latest = latest_snapshot_provider() if latest_snapshot_provider else snapshot
+        still_live = next((o for o in latest.objects if o.uid == live.uid), None)
+        still_current = (still_live is not None
+                         and tracks <= set(str(t) for t in still_live.track_ids)
+                         and 0 <= float(latest.timestamp) - float(current['timestamp']) <= 120)
+        if report['outcome'] == 'unique' and report['source'] == 'vlm':
+            uid = report['prior_uid']
+            # Never create two verified historical identities for the same
+            # runtime UID, or silently replace an established correspondence.
+            collisions = [s for s in self.memory.object_states.values()
+                          if s.matched_runtime_uid == live.uid and s.object_uid != uid]
+            state = self.memory.object_states[uid]
+            if not still_current:
+                report['admission_error'] = 'Tracked evidence expired or target disappeared during verification'
+            elif collisions or state.matched_runtime_uid not in (None, '', live.uid):
+                report['admission_error'] = 'Existing correspondence conflicts with this proposal'
+            else:
+                self.memory.mark_object_verified(uid, live.uid, int(step))
+                report['binding_written'] = True
+        report['step'] = int(step)
+        self._correspondence_reports[digest] = dict(report)
+        with (self.artifact_dir / 'instance_correspondence.jsonl').open('a') as stream:
+            stream.write(json.dumps(report, ensure_ascii=False, allow_nan=False) + '\n')
+        return report
 
     def update_and_query(self, *, snapshot: Any, plan: Any, step: int) -> dict[str, Any]:
         """Update memory from semantic snapshot and query prior rankings.

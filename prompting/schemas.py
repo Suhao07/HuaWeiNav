@@ -26,6 +26,16 @@ except ModuleNotFoundError:
         return default_factory() if default_factory is not None else default
 
 
+class ParsedInstanceCorrespondence(BaseModel):
+    """Cross-map identity judgment, separate from category/task acceptance."""
+
+    outcome: Literal["unique", "ambiguous", "fragments", "no_match", "insufficient"] = "insufficient"
+    prior_uid: str = ""
+    supporting_observation_ids: list[str] = Field(default_factory=list)
+    conflicting_observation_ids: list[str] = Field(default_factory=list)
+    evidence_summary: str = ""
+
+
 class ReasoningStep(BaseModel):
     explanation: str = ""
     output: str = ""

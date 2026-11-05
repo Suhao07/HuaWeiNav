@@ -955,6 +955,9 @@ class PriorMapFloorPlanVisualizer:
         draw.text((24, 20), "Prior map | red: target hypothesis | teal: robot | orange/purple: frontier", fill="#111827", font=font)
         target_index = 0
         for marker in view.markers:
+            # Positionless priors remain in metadata but have no drawable label.
+            if not marker.get("xy") or len(marker["xy"]) != 2:
+                continue
             if marker.get("target_prior"):
                 x, y = transform.to_canvas(marker["xy"])
                 target_index += 1

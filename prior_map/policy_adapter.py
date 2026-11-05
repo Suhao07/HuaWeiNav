@@ -219,6 +219,7 @@ def _annotate_candidate(candidate: Any, object_priors: Sequence[ObjectPrior]) ->
         "reason": prior.reason,
         "parent_room_uid": prior.parent_room_uid,
         "exact": prior.exact,
+        "match_scope": "historical_instance" if prior.exact else "category_prior",
         "matched_runtime_uid": prior.matched_runtime_uid,
         "score_components": dict(prior.metadata.get("score_components", {})),
     }
@@ -249,12 +250,12 @@ def _match_object_prior(candidate: Any, object_priors: Sequence[ObjectPrior]) ->
     for prior in object_priors:
         if _any_match(candidate_ids, (prior.object_uid, prior.matched_runtime_uid)):
             return prior
-    for prior in object_priors:
-        if prior.matched_runtime_uid:
-            continue
-        if _any_match(candidate_labels, (prior.label,)):
-            return prior
-    return None
+    # A shared label can support one category hypothesis, not establish the
+    # identity of a concrete historical instance (or select among hypotheses).
+    hypotheses = [prior for prior in object_priors
+                  if not prior.exact and not prior.matched_runtime_uid
+                  and _any_match(candidate_labels, (prior.label,))]
+    return hypotheses[0] if len(hypotheses) == 1 else None
 
 
 def _first_text(value: Any, names: Sequence[str]) -> Optional[str]:
