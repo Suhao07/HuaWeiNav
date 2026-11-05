@@ -1,0 +1,64 @@
+{
+  "seed": 20261105,
+  "counts": {
+    "intentionnav_conditions": 1000,
+    "intentionnav_geometry": 500,
+    "langmap_tasks": 1000
+  },
+  "intention_styles": [
+    "natural_en",
+    "emotional_en"
+  ],
+  "langmap_types": {
+    "region": 330,
+    "instance": 368,
+    "room": 302
+  },
+  "source_hashes": {
+    "intention": "fcf28886c8c853f9e3f9158dc420d63090a6fec58c44f094e54f9657e2b22b27",
+    "langmap": {
+      "00800-TEEsavR23oF.json.gz": "f43eb10b6ded8ab7310145b9b1ea8aa211ee4adf4b97b79a408ae6b49f648554",
+      "00802-wcojb4TFT35.json.gz": "d905f7e29e73b8f4c706df57c19cec265a186afded23e1f843b143143847c690",
+      "00803-k1cupFYWXJ6.json.gz": "d31d7ccfab7931a69d687010574beb89a351694201fb656a116e7b9763df1483",
+      "00808-y9hTuugGdiq.json.gz": "280415684af4e1efabc243bea253e8d9926a29579a08fe2a0aa798adc109f6d6",
+      "00810-CrMo8WxCyVb.json.gz": "c8794092bf1b68d152fd0d753c7aae31e24648d3e71c044db77ed258922e6033",
+      "00813-svBbv1Pavdk.json.gz": "5320c0ff252ebbbe590ffaa6c7d36d668f0c5211fd5faf30ab3bd898a0e57d8d",
+      "00814-p53SfW6mjZe.json.gz": "e8e2d64f4014bc55cda751a78349a842cdaab7a61b27a7af682d55fc4fab64d2",
+      "00815-h1zeeAwLh9Z.json.gz": "a6b8217d7630c4575aada8d57afc931612157a4a5f6b80ad5fe8d3c7efd11b09",
+      "00820-mL8ThkuaVTM.json.gz": "6236d33b49beec25f5dd27931df4fb30176328ffc4c6e4eef5b42a677af991c4",
+      "00821-eF36g7L6Z9M.json.gz": "ca898e1651b0c51323a0814f5c3c77fa6495fd9882a61f8b9e572c0aa19aae3c",
+      "00823-7MXmsvcQjpJ.json.gz": "75e4d1aa99d09189658661192531980b5bbbb536573b975e1179bc4723d4d875",
+      "00824-Dd4bFSTQ8gi.json.gz": "77325b36e621d99bdb3115c305f34227db8b538ca5b38ba5150ffd93e223bdca",
+      "00827-BAbdmeyTvMZ.json.gz": "f13cc935d41bb84d5d21f70b51cbc794670efa75ab17dcc468338a7bf1b1d7ae",
+      "00829-QaLdnwvtxbs.json.gz": "20fb0a7d30aba003bf53e9034402698d1c398090fc12934f1edad97dd95c6af7",
+      "00831-yr17PDCnDDW.json.gz": "029b86e1e9568f3cea7a8ff41cd463aecbd52a01c26d04f1a9e46e1d5b05b331",
+      "00832-qyAac8rV8Zk.json.gz": "01ce7c61f007670557b40921d7cef3be97272526454d1e1303c1b3bfc2bb20dd",
+      "00835-q3zU7Yy5E5s.json.gz": "c38cb50e9df48b4bae38e08a2b1eefabf90a5ce1277e3d3b3be3586a4f7720be",
+      "00839-zt1RVoi7PcG.json.gz": "b5d32e6ba38b355539430ed710e5a5fd9d1161850d56dee6e5d6f548616e9ccf",
+      "00843-DYehNKdT76V.json.gz": "53b62f11e58798001edb9dfed75187a55b249a3fef6e727020ceb1b137be2c16",
+      "00844-q5QZSEeHe5g.json.gz": "916643888d34f5b618635e820bf81844de7f18ac1ddaf97eec6f043f6d7ef45b",
+      "00847-bCPU9suPUw9.json.gz": "4a6d066cb5ce19e9d38cb8f455a765b738f626719a15c7352f0cb1a0cc357787",
+      "00848-ziup5kvtCCR.json.gz": "39b6e43257b84127b9c63ffa538838e17ebdb45468e35fdb930fa4f8ff4d7c3c",
+      "00849-a8BtkwhxdRV.json.gz": "1d15a7fb61b5b1b1cd818d2eacbb533ecfe5c18aceb94b8752db9fd04d54e701",
+      "00853-5cdEh9F2hJL.json.gz": "74cbca806ff39b86defe5e10c5cf592472778c59ce762cb3e94036573a809766",
+      "00861-GLAQ4DNUx5U.json.gz": "63771483ef3da937c34b0696e5e47181f0076dd1be83dd0b9848782be90e8bc9",
+      "00862-LT9Jq6dN3Ea.json.gz": "01cb25426370e321cbf6ca86f6d9758e20ca1ae41af131fb100feac671f0a051",
+      "00869-MHPLjHsuG27.json.gz": "13526c0324773331d02b91f3fc93ab929c9054b129acfedf1aa935c0ed6c20b7",
+      "00871-VBzV5z6i1WS.json.gz": "ccc7f3c64b10ab61f610f96e9411212e65814e7dbf34a3f04bc394c87e04d3c3",
+      "00873-bxsVRursffK.json.gz": "10604ec56684c263ded378b5b9b2f6f984d75152f5c17cab0645888378b4def8",
+      "00876-mv2HUxq3B53.json.gz": "ba495ce40836e4a05ff1d0008c46c0ed0a8215ff56cde215eb5bf5626026dc90",
+      "00877-4ok3usBNeis.json.gz": "6a02ad549d9b000139c93ecd524eb31e7cab2765a42722c1d6919c81a590e2e3",
+      "00878-XB4GS9ShBRE.json.gz": "a35d8957c51516d2aec947add64bee24d153e7eb28ef31781105eec699b26f49",
+      "00880-Nfvxx8J5NCo.json.gz": "594b571e19ddf7b67d14eeba873abb0268737c56f3c4d681d5e879e22114cbdc",
+      "00890-6s7QHgap2fW.json.gz": "bbf23403f4d089e04c4e3c4127504e00d7a1692cad03a34f9844f70ed5d68eb5",
+      "00891-cvZr5TUy5C5.json.gz": "d857b0c0308269466b6e6023518ec389816af79529cadfaa11823bb0e5ef2a80",
+      "00894-HY1NcmCgn3n.json.gz": "76a199483f0e8853776350e162db976472328a35dce10781f82038f34ba9eff9"
+    }
+  },
+  "manifest_sha256": {
+    "intentionnav_1000.jsonl": "6f6f7b72985fc54973b5b3270623be75c0897a9a40b3606adeb3e89d962e4430",
+    "langmap_1000.jsonl": "6fe984ff4718f588ab4e73d8e7e3f53896f911320f64428e621dd2367f42eff0",
+    "langmap_runtime.json": "596b498a175886c29d185bd01f6b5092593accb9aaecba2138ba024bf0caefed"
+  },
+  "reporting": "Separate dataset metrics; IntentionNav also grouped by style and paired geometric task"
+}
