@@ -32,31 +32,33 @@ def _exact_or_compact_matches(candidates: Iterable[str], classes: Iterable[str])
 
 
 def _llm_ground_terms(concept: ConceptQuery, available_classes: Iterable[str], vlm: str) -> GroundingResult:
+    """Map a concept into a bounded vocabulary proposal; model failures propagate.
+
+    空词表表示模型明确给出的映射结果。传输或解析异常交给调用方处理，
+    保留失败事实，避免将服务错误伪装成有效的空映射。
+    """
     if _llm_offline() or not HAS_PYDANTIC:
         return GroundingResult()
-    try:
-        client, model = get_client_and_model(vlm)
-        completion = client.beta.chat.completions.parse(
-            model=model,
-            messages=[
-                {"role": "system", "content": CONCEPT_GROUNDING_PROMPT},
-                {
-                    "role": "user",
-                    "content": (
-                        f"Target concept: {concept.name}\n"
-                        f"Concept role: {concept.role}\n"
-                        f"Concept terminal: {concept.terminal}\n"
-                        f"Target aliases: {concept.aliases}\n"
-                        f"Available detector classes: {list(available_classes or [])}"
-                    ),
-                },
-            ],
-            response_format=GroundingResult,
-            trace_label=CONCEPT_GROUNDING.trace_label,
-        )
-        return completion.choices[0].message.parsed or GroundingResult()
-    except Exception:
-        return GroundingResult()
+    client, model = get_client_and_model(vlm)
+    completion = client.beta.chat.completions.parse(
+        model=model,
+        messages=[
+            {"role": "system", "content": CONCEPT_GROUNDING_PROMPT},
+            {
+                "role": "user",
+                "content": (
+                    f"Target concept: {concept.name}\n"
+                    f"Concept role: {concept.role}\n"
+                    f"Concept terminal: {concept.terminal}\n"
+                    f"Target aliases: {concept.aliases}\n"
+                    f"Available detector classes: {list(available_classes or [])}"
+                ),
+            },
+        ],
+        response_format=GroundingResult,
+        trace_label=CONCEPT_GROUNDING.trace_label,
+    )
+    return completion.choices[0].message.parsed
 
 
 def ground_target(

@@ -9,7 +9,7 @@ from __future__ import annotations
 from typing import Any, Literal
 
 try:
-    from pydantic import BaseModel, Field
+    from pydantic import BaseModel, Field, constr
     HAS_PYDANTIC = True
 except ModuleNotFoundError:
     HAS_PYDANTIC = False
@@ -24,6 +24,9 @@ except ModuleNotFoundError:
 
     def Field(default=None, default_factory=None, **_kwargs):
         return default_factory() if default_factory is not None else default
+
+    def constr(**_kwargs):
+        return str
 
 
 class ParsedInstanceCorrespondence(BaseModel):
@@ -75,11 +78,12 @@ class ParsedInstruction(BaseModel):
 
 
 class GroundingResult(BaseModel):
-    detector_terms: list[str] = Field(default_factory=list)
-    aliases: list[str] = Field(default_factory=list)
-    description: str = ""
-    negative_terms: list[str] = Field(default_factory=list)
-    reason: str = ""
+    """A small detector vocabulary proposal, with bounded phrases and explanations."""
+    detector_terms: list[constr(max_length=64)] = Field(default_factory=list, max_items=4)
+    aliases: list[constr(max_length=64)] = Field(default_factory=list, max_items=4)
+    description: str = Field(default="", max_length=240)
+    negative_terms: list[constr(max_length=64)] = Field(default_factory=list, max_items=4)
+    reason: str = Field(default="", max_length=160)
 
 
 class ExecutionStrategyResult(BaseModel):
@@ -96,16 +100,26 @@ class ParsedConceptMatch(BaseModel):
     reason: str = ""
 
 
-class ParsedBatchConceptItem(BaseModel):
-    uid: str = ""
-    matches_concept: bool = False
-    confidence: float = 0.0
-    terminal_eligible: bool = False
-    reason: str = ""
+class CandidateConceptJudgment(BaseModel):
+    """Required label-compatibility judgment; absence is distinct from a negative match."""
+    matches_concept: bool
+    confidence: float = Field(ge=0, le=1)
+    terminal_eligible: bool
+    reason: str = Field(max_length=160)
+
+    class Config:
+        extra = 'forbid'
 
 
-class ParsedBatchConceptMatch(BaseModel):
-    matches: list[ParsedBatchConceptItem] = Field(default_factory=list)
+def concept_batch_response_model(object_uids):
+    """Encode dom(response)=candidate UIDs as required JSON object properties.
+
+    每个 UID 对应一个判断，负例也必须返回。将完整性写进生成与解析协议，
+    避免可变长列表允许空结果、漏项或重复身份。
+    """
+    from pydantic import create_model
+    return create_model('CandidateConceptJudgments',
+                        **{uid: (CandidateConceptJudgment, ...) for uid in object_uids})
 
 
 class ParsedRelationResult(BaseModel):

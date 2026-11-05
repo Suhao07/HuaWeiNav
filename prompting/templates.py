@@ -57,6 +57,9 @@ concept, not nearby/support objects. Do not include room names or support
 objects as detector terms.
 Also provide a concise semantic description and negative_terms that distinguish
 this concept from related but different concepts.
+Each list contains up to four distinct phrases, each at most 64 characters.
+Use one short sentence for description (up to 240 characters) and reason
+(up to 160 characters). Empty lists are valid when no relevant term exists.
 """
 
 #执行策略

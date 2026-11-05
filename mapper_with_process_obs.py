@@ -1728,56 +1728,15 @@ class Instruct_Mapper:
             final_answer: int
             reason: str
 
-        if self.vlm in ('gemini', 'cognav'):
-            try:
-                client, model_name = get_client_and_model(self.vlm)
-
-                completion = client.beta.chat.completions.parse(
-                    # model="gemini-2.5-pro-exp-03-25",
-                    model=model_name,
-                    messages=[{
-                        "role": "system",
-                        "content": ROOM_PROMPT
-                    }, {
-                        "role": "user",
-                        "content": prompt_info
-                    }],
-                    response_format=Reasoning,
-                    trace_label="room_selection",
-                )
-            except Exception as e:
-                if self.vlm != 'gemini':
-                    raise
-                logger.error(f'Gemini limit: {e}')
-                client, _ = get_client_and_model(self.vlm)
-
-                completion = client.beta.chat.completions.parse(
-                    model="gemini-2.0-flash",
-                    messages=[{
-                        "role": "system",
-                        "content": ROOM_PROMPT
-                    }, {
-                        "role": "user",
-                        "content": prompt_info
-                    }],
-                    response_format=Reasoning,
-                    trace_label="room_selection_retry",
-                )
-        if self.vlm == 'openai':
-            client, _ = get_client_and_model(self.vlm)
-
-            completion = client.beta.chat.completions.parse(
-                model="gpt-4o-2024-08-06",
-                messages=[{
-                    "role": "system",
-                    "content": ROOM_PROMPT
-                }, {
-                    "role": "user",
-                    "content": prompt_info
-                }],
-                response_format=Reasoning,
-                trace_label="room_selection",
-            )
+        # 模型路由由统一适配器负责，所有导航模式使用相同的服务配置。
+        client, model_name = get_client_and_model(self.vlm)
+        completion = client.beta.chat.completions.parse(
+            model=model_name,
+            messages=[{"role": "system", "content": ROOM_PROMPT},
+                      {"role": "user", "content": prompt_info}],
+            response_format=Reasoning,
+            trace_label="room_selection",
+        )
 
         answer = completion.choices[0].message.parsed
         # save the answer to a txt file
@@ -1878,36 +1837,15 @@ class Instruct_Mapper:
             final_answer: int
             reason: str
 
-        if self.vlm in ('gemini', 'cognav'):
-            client, model_name = get_client_and_model(self.vlm)
-
-            completion = client.beta.chat.completions.parse(
-                model=model_name,
-                messages=[{
-                    "role": "system",
-                    "content": RELOCATE_PROMPT
-                }, {
-                    "role": "user",
-                    "content": prompt_info
-                }],
-                response_format=Reasoning,
-                trace_label="relocate_planner",
-            )
-        if self.vlm == 'openai':
-            client, _ = get_client_and_model(self.vlm)
-
-            completion = client.beta.chat.completions.parse(
-                model="gpt-4o-2024-08-06",
-                messages=[{
-                    "role": "system",
-                    "content": RELOCATE_PROMPT
-                }, {
-                    "role": "user",
-                    "content": prompt_info
-                }],
-                response_format=Reasoning,
-                trace_label="relocate_planner",
-            )
+        # 模型路由由统一适配器负责，所有导航模式使用相同的服务配置。
+        client, model_name = get_client_and_model(self.vlm)
+        completion = client.beta.chat.completions.parse(
+            model=model_name,
+            messages=[{"role": "system", "content": RELOCATE_PROMPT},
+                      {"role": "user", "content": prompt_info}],
+            response_format=Reasoning,
+            trace_label="relocate_planner",
+        )
 
         answer = completion.choices[0].message.parsed
         # save the answer to a txt file

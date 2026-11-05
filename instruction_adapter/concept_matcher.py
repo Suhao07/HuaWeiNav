@@ -12,7 +12,7 @@ import numpy as np
 
 from llm_utils.cognav_llm_adapter import get_client_and_model
 from prompting.registry import CONCEPT_MATCH_BATCH, CONCEPT_MATCH_SINGLE
-from prompting.schemas import HAS_PYDANTIC, ParsedBatchConceptMatch, ParsedConceptMatch
+from prompting.schemas import HAS_PYDANTIC, concept_batch_response_model, ParsedConceptMatch
 from prompting.templates import CONCEPT_MATCH_PROMPT
 
 from .contracts import ConceptQuery
@@ -326,7 +326,9 @@ class RuntimeConceptMatcher:
             "observed_objects": objects_payload,
             "task": (
                 "For each observed object, decide whether it satisfies the concept "
-                "for the requested role. Return one item per uid."
+                "for the requested role. Return a JSON object keyed by every supplied uid, "
+                "each containing matches_concept, confidence, terminal_eligible and a concise reason. "
+                "Include negative judgments for incompatible labels."
             ),
         }
         completion = client.beta.chat.completions.parse(
@@ -335,18 +337,18 @@ class RuntimeConceptMatcher:
                 {"role": "system", "content": CONCEPT_MATCH_PROMPT},
                 {"role": "user", "content": [{"type": "text", "text": json.dumps(payload, ensure_ascii=False, indent=2)}]},
             ],
-            response_format=ParsedBatchConceptMatch,
+            response_format=concept_batch_response_model([row['uid'] for row in objects_payload]),
             trace_label=CONCEPT_MATCH_BATCH.trace_label,
+            # B(n)=128+192n：预留 JSON 外壳及每项 UID、判断、简短理由。
+            # 这是输出预算，不截断输入；完成仍由 EOS 决定。
+            max_tokens=128 + 192 * len(pending),
         )
         parsed = completion.choices[0].message.parsed
         if parsed is None:
             raise ValueError("Batch concept matcher returned no structured judgments")
-        by_uid = {str(item.uid): item for item in list(getattr(parsed, "matches", []) or [])}
         records = []
         for _obj, _candidate, observed_label, object_uid in pending:
-            item = by_uid.get(object_uid)
-            if item is None:
-                raise ValueError(f"Batch concept matcher omitted candidate {object_uid}")
+            item = getattr(parsed, object_uid)
             record = ConceptMatchRecord(
                 instruction_hash=inst_hash,
                 concept_id=concept.id,

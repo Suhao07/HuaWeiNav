@@ -12,8 +12,6 @@ from deployment.lvlm_server.schema_smoke import (
 )
 from prompting.schemas import (
     GroundingResult,
-    ParsedBatchConceptItem,
-    ParsedBatchConceptMatch,
     ParsedInstruction,
     ParsedRelationResult,
     ParsedTarget,
@@ -39,13 +37,10 @@ class _ScriptedStructuredClient:
             parsed = ParsedInstruction(targets=[ParsedTarget(name="book", terminal=True)])
         elif schema is GroundingResult:
             parsed = GroundingResult(detector_terms=["tv_monitor"])
-        elif schema is ParsedBatchConceptMatch:
-            parsed = ParsedBatchConceptMatch(
-                matches=[
-                    ParsedBatchConceptItem(uid="anchor_1"),
-                    ParsedBatchConceptItem(uid="distractor_1"),
-                ]
-            )
+        elif schema.__name__ == "CandidateConceptJudgments":
+            judgment = dict(matches_concept=False, confidence=0.5,
+                            terminal_eligible=False, reason="Different role.")
+            parsed = schema(anchor_1=judgment, distractor_1=judgment)
         elif schema is ParsedRelationResult:
             parsed = ParsedRelationResult(verified=False, confidence=0.5, need_better_view=True)
         elif schema is ParsedVerification:

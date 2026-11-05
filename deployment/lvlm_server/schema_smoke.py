@@ -21,7 +21,7 @@ from prompting.registry import (
 )
 from prompting.schemas import (
     GroundingResult,
-    ParsedBatchConceptMatch,
+    concept_batch_response_model,
     ParsedInstruction,
     ParsedRelationResult,
     ParsedVerification,
@@ -137,7 +137,7 @@ def build_schema_cases(image_url: str) -> list[SchemaSmokeCase]:
             user_content=[
                 {"type": "text", "text": json.dumps(match_payload, ensure_ascii=False, indent=2)}
             ],
-            response_format=ParsedBatchConceptMatch,
+            response_format=concept_batch_response_model(["anchor_1", "distractor_1"]),
             check=_check_batch_match,
         ),
         SchemaSmokeCase(
@@ -254,10 +254,10 @@ def _check_grounding(parsed: GroundingResult) -> list[str]:
     return []
 
 
-def _check_batch_match(parsed: ParsedBatchConceptMatch) -> list[str]:
+def _check_batch_match(parsed) -> list[str]:
     """Check that batched grounding returns one record per requested uid."""
 
-    returned = {str(item.uid) for item in parsed.matches or []}
+    returned = set(parsed.__fields__)
     expected = {"anchor_1", "distractor_1"}
     missing = sorted(expected - returned)
     return [f"batch matcher omitted uids: {missing}"] if missing else []

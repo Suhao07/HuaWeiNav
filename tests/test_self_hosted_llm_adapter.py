@@ -108,10 +108,8 @@ def test_self_hosted_adapter_retries_invalid_json_and_validates_response() -> No
     assert len(completions.requests) == 2
     assert isinstance(completions.requests[0]["messages"][-1]["content"], list)
     assert "corrected JSON object" in completions.requests[1]["messages"][-1]["content"]
-    assert all(
-        not isinstance(message.get("content"), list)
-        for message in completions.requests[1]["messages"]
-    )
+    original = completions.requests[0]["messages"]
+    assert completions.requests[1]["messages"][:len(original)] == original
     assert "response_format" not in completions.requests[0]
 
 
@@ -184,3 +182,68 @@ def test_provider_factory_accepts_served_model_alias(monkeypatch) -> None:
 
     assert client is sentinel
     assert model == "qwen-vl-served"
+
+
+def test_schema_echo_is_retried_instead_of_accepting_defaults(monkeypatch):
+    monkeypatch.setenv("STRIVE_LLM_PARSE_FALLBACK", "0")
+    fake, completions = _fake_client([
+        '{"properties":{"satisfied":true},"type":"object"}',
+        '{"satisfied":false,"decision":"uncertain","reason":"missing evidence"}',
+    ])
+    client = SelfHostedOpenAICompatibleClient(base_url="http://local/v1", client=fake)
+    result = client.beta.chat.completions.parse(
+        model="qwen", messages=[{"role":"user","content":"verify"}], response_format=_Decision)
+    assert len(completions.requests) == 2
+    assert result.choices[0].message.parsed.reason == "missing evidence"
+
+
+def test_guided_json_requires_complete_instance_and_rejects_trailing_text(monkeypatch):
+    monkeypatch.setenv("VLN_LVLM_GUIDED_JSON", "1")
+    fake, completions = _fake_client([
+        '{"satisfied":false} trailing schema',
+        '{"satisfied":false,"decision":"uncertain","reason":"missing evidence"}',
+    ])
+    client = SelfHostedOpenAICompatibleClient(base_url="http://local/v1", client=fake)
+    client.beta.chat.completions.parse(
+        model="qwen", messages=[{"role":"user","content":"verify"}], response_format=_Decision)
+    assert len(completions.requests) == 2
+    schema = completions.requests[0]["extra_body"]["guided_json"]
+    assert set(schema["required"]) == {"satisfied", "decision", "reason"}
+    assert schema["additionalProperties"] is False
+
+
+def test_length_retry_increases_budget_and_preserves_candidates():
+    """截断重试沿用候选事实，增长预算，并保存正常完成结果。"""
+    requests = []
+    original = [{"role": "user", "content": [{"type": "text", "text": 'candidates: ["a", "b"]'}]}]
+
+    def create(**kwargs):
+        requests.append(kwargs)
+        truncated = len(requests) == 1
+        return SimpleNamespace(choices=[SimpleNamespace(
+            message=SimpleNamespace(content='{"satisfied":' if truncated else
+                                    '{"satisfied":false,"decision":"uncertain","reason":"evidence"}'),
+            finish_reason="length" if truncated else "stop")])
+
+    fake = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    client = SelfHostedOpenAICompatibleClient(base_url="http://local/v1", client=fake)
+    client.beta.chat.completions.parse(model="qwen", messages=original,
+                                      response_format=_Decision, max_tokens=3200)
+    assert [r["max_tokens"] for r in requests] == [3200, 6400]
+    assert requests[1]["messages"][:len(requests[0]["messages"])] == requests[0]["messages"]
+
+
+def test_transport_failure_preserves_exception_without_format_retry():
+    """传输失败由传输层处理，格式修复只处理实际返回的响应。"""
+    import pytest
+    calls = []
+
+    def create(**kwargs):
+        calls.append(kwargs)
+        raise ConnectionError("transport unavailable")
+
+    fake = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    client = SelfHostedOpenAICompatibleClient(base_url="http://local/v1", client=fake)
+    with pytest.raises(ConnectionError):
+        client.beta.chat.completions.parse(model="qwen", messages=[], response_format=_Decision)
+    assert len(calls) == 1

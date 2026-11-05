@@ -7,6 +7,7 @@ OpenAI-compatible servers implement ``beta.chat.completions.parse``.
 
 from __future__ import annotations
 
+import json
 import os
 import time
 from dataclasses import dataclass
@@ -198,11 +199,11 @@ class _SelfHostedParsedChat:
         last_content = ""
         last_error: Optional[Exception] = None
 
+        generation_kwargs = _generation_kwargs(kwargs)
         for attempt in range(self.parse_retries + 1):
             request_messages = normalized if attempt == 0 else _repair_messages(normalized, last_content)
             started = time.perf_counter()
             try:
-                generation_kwargs = _generation_kwargs(kwargs)
                 if json_schema is not None:
                     generation_kwargs["extra_body"] = {"guided_json": json_schema}
                 request_id = record_request(trace_label, model=model, messages=request_messages,
@@ -213,6 +214,8 @@ class _SelfHostedParsedChat:
                     **generation_kwargs,
                 )
                 last_content = _message_text(completion)
+                finish_reason = getattr(completion.choices[0], "finish_reason", None)
+                usage = getattr(completion, "usage", None)
                 record_call(
                     trace_label,
                     raw_response=last_content,
@@ -223,13 +226,21 @@ class _SelfHostedParsedChat:
                         "model": model,
                         "response_format": getattr(response_format, "__name__", str(response_format)),
                         "attempt": attempt + 1,
+                        "finish_reason": finish_reason,
+                        "usage": usage.model_dump() if usage is not None else None,
                         "latency_ms": (time.perf_counter() - started) * 1000.0,
                     },
                 )
-                payload = extract_json_object(last_content)
+                if finish_reason == "length":
+                    generation_kwargs["max_tokens"] = 2 * generation_kwargs.get("max_tokens", 1024)
+                    raise ValueError("Output reached its token budget; regenerate the complete JSON")
+                payload = json.loads(last_content) if json_schema is not None else extract_json_object(last_content)
+                fields = _response_json_schema(response_format)["properties"]
+                if not isinstance(payload, dict) or not set(payload).intersection(fields):
+                    raise ValueError("Response must contain model fields as a JSON instance")
                 parsed = validate_response_model(response_format, payload)
                 return _parsed_completion(parsed, last_content)
-            except Exception as exc:
+            except ValueError as exc:
                 last_error = exc
                 if attempt >= self.parse_retries:
                     break
@@ -265,6 +276,9 @@ def _response_json_schema(response_format: Any) -> dict[str, Any]:
     schema = schema_builder()
     if not isinstance(schema, dict):
         raise TypeError("response_format JSON schema must be a dictionary")
+    # 服务端必须生成完整字段，模型默认值仅供内部对象构造使用。
+    schema["required"] = list(schema["properties"])
+    schema["additionalProperties"] = False
     return schema
 
 
@@ -304,16 +318,12 @@ def _message_text(completion: Any) -> str:
 
 
 def _repair_messages(messages: list[dict[str, Any]], content: str) -> list[dict[str, Any]]:
-    """Build one bounded schema-repair turn without resending image bytes twice."""
+    """Regenerate from the same complete observation and candidate context."""
 
-    # 第二轮只纠正结构化文本。保留包含 JSON schema 的 system message，
-    # 不再上传原始图像；上一轮回答已经携带待修复的语义内容。
-    repaired = [
-        dict(message)
-        for message in messages
-        if message.get("role") == "system" and isinstance(message.get("content"), str)
-    ]
-    repaired.append({"role": "assistant", "content": str(content or "")[:8000]})
+    # 重试修复输出协议，任务、候选 UID 与视觉证据保持原样。
+    repaired = [dict(message) for message in messages]
+    if content:
+        repaired.append({"role": "assistant", "content": content})
     repaired.append(
         {
             "role": "user",
