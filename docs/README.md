@@ -8,6 +8,12 @@
 - **[项目技术白皮书](project_technical_whitepaper.md)**：第3.2、5.9、6.3—6.4节概括共享地图、定位校准、区域决策与局部导航数学模型。
 - **[轻量先验地图方案](prior_map_mode.md)**：详细设计、实施边界与验收计划。
 
+## 实物模式（已完成 bridge-off 规划与速度输出验收）
+
+- [正式实物模式一键入口](real_robot_navigation_entry.md)：默认关闭底盘 bridge；启动、日志及后续 live 配置。
+- [重要参数调节与迁移说明](real_robot_parameter_tuning.md)：当前值、调节依据、参数配合和验证方法。
+- [部署状态与后续现场验证](real_robot_deployment_todo.md)：完成口径和历史证据；实际行驶到达尚未验收。
+
 ## 目录约定
 
 ```text

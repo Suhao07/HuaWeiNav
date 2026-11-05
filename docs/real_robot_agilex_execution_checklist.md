@@ -1,5 +1,7 @@
 # HuaweiNav 复用 FWTW 松灵接口执行清单
 
+> 2026-11-05：当前软件交付状态以 [部署清单](real_robot_deployment_todo.md) 和 [正式实物入口](real_robot_navigation_entry.md) 为准；bridge-off 验收已完成，真实运动仍需后续现场验证。下文为历史实现分解与验收参考；旧复选框不代表当前代码仍未实现，已通过的开发/回放不重复列为现场任务。
+
 核对日期：2026-09-21。范围：本地代码与已有部署记录；本次没有连接机器人或发送控制。
 
 目标：在已有 SysNav 下层和安全仲裁之上，复用 FWTW 的 rosbridge、遥测和 mux

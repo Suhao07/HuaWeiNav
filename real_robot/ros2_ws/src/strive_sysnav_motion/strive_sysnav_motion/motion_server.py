@@ -230,6 +230,10 @@ class SysNavMotionServer(Node):
                 status = self.controller.poll_status(goal_id)
                 self._publish_feedback(goal_handle, status)
                 if status.is_terminal():
+                    # An Action result alone does not revoke the native planner goal.
+                    # Clear that goal and hold the mux before reporting any terminal result.
+                    # Keep the captured status so NO_PROGRESS is not rewritten as CANCELLED.
+                    self.controller.cancel(goal_id)
                     if status.status == NavigationStatusCode.REACHED and motion_goal.look_at is not None:
                         alignment = self._align_view(goal_handle, normalized_request, status)
                         if alignment[0] != AlignView.Result.ALIGNED:

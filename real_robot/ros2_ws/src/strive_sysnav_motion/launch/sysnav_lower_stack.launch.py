@@ -13,6 +13,15 @@ def generate_launch_description():
     """Return the lower-stack launch description with explicit topic remaps."""
 
     args = {
+        "use_terrain_analysis": "true",
+        "vehicle_length": "0.6",
+        "vehicle_width": "0.6",
+        "check_rot_obstacle": "true",
+        "follower_max_yaw_deg_s": "20.0",
+        "follower_stop_distance_m": "0.5",
+        "follower_lookahead_m": "1.0",
+        "follower_slowdown_distance_m": "1.0",
+        "start_autonomy_enabled": "false",
         "cloud_topic": "/cloud_registered",
         "terrain_frame": "map",
         "chassis_ready_topic": "/platform/chassis_ready",
@@ -42,7 +51,7 @@ def generate_launch_description():
         "require_controller_contract": "true",
         "sensor_watchdog_timeout_s": "0.5",
         "world_frame": "map",
-        "xy_goal_tolerance_m": "0.35",
+        "xy_goal_tolerance_m": "1.0",
         "z_goal_tolerance_m": "1.0",
         "navigation_timeout_s": "60.0",
         "no_progress_timeout_s": "12.0",
@@ -70,6 +79,7 @@ def generate_launch_description():
         executable="terrainAnalysis",
         name="terrainAnalysis",
         output="screen",
+        condition=IfCondition(LaunchConfiguration("use_terrain_analysis")),
         parameters=[{"terrainFrame": LaunchConfiguration("terrain_frame")}],
         remappings=[
             ("/state_estimation", odom),
@@ -84,7 +94,13 @@ def generate_launch_description():
         output="screen",
         parameters=[
             {"pathFolder": PathJoinSubstitution([FindPackageShare("local_planner"), "paths"])},
-            {"useTerrainAnalysis": True},
+            {"useTerrainAnalysis": LaunchConfiguration("use_terrain_analysis")},
+            {"autonomyMode": True},
+            {"autonomySpeed": LaunchConfiguration("autonomy_speed")},
+            {"vehicleLength": LaunchConfiguration("vehicle_length")},
+            {"vehicleWidth": LaunchConfiguration("vehicle_width")},
+            {"checkObstacle": True},
+            {"checkRotObstacle": LaunchConfiguration("check_rot_obstacle")},
             {"maxSpeed": LaunchConfiguration("max_speed")},
             {"cancel_topic": LaunchConfiguration("cancel_topic")},
             {"status_topic": LaunchConfiguration("planner_status_topic")},
@@ -106,6 +122,11 @@ def generate_launch_description():
             {"autonomyMode": True},
             {"autonomySpeed": LaunchConfiguration("autonomy_speed")},
             {"maxSpeed": LaunchConfiguration("max_speed")},
+            {"maxYawRate": LaunchConfiguration("follower_max_yaw_deg_s")},
+            {"stopDisThre": LaunchConfiguration("follower_stop_distance_m")},
+            {"lookAheadDis": LaunchConfiguration("follower_lookahead_m")},
+            {"slowDwnDisThre": LaunchConfiguration("follower_slowdown_distance_m")},
+            {"maxAccel": LaunchConfiguration("max_linear_accel")},
             {"manual_cmd_topic": LaunchConfiguration("manual_cmd_topic")},
         ],
         remappings=[
@@ -179,7 +200,7 @@ def generate_launch_description():
             {"max_linear_accel_mps2": LaunchConfiguration("max_linear_accel")},
             {"max_angular_accel_rps2": LaunchConfiguration("max_angular_accel")},
             {"command_watchdog_timeout_s": LaunchConfiguration("command_watchdog_timeout")},
-            {"start_autonomy_enabled": False},
+            {"start_autonomy_enabled": LaunchConfiguration("start_autonomy_enabled")},
         ],
     )
     # 安全 mux 可以显式关闭用于底层 planner 离线调试；真实运行默认开启，

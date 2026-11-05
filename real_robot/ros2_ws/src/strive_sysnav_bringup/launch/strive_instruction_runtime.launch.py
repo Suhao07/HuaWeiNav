@@ -11,6 +11,10 @@ def generate_launch_description():
 
     return LaunchDescription(
         [
+            DeclareLaunchArgument("require_motion_ready", default_value="false"),
+            DeclareLaunchArgument("motion_ready_topic", default_value="/platform/autonomy_enable"),
+            DeclareLaunchArgument("goal_resolution", default_value="viewpoint"),
+            DeclareLaunchArgument("approach_standoff_m", default_value="0.8"),
             DeclareLaunchArgument("instruction", default_value=""),
             DeclareLaunchArgument("object_topic", default_value="/object_nodes_list"),
             DeclareLaunchArgument("room_topic", default_value="/room_nodes_list"),
@@ -46,6 +50,7 @@ def generate_launch_description():
             DeclareLaunchArgument("prior_map_vlm_interval", default_value="10"),
             DeclareLaunchArgument("room_semantic_interval", default_value="10"),
             DeclareLaunchArgument("enable_room_semantics", default_value="false"),
+            DeclareLaunchArgument("correspondence_package", default_value=""),
             DeclareLaunchArgument("run_directory", default_value="/tmp/strive_real_robot_runtime"),
             DeclareLaunchArgument("decision_period_s", default_value="1.0"),
             DeclareLaunchArgument("queue_size", default_value="10"),
@@ -71,6 +76,10 @@ def generate_launch_description():
                 output="screen",
                 parameters=[
                     {
+                        "require_motion_ready": LaunchConfiguration("require_motion_ready"),
+                        "motion_ready_topic": LaunchConfiguration("motion_ready_topic"),
+                        "goal_resolution": LaunchConfiguration("goal_resolution"),
+                        "approach_standoff_m": LaunchConfiguration("approach_standoff_m"),
                         "instruction": LaunchConfiguration("instruction"),
                         "object_topic": LaunchConfiguration("object_topic"),
                         "room_topic": LaunchConfiguration("room_topic"),
@@ -106,6 +115,7 @@ def generate_launch_description():
                         "prior_map_vlm_interval": LaunchConfiguration("prior_map_vlm_interval"),
                         "room_semantic_interval": LaunchConfiguration("room_semantic_interval"),
                         "enable_room_semantics": LaunchConfiguration("enable_room_semantics"),
+                        "correspondence_package": LaunchConfiguration("correspondence_package"),
                         "run_directory": LaunchConfiguration("run_directory"),
                         "decision_period_s": LaunchConfiguration("decision_period_s"),
                         "queue_size": LaunchConfiguration("queue_size"),

@@ -546,6 +546,8 @@ episode-*/prior_map/
 
 ## 实物机器人入口
 
+**实物模式已完成（bridge-off 规划与速度输出验收）**：真实输入下，为前方 chair 的接近点生成局部轨迹与限幅速度，默认不启动底盘 bridge。未实际行驶或到达。见 [正式一键入口](docs/real_robot_navigation_entry.md) 和 [重要参数调节与迁移说明](docs/real_robot_parameter_tuning.md)。
+
 实物机器人模式的输入输出、数据流、控制流和可插拔接口见
 [docs/real_robot_framework.md](docs/real_robot_framework.md)。独立 LVLM 推理服务器
 及 VLN 客户端配置见 [docs/lvlm_server_deployment.md](docs/lvlm_server_deployment.md)。

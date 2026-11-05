@@ -10,7 +10,7 @@ import rclpy
 from nav_msgs.msg import Odometry, Path as NavPath
 from rclpy.node import Node
 from sensor_msgs.msg import Image, PointCloud2
-from std_msgs.msg import String
+from std_msgs.msg import String, Bool
 from tare_planner.msg import DetectionResult, ObjectNodeList, RoomNodeList, ViewpointPose
 
 from instruction_adapter.compiler import compile_instruction_plan
@@ -27,6 +27,7 @@ from real_robot.control.controller_contract import (
 )
 from real_robot.contracts import NavigationStatusCode, Pose3D
 from real_robot.action_motion_controller import RosActionMotionController
+from real_robot.approach import StandoffGoalResolver
 from real_robot.sysnav_ros_adapters import (
     RosNavigationStatusProvider,
     RosWaypointController,
@@ -91,6 +92,11 @@ class StriveInstructionRuntimeNode(Node):
         self.allow_emergency_stop_publish = _param_bool(self.get_parameter("allow_emergency_stop_publish").value)
         self.lower_controller_enabled = _param_bool(self.get_parameter("lower_controller_enabled").value)
         self._validate_motion_safety()
+        self.require_motion_ready = _param_bool(self.get_parameter("require_motion_ready").value)
+        self._motion_ready = False
+        self._motion_ready_stamp = 0.0
+        if self.require_motion_ready:
+            self.create_subscription(Bool, str(self.get_parameter("motion_ready_topic").value), self._update_motion_ready, 10)
         self._latest_pose: Optional[Pose3D] = None
         self._latest_image_stamp: Optional[float] = None
 
@@ -281,12 +287,17 @@ class StriveInstructionRuntimeNode(Node):
         self.declare_parameter("prior_map_vlm_interval", 10)
         self.declare_parameter("room_semantic_interval", 10)
         self.declare_parameter("enable_room_semantics", False)
+        self.declare_parameter("correspondence_package", "")
         self.declare_parameter("run_directory", "/tmp/strive_real_robot_runtime")
         self.declare_parameter("decision_period_s", 1.0)
         self.declare_parameter("queue_size", 10)
         # ``use_sim_time`` is declared by rclpy's Node constructor.  Declaring
         # it again makes the physical-runtime node fail before it can write a
         # dry-run decision on ROS 2 Humble.
+        self.declare_parameter("require_motion_ready", False)
+        self.declare_parameter("motion_ready_topic", "/platform/autonomy_enable")
+        self.declare_parameter("goal_resolution", "viewpoint")
+        self.declare_parameter("approach_standoff_m", 0.8)
         self.declare_parameter("dry_run", True)
         self.declare_parameter("dry_run_status", "idle")
         self.declare_parameter("require_pose", True)
@@ -344,6 +355,12 @@ class StriveInstructionRuntimeNode(Node):
         normalized = policy_mode.strip().lower()
         if normalized in {"semantic_snapshot", "semantic_map_snapshot", "instruction", "instruction_plan"}:
             # 中文核心边界：语义策略只提交 target/anchor 身份；可执行位姿必须来自 SysNav viewpoint。
+            resolution = str(self.get_parameter("goal_resolution").value)
+            if resolution == "standoff":
+                return StandoffGoalResolver(float(self.get_parameter("approach_standoff_m").value),
+                                            float(self.get_parameter("xy_goal_tolerance_m").value))
+            if resolution != "viewpoint":
+                raise ValueError("goal_resolution must be viewpoint or standoff")
             return SysNavGoalResolver(SnapshotViewpointProvider())
         return PreResolvedGoalResolver()
 
@@ -384,6 +401,7 @@ class StriveInstructionRuntimeNode(Node):
             object_provider=lambda: self.semantic_bridge.build_snapshot(timestamp=self._now_seconds()),
             detection_provider=lambda: self.observation_cache.latest_detection_frame,
             detection_after_provider=self.observation_cache.latest_detection_after,
+            detection_observation_provider=self.observation_cache.observation_for_detection,
             mode=self.evidence_mode,
             now_fn=self._now_seconds,
         )
@@ -408,6 +426,19 @@ class StriveInstructionRuntimeNode(Node):
 
         if self.prior_map_runtime is None:
             return {}
+        package = str(self.get_parameter('correspondence_package').value or '')
+        if package:
+            try:
+                self.prior_map_runtime.process_correspondence_package(
+                    package, snapshot=snapshot, step=step,
+                    latest_snapshot_provider=lambda: self.semantic_bridge.build_snapshot(
+                        timestamp=self._now_seconds()))
+                self._last_correspondence_error = None
+            except (OSError, ValueError, KeyError) as error:
+                message = f'Instance correspondence not admitted: {type(error).__name__}: {error}'
+                if getattr(self, '_last_correspondence_error', None) != message:
+                    self.get_logger().warning(message)
+                    self._last_correspondence_error = message
         return self.prior_map_runtime.update_and_query(snapshot=snapshot, plan=plan, step=step)
 
     def _update_odom(self, msg: Odometry) -> None:
@@ -439,10 +470,17 @@ class StriveInstructionRuntimeNode(Node):
 
         return self._latest_pose or Pose3D(position=(0.0, 0.0, 0.0), frame_id=self.world_frame)
 
+    def _update_motion_ready(self, msg):
+        """Cache bridge authorization; live tasks wait for fresh explicit enable."""
+        self._motion_ready = bool(msg.data)
+        self._motion_ready_stamp = self._now_seconds()
+
     def _readiness(self) -> RuntimeReadiness:
         """Return whether required live inputs have arrived."""
 
         missing = []
+        if self.require_motion_ready and (not self._motion_ready or not 0 <= self._now_seconds() - self._motion_ready_stamp <= 0.5):
+            missing.append("motion_authorization")
         if not self.semantic_bridge.has_object_snapshot():
             missing.append("object_nodes")
         if self.require_pose and self._latest_pose is None:

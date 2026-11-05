@@ -175,3 +175,31 @@ def test_native_safety_hil_starts_the_complete_lower_motion_chain() -> None:
     assert "safety_velocity_mux" in runner
     assert "cmd_vel/autonomy" in runner
     assert "nonzero_final_cmd_messages" not in runner
+
+
+def test_docker_wrapper_preserves_viewpoint_frame_and_topics(tmp_path, monkeypatch):
+    """The host sensor contract must reach runtime/provider inside Docker."""
+    import json
+    import os
+    import subprocess
+
+    docker = tmp_path / "docker"
+    receipt = tmp_path / "docker-args.json"
+    docker.write_text(
+        "#!/usr/bin/env python3\nimport json, os, sys\n"
+        "if sys.argv[1] == 'info': print('{}')\n"
+        "else: open(os.environ['DOCKER_ARGS_RECEIPT'], 'w').write(json.dumps(sys.argv[1:]))\n"
+    )
+    docker.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tmp_path) + os.pathsep + os.environ["PATH"])
+    monkeypatch.setenv("DOCKER_ARGS_RECEIPT", str(receipt))
+    expected = {"SYSNAV_WORLD_FRAME": "camera_init", "ODOM_TOPIC": "/field/odom",
+                "VIEWPOINT_TOPIC": "/field/viewpoints", "START_SEMANTIC_MAPPING": "false",
+                "MAPPING_CONFIG": "/field/mapping.yaml", "PROJECTION_CONFIG": "/field/projection.yaml",
+                "DETECTION_TOPIC": "/field/detections", "OBJECT_NODES_TOPIC": "/field/objects"}
+    for key, value in expected.items():
+        monkeypatch.setenv(key, value)
+    subprocess.run(["bash", "docker/run_real_robot_sysnav_stack.sh"], check=True)
+    args = json.loads(receipt.read_text())
+    env = dict(args[i+1].split("=", 1) for i, arg in enumerate(args) if arg == "-e")
+    assert {key: env.get(key) for key in expected} == expected

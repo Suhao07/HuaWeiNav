@@ -1,4 +1,532 @@
-# VLN 实物部署状态与 TODO
+# VLN 实物部署状态与后续现场验证
+
+## 实物模式：已完成（2026-11-05，bridge-off 规划与速度输出验收）
+
+按用户约定，正式一键入口、真实输入的前方 chair 接近点规划、限幅速度输出与默认关闭 bridge 均已完成。本轮无剩余软件部署阻塞项；实际行驶到达、未知空间探索和最终视觉 STOP 是后续独立现场验证范围，未标记通过。
+
+后续参数修复（本地离线）：旧停止/到达阈值冲突已复现；最终按用户要求接入 0.5 m 停止、1.0 m 到达、1.0 m 前视/减速距离及入口检查。69 项回归通过，车端旧镜像尚未更新，bridge 未开启。详见 [停止距离诊断](real_robot_stop_distance_diagnosis.md)。
+
+重要调参、迁移方法及参数配合风险见 [实物参数调节说明](real_robot_parameter_tuning.md)。以下正式入口记录优先于所有历史记录。
+
+- [x] 已把 standoff、底盘位姿转换、原生规划/跟踪和安全速度复用器接入正式 runtime→Action→MotionServer 链路，不再用日志读取探针驱动目标。
+- [x] Orin 一键入口：部署根目录 `bash scripts/run_real_robot_navigation.sh`。默认 preview，bridge 关闭，日志自动持久化。
+- [x] 修复 Action 终止未撤销原生目标及 XY 容差未传递的问题；正式实测无进展后速度持续归零，没有误报 REACHED。
+- [x] 56 项本地测试、最终镜像文件校验、真实输入及一次容器重启回归通过；UDP-only DDS 下同一 LIO 进程持续供数。
+- [x] 已写清迁移参数、live 模式开关、控制合同、硬件状态和自动模式服务授权。live 未启动，车未受本轮软件驱动。
+
+验收时镜像 `896fbd15b040...`，容器 `huawei-vln-navigation`。操作以 [正式实物模式一键入口](real_robot_navigation_entry.md) 为准。实际运动/探索/视觉 STOP 和历史混合实例问题保留为后续范围，未假定完成。
+
+---
+
+## 历史 shadow 验收结果（已升级到上方正式入口）
+
+用户明确将本轮实物部署验收收敛为：前方 chair → 实物输入目标选择 → 合理规划轨迹 → 速度输出，默认关闭底盘 bridge。**此口径已通过**，不宣称实际行驶或未知空间探索已验收。
+
+- [x] 真实定位/点云/在线对象输入，选择当前生产决策中的 `sysnav_object:2` chair，并按底盘方向检查在前方。
+- [x] 修复融合消息写死 map 的坐标系标注；统一 camera_init；按已记录的底盘在雷达中 `[-0.2, 0, -1.5708]` 外参组合底盘 pose。
+- [x] shadow 接近候选距椅子中心 0.8 m；原生 localPlanner 生成约 0.43 m 轨迹，最多 44 点。
+- [x] 原生 pathFollower → SafetyVelocityMux 输出最终隔离速度；35 秒测试 640 个速度样本，639 个非零，线速度峰值 0.066 m/s、角速度峰值 0.113 rad/s。
+- [x] bridge 未启动，四个物理控制话题发布者均为 0；测试子进程已清理，静止感知/定位继续运行。
+- [x] 固化入口、候选镜像、原始失败/成功记录、轨迹图及迁移参数说明。
+
+说明：目标 UID 来自生产 runtime；接近点是显式 shadow standoff 候选，不是已验证历史视点。当时该验收入口尚未接入生产目标解析；现已由上方正式入口集成 standoff resolver。这些结果不能用于推断任意指令/未知空间的自主导航已完成。
+
+本轮不再继续的中间测试：重复全地图重放、为当前可见 chair 强制精确历史绑定、重复离线掩码审阅、为此验收追加豆包调用。原始证据保留，不删除。
+
+后续仅在实际接底盘时开展：控制模式/故障码/watchdog 与接管核定、移动中定位及跟踪、实际到达与视觉 STOP、未知空间探索。历史碎片和原生跟踪器静止时转向切换保留为局限；安全 mux 已限制速度变化，不把它解释成运动闭环稳定性验证。
+
+操作与参数见 [实物 shadow 部署说明](real_robot_shadow_deployment_20261105.md)。最终证据：`logs/diagnostics/shadow-acceptance/strive-shadow-final/{result.json,metrics.json,trajectory_and_speed.png}`。
+
+---
+以下为此前更严格的物理闭环交付清单及历史证据，不作为本轮 bridge-off 验收的阻塞项。
+
+> 2026-11-05 离线掩码复核：历史实例混合/碎片与豆包解释错误同时存在；原请求图像配对无误。已在本地改为精确 masked-RGB 裁剪输入，33 项测试通过，未调用模型复测、未部署、未绑定。历史融合混合仍待修复，详见 [诊断报告](real_robot_correspondence_mask_diagnosis_20261105.md)。
+
+
+## 历史执行清单（不作为本次完成的阻塞项）
+
+本节作为下一轮执行入口；下文历史记录和 AgileX A1–A9 保留作证据/接口参考，
+其中旧的未勾选开发项不再直接当作当前待办。此次没有开启自主运动、发布速度、
+切换选源。12:43 起按用户授权恢复了感知链路；采集收尾后已按实际车位发布一次
+`/initialpose` 恢复保存地图定位，详见下方最新记录。
+
+### 历史候选交付状态
+
+| 关口 | 已有实际证据 | 尚未完成 |
+| --- | --- | --- |
+| G1 地图与定位 | 局部地图持久化；移动/重启后重新配准并恢复保存地图定位；静止连续性验证 | 目标路线覆盖与移动过程定位验证 |
+| G2 感知与绑定 | 新镜像在线带 ID 椅子、点云融合、对象视点关联及 dry-run 目标；图像/框/位姿配对 | 判定/准入/ROS 接线已静止上线；真实模型与精确绑定未验收，保留碎片歧义 |
+| G3 底盘控制 | 同一 API 转接实现；只读遥测/类型/发布者查询 | 核定模式/故障/硬件 watchdog；受限合同与现场授权；低速及异常停车实测 |
+| G4 完整交付 | 当前候选镜像/资产/地图身份与静止启动回滚手册 | 配置真实视觉模型并验收新鲜视觉核验；真实行驶→视觉→STOP及失败/接管记录 |
+
+当前运行 `huawei-vln-static-correspondence-candidate`，镜像 `3d97aec88b89...`；自主运动关闭。
+待用户确认当前遥控器状态。视觉服务已指定沿用 Doubao，并找到本机 Ark 凭据；
+用户已明确授权一次冻结图像判定；已完成 1 个真实 Doubao HTTP 请求，结果 fragments，未通过唯一绑定。
+对应判定接线已完成本地及 ARM 断网测试并静止上线，但真实模型调用仍关闭，不能记为实物绑定通过。
+
+底盘只读接口核对：`/robot_status` 类型 `robot_status_core/RobotStatus`，
+`/ranger_status` 类型 `ranger_msgs/RangerStatus`，两者发布者均为 `/ranger_base_node`。
+消息定义仅有灯/电机 ID 常量，没有 control_mode/base_state/fault_code 的枚举定义；
+字段值差异仍待驱动/硬件规范或现场状态对照核定，不允许把 128 放入 ready_fault_codes。
+证据 `logs/diagnostics/evidence-static-validation/chassis-schema.json`。
+
+### 历史接续条件（一次冻结判定已完成）
+
+用户已明确授权指定冻结证据的一次 Doubao 判定，已发送且仅发送 1 个 HTTP 请求。
+此前的外发授权阻塞仅对本次调用解除，不扩展为任意新图像、额外模型调用或运动授权。
+结果为 fragments，未通过唯一绑定；代码保留未绑定状态，没有修改车端地图或发送运动指令。
+
+- 首次执行在 HTTP 发送前触发 SDK AttributeError。断网诊断定位为 openai 1.64.0 的
+  beta raw 接口无 create；已将 Doubao 文本创建请求路由到标准 chat.completions，
+  保留 beta 的 parse 路径。真实 SDK 的 MockTransport 回归及相关测试共 30 项通过。
+  此修复目前仅在本地，车端镜像仍为 3d97aec88b89，后续服务启用前需同步。
+- 修复后调用 `doubao-seed-2-0-pro-260215`，相同冻结包哈希
+  `f36cc5c8a25f7bcd36d7c7c0c728cc6b03e5bc96fabe01aaaf8e4aeffbe94b70`，
+  单次 HTTP 请求约 22.3 s。原始结果、前置错误及审查在
+  `logs/diagnostics/instance-correspondence-doubao/`。
+- 模型返回 fragments，原始响应虽带候选 UID，适配层按非唯一结果清空该 UID。
+  3 条支持、8 条冲突观测只是模型判断。解释将部分 monitor/trash bag 标签视为其他物体，
+  与此前逐张掩码的椅背/椅子局部观察有不一致，不能据此自动删除观测或修改地图。
+- 尚需解决证据对应歧义并在当前 runtime 会话重新配对采集，才能验收静止精确绑定；
+  旧包不能直接写入新会话。任何进一步外发需在用户授权范围内。
+- 地图路线覆盖与移动定位、底盘模式/故障/watchdog 核定、低速跟踪/停止/取消/接管及
+  真实行驶→视觉→STOP 仍未完成；自主运动继续关闭，运动仍须另行授权。
+
+### 精确实例绑定的源证据复核（2026-11-05）
+
+- 更正证据范围：此前输入包的 6 + 5 条是 compact bundle 为两候选保留的样本，
+  不能作为完整融合历史。本机未压缩源的 manifest、prior_map、observations、build_receipt
+  SHA256 与压缩回执一致；完整成员分别为 131、52 条，总源观测为 5382 条。
+- 以原始 RGB-D/mask、原 5 cm voxel、6 m 深度上限及 confidence >= 1 重建固定成员，
+  不重新运行检测、不重新分配 UID。恢复点数 25916/2509，与部署地图完全一致；
+  质心误差 3.16e-6/2.73e-7 m。该结果验证源证据到地图几何的可追溯性，不是身份验收。
+- 两云的原始点定向覆盖（最近距离 < 0.1 m）为大→小 0.5916、小→大 0.9753；
+  与逐张掩码观察相结合，支持椅子整体与局部碎片并存，不能据此直接合并。
+  这些覆盖值包含重复观测点权重，不等于去重后表面比例或身份置信度。
+- 掩码核查：frame1640:detection9 虽标签 monitor，实际覆盖椅背；不能仅凭标签宣称
+  显示器混入。frame1365:detection2/9 在桌侧边缘，和主椅子 mask 分离。
+  构建回执明确记录 frame1365:detection2 UID 在 duplicate_instance_merges 中并入
+  frame1350:detection1；具体错误准入仍需全关联历史重放，不能仅从最终合并反推原因。
+- 下一步绑定判定必须允许“多个历史 UID 指向同一物体碎片/身份仍不唯一”，不能强制
+  最近 UID 或自动把多个候选标成已验证。当前生产绑定接线仍未完成，未写入绑定、
+  未替换车端地图、未启动运动。复核脚本与原始结果：
+  `logs/diagnostics/instance-source-reconstruction/{reconstruct.py,result.json,review.json}`。
+
+### 完整关联历史重放（已结束，非全图完全一致）
+
+- 修复 `scripts/diagnose_prior_associations.py` 的重放一致性：读取原构建深度
+  confidence 阈值并复用 `load_fusion_observation`；拒绝用 compact 证据冒充完整源；
+  完整 baseline 增加末尾 duplicate merge 后的最终 UID 与点数/质心比较。5 项针对性测试通过。
+- 5382 条源观测全部处理，进程 exit=0。5381 条最终 UID 一致；
+  `frame685:detection14` 在两个显示器/计算机相关簇间不同，造成 2 个簇各差 25 点、
+  最大质心偏差约 1.92 mm。差异原因尚未定位，不宣称全图确定性复现，也不归因为浮点误差。
+- 目标椅子 183 条归属全部一致，两个实例点数 25916/2509 完全一致。
+  合并前实际有三个簇：主椅子 80 条/16255 点，小碎片 52 条/2509 点，
+  table 种子簇 51 条/9661 点（其中 48 条 chair/desk chair）。
+- 进一步更正此前“桌子并入椅子”的简化描述：table 是初始种子标签，不是最终簇身份。
+  主椅子与 table 种子簇按原 5 cm voxel 去重后双向覆盖为 0.9339/0.9693，
+  满足现有 >0.85 的双向规则；主椅子与小碎片为 0.5503/0.9009，未满足双向规则。
+  保留碎片是局部/整体保护的结果；没有充分证据将末尾重复合并判为算法错误。
+- 不降低融合阈值、不手工合并 UID。当前首要软件缺口仍是有图像/掩码证据、能表达
+  碎片及歧义的实例对应判定与生产写入接线。全图的单条复现差异另留作局限，
+  不把重复全图重放设为当前椅子部署的必要中间测试。
+- 结果位于 `logs/diagnostics/full-source-association/`：`baseline.json` 是全部关联记录，
+  `target-merges.json` 是合并前去重表面比较，`summary.json` 保留差异及局部结论；
+  `launch_receipt.json` 已标记完成并保留输入/代码哈希。未改变车端地图、绑定或运动设置。
+
+### 实例对应判定接线（本地，未部署）
+
+- 新增 `prior_map/instance_correspondence.py`，复用共享 Ark/OpenAI-compatible 客户端，
+  独立结构化结果包含 unique/ambiguous/fragments/no_match/insufficient。
+  检查文件哈希、图像/框时间配对、框边界、历史 mask 尺寸/非空及观测归属。
+  同类、近距离和全场景相似不能替代实例判定；不强制从碎片中挑一个 UID。
+- `PriorMapRealRobotRuntime.process_correspondence_package` 已由 ROS 推理入口调用，
+  输入由 `correspondence_package` 参数指定（默认空，不调用服务）。准入核对加载地图
+  ID/revision/hash、当前 runtime session、当前对象/track 及 120 s 时效；模型返回后
+  再检查对象仍在。唯一且无冲突的真实客户端结果才调用 `mark_object_verified`，
+  同一包只消费一次；注入客户端、离线、服务错误及非唯一结果均不写绑定。
+- `prior_map/correspondence_session.json` 提供当前进程的 session_id 和地图身份。
+  旧冻结包使用旧容器身份，且已过时，只能用于离线模型判定；不能改写旧 session 字段
+  冒充新采集。车端更新后需要在当前会话重新配对采集并准备输入包。
+- 接线测试覆盖写入后进入真实 prior query，另发现并修复无位置先验在 PNG 标注阶段
+  的 None 坐标崩溃（只跳过不可绘制标注，不伪造坐标）。相关本地测试见后续结果。
+- 证据读取进一步固定为一次读取的字节快照：哈希校验、图像尺寸检查和模型输入使用
+  同一份 bytes，避免文件在校验后替换造成记录与模型所见不一致。文件替换回归测试通过；
+  原冻结包哈希及 23 个图像块保持一致，本次检查没有网络请求。
+- 真实服务固定使用此前的 `doubao-seed-2-0-pro-260215`，Ark 端点为
+  `https://ark.cn-beijing.volces.com/api/v3`；凭据从本机原文件读取，不复制到仓库。
+  第一次请求在执行前被自动审批拒绝，尚未外发。待授权内容为 1 张当前图、8 张历史图
+  （11 条观测中重复使用）、11 张 mask 及框/ID；本地预检生成 23 个图像块。
+  `logs/diagnostics/instance-correspondence-doubao/local-validation.json` 仅证明本地包校验，
+  不是模型成功或实例绑定证据。
+
+### 历史对应判定候选静止上线
+
+- 镜像 `huawei-vln-realworld:orin-r36.5-yoloworld-correspondence-candidate`，
+  ID `sha256:3d97aec88b898338ed74a4e4620819433053e6852c22caae2ef9972d892b9679`。
+  在父镜像 `016e990ad481...` 上覆盖 8 个源码/launch 文件，不更新依赖。
+- ARM 临时容器 `--network none`，不挂载设备或密钥：源码哈希、编译、schema、OpenAI
+  导入、安装后的 node/launch 路径及真实证据包离线预检通过；19 项对应判定测试通过。
+- 切换前将旧运行目录完整复制为宿主 `logs/pre-correspondence-switch-runtime`（127 MB），
+  新容器 `huawei-vln-static-correspondence-candidate`，tmux `strive_static_correspondence`。
+  LIO/相机未重启，地图未更换。`LLM_OFFLINE=1`、final verifier=false、correspondence_package
+  默认空及全部运动开关关闭；没有外部视觉请求。
+- 45.00 s 只读窗口：21 条检测均含带 ID 的 chair；22 条对象消息；odom 4197、body cloud
+  401、RGB 335 条。四个运动话题发布者均为 0。视点事件未在本探针窗口重发，
+  但实际 runtime 日志含 viewpoint 0、visible objects 1/2/3 及解析后的目标位姿。
+- 决策快照 115 条：31 wait、84 go_to_object；目标 `sysnav_object:2`，reason 为
+  `dry-run recorded go_to_object; no waypoint published`。这是目标/视点解析，不是路线或行驶验收。
+- 新 runtime session 为 `5b3a84c4-a9b9-4272-89ec-f6b5be203da1`，旧输入包不能直接写入
+  本次会话。`matched=false` 保持；真实 Doubao 调用仍待明确图像外发授权。
+- 源码 manifest、启动脚本、ARM 检查结果、探针及决策在本地
+  `logs/diagnostics/correspondence-candidate-build/`，宿主部署根 `correspondence-candidate-build/`。
+  启动/导出/回滚步骤已更新至 `docs/real_robot_static_candidate_runbook_20261105.md`。
+
+### 11:24 初始诊断（修复前快照）
+
+- 本机 USB 网卡 carrier=1，地址 192.168.1.193；.101/.102 经该网卡直连。
+- Orin .101 密钥认证失败后，使用用户提供的登录方式完成检查（凭据不留档）。
+  11:24 CST 主机 ubuntu，uptime 46 分钟，说明已重新开机；部署 realworld_eb188e7
+  HEAD=fe1037b。无运行容器，仅 livox_odom 会话，无 D435i 节点/会话。
+  内存可用约 13 GiB、磁盘可用 56 GiB。LIO 的 pcd_save.pcd_save_en、
+  location_mode、publish.scan_bodyframe_pub_en 均为 false。
+  四话题逐个 5 秒 echo 均超时；再用 sensor_data QoS 同时订阅 8 秒，
+  /livox/lidar、/livox/imu、/aft_mapped_to_init、/cloud_registered_body 均 0 样本。
+  进程存在不等于数据链可用；断流原因尚未诊断，不能直接归因为历史 NTP 问题。
+- 底盘 .102 的 ROS master 11311、rosbridge 9090、视频服务 8080 可达；master 为 Navis。
+- 约 7 秒只读订阅：robot_status 8 条、ranger_status 7 条、BMS 7 条；
+  mux selected 为 `/run_management/virtual_joy`，末次线/角速度为零。
+  `/odom` 和 `/base_cmd_vel` 在本窗口没有收到样本，不能据此判断 Orin LIO 状态。
+- 状态报告 fault_code=128，robot_status 文本为“过压保护”；ranger 电压 55.5 V，
+  BMS 电压 51.9 V、SOC=100%。两种消息的 base_state/control_mode 也不一致，
+  保留原始语义，不自行解释硬件枚举或确认故障解除。
+- 结论：网络在线；尚不能确认可开始推车建图或完整静止绑定。登录已恢复，但传感器无样本、存图关闭、相机未启动。
+  先确认车是否移动、恢复并复核传感器流，再核实故障及允许人工移动的状态。
+  本次已发现重启，历史 alignment 的有效性需重新验证。
+
+### 12:48 感知恢复与建图准备
+
+- 校时顺序证据：开机约 30 秒启动 Livox/LIO；timesyncd 到单调时间 110.624 秒
+  才首次同步，墙钟从 11 月 4 日 22:35 跳至 11 月 5 日 10:39。两进程最后输出停在
+  校时前；已同步后重启即恢复七路真实消息。定位到开机校时与传感器启动的顺序问题，
+  未通过人为跳时复现内部阻塞，也未修改雷达 SDK。
+- 持久修复：orin26 的 crontab 原 `sleep 20; start_livox_odom.sh start`
+  改为 `timeout 300 /usr/lib/systemd/systemd-time-wait-sync && start_livox_odom.sh start`。
+  校时等待命令当前返回 0，crontab 写后校验一致；冷启动复验尚未执行，不为该项重启现场系统。
+  备份/新值和原日志位于车端部署目录 `logs/diagnostics/sensor-recovery-20261105/`，
+  已复制到本地同名目录。回滚用该目录 `crontab-before.txt` 恢复用户 crontab。
+- 30 秒同进程采样：雷达 1729、IMU 1729、odom 1789、body cloud 276、
+  RGB 410、对齐深度 411、CameraInfo 428 条，所有时间戳倒退计数为 0。
+  body cloud 约 9.44 Hz，RGB/深度约 14.4 Hz；高频话题为探针实际收到的速率，
+  不当作发布端频率。XY 范围约 0.95/1.03 cm、yaw 范围约 0.238°。
+- 用户确认车自昨日配准后未移动。原位切到存图模式，实读
+  `pcd_save.pcd_save_en=true`、`publish.scan_bodyframe_pub_en=true`、`location_mode=false`；
+  七路话题再次全部收到消息。此次重启后位姿约 (0.001,-0.010,-0.012)m、yaw -0.012°，
+  原起点对齐可用于本次测试，正向物体残差仍由 G2 核验。当前不要再重启 LIO，保存用 SIGINT。
+- 静止绑定容器 `huawei-vln-static-binding-20261105` 已运行：
+  镜像 `huawei-vln-realworld:orin-r36.5-agilex-1aea701`，车端 HEAD=fe1037b；
+  先验 fbb15f81e4、格式 bundle、既有原位 alignment、目标 chair、规则解析、LLM_OFFLINE=1。
+  检测/融合已连续产出 cart，viewpoint 0 已被 mapping 接收；当前视野尚无 chair，
+  runtime 为 `No eligible observed candidate`，这是静止绑定测试就绪而非正向绑定通过。
+- 所有运动开关关闭：dry_run=true、lower_controller=false、ALLOW_REAL_MOTION=false，
+  AgileX bridge 未启动；ROS2 /cmd_vel 与 /cmd_vel/autonomy 查询为不存在。
+  最终视觉 verifier 在本次静止准备中关闭，不支持任务 STOP 验收。
+- 初次静止启动误将 source_format 设为 phone，导致 runtime 退出；纠正为 bundle 后成功。
+  首次失败日志保留，传感器不受影响。
+- **当前结论：** 感知、存图和静止绑定软件链已就绪。推车仍需现场确认底盘的过压提示及
+  人工推行状态；目标椅子的正向绑定需人工摆位。存图会持续积累内存，若现场延期，
+  应先保存当前扫描再结束存图会话，不把已经累积的地图直接丢弃。
+
+### 12:50 现场延期后的最终运行状态
+
+用户确认车未移动、仍连接充电器，要求先完成其他部分并保持无运动。
+充电连接已确认；fault_code=128 的原因尚未证实，留待断开充电后现场复核。
+
+- 感知恢复、自启校时顺序修复、静止绑定软件准备均已完成；实际椅子正向绑定尚待摆位。
+- 为避免等待推车期间继续积累内存，经 SIGINT 保存当前静止扫描：
+  车端 `output/lio_maps/static-recovery-20261105/lio_map.pcd`，2,274,880 点，
+  72,796,413 bytes，SHA256 `1a085dcb1854bc9ee37c9c5f25e1b82197be3a16ebddb229246c81b57915fd89`，
+  元数据哈希复核一致；仅为静止局部扫描，完整区域图尚未建立。
+- 原位恢复普通感知模式（LIO_PCD_SAVE_EN=0），D435i 与静止 dry-run 容器保持运行；
+  七路传感器再次 PASS。此前“存图已开启”为 12:45–12:49 会话状态，当前已关闭。
+- 推车前：现场断开充电、确认可人工推行和底盘状态；车保持原位时再次开启存图，
+  实读参数及实际消息后再推车。全程保持自主控制关闭。
+- 不以充电器连接推断过压保护正常；不为完成本轮感知修复启用自主运动或发布初始化位姿。
+
+### 15:04 现场小范围采集已开启
+
+用户到车旁、已断充、车未移动，说明此前告警对应遥控器未开，计划使用原遥控器操作。
+该解释记录为用户现场确认，尚未独立证明 fault_code 枚举含义。
+Orin 在约 15:01 重启后 LIO 自启已有位姿输出，校时状态 yes。
+原位以存图模式启动，实读 pcd_save.pcd_save_en=true，恢复 D435i，七路话题采样 PASS。
+重启既有静止绑定容器，dry-run=true、远端桥接关闭、下层控制关闭；ROS2 /cmd_vel 不存在。
+录包会话 `field_capture_20261105` 已订阅位姿、body cloud、RGB compressed、CameraInfo，
+目录 `output/field_checks/tethered-20261105T1504`，数据库已写入约 50 MB。
+当前存图与录包均在运行；需用户完成小幅移动并通知结束后正常保存，禁止直接重启 LIO。
+网线限制下先做原位基线、10–20 cm 往返、停稳取景；范围只覆盖局部一致性与静止绑定，
+不能记为完整区域建图或自主运动验收。检测器刚完成加载，正向物体绑定仍待实际观测。
+
+### 15:08 首轮网线限制下的人工运动采集
+
+用户报告第一轮完成并确认已回原位置/原朝向。录包正常结束，LIO 存图保持运行。
+本轮约 226 秒（含等待）：odom 22,437 条、body cloud 2,138 条、RGB compressed 与
+CameraInfo 各 3,377 条。首末各 5 秒位姿中位数的 XY 差 0.210 m、yaw 差 -23.19°，
+最大起点位移 0.549 m；运动主要位于录包第 125–150 秒，之后估计位姿稳定在新位置。
+起止相机画面明显不同：起点含左侧门口，结束偏向楼梯下滑板车/椅子。
+因此当前结果为 inconclusive：不能把起止位姿差直接解释为回位误差或 LIO 漂移。
+用户随后确认车头角度可能未完全对齐，实际回位姿态缺少独立真值；本轮验证了运动期间
+数据采集，但回位精度不作结论。跳过重复往返，转入椅子取景/静止绑定。
+本地分析及图片：`logs/diagnostics/tethered-20261105T1504/`；完整 bag 留在车端
+`output/field_checks/tethered-20261105T1504/`。静止绑定尚无 eligible chair，不能记为成功。
+
+### 15:15 两轮采集收尾
+
+第二段录包正常结束：约 195.7 秒，odom 19,501、body cloud 1,850、RGB 2,929、
+CameraInfo 2,928 条；对应 runtime 决策 196 次，89 次 No eligible observed candidate、
+107 次 inference pending，motion_goal 为 0。最大右转视角中椅子清楚入镜，末帧则在右缘；
+因此正向绑定未通过，下一步优先离线检查已录图像的检测/融合/候选过滤，不要求现场重复取景。
+证据：本地 `logs/diagnostics/chair-20261105T1510/{analysis.json,rightmost_view.jpg,last_view.jpg}`。
+完整录包保留车端 `output/field_checks/chair-20261105T1510/`。
+
+地图已通过 SIGINT 保存到车端部署 `output/lio_maps/tethered-20261105T1503/`：
+6,032,950 点，193,054,653 bytes，SHA256
+`e5223d558032b77ab7066227584dae53a5566c33249d62cfe16a220217e21e5f`，实读哈希与元数据一致。
+`prior_alignment.json` 已由原起点标定与本 PCD 哈希生成，仅适用于该 PCD 定位模式；
+这是受网线限制的局部采集，不是完整场地地图，尚未进行定位模式初始化/重定位验证。
+
+收尾状态：两段录包结束，静止绑定容器停止，LIO 保存后退出，D435i 相机会话保留。
+当前车已经移动，禁止在新位置以普通建图模式重启后沿用旧 camera_init 对齐。
+下一次可在保存地图的定位模式恢复，需以实际当前位置设置初始化位姿；本轮未发布 /initialpose。
+全程未启用自主运动。Docker 历史日志导出的时间范围与本轮不一致，不能作为本轮完整标签计数，
+本轮决策统计以 runtime_decisions.jsonl 的时间窗口和录包为准，后续诊断需保留该证据限制。
+
+### 离线椅子诊断
+
+离线椅子诊断更新：已确认并最小修复 detector 的 BGR/RGB 重复转换。
+修复后真实 inference 在 97 帧全段采样和 38 帧清晰片段仍为 0 个带 ID 的 chair；
+首个阻断在检测输出。后续复用已有 YOLO-World 权重，在相同 38 帧上取得 29 帧带 ID
+的椅子输出，并通过实际 SAM2/点云融合产生 29 次椅子对象发布；最近邻传感器诊断
+不等价于完整 ROS 回放，先验绑定/视点仍未验收。额外修复 SAM2 RGB 输入、YOLO-World
+词表初始化和无图像路径时 ROS 序列化。下一项是负例核对及真实对象→先验→视点验证，
+不重复现场采集或放宽候选过滤。默认模型未切换，修复尚未写入正式车端镜像。
+实际对象→先验→目标解析器的离线审计又修复了同名标签误绑定 exact 历史实例的问题：
+旧逻辑会把当前椅子匹配给约 5.01 米外的历史椅子；修复后保留未绑定状态。
+29/29 次语义目标选择成功，但因无真实视点，运动目标仍为 0/29。
+近邻两个历史候选残差约 0.137/0.180 米，仍有碎片身份歧义；下一项是实际 provider/bridge
+的隔离回放和对象视点关联，不把标签同名或距离近当成已验证的具体实例绑定。
+后续实际 ROS 隔离回放已产生 15 次对象发布、视点 0 及其椅子 ID 4 关联；正式 cache
+和目标解析器可保留关联并生成该记录视点的目标，排除视点后正确返回 None。
+这是冻结检测驱动的离线正例，未发布运动、未验收新路线或最终视觉 STOP。
+完整检测并发资源、具体实例绑定、正式候选部署、保存地图定位和实车控制关口仍保留。
+候选 profile 与离线 CLIP 挂载已补齐；另一段录包 111 帧中 28 帧椅子预测经视觉核对均
+含实际椅子，起始无椅子帧正确无输出，尚不报告全量准确率。独立候选源码与 5 项资产
+已校验，候选镜像已构建成功，image ID 为
+`sha256:20594ab739c332743117f6ebaec338272809af8225cb9d69c0398bec566cf5b7`。
+新镜像的实际 DetectNode 离线运行验证已通过：111 帧中 24 帧带 ID 椅子，
+与既有同录包跟踪正例时间戳集合一致；无椅子首帧无输出。静止在线结果见后文。
+用户确认采集后未移动/转向/重启，已用录包末尾位姿恢复保存地图静止定位。
+详见 [离线诊断记录](real_robot_chair_detection_diagnosis_20261105.md)。
+
+### 保存地图静止定位复核（采集收尾后）
+
+- 保存 PCD 哈希复核一致；实读 location_mode=true、pcd_save=false，加载上述局部地图。
+- 根据用户确认的未移动/转向/重启状态，以录包末尾位姿发布一次 initialpose；
+  Point-LIO 初始化成功，ICP 分数 0.005833。未启动控制器或发送速度。
+- 44.88 秒收到 4,405 条 odom，时间戳倒退 0 次；排除前 5 秒后的 XYZ 跨度
+  8.95/7.41/8.11 mm，yaw 跨度 0.191°。末尾与种子 XY 差约 2.3 mm、yaw 差 -0.084°。
+  这些是静止稳定性/初值一致性，不是独立真值定位精度。
+- 首末单帧世界点云分别仅 80/66 点，对保存地图的最近邻距离中位数 5.73/4.02 mm，
+  20 cm 内比例 97.5%/96.97%；只支持局部重合核对，不代表整场地图覆盖验收。
+- 本地证据 `logs/diagnostics/localization-20261105/{analysis.json,receipt.json,lio.log}`。
+  LIO 保持定位模式。后续仍需在目标区域正常摆位中验证连续定位与在线绑定。
+
+### 新候选镜像运行与在线静止核对
+
+- 新镜像关键 detector/policy 修复文件哈希与本地一致；隔离容器断网加载本地 CLIP、
+  YOLO-World，直接运行安装后的 DetectNode，不替换为外部推理实现。
+- 固定独立录包 111 帧，41 prompts、BGR、640、conf=0.35、原 BoT-SORT：
+  24 帧带 ID 椅子，与此前独立录包的跟踪正例集合一致；不把 24/111 当召回率。
+  去掉首帧预热后推理中位数约 0.090 s、P95 0.129 s，不包含 SAM2/在线总延迟。
+- 已启动独立候选容器 `huawei-vln-realworld-d435i-yoloworld-candidate`，
+  tmux `strive_candidate_static`；新模型、SAM2 mapping、dry-run runtime 和 viewpoint bridge
+  正常启动，加载与保存 PCD 绑定的 alignment。provider 按既有逻辑等待首个对象发布。
+- 45 秒在线只读采样：odom 4,243、body cloud 403、RGB 335 条；检测结果/对象/视点均 0。
+  detector 持续报告无 track ID；当前图片中椅子大部分在右侧画外，无法完成在线正例。
+  这是当前取景下检测输出不足的证据，不能据此称融合或绑定失败，也不能称 G2 已通过。
+- `/cmd_vel`、`/cmd_vel/autonomy`、`/way_point`、`/waypoint` 发布者均为 0；
+  dry_run=true、lower_controller=false，底盘桥接关闭。未开启自主运动。
+- 本地证据与可复现脚本：`logs/diagnostics/candidate-static-20261105/`。
+  后续需在现场允许的小范围遥控摆位后验证实时正例；不再重复同一离线检测回归。
+
+### 在线触发的新故障与现场移动/重启
+
+- 首个对象触发 provider 启动后，候选栈异常退出，明确报错：
+  `viewpoint input frame=camera_init; expected world_frame=map`。
+  根因是宿主 Docker wrapper 未传递 `SYSNAV_WORLD_FRAME`，provider 使用默认 map。
+  保留严格 frame 检查，修复 wrapper 的世界系和 provider odom/viewpoint 话题传递。
+- 新增真实 shell wrapper 的 fake-Docker 参数回归，1 项通过；宿主修复已部署，SHA256
+  `4e09cb4750deb2faeed040bafabb7c791c2e74255a1b8eb24d313d3a4ced98d6`。
+  镜像 ID 不变；此宿主启动器变更是冻结源码包之后的显式部署差异，尚待在线触发复验。
+- 用户随后确认已移动机器人并主动重启。重启后实读 location_mode=false、pcd_save=false；
+  先前静止定位通过记录仅对重启前有效，不能把当前新 origin 与旧 alignment 混用。
+  相机已恢复，`after-reboot.jpg` 显示椅背、座面与底座清晰入镜；传感器检查中
+  RGB/深度/CameraInfo/Livox/IMU 有样本，body cloud 超时，尚未恢复完整定位感知链。
+  候选感知/绑定容器当前停止；等待实际新车位说明后重定位，不自动沿用旧种子。
+- 完整故障日志已归档 `logs/diagnostics/candidate-static-20261105/candidate-static-frame-failure.log`。
+  继续保持自主运动关闭；相机可单独恢复，不能将普通 LIO 输出当作保存地图定位已恢复。
+
+### 宿主配置传递补全与证据更正
+
+- 进一步实测发现 wrapper 还漏传 `START_SEMANTIC_MAPPING`、`MAPPING_CONFIG`、
+  `PROJECTION_CONFIG`、`DETECTION_TOPIC`、`OBJECT_NODES_TOPIC`。这会导致期望的关闭开关、
+  D435i 标定与主题名在容器内回退默认值；已补齐并扩展 fake-Docker shell 回归。
+- 因此，上述修复前“预期话题 45 秒零输出”不能作为实际检测/融合输出为零的证明。
+  当时部分检测实际进入默认 mapping，且首个对象触发 provider 崩溃；该故障日志仍有效。
+  当前图像取景变化的视觉事实有效，但不能仅据零消息计数将在线问题归因为取景。
+- 用户确认有平移且已停稳。当前只启动检测，不启动先验绑定；容器内已实读确认
+  mapping=false、正确 D435i 配置及 `/huawei_vln/d435i_detection_result` 话题。
+  为只读重定位采样恢复普通 LIO 的 world/body cloud 发布，存图关闭，未发布定位初值。
+  旧地图 alignment 仍不得用于当前普通 LIO 原点。
+- 补全后在线采样 45 秒收到 20 条检测，20 条均有 chair、ID 始终为 2；实际阈值 0.35、
+  分辨率 640、处理间隔 2 s。检测消息年龄中位数约 0.301 s，最大 1.530 s（含启动阶段）。
+  同窗 odom 4,470、body cloud 424、RGB 594；四个运动话题发布者均为 0。
+  当前仅检测，objects/viewpoints 为 0 是配置预期，不作为融合验收。
+- 新车位静止点云采集 760 条、68,145 点；216 个位置/朝向初值及 12 个精配准候选
+  收敛到近似位置，验证点集 96.6% 在图上最近邻 10 cm 内。已用该候选发布一次 initialpose；
+  Point-LIO ICP=0.007914，45 秒 4,446 条 odom 无时间戳倒退，稳定后 XYZ 跨度
+  6.43/7.81/10.63 mm、yaw 0.206°。末位姿约 (-0.228,0.163,-0.025)m、yaw -54°。
+  当前已恢复保存地图定位；这是静止局部一致性，不代表路线覆盖或绝对精度。
+  新证据在 `logs/diagnostics/relocalization-after-move/`；完整静止链路已重新启动，待采样验收。
+  修复后的宿主启动器哈希与证据见 `logs/diagnostics/candidate-static-20261105/host-launcher-delta.json`。
+
+### 新车位在线感知→视点→目标生成（修复后）
+
+- 当前保存地图定位已恢复，容器中实际采用 D435i 标定/融合配置及 camera_init 世界系。
+  45 秒：检测 22 条、对象 22 次、viewpoint pose 2 条；视点 0 的 observed_object_ids
+  从空变为 [1,2,3]，其中 chair 为 sysnav_object:2。provider 未再因 frame 错误退出。
+- 已归档 75 条 runtime 决策，其中 32 次 go_to_object；目标为 sysnav_object:2，
+  解析到 viewpoint 0，坐标约 (-0.2274,0.1626,-0.0281)m、frame=camera_init。
+  该视点来自当前实际观测车位，证明目标解析接线，不证明新路线可通行或实际行驶成功。
+- 精确历史实例标注仍 matched=false，保留歧义；类别目标可生成不能替代实例绑定。
+  最终 verifier 关闭，candidate bbox 元数据仍有 NaN，最终视觉证据路径未验收。
+- 四个运动话题发布者均为 0，dry-run 记录 no waypoint published；底盘控制没有开启。
+  证据：`logs/diagnostics/static-online-after-fix/{probe.json,runtime_decisions.jsonl,summary.json}`。
+
+### 最终视觉证据入口审计
+
+- `candidate_from_object` 对缺失二维框执行 `np.array(None, dtype=float)`，生成 `[NaN]`。
+  已在本地改为缺失/非有限/非四元/退化框输出空列表；有效 xyxy 保留。
+  不用虚构框补齐，也不改变候选 UID 或语义选择。此修复尚未进入当前运行镜像。
+- 使用现有 Python 3.10 / pydantic 环境执行 `test_scene_query.py` 与
+  `test_real_robot_final_verifier.py`，10 项通过。默认 Python 环境缺 pydantic，
+  其 verifier 回退导致的两项失败不归因为本次修改；未更改环境或绕过断言。
+- 最终 verifier adapter 使用当前 capture 的框覆盖候选地图框，因此 `[NaN]` 本身
+  不证明视觉核验必然失败；仍需检验现场 capture 的图像/检测时间戳配对与实例归属。
+  当前 ROS cache 将检测关联到 latest RGB，而检测存在处理延迟；下一步应对这条
+  配对链做实际取证核对，不能把静止检测稳定或模拟 verifier 测试当作最终视觉 STOP。
+
+### 检测图像、框与位姿配对修复
+
+- `RosObservationCache.update_detection_result` 不再无条件借用 latest RGB：优先保留
+  检测消息携带的输入图像，空内联 header 使用检测 envelope 时间戳；非空但矛盾的
+  时间戳不接受。无内联图像时只查找同时间戳 RGB 缓存，不拼接另一帧。
+- 保留有界位姿历史，证据图像配对最近实测位姿（最大偏差 0.25 s）；REACHED 时间屏障
+  同时约束图像/检测和配对位姿。没有可配对图像时返回新整帧而不套用旧框。
+  同类但不同 track ID 不得替代已选实例。runtime 已接入该配对入口。
+- 缺失/无效 bbox 修复及图像配对、ID 区分、时间屏障、runtime 回归共 47 项通过，
+  环境为 `/home/ubuntu/anaconda3/envs/conceptgraph/bin/python`，没有真实运动或 VLM 请求。
+- 实时隔离订阅验证成功：sysnav_object:2、track 2，检测/证据时间戳均
+  1793869929.2047157；位姿偏差约 -0.00418 s；原始检测图像和落盘图像字节哈希均为
+  `5ab9d56d3970bfc8c2415b6c67ef2be7c1efcf91f6903cbe2c5f617929bc6338`。
+  实测用 IDLE 状态加时间屏障验证传输，不伪造 REACHED，也没有产生 STOP。
+- 证据 `logs/diagnostics/live-evidence-check/`。当前运行节点尚未替换；三文件独立候选
+  镜像已构建并完成容器内哈希/导入/安装接线验证，ID 为
+  `sha256:016e990ad48182ca54cb6d8ab4f802a2bb5be505e9d8c316912a6725e3320745`，
+  tag=`huawei-vln-realworld:orin-r36.5-yoloworld-evidence-candidate`。尚未切换运行服务。
+  基线/文件哈希、构建配方与验证回执在 `logs/diagnostics/evidence-candidate-build/`。
+  这些检查只证明证据配对，不证明精确先验身份、真实视觉判定或最终闭环完成。
+
+### 证据修复候选已上线及底盘只读复核
+
+- 当前运行镜像已切换为 `016e990ad481...`，容器 `huawei-vln-static-evidence-candidate`；
+  旧决策已在停止旧容器前保存，相机/LIO 未重启。新镜像 45 秒采样有 21 条检测、22 次对象。
+  本窗口错过一次性 viewpoint 事件，runtime 仍保存有效视点 0：192 条决策中 156 次
+  go_to_object，目标 sysnav_object:2，bbox_2d=[]；严格 JSON 序列化通过。
+  四个运动话题发布者均为 0，未启用自主运动。
+- 新的 10 秒底盘只读订阅：robot_status/ranger_status 各 485 条、BMS 484 条、selected 2 条。
+  selected 仍为 `/run_management/virtual_joy`，反馈速度为 0；ranger 模式/状态为 0/2，
+  robot_status 为 1/0，两者 fault_code=128。robot_status 文本为过压保护，BMS 电压 52.3 V、
+  ranger 电压 55.5 V。未知枚举不按正常处理，也不以用户过去的遥控器解释覆盖当前样本。
+  已询问当前遥控器状态；本次没有 advertise、速度 publish 或选源 service call。
+- 原始证据：`logs/diagnostics/evidence-static-validation/`。
+  启动、停止、回滚与版本边界见 [静止候选运行手册](real_robot_static_candidate_runbook_20261105.md)。
+
+### 精确实例绑定的当前缺口与核验输入
+
+- 全仓调用审计确认：`PriorMapMemory.mark_object_verified` 仅有测试调用，生产 runtime
+  没有已接入的跨地图身份判定→写入路径。因此 matched=false 不只是检测质量问题；
+  需要真实身份判断及其 provenance 接线，不能靠调宽类别/距离阈值消除未绑定状态。
+- 新镜像目标快照的椅子到两个最近历史实例 XY 残差为 0.0727/0.1230 m，第三个 1.895 m。
+  只比较 XY，未验证 Z 对齐。前两者不能凭最近距离唯一接受。
+- 检索全部历史支持观察：detection1 有 6 条（desk chair 2、chair 1、table/shelf unit/monitor
+  各 1）；detection6 有 5 条（trash bag 3、desk chair/chair 各 1）。这是标签混杂的信号，
+  不是仅凭标签便断言不同实物，也不足以自动合并历史实例。
+- 新容器会话内已重采当前椅子证据，使用镜像原生 cache：图像/检测时间戳一致，位姿偏差
+  约 0.000042 s，原图字节哈希与落盘一致；未伪造到达或发送 STOP。
+  不能把旧容器数字 ID=2 自动当作新会话同一身份，输入包显式绑定 container ID/started_at。
+- 完整输入包：`logs/diagnostics/instance-correspondence-inputs/inputs.json`，含 11 条原始
+  观察、图像、掩膜、框与 26 项文件哈希；decision=not_performed、binding_written=false。
+- 当前项目/进程环境未发现可用视觉模型服务配置，运行仍 LLM_OFFLINE=1。
+  已询问沿用的现有服务配置路径/地址和模型名，不在聊天收集密钥；此时不得将静态图像
+  输送检查或 mocked verifier 的通过记为真实视觉判定通过。
+
+### 已核对的底盘转接接口
+
+用户指定核对 FW2W ICRA2027；正式源码位于
+`/home/ubuntu/WorkSpace/research/code/ICRA2027/FWTW/tools/agilex_api/`。
+`ros2_cmd_vel_to_agilex_ws.py` 将 ROS2 Twist 经 .102:9090 rosbridge 发布到
+`/navflow_cmd_vel`；`keyboard_mux_switch.py` 通过 `/mux_vel/add`、`/mux_vel/select`
+管理自动源与 `/run_management/virtual_joy` 人工源。physical 需要明确使能。
+STRIVE 已在 `agilex_platform.py` 集成同一转接协议，并从安全仲裁输出提取 Twist，
+核对选源回执和硬件状态合同；不再另启 FWTW bridge，避免双发布者。
+重新核对本地 `agilex_platform.py::_worker_session`：STRIVE 已每 2 秒发送应用层
+`op=ping`，此前“未见对应实现”的记录有误，不应新增重复心跳实现。
+G3 仍需验收本车实际断链停车行为；源码中的心跳与断连撤销授权不能代替实车停车证据。
+接口只负责控制转接，不能恢复 Orin 的 LiDAR/LIO 数据流，也不能证明故障已解除。
+
+### 历史物理闭环口径的四个交付关口
+
+- [ ] **G1 持久地图与定位**：局部 PCD、哈希、alignment 及保存地图静止初始化已完成。
+  剩余是在实际任务覆盖区域和后续绑定摆位中验证连续定位；网线限制下的小范围采集
+  不能当作完整场地图。既有尺度真值豁免仍保留，不补做卷尺精度实验。
+- [ ] **G2 静止绑定与视点**：用先验约 (-1.0,-0.25) 的椅子做正向绑定，
+  在正常摆位过程中取不同视角，确认同一实物 UID、坐标残差和可执行 viewpoint；
+  顺带保留一个同类干扰/不匹配样例。全程 dry-run、远端控制关闭。
+  已有 cart 负例可复用，不单独重复运行。记录现有匹配阈值，不能只凭 matched=true 判通过。
+- [ ] **G3 实际底盘控制验收**：故障状态和底盘 watchdog/急停语义明确后，完成受限控制合约、
+  唯一输出归属与限速；取得现场运动授权再验证短距离跟踪、停止、取消、人工接管、
+  断链/传感器过期停止及重连不恢复旧命令。按不同停止机制覆盖，合并重复场景；
+  停车时间/距离阈值在试验前固定，实际停车证据不可用零速日志替代。
+- [ ] **G4 真实任务与交付**：自然语言→先验→在线绑定→视点→实际行驶→新鲜视觉核验→STOP；
+  至少一个完整成功任务及失败/接管记录。把整栈连续 30 分钟资源/TF/丢帧观测并入现场会话，
+  不再另开空转长测；固定部署版本、地图/标定哈希、配置、启动/停止/回滚步骤。
+  单例闭环只支持受限场景交付，不作为泛化成功率结论。
+
+### 从当前待办移除的重复或非阻塞工作
+
+- 不重跑已通过的同一录包 1 m 路径规划、101 点路径及 HOLD 全零回放；
+  仅在相关代码/配置变化或现场出现新问题时做对应回归。
+- 不重复实现已落地的 bridge、类型适配、viewpoint 订阅就绪和 frame 修复；
+  已有本地/fake 测试不作为新阶段独立任务。
+- 不另做完整 HM3D 对照、仿真 sofa 修复、碎片几何阈值搜索或 tv/monitor 模型优化；
+  已知局限保留，若现场目标受影响再定向处理。
+- 不把“三个起点各一次”等建议采样数当硬性门槛；围绕不同失效机制采样，
+  固定实际尝试分母和失败，不以删测试缩减控制安全与完整闭环验收。
+
+**启动注意：** `start_real_robot_sensors.sh ... start` 会复用已有 livox_odom 会话，
+仅设置 `LIO_PCD_SAVE_EN=1` 再调用 start 不保证切换存图。必须先检查当前参数、
+保护未保存数据，再按现场许可有序重启并复核参数；禁止直接 kill-session 丢图。
+
 
 > 更新日期：2026-09-08
 > 代码基线：本地 `realworld` 最新为 `ea37c38`（包含 `ad08c1a` 的低速 OCC 融合接受结论和 `3978b5c` 的 semantic mapping 合并索引修复）；`origin/realworld` 仍落后 6 个提交，未在本轮推送。新机器人工作区已用同一修复提交为 `0acbf3e` 并用于镜像重建，旧 `/home/orin26/HuaweiVLN` 保留为只读回滚工作区，未被覆盖。
@@ -76,7 +604,7 @@
 勾选规则：只有代码、命令输出或真机记录能够直接证明的事项才标记为完成。单元测试、
 bag replay、HIL 和影子 topic 不能替代真实底盘验收。
 
-## 1. 当前结论
+## 1. 历史结论（以文首正式入口状态为准）
 
 ### 2026-11-03 先验地图合并部署（只读，无运动）
 
@@ -228,7 +756,7 @@ bag replay、HIL 和影子 topic 不能替代真实底盘验收。
       pathFollower、MotionServer、SafetyVelocityMux）并循环回放录包，发 `camera_init` 动作目标：
       目标被接受，`/way_point` frame `camera_init`，`path_valid=true`；mux 全程 HOLD
       （autonomy 未使能），551 条 `/cmd_vel` 全为零，目标以 `goal_timeout`（“safety mux
-      remained in hold”）结束。低速实车验收只差放行 autonomy 与控制合约文件。
+      remained in hold”）结束。该回放证明 HOLD 链路有效；真实运动仍需当前清单 G3 的合同、底盘状态与现场控制验收，不能仅放行 autonomy。
     - 16:26:43 在原位以存图模式重启 LIO（重启前位姿 (-0.005,0.010)，偏航差约 0.3°），
       对齐 JSON 继续适用。当日推车推迟；存图模式静止时内存约 +1.4 GB/h，16:45:29 原位恢复
       非存图会话（车未动）。推车前需原位再以 `LIO_PCD_SAVE_EN=1` 重启。

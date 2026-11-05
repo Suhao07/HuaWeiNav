@@ -3,6 +3,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+if [[ "${START_FORMAL_NAVIGATION:-0}" == 1 ]]; then
+  exec bash "$SCRIPT_DIR/start_real_robot_navigation.sh" "$@"
+fi
 WS_DIR="${STRIVE_REAL_ROBOT_WS:-${REPO_ROOT}/real_robot/ros2_ws}"
 ROS_DISTRO_NAME="${ROS_DISTRO:-humble}"
 ROS_SETUP="/opt/ros/${ROS_DISTRO_NAME}/setup.bash"
