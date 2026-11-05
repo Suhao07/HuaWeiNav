@@ -8,9 +8,13 @@ from .contracts import BenchmarkProvider
 from .gibson_objectnav import GibsonCustomProvider, GibsonObjectNavProvider
 from .hm3d_objectnav import HM3DInstructionProvider, HM3DObjectNavProvider
 from .hm3d_ovon import HM3DOVONProvider
+from .langmap import LangMapProvider
+from .goat_language import GOATLanguageProvider
 
 
 _PROVIDERS: Dict[str, Type[BenchmarkProvider]] = {
+    "langmap": LangMapProvider,
+    "goat_language": GOATLanguageProvider,
     "hm3d_objectnav": HM3DObjectNavProvider,
     "hm3d_instruction": HM3DInstructionProvider,
     "hm3d_ovon": HM3DOVONProvider,

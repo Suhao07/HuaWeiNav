@@ -277,7 +277,8 @@ if __name__ == "__main__":
     # Provider-specific success distance must reach the agent as well as Habitat.
     # 否则 final-stop verifier 和靠近控制会沿用 HM3D 默认 1.0m，
     # 与 OVON 等 benchmark 的 1.5m 成功半径不一致。
-    habitat_agent.success_distance = benchmark_spec.success_distance
+    # LangMap 的 0.25m 衡量合法视点距离；对象接近控制继续使用原策略的表面距离。
+    habitat_agent.success_distance = 1.0 if benchmark_spec.benchmark in {"langmap", "goat_language"} else benchmark_spec.success_distance
     evaluation_metrics = []
     instruction_parser = StriveInstructionParser(
         backend=args.instruction_adapter_backend,
@@ -329,7 +330,7 @@ if __name__ == "__main__":
             raw_instruction = custom_instruction
             episode_info = {}
             plan_source = "custom_instruction"
-        elif args.enable_instruction_adapter:
+        elif args.enable_instruction_adapter or benchmark_spec.benchmark in {"langmap", "goat_language"}:
             episode_info = getattr(current_episode, "info", None) or {}
             raw_instruction = str(episode_info.get("instruction", "")).strip() or target
             plan_source = "episode_instruction"
@@ -425,6 +426,18 @@ if __name__ == "__main__":
                 or habitat_agent.instruct_goal
             ),
         })
+        if benchmark_spec.benchmark == "langmap":
+            official = habitat_env.get_metrics()['langmap_evaluation']
+            evaluation_metrics[-1].update(
+                habitat_stop_success=habitat_agent.metrics['success'],
+                habitat_stop_spl=habitat_agent.metrics['spl'],
+                success=official['success'], spl=official['spl'],
+                distance_to_goal=official['distance_to_goal'],
+                langmap_path_length=official['path_length'],
+                langmap_start_distance=official['start_distance'])
+            with open(os.path.join(episode_dir, 'langmap_result.json'), 'w') as stream:
+                json.dump(dict(id=current_episode.episode_id, instruction=raw_instruction,
+                               **official), stream, indent=2)
         write_metrics(evaluation_metrics, path=f"./{args.save_dir}/metrics.csv")
         logger.info('\n')
 
