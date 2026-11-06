@@ -337,14 +337,12 @@ class GuidedNavigation:
         return "moving"
 
 
-def run_guided_episode(agent, *, episode_idx, max_steps, max_model_calls=100):
-    """Execute baseline skills; retain model calls for semantic/recovery events.
-
-    Exploration arrivals update the scene. Object arrivals capture directed
-    evidence, preserving the original verification/view-control feedback loop.
-    """
-    guided = GuidedNavigation(agent, Path(agent.save_dir) / f"episode-{episode_idx}" / "harness",
-                              max_model_calls)
+def run_guided_episode(agent, *, episode_idx, max_steps, max_model_calls=100,
+                       stop_on_success=True, output_dir=None):
+    """Execute baseline skills, optionally leaving STOP ownership to the sequence driver."""
+    directory = (Path(output_dir) if output_dir is not None
+                 else Path(agent.save_dir) / f"episode-{episode_idx}" / "harness")
+    guided = GuidedNavigation(agent, directory, max_model_calls)
     agent.on_node_flag = True
     run_observation_mapping_cycle(agent, node=None, episode_idx=episode_idx)
     state, termination = "select", "episode_limit"
@@ -391,15 +389,18 @@ def run_guided_episode(agent, *, episode_idx, max_steps, max_model_calls=100):
                 break
         if state == "verified_finish":
             agent.found_goal = True
-            agent.obs = agent.execution.step(0)
-            agent.update_trajectory()
+            if stop_on_success:
+                agent.obs = agent.execution.step(0)
+                agent.update_trajectory()
             termination = "verified_finish"
             break
     if guided.tools.motion.active_request_id is not None:
         guided.tools.motion.cancel()
         guided.tools.motion.poll_active()
-    (guided.directory / "termination.json").write_text(json.dumps({
+    result = {
         "reason": termination, "decision_owner": "baseline_guided",
         "model_calls": guided.runtime.model_calls, "steps": agent.episode_steps,
         "task_complete": agent.task.progress.completed,
-    }, indent=2))
+    }
+    (guided.directory / "termination.json").write_text(json.dumps(result, indent=2))
+    return result

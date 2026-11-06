@@ -108,8 +108,9 @@ def test_directed_verification_reuses_feedback_without_panorama(monkeypatch):
     assert gap["heading_offset_deg"] == pytest.approx(45)
 
 
+@pytest.mark.parametrize("stop_on_success", [True, False])
 @pytest.mark.parametrize("kind", ["frontier", "object", "blocked"])
-def test_terminal_event_dispatches_observation_or_verification_once(monkeypatch, tmp_path, kind):
+def test_terminal_event_dispatches_observation_or_verification_once(monkeypatch, tmp_path, kind, stop_on_success):
     from pathlib import Path
     from motion.contracts import NavigationStatus, NavigationStatusCode
     import backends.habitat.guided_runtime as runtime
@@ -147,13 +148,46 @@ def test_terminal_event_dispatches_observation_or_verification_once(monkeypatch,
                   verify=verify, select=lambda idx: False, recover=recover, observation_updated=lambda: None,
                   motion_finished=lambda feedback: None)
     monkeypatch.setattr(runtime, "GuidedNavigation", construct)
-    runtime.run_guided_episode(agent, episode_idx=0, max_steps=500)
+    if stop_on_success:
+        result = runtime.run_guided_episode(agent, episode_idx=0, max_steps=500)
+        directory = tmp_path / 'episode-0' / 'harness'
+    else:
+        directory = tmp_path / 'subtask-1' / 'harness'
+        result = runtime.run_guided_episode(agent, episode_idx=0, max_steps=500,
+                                            stop_on_success=False, output_dir=directory)
+        assert not (tmp_path / 'episode-0' / 'harness').exists()
+    import json
+    assert json.loads((directory / 'termination.json').read_text()) == result
     if kind == "frontier":
         assert events == ["observe", "advance", "observe", "visited"]
     elif kind == "object":
-        assert events == ["observe", "advance", ("verify", (1, 2, 0)), "stop"]
+        assert events == ["observe", "advance", ("verify", (1, 2, 0))] + (["stop"] if stop_on_success else [])
+        assert result['reason'] == 'verified_finish' and result['task_complete']
+        assert agent.env.episode_over is stop_on_success
     else:
         assert events == ["observe", "advance", "recover"]
+
+
+@pytest.mark.parametrize('camera_height', [0.88, 1.31])
+def test_waypoint_distance_starts_at_actual_body_pose(camera_height):
+    import numpy as np
+    from navigation.action_controller import current_habitat_position, geodesic_distance_to_waypoint
+
+    body = np.array([3., 2.65, -4.])
+    sim = NS(get_agent_state=lambda: NS(position=body), geodesic_distance=Mock(return_value=2.))
+    agent = NS(env=NS(sim=sim), mapper=NS(initial_position=np.array([1., -2., 2.5 + camera_height]),
+                                       current_position=np.array([2., -2., 0.])))
+    assert np.array_equal(current_habitat_position(agent), body)
+    assert geodesic_distance_to_waypoint(agent, np.array([5., 6., -camera_height])) == 2.
+    start, end = sim.geodesic_distance.call_args.args
+    assert np.array_equal(start, body)
+    assert np.array_equal(end, [6., 2.65, 4.])
+    from planning.exploration_policy import _geodesic_distances_to_nodes
+    agent.mapper.env = agent.env
+    assert _geodesic_distances_to_nodes(agent.mapper, [NS(position=np.array([5., 6., -camera_height]))]).tolist() == [2.]
+    start, end = sim.geodesic_distance.call_args.args
+    assert np.array_equal(start, body)
+    assert np.array_equal(end, [6., 2.65, 4.])
 
 
 def test_initial_and_feedback_views_share_planner_arrival(monkeypatch):
