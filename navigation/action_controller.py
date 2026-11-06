@@ -32,12 +32,7 @@ def habitat_waypoint(agent: Any, waypoint: np.ndarray | None = None, *, frame_id
 def current_habitat_position(agent: Any) -> np.ndarray:
     """Return current agent position in Habitat simulator coordinates."""
 
-    current_position = agent.mapper.current_position + agent.mapper.initial_position
-    return np.array([
-        current_position[0],
-        agent.mapper.initial_position[2] - 0.88,
-        current_position[1],
-    ])
+    return np.array(agent.env.sim.get_agent_state().position, dtype=float)
 
 
 def geodesic_distance_to_waypoint(agent: Any, waypoint: np.ndarray | None = None, *, frame_id="mapper_local") -> float:

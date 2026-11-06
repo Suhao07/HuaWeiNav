@@ -75,17 +75,18 @@ def _evidence_image_and_rotation(images: list[np.ndarray], rotations: list[Any],
     return image, rotation
 
 
-def _project_bbox(obj_pcd: Any, camera_intrinsic: Any, position: Any, rotation: Any, *, padding: int = 3) -> np.ndarray | None:
+def _project_bbox(obj_pcd: Any, camera_intrinsic: Any, position: Any, rotation: Any, *, image_shape: tuple[int, int], padding: int = 3) -> np.ndarray | None:
     """Project an object point cloud and return a clamped image-space bbox."""
 
+    height, width = image_shape
     camera_points = project_to_camera(obj_pcd, camera_intrinsic, position, rotation)
     camera_points = np.array(camera_points).T
     camera_points = np.array(camera_points[:, :2], dtype=np.int32)
     flag = (
         (camera_points[:, 0] >= 0) &
-        (camera_points[:, 0] < 640) &
+        (camera_points[:, 0] < width) &
         (camera_points[:, 1] >= 0) &
-        (camera_points[:, 1] < 480)
+        (camera_points[:, 1] < height)
     )
     camera_points = camera_points[flag]
     if camera_points.shape[0] == 0:
@@ -93,7 +94,7 @@ def _project_bbox(obj_pcd: Any, camera_intrinsic: Any, position: Any, rotation: 
 
     bbox = np.array([np.min(camera_points, axis=0), np.max(camera_points, axis=0)])
     bbox[0] = np.maximum(bbox[0] - padding, 0)
-    bbox[1] = np.minimum(bbox[1] + padding, [639, 479])
+    bbox[1] = np.minimum(bbox[1] + padding, [width - 1, height - 1])
     return np.array([bbox[0][0], bbox[0][1], bbox[1][0], bbox[1][1]])
 
 
@@ -113,6 +114,7 @@ def project_object_view(agent: Any, obj: Any, images: list[np.ndarray], rotation
         agent.mapper.camera_intrinsic,
         agent.mapper.current_position,
         rotation,
+        image_shape=image.shape[:2],
     )
     if bbox_xyxy is None:
         return None
@@ -122,6 +124,7 @@ def project_object_view(agent: Any, obj: Any, images: list[np.ndarray], rotation
         agent.mapper.camera_intrinsic,
         agent.mapper.current_position,
         rotation,
+        image_shape=image.shape[:2],
         padding=0,
     )
     return ObjectViewEvidence(

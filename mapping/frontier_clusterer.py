@@ -58,7 +58,7 @@ def analyze_frontier_clusters(
     centers_from_frontiers_map_idxs: list[np.ndarray] = []
     centers_from_clusters: list[np.ndarray] = []
 
-    max_label = labels.max().cpu().numpy()
+    max_label = labels.max().cpu().numpy() if len(labels) else -1
     for cluster_idx in range(max_label + 1):
         mask_idx_tensor = o3d.core.Tensor(
             (labels == cluster_idx).nonzero()[0],

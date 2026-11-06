@@ -14,7 +14,8 @@ def calc_depth_img(camera_intrinsic, min_depth, max_depth):
     - min_depth_image: (H, W) 深度图，对应 min_depth 球面
     - max_depth_image: (H, W) 深度图，对应 max_depth 球面
     """
-    w, h = 640, 480  # 图像尺寸
+    w = int(round(2 * camera_intrinsic[0, 2] + 1))
+    h = int(round(2 * camera_intrinsic[1, 2] + 1))
 
     # fx, fy = camera_intrinsic[0, 0], camera_intrinsic[1, 1]
     # cx, cy = camera_intrinsic[0, 2], camera_intrinsic[1, 2]

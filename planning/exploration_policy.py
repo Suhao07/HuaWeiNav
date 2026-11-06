@@ -153,17 +153,11 @@ def _geodesic_distances_to_nodes(mapper: Any, nodes: list[Any]) -> np.ndarray:
         Distance array aligned with ``nodes``.
     """
 
+    current_position = np.asarray(mapper.env.sim.get_agent_state().position, dtype=float)
     nodes_positions = np.array([node.position for node in nodes], dtype=float)
     nodes_positions = nodes_positions + mapper.initial_position
-    nodes_positions[:, 2] = mapper.initial_position[2] - 0.88
+    nodes_positions[:, 2] = current_position[1]
     nodes_positions = nodes_positions[:, [0, 2, 1]]
-
-    current_position = mapper.current_position + mapper.initial_position
-    current_position = np.array([
-        current_position[0],
-        mapper.initial_position[2] - 0.88,
-        current_position[1],
-    ])
     return np.array([
         float(mapper.env.sim.geodesic_distance(current_position, node_position))
         for node_position in nodes_positions

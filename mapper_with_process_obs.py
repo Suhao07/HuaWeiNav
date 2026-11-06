@@ -211,7 +211,7 @@ class Instruct_Mapper:
 
 
 
-        h, w = 480, 640
+        h, w = self.lower_img.shape
         coord_map_left = np.zeros((h, w, 2), dtype=np.float32)
         coord_map_right = np.zeros((h, w, 2), dtype=np.float32)
         coord_map_middle = np.zeros((h, w, 2), dtype=np.float32)
@@ -339,18 +339,7 @@ class Instruct_Mapper:
         cluster_points = self.navigable_pcd.point.positions.cpu().numpy().copy()
         obstacle_points = self.obstacle_pcd.point.positions.cpu().numpy().copy()
 
-        nav_map = np.zeros((self.voxel_dimension[0], self.voxel_dimension[1]))
-        obstacle_map = np.zeros((self.voxel_dimension[0], self.voxel_dimension[1]))
-        cluster_points_map = translate_point_to_grid(cluster_points, self.grid_resolution, self.voxel_dimension)[:, :2]
-        obstacle_points_map = translate_point_to_grid(obstacle_points, self.grid_resolution, self.voxel_dimension)[:, :2]
-
-        nav_map[cluster_points_map[:, 0], cluster_points_map[:, 1]] = 1
-        obstacle_map[obstacle_points_map[:, 0], obstacle_points_map[:, 1]] = 1
-
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-        obstacle_map = cv2.dilate(obstacle_map, kernel, iterations=1)
-        obstacle_map = cv2.bitwise_not(obstacle_map)
-        nav_map = cv2.bitwise_and(nav_map, obstacle_map)
+        navigable_cells = self._visibility_cells(cluster_points, obstacle_points)
 
         # get all the possible 2 nodes pair
         node_pairs = []
@@ -380,7 +369,7 @@ class Instruct_Mapper:
 
             obs_num = 0
             for point in interpolate_points:
-                if nav_map[point[0], point[1]] == 0:
+                if tuple(point) not in navigable_cells:
                     obs_num = obs_num + 1
 
             if obs_num > 5:
@@ -423,8 +412,10 @@ class Instruct_Mapper:
         self.rotation = rotation
         self.current_rotation = self.rotation_func(rotation)
         self.original_depth = depth.copy()
-        self.ori_current_depth = ori_preprocess_depth(depth) # 直接每个pixel都根据max,min做clip
-        self.current_depth = preprocess_depth(depth, self.lower_img, self.upper_img) # 球面深度clip
+        mapping_depth = depth.copy()
+        # 原始观测归采集方所有；建图预处理只修改自己的副本。
+        self.ori_current_depth = ori_preprocess_depth(mapping_depth) # 直接每个pixel都根据max,min做clip
+        self.current_depth = preprocess_depth(mapping_depth, self.lower_img, self.upper_img) # 球面深度clip
         self.current_rgb = preprocess_image(rgb)
 
         self.trajectory_position.append(self.current_position)
@@ -473,10 +464,13 @@ class Instruct_Mapper:
                                                > self.floor_height + 0.2).nonzero()[0])
         whole_pcd_points = whole_pcd.point.positions.cpu().numpy()
         whole_pcd_points[:, 2] = np.ones_like(whole_pcd_points[:, 2]) * self.floor_height
-        whole_pcd = gpu_pointcloud_from_array(whole_pcd_points,
-                                              np.ones_like(whole_pcd_points) * 100, self.pcd_device)
-        whole_pcd = whole_pcd.voxel_down_sample(self.pcd_resolution)
-        whole_pcd_points = whole_pcd.point.positions.cpu().numpy()
+        # 障碍高度带为空表示本次没有障碍证据，保留 (0, 3) 空集供射线查询。
+        # Open3D 的体素哈希要求非空键；空集无需降采样，也不能据此跳过地面更新。
+        if len(whole_pcd_points):
+            whole_pcd = gpu_pointcloud_from_array(whole_pcd_points,
+                                                  np.ones_like(whole_pcd_points) * 100, self.pcd_device)
+            whole_pcd = whole_pcd.voxel_down_sample(self.pcd_resolution)
+            whole_pcd_points = whole_pcd.point.positions.cpu().numpy()
 
         current_pcd_points = self.current_pcd.point.positions.cpu().numpy()
         current_pcd_points[:, 2] = np.ones_like(current_pcd_points[:, 2]) * self.floor_height
@@ -736,8 +730,9 @@ class Instruct_Mapper:
             tmp_world_points = []
             idx = []
             for i in range(3):
-                wmin = 640 * i
-                wmax = 640 * (i + 1)
+                width = depth_list[i].shape[1]
+                wmin = width * i
+                wmax = width * (i + 1)
                 nwbox = bbox.clone()
                 if nwbox[2] < wmin or nwbox[0] >= wmax:
                     continue
@@ -940,10 +935,14 @@ class Instruct_Mapper:
         o3d.io.write_line_set(path + "graph.ply", line_set)
 
     def calculate_intersections(self, point_cloud, current_position, num_rays=72, max_distance=2.5):
-        point_map = np.zeros((self.voxel_dimension[0], self.voxel_dimension[1]))
-        point_positions = point_cloud
-        point_grid_idxs = translate_point_to_grid(point_positions, self.grid_resolution, self.voxel_dimension)
-        point_map[point_grid_idxs[:, 0], point_grid_idxs[:, 1]] = 1
+        """Find each ray's first unobserved cell on the existing metric lattice.
+
+        栅格集合 S={grid(p)[:2]} 表示已观测地面，射线在首次 q∉S 时结束。
+        使用稀疏集合保留原坐标量化与射线顺序，同时支持超出初始50m窗口的场景。
+        未观测区域保持未知；不裁剪坐标，也不把边界格复制成可通行地面。
+        """
+        point_grid_idxs = translate_point_to_grid(point_cloud, self.grid_resolution, self.voxel_dimension)
+        observed_cells = set(map(tuple, point_grid_idxs[:, :2]))
 
         intersections = []
         intersections_false_postive = []
@@ -954,12 +953,13 @@ class Instruct_Mapper:
 
         for angle in angles:
             direction = np.array([np.cos(angle), np.sin(angle)])
-            end_point = origin_point + direction * max_distance_map
+            # 与 grid(p)=floor(p/resolution)+offset 使用同一量化；int 会把负坐标向零截断。
+            end_point = np.floor(origin_point + direction * max_distance_map).astype(int)
 
-            interpolate_points = bresenham(origin_point[0], origin_point[1], int(end_point[0]), int(end_point[1]))
+            interpolate_points = bresenham(origin_point[0], origin_point[1], end_point[0], end_point[1])
             interpolate_points = list(interpolate_points)
             for idx, point in enumerate(interpolate_points):
-                if point_map[point[0], point[1]] == 0:
+                if tuple(point) not in observed_cells:
                     point = np.array(list(point))
                     point_1 = translate_single_grid_to_point(point, self.grid_resolution, self.voxel_dimension)[:2] + 0.15 * direction
                     intersections.append(point_1)
@@ -1361,9 +1361,6 @@ class Instruct_Mapper:
             labels = np.array(
                 pcd_removed.cluster_dbscan(eps=0.08, min_points=4, print_progress=False))
 
-        # logger.info(labels)
-        if step != 12 and len(labels) == 0:
-            return
         cluster_result = analyze_frontier_clusters(
             self,
             pcd_removed=pcd_removed,
@@ -1383,6 +1380,12 @@ class Instruct_Mapper:
         centers_from_frontiers = cluster_result.centers_from_frontiers
         centers_from_frontiers_map_idxs = cluster_result.centers_from_frontiers_map_idxs
         centers_from_clusters = cluster_result.centers_from_clusters
+        # 裁剪的是节点覆盖区域，不能同时吞掉圈内仍未探索的门口前沿。
+        for center, frontier_idxs in zip(frontier_centers, global_frontier_map_idxs):
+            if polygon_path.contains_point(center[:2]) and not any(
+                    np.allclose(center, existing) for existing in centers_from_frontiers):
+                centers_from_frontiers.append(center)
+                centers_from_frontiers_map_idxs.append(frontier_idxs)
 
         current_nav_pcd_to_save = o3d.t.geometry.PointCloud(self.pcd_device)
         current_nav_pcd_to_save = gpu_merge_pointcloud(current_nav_pcd_to_save, pcd_in_circle, False)
@@ -1536,14 +1539,23 @@ class Instruct_Mapper:
 
         return frontier_clusters, frontier_centers, frontier_map_idxs, frontier_map_idxs_all
 
+    def _visibility_cells(self, cluster_points, obstacle_points):
+        """Return observed cells after the existing 2×2 obstacle dilation.
+
+        N = grid(ground) ∖ (grid(obstacles) ⊕ {(0,0),(0,1),(1,0),(1,1)}).
+        正方向偏移对应 OpenCV 2×2 核的默认锚点；稀疏集合支持任意场景坐标。
+        """
+        ground = translate_point_to_grid(cluster_points, self.grid_resolution, self.voxel_dimension)[:, :2]
+        obstacles = translate_point_to_grid(obstacle_points, self.grid_resolution, self.voxel_dimension)[:, :2]
+        blocked = {(int(x) + dx, int(y) + dy) for x, y in obstacles
+                   for dx, dy in ((0, 0), (0, 1), (1, 0), (1, 1))}
+        return set(map(tuple, ground)) - blocked
+
     def is_visible(self, point1, point2, cluster_points, obstacle_points):
         point1 = point1.copy()
         point2 = point2.copy()
         cluster_points = cluster_points.copy()
         obstacle_points = obstacle_points.copy()
-
-        nav_map = np.zeros((self.voxel_dimension[0], self.voxel_dimension[1]))
-        obstacle_map = np.zeros((self.voxel_dimension[0], self.voxel_dimension[1]))
 
         # find the closet point in cluster_points to point1 and point2
         distance1 = np.linalg.norm(cluster_points[:, :2] - point1[:2], axis=1)
@@ -1554,22 +1566,13 @@ class Instruct_Mapper:
 
         point1_map = translate_point_to_grid(point1, self.grid_resolution, self.voxel_dimension)[:2]
         point2_map = translate_point_to_grid(point2, self.grid_resolution, self.voxel_dimension)[:2]
-        cluster_points_map = translate_point_to_grid(cluster_points, self.grid_resolution, self.voxel_dimension)[:, :2]
-        obstacle_points_map = translate_point_to_grid(obstacle_points, self.grid_resolution, self.voxel_dimension)[:, :2]
-
-        nav_map[cluster_points_map[:, 0], cluster_points_map[:, 1]] = 1
-        obstacle_map[obstacle_points_map[:, 0], obstacle_points_map[:, 1]] = 1
-
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-        obstacle_map = cv2.dilate(obstacle_map, kernel, iterations=1)
-        obstacle_map = cv2.bitwise_not(obstacle_map)
-        nav_map = cv2.bitwise_and(nav_map, obstacle_map)
+        navigable_cells = self._visibility_cells(cluster_points, obstacle_points)
 
         interpolate_points = bresenham(point1_map[0], point1_map[1], point2_map[0], point2_map[1])
         interpolate_points = list(interpolate_points)[1:-1]
 
         for point in interpolate_points:
-            if nav_map[point[0], point[1]] == 0:
+            if tuple(point) not in navigable_cells:
                 return False
 
         return True
@@ -1579,13 +1582,12 @@ class Instruct_Mapper:
         point2_map = translate_point_to_grid(point2, self.grid_resolution, self.voxel_dimension)[:2]
         cluster_points_map = translate_point_to_grid(cluster_points, self.grid_resolution, self.voxel_dimension)[:, :2]
 
-        nav_map = np.zeros((self.voxel_dimension[0], self.voxel_dimension[1]))
-        nav_map[cluster_points_map[:, 0], cluster_points_map[:, 1]] = 1
+        navigable_cells = set(map(tuple, cluster_points_map))
 
         interpolate_points = bresenham(point1_map[0], point1_map[1], point2_map[0], point2_map[1])
 
         for point in interpolate_points:
-            if nav_map[point[0], point[1]] == 0:
+            if tuple(point) not in navigable_cells:
                 return False
 
         return True
@@ -2144,13 +2146,9 @@ class Instruct_Mapper:
                 coeff = penal_coeff * coeff
 
         # calculate the geometric distance from the current position to the end position
-        current_position = self.current_position
-        current_position = current_position + self.initial_position
-        current_position[2] = self.initial_position[2]-0.88
-        current_position = [current_position[0], current_position[2], current_position[1]]
+        current_position = self.env.sim.get_agent_state().position
         end_position = end.position + self.initial_position
-        end_position[2] = self.initial_position[2]-0.88
-        end_position = [end_position[0], end_position[2], end_position[1]]
+        end_position = [end_position[0], current_position[1], end_position[1]]
         distance_to_end = self.env.sim.geodesic_distance(current_position, end_position)
 
         distance_to_end = coeff * distance_to_end
