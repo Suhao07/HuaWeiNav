@@ -98,6 +98,7 @@ class HM3D_Objnav_Agent:
         self.view_control_state = ViewControlState()
         self.last_check_again_image_path = ""
         self.last_check_again_evidence = None
+        self.current_surface_evidence = None
         self.final_instruction_accepted_this_step = False
         self.instruction_success = False
         self.instruction_decision = ""
@@ -685,93 +686,66 @@ class HM3D_Objnav_Agent:
         self.mapper.get_nodes_process(node, idx=idx, step=step, path_idx=path_idx)
 
     def _project_object_bbox_on_current_view(self):
-        r"""Project the candidate into the current frame and measure its visible support.
+        """Measure the selected instance in one immutable RGB-D observation.
 
-        图像、bbox 与停止距离共用同一个当前可见支撑集合：
-
-        .. math::
-            V = \{p \in P : z_{cam}(p) > 0,\ (u,v) \in \Omega_{H \times W},\
-                z_{cam}(p) - D(u,v) < 0.2\},\qquad
-            d = \min_{p \in V} \lVert p_{xy} - c_{xy} \rVert_2
-
-        其中 P 是实例累计点云，D 是当前米制深度，c 是当前相机位置。
-        累计点云中当前帧看不到的表面不参与距离，避免 STOP 距离与图像证据
-        来自不同观察。
-
-        Returns:
-            ``(bbox_tensor, geometry)``；当前帧没有可见支撑时 bbox 为 None，
-            geometry 只含投影回执路径。
+        当前检测区域、原始深度表面和停止距离共同绑定 observation_identity。
+        历史融合点云仅用于实例对应；最终距离来自当前原始深度反投影。
         """
-        current_depth = self.obs['depth'].copy()
-        height, width = current_depth.shape[:2]
-        positions = self.object_final.pcd.point.positions.cpu().numpy()
-        camera_points = project_to_camera(self.object_final.pcd, self.mapper.camera_intrinsic,
-                                          self.mapper.current_position,
-                                          self.mapper.current_rotation)
-        camera_points = np.array(camera_points)
-        camera_points = camera_points.T
-        projected_points = camera_points.copy()
-        depth = np.array(camera_points[:, 2], dtype=np.float32)
-        camera_points = np.array(camera_points[:, :2], dtype=np.int32)
-        flag = (camera_points[:, 0] >= 0) & (camera_points[:, 0] < width) & \
-               (camera_points[:, 1] >= 0) & (camera_points[:, 1] < height)
-        camera_points = camera_points[flag]
-        depth = depth[flag]
+        from navigation_core.surface_evidence import measure_instance_surface
 
-        current_depth = current_depth[camera_points[:, 1], camera_points[:, 0]][:, 0]
-        current_depth = np.array(current_depth, dtype=np.float32)
-        depth_flag = (depth - current_depth) < 0.2
-        # project_to_camera 只返回光轴前方的点：z_cam = R[:,2]^T (p - t)，深度 = -z_cam > 0。
-        # 用同一判据恢复原始点序号，使可见支撑能回到世界坐标求距离。
-        front = (positions - self.mapper.current_position) @ self.mapper.current_rotation[:, 2] < 0
-        visible_point_index = np.flatnonzero(front)[flag][depth_flag]
-        # 保存同一次观测的原始输入与实际筛选结果。深度 JPEG 只能预览，
-        # 无法重放 z_map - z_obs 的判断；这里保留传感器输出的米制深度
-        # （含传感器量程截断），供空间支撑审计。
-        # projected_points 顺序对应 project_to_camera 中光轴深度为正的原始点。
+        identity = self._observation_identity(self.object_final.uid)
+        if self.current_surface_evidence is not None and self.current_surface_evidence[0] == identity:
+            return self.current_surface_evidence[1:3]
+        positions = self.object_final.pcd.point.positions.cpu().numpy()
+        projected = np.asarray(project_to_camera(
+            self.object_final.pcd, self.mapper.camera_intrinsic,
+            self.mapper.current_position, self.mapper.current_rotation)).T
+        raw_depth = self.obs['depth'].squeeze()
+        h, w = raw_depth.shape
+        uv = projected[:, :2].astype(int)
+        in_image = (uv[:, 0] >= 0) & (uv[:, 0] < w) & (uv[:, 1] >= 0) & (uv[:, 1] < h)
+        masks = self.mapper.object_perceiver.sam.segment_current_target(
+            self.obs['rgb'][..., :3], self.mapper.target)
+        base = self.mapper.translation_func(self.env.sim.get_agent_state().position) - self.mapper.initial_position
+        geometry, mask, support = measure_instance_surface(
+            projected[in_image], raw_depth, masks, self.mapper.camera_intrinsic,
+            self.mapper.current_rotation, self.mapper.current_position, base)
+        geometry['observation_identity'] = identity
+        geometry['projection_failed_in_final_view'] = not geometry['surface_match']
         out_dir = os.path.join(self.save_dir, f'episode-{self.episode_samples - 1}', 'final_verifier')
         os.makedirs(out_dir, exist_ok=True)
-        identity = self._observation_identity(self.object_final.uid)
-        candidate_key = self.object_final.uid.replace(':', '_')
-        projection_path = os.path.join(
-            out_dir, f'projection_{self.episode_steps}_r{identity["task_revision"]}_{candidate_key}.npz')
+        key = self.object_final.uid.replace(':', '_')
+        path = os.path.join(out_dir, f'projection_{self.episode_steps}_r{identity["task_revision"]}_{key}.npz')
+        front = (positions - self.mapper.current_position) @ self.mapper.current_rotation[:, 2] < 0
+        accepted = np.zeros(int(in_image.sum()), dtype=bool)
+        accepted[support] = True
         np.savez_compressed(
-            projection_path,
-            observation_identity=json.dumps(identity),
-            points_xyz=positions,
+            path, observation_identity=json.dumps(identity), points_xyz=positions,
             camera_intrinsic=self.mapper.camera_intrinsic,
             camera_to_mapper_rotation=self.mapper.current_rotation,
-            camera_to_mapper_translation=self.mapper.current_position,
-            rgb=self.obs['rgb'], depth_m=self.obs['depth'],
-            projected_uv_depth=projected_points, in_image=flag,
-            sampled_depth_m=current_depth, passes_occlusion=depth_flag,
-            visible_point_index=visible_point_index,
-        )
-        camera_points = camera_points[depth_flag]
+            camera_to_mapper_translation=self.mapper.current_position, base_position=base,
+            rgb=self.obs['rgb'], depth_m=raw_depth, depth_source='sensor_raw',
+            instance_masks=masks, selected_mask=mask,
+            projected_uv_depth=projected, in_image=in_image, passes_occlusion=accepted,
+            visible_point_index=np.flatnonzero(front)[in_image][support])
+        geometry['projection_evidence_path'] = path
+        bbox = None
+        if geometry['surface_match']:
+            x1, y1, x2, y2 = geometry['bbox_xyxy']
+            geometry.update(bbox_center_norm=[(x1+x2)/(2*w), (y1+y2)/(2*h)],
+                            bbox_area_ratio=(x2-x1+1)*(y2-y1+1)/(w*h),
+                            visible_projected_points=len(support))
+            bbox = torch.tensor([geometry['bbox_xyxy']], dtype=torch.float32)
+        self.current_surface_evidence = (identity, bbox, geometry, mask)
+        return bbox, geometry
 
-        if len(camera_points) == 0:
-            return None, {"projection_evidence_path": projection_path}
-
-        bbox = np.array([np.min(camera_points, axis=0), np.max(camera_points, axis=0)])
-        # x1 y1 x2 y2
-        bbox_np = np.array([bbox[0][0], bbox[0][1], bbox[1][0], bbox[1][1]], dtype=np.float32)
-        bbox_width = max(1.0, float(bbox_np[2] - bbox_np[0]))
-        bbox_height = max(1.0, float(bbox_np[3] - bbox_np[1]))
-        visible_xy = positions[visible_point_index, :2]
-        geometry = {
-            "projection_evidence_path": projection_path,
-            "bbox_xyxy": [float(x) for x in bbox_np.tolist()],
-            "bbox_center_norm": [
-                float(((bbox_np[0] + bbox_np[2]) / 2.0) / width),
-                float(((bbox_np[1] + bbox_np[3]) / 2.0) / height),
-            ],
-            "bbox_area_ratio": float((bbox_width * bbox_height) / (width * height)),
-            "visible_projected_points": int(len(camera_points)),
-            "distance_to_object": float(np.min(np.linalg.norm(
-                visible_xy - self.mapper.current_position[:2], axis=1))),
-            "distance_source": "current_view_visible_support",
-        }
-        return torch.tensor(bbox_np).unsqueeze(0), geometry
+    def _current_instance_image(self, bbox):
+        """Render the current instance boundary while preserving scene context."""
+        image = visualize_mask(self.rgb_trajectory[-1].copy(), bbox)
+        mask = self.current_surface_evidence[3].astype(np.uint8)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(image, contours, -1, (0, 255, 255), 2)
+        return image
 
     @staticmethod
     def _view_quality_facts(geometry):
@@ -867,32 +841,9 @@ class HM3D_Objnav_Agent:
             return None
 
     def _accepted_distance_from_evidence(self, evidence, result):
-        """Return the best logged target distance and its provenance.
-
-        Habitat's `distance_to_goal` can point to the benchmark category goal,
-        while instruction mode may accept a different terminal instance.  Metrics
-        therefore need an instruction-level distance derived from verifier
-        evidence rather than the dataset metric.
-        """
-
-        geometry = dict((evidence or {}).get("geometry") or {})
-        try:
-            if geometry.get("distance_to_object") is not None:
-                source = str(geometry.get("source") or "final_verifier.geometry")
-                return float(geometry["distance_to_object"]), source
-        except Exception:
-            pass
-
-        view_control = self._view_control_context_from(evidence, result)
-        for key in ("latest_visual_evidence", "best_visual_evidence", "pinned_visual_evidence"):
-            distance = self._distance_from_visual_packet(view_control.get(key))
-            if distance is not None:
-                return distance, f"view_control.{key}"
-
-        distance = self._estimate_distance_to_object_final()
-        if distance is not None:
-            return float(distance), "object_final_pointcloud_estimate"
-        return None, ""
+        """Log the exact measurement that admitted this final stop."""
+        geometry = evidence['geometry']
+        return geometry['distance_to_object'], geometry['distance_source']
 
     def _observation_identity(self, candidate_uid):
         """Bind evidence to its task, instance and measured camera observation.
@@ -918,7 +869,7 @@ class HM3D_Objnav_Agent:
 
         img = self.rgb_trajectory[-1].copy()
 
-        img_vis = visualize_mask(img, bbox)
+        img_vis = self._current_instance_image(bbox)
         os.makedirs(f'{self.save_dir}/episode-{self.episode_samples-1}/check_again', exist_ok=True)
         self.last_check_again_image_path = (
             f'{self.save_dir}/episode-{self.episode_samples-1}/check_again/rgb_{episode_step}.jpg'
@@ -1043,7 +994,7 @@ class HM3D_Objnav_Agent:
         os.makedirs(out_dir, exist_ok=True)
 
         img = self.rgb_trajectory[-1].copy()
-        img_vis = visualize_mask(img, bbox)
+        img_vis = self._current_instance_image(bbox)
         current_path = os.path.join(out_dir, f'current_bbox_{self.episode_steps}.jpg')
         cv2.imwrite(current_path, img_vis)
 
@@ -1465,8 +1416,11 @@ class HM3D_Objnav_Agent:
         if evidence_override is not None and evidence_override.get("observation_identity") != self._observation_identity(candidate.uid):
             logger.info("Capture fresh evidence for candidate {}: observation identity changed", candidate.uid)
             evidence_override = None
+        if bbox is None:
+            evidence_override = None
         if evidence_override is not None:
             evidence = dict(evidence_override)
+            evidence['geometry'] = self._augment_final_stop_geometry(dict(geometry))
             evidence.setdefault("relation_evidence_paths", [])
             if plan is not None and target_for_candidate is not None:
                 evidence = self._attach_view_control_context(evidence, candidate)
@@ -1513,7 +1467,7 @@ class HM3D_Objnav_Agent:
             evidence = {
                 "observation_identity": self._observation_identity(candidate.uid),
                 "geometry": self._augment_final_stop_geometry({
-                    "projection_failed_in_final_view": True,
+                    **geometry, "projection_failed_in_final_view": True,
                 }),
                 "relation_evidence_paths": [],
             }

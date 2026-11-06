@@ -272,3 +272,20 @@ def test_visual_projection_uses_declared_constraint_owner_and_runtime_delegation
     assert next_target["visual_predicates"][0]["relation"] == "on"
     assert next_target["visual_predicates"][0]["verifier"] == "vlm"
     assert next_target["domain_predicates"] == []
+
+
+def test_current_stop_requires_distance_even_with_pinned_reference():
+    evidence = {'geometry': {'required_stop_distance': 1.,
+                              'projection_failed_in_final_view': True},
+                'view_control': {'pinned_visual_evidence': {'image_path': 'old.jpg'}}}
+    constraints = hard_stop_constraints_from_evidence(evidence)
+    assert not constraints['satisfied']
+    assert len(constraints['failed']) == 2
+
+
+def test_surface_identity_must_match_current_observation():
+    evidence = {'observation_identity': {'observation_id': 'new'},
+                'geometry': {'surface_match': True, 'surface_status': 'matched',
+                             'observation_identity': {'observation_id': 'old'},
+                             'distance_to_object': .5, 'required_stop_distance': 1.}}
+    assert not hard_stop_constraints_from_evidence(evidence)['satisfied']

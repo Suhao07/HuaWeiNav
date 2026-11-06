@@ -136,41 +136,44 @@ def test_traversability_preserves_both_input_poses():
 
 
 def test_projection_receipt_preserves_metric_depth_and_actual_filter(tmp_path):
-    """Replay inputs retain sensor clipping values and the production occlusion mask."""
-    projected = np.array([[10, 20, .19], [30, 40, 1.0]], dtype=float)
-    # R=I、t=0 时光轴前方为 z<0；第三个点在相机后方，不进入投影序列。
-    points = np.array([[1, 2, -3], [4, 5, 6], [0.1, 0.1, -6]], dtype=float)
+    """Save raw depth, exact surface selection and a candidate-bound frame cache."""
+    projected = np.array([[10, 20, .5], [11, 20, .5], [10, 21, .5], [30, 40, 1.0]])
+    points = np.array([[1, 2, -3], [1, 2, -4], [1, 3, -4], [0.1, .1, -6], [4, 5, 6.]])
+    masks = np.zeros((1, 480, 640), dtype=bool)
+    masks[0, 19:23, 9:13] = True
+    detector = Mock(return_value=masks)
     ns = methods("objnav_agent_with_process_obs.py", {"_project_object_bbox_on_current_view"}, {
         "np": np, "os": os, "json": json,
         "project_to_camera": lambda *args: projected.T,
-        "torch": NS(tensor=lambda value: NS(unsqueeze=lambda axis: value)),
+        "torch": NS(tensor=lambda value, **kwargs: np.array(value), float32=None),
     })
-    agent = NS(save_dir=str(tmp_path), episode_samples=1, episode_steps=4,
+    agent = NS(save_dir=str(tmp_path), episode_samples=1, episode_steps=4, current_surface_evidence=None,
+               env=NS(sim=NS(get_agent_state=lambda: NS(position=np.zeros(3)))),
                obs={"depth": np.full((480, 640, 1), .5, dtype=np.float32),
                     "rgb": np.zeros((480, 640, 3), dtype=np.uint8)},
                object_final=NS(uid="candidate", pcd=NS(point=NS(positions=NS(
                    cpu=lambda: NS(numpy=lambda: points))))),
                mapper=NS(camera_intrinsic=np.eye(3), current_position=np.zeros(3),
-                         current_rotation=np.eye(3)),
+                         current_rotation=np.eye(3), initial_position=np.zeros(3),
+                         translation_func=lambda x:x, target='chair',
+                         object_perceiver=NS(sam=NS(segment_current_target=detector))),
                _observation_identity=lambda uid: {"candidate_uid": uid, "observation_id": "0:4", "task_revision": 1})
     bbox, geometry = ns["_project_object_bbox_on_current_view"](agent)
-    np.testing.assert_array_equal(bbox, [10, 20, 10, 20])
-    # 停止距离只取当前可见支撑；更近的被遮挡点与相机后方点不参与。
-    assert geometry["distance_to_object"] == pytest.approx(np.sqrt(5))
-    assert geometry["distance_source"] == "current_view_visible_support"
+    np.testing.assert_array_equal(bbox, [[9, 19, 12, 22]])
+    assert geometry["distance_source"] == "current_instance_raw_depth"
     with np.load(geometry["projection_evidence_path"], allow_pickle=False) as receipt:
-        np.testing.assert_array_equal(receipt["depth_m"], agent.obs["depth"])
+        np.testing.assert_array_equal(receipt["depth_m"], agent.obs["depth"].squeeze())
         np.testing.assert_array_equal(receipt["points_xyz"], points)
         np.testing.assert_array_equal(receipt["projected_uv_depth"], projected)
-        np.testing.assert_array_equal(receipt["passes_occlusion"], [True, False])
-        np.testing.assert_array_equal(receipt["visible_point_index"], [0])
-        assert json.loads(str(receipt["observation_identity"]))["candidate_uid"] == "candidate"
-    # 同一步可能检查多个实例，后一个实例的投影不得覆盖前一个的证据。
+        np.testing.assert_array_equal(receipt["passes_occlusion"], [True, True, True, False])
+        np.testing.assert_array_equal(receipt["visible_point_index"], [0, 1, 2])
+        assert str(receipt['depth_source']) == 'sensor_raw'
+    ns["_project_object_bbox_on_current_view"](agent)
+    assert detector.call_count == 1
     agent.object_final.uid = "other"
     _, other_geometry = ns["_project_object_bbox_on_current_view"](agent)
     assert other_geometry["projection_evidence_path"] != geometry["projection_evidence_path"]
-    with np.load(geometry["projection_evidence_path"], allow_pickle=False) as receipt:
-        assert json.loads(str(receipt["observation_identity"]))["candidate_uid"] == "candidate"
+    assert detector.call_count == 2
 
 
 def test_final_evidence_views_instances_sharing_candidate_surface(tmp_path):

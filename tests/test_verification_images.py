@@ -147,3 +147,104 @@ def test_exact_visual_cache_rechecks_current_physical_stop(tmp_path, monkeypatch
     assert len(calls) == 2
     verifier.verify('red chair',{},candidate,evidence)
     assert len(calls) == 3
+
+
+def test_goal_reference_is_sent_separately_and_recorded_as_image_dependency(tmp_path, monkeypatch):
+    import json
+    from hashlib import sha256
+    from PIL import Image
+    import instruction_adapter.verifier as module
+    from prompting.schemas import ParsedVerification
+
+    current, reference = tmp_path / "current.png", tmp_path / "goal.png"
+    Image.new("RGB", (2, 2), "red").save(current)
+    Image.new("RGB", (2, 2), "blue").save(reference)
+    requests = []
+
+    def parse(**kwargs):
+        requests.append(kwargs)
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
+            parsed=ParsedVerification(satisfied=False, decision="uncertain")))])
+
+    client = SimpleNamespace(beta=SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(parse=parse))))
+    monkeypatch.setenv("STRIVE_FINAL_VERIFIER", "on")
+    monkeypatch.setenv("LLM_OFFLINE", "0")
+    monkeypatch.setattr(module, "get_client_and_model", lambda _: (client, "test"))
+    plan = {"targets": [
+        {"id": "other", "name": "chair", "attributes": {"goal_reference_image": str(tmp_path / "unused.png")}},
+        {"id": "goal", "name": "chair", "attributes": {"goal_reference_image": str(reference)}},
+    ]}
+    identity = {"candidate_uid": "u", "task_revision": 1, "observation_id": "current"}
+    result = module.FinalInstructionVerifier(evidence_dir=str(tmp_path / "blobs")).verify(
+        "find the pictured chair", plan, CandidateInstance("u", "chair"),
+        {"target_id": "goal", "observation_identity": identity, "current_rgb_with_bbox_path": str(current)})
+    content = requests[0]["messages"][1]["content"]
+    assert len(content) == 5
+    assert json.loads(content[1]["text"])["role"] == "current_candidate_observation"
+    assert json.loads(content[1]["text"])["observation_identity"] == identity
+    goal_role = json.loads(content[3]["text"])
+    assert goal_role["role"] == "goal_reference"
+    assert "user's goal reference image" in goal_role["instruction"]
+    assert "same physical instance" in goal_role["instruction"]
+    assert "category alone is insufficient" in goal_role["instruction"]
+    assert "not a current candidate observation" in goal_role["instruction"]
+    assert "observation_identity" not in goal_role
+    for source, block in ((current, content[2]), (reference, content[4])):
+        assert block["image_url"]["url"].startswith("data:image/png;base64,")
+        sent_bytes = base64.b64decode(block["image_url"]["url"].split(",", 1)[1])
+        archived = result.diagnostics["image_sources"][str(source)]
+        assert sent_bytes == source.read_bytes() == Path(archived).read_bytes()
+        assert archived in result.evidence_ids
+        assert result.dependencies["image:" + archived] == sha256(sent_bytes).hexdigest()
+    assert image_dependencies_valid(result.dependencies)
+    Path(result.diagnostics["image_sources"][str(reference)]).unlink()
+    assert not image_dependencies_valid(result.dependencies)
+
+
+def test_goal_reference_content_and_revision_invalidate_visual_cache(tmp_path, monkeypatch):
+    import json
+    from PIL import Image
+    import instruction_adapter.verifier as module
+    from prompting.schemas import ParsedVerification
+
+    current, reference = tmp_path / "current.png", tmp_path / "goal.png"
+    Image.new("RGB", (2, 2), "red").save(current)
+    Image.new("RGB", (2, 2), "blue").save(reference)
+    requests = []
+
+    def parse(**kwargs):
+        requests.append(kwargs)
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
+            parsed=ParsedVerification(satisfied=False, decision="uncertain")))])
+
+    client = SimpleNamespace(beta=SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(parse=parse))))
+    monkeypatch.setenv("STRIVE_FINAL_VERIFIER", "on")
+    monkeypatch.setenv("LLM_OFFLINE", "0")
+    monkeypatch.setenv("STRIVE_EVIDENCE_REUSE", "1")
+    monkeypatch.setattr(module, "get_client_and_model", lambda _: (client, "test"))
+    verifier = module.FinalInstructionVerifier(evidence_dir=str(tmp_path / "blobs"))
+    attributes = {"goal_reference_image": str(reference)}
+    task = {"revision": 1, "targets": [{"id": "goal", "name": "chair", "attributes": attributes}]}
+    plan = {"diagnostics": {"task_spec": task}}
+    candidate = CandidateInstance("u", "chair")
+    evidence = {"current_rgb_with_bbox_path": str(current)}
+    first = verifier.verify("find the pictured chair", plan, candidate, evidence)
+    repeat = verifier.verify("find the pictured chair", plan, candidate, evidence)
+    assert len(requests) == 1 and repeat.dependencies == first.dependencies
+    Image.new("RGB", (2, 2), "green").save(reference)
+    changed = verifier.verify("find the pictured chair", plan, candidate, evidence)
+    assert len(requests) == 2 and changed.dependencies != first.dependencies
+    task["revision"] = 2
+    revised = verifier.verify("find the pictured chair", plan, candidate, evidence)
+    assert len(requests) == 3 and revised.task_revision == 2
+    assert requests[1]["messages"] == requests[2]["messages"]
+    attributes.pop("goal_reference_image")
+    absent = verifier.verify("find the pictured chair", plan, candidate, evidence)
+    assert len(requests) == 4
+    content = requests[-1]["messages"][1]["content"]
+    assert len(content) == 3
+    assert json.loads(content[1]["text"])["role"] == "current_candidate_observation"
+    assert "goal_reference" not in str(requests[-1]["messages"])
+    assert absent.evidence_ids == [absent.diagnostics["image_sources"][str(current)]]
+    assert {key for key in absent.dependencies if key.startswith("image:")} == {
+        "image:" + absent.evidence_ids[0]}

@@ -117,41 +117,34 @@ def hard_stop_constraints_from_evidence(evidence: dict[str, Any] | None) -> dict
 
     distance = geometry.get("distance_to_object")
     required = geometry.get("required_stop_distance", geometry.get("success_distance"))
-    if distance is not None and required is not None:
-        try:
-            distance_f = float(distance)
-            required_f = float(required)
-            constraints.append({
-                "name": "within_final_stop_distance",
-                "satisfied": distance_f <= required_f,
-                "current_distance_to_object": distance_f,
-                "required_stop_distance": required_f,
-                "margin": required_f - distance_f,
-                "reason": (
-                    f"current target distance {distance_f:.3f}m "
-                    f"vs required stop distance {required_f:.3f}m"
-                ),
-            })
-        except Exception:
-            constraints.append({
-                "name": "within_final_stop_distance",
-                "satisfied": False,
-                "unknown": True,
-                "reason": "distance_to_object or required_stop_distance is not numeric",
-            })
+    if required is not None:
+        required_f = float(required)
+        distance_f = None if distance is None else float(distance)
+        constraints.append({
+            "name": "within_final_stop_distance",
+            "satisfied": distance_f is not None and distance_f <= required_f,
+            "current_distance_to_object": distance_f,
+            "required_stop_distance": required_f,
+            "margin": None if distance_f is None else required_f - distance_f,
+            "reason": f"current surface distance {distance_f}m; required {required_f}m",
+        })
 
     projection_failed = bool(geometry.get("projection_failed_in_final_view", False))
     constraints.append({
         "name": "target_projected_or_reference_available",
-        "satisfied": not projection_failed or bool(
-            (evidence.get("view_control") or {}).get("pinned_visual_evidence")
-            or (evidence.get("view_control") or {}).get("best_visual_evidence")
-        ),
+        "satisfied": not projection_failed,
         "projection_failed_in_final_view": projection_failed,
-        "reason": "current projection exists or a pinned/best visual reference is available",
+        "reason": "Current target observation supplies final-stop geometry.",
     })
+    if 'surface_match' in geometry:
+        constraints.append({
+            "name": "current_instance_surface_correspondence",
+            "satisfied": bool(geometry['surface_match']) and
+                geometry['observation_identity'] == evidence['observation_identity'],
+            "reason": geometry['surface_status'],
+        })
 
-    failed = [item for item in constraints if not bool(item.get("satisfied"))]
+    failed = [item for item in constraints if not item["satisfied"]]
     planner_proof = (
         evidence.get("planner_infeasibility_proof")
         or evidence.get("physical_infeasibility_proof")
@@ -390,6 +383,20 @@ class FinalInstructionVerifier:
                 "role": "overlapping_instance_observation",
                 "candidate_surface_fraction_on_this_instance": item["candidate_surface_fraction"],
                 "bbox_xyxy_in_this_image": item["bbox_xyxy"],
+            }, ensure_ascii=False)})
+            content.append(block)
+
+        reference_path = _nested_image_path(
+            payload, "task", "active_target", "attributes", "goal_reference_image")
+        block = load_image(reference_path)
+        if block is not None:
+            content.append({"type": "text", "text": json.dumps({
+                "role": "goal_reference",
+                "instruction": (
+                    "This is the user's goal reference image, not a current candidate observation. "
+                    "Accept only if visual evidence establishes that the candidate is the same physical "
+                    "instance as the target in this image; matching the object category alone is insufficient."
+                ),
             }, ensure_ascii=False)})
             content.append(block)
 

@@ -56,6 +56,23 @@ class MMDINO_Grounded_SAM:
             masks = masks.squeeze(1)
         return masks.cpu()
 
+    def segment_current_target(self, img, target):
+        """Detect and segment current RGB instances for open-vocabulary verification.
+
+        Reuses the deployed detector, thresholds, NMS and SAM. A historical
+        projection never supplies the segmentation box or certifies identity.
+        """
+        prediction = self._run_grounding(img, target)
+        scores = torch.tensor(prediction["scores"])
+        boxes = torch.tensor(prediction["bboxes"]).reshape(-1, 4)
+        keep = scores >= self.TARGET_BOX_THRESHOLD
+        boxes, scores = boxes[keep], scores[keep]
+        if len(boxes) == 0:
+            return np.empty((0, *img.shape[:2]), dtype=bool)
+        boxes = boxes[nms(boxes, scores, self.NMS_IOU_THRESHOLD)]
+        self.sam_predictor.set_image(img)
+        return self._predict_masks(img, boxes).numpy().astype(bool)
+
     def initialize(self, target):
         TEXT_PROMPTs = []
         class_labels = []
