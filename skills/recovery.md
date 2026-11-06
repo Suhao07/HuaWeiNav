@@ -1,2 +1,9 @@
-# 阻塞恢复
-运行时已提供运动终态回执时直接消费；结果待确认时通过 motion_status 获取执行反馈。运行中保留当前控制权；需要换目标时调用 cancel_motion，再查询终态确认。unknown 表示执行结果待核实，保留原 request_id，通过执行端对账恢复。HOLD 的解除由运行时操作入口负责。确认阻塞后查询其他可用视点；原始执行错误必须保留在工具日志中。
+# Recovery from Blocked Motion
+
+Use a terminal motion receipt directly when the runtime has already supplied one. Otherwise, call `motion_status` to obtain execution feedback.
+
+Preserve current control ownership while motion is running. To switch targets, call `cancel_motion`, then query the motion status to confirm its terminal state.
+
+`unknown` means the execution outcome still requires confirmation. Preserve the original `request_id` and reconcile the request with the execution backend. Releasing `HOLD` is the responsibility of the runtime's operational interface.
+
+Once motion is confirmed blocked, query other available viewpoints. Preserve original execution errors in the tool logs.

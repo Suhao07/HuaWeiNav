@@ -1,6 +1,7 @@
 """Replay Agent calls through real task/query/motion/verifier tool bindings."""
 from types import SimpleNamespace
 import json
+import re
 
 import pytest
 
@@ -88,6 +89,12 @@ def test_tool_loop_moves_verifies_and_finishes_from_domain_state(monkeypatch, tm
     client_model, requests = model_calls([tool_call(name=n, arguments=a, reason="replay") for n, a in specs])
     trace = tmp_path / "events.jsonl"
     runtime = AgentRuntime(tools, trace, max_model_calls=len(specs), client_model=client_model)
+    from prompting import templates
+    # Check model-facing instructions; task inputs may remain multilingual.
+    prompt_texts = [runtime.system_prompt, json.dumps(ToolCall.schema(), ensure_ascii=False)]
+    prompt_texts.extend(value for name, value in vars(templates).items()
+                        if name.endswith("_PROMPT") and isinstance(value, str))
+    assert all(re.search(r"[\u3400-\u9fff]", text) is None for text in prompt_texts)
     assert not tools.propose_finish()["accepted"]
     for index in range(len(specs)):
         if index == 7:

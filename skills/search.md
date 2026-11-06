@@ -1,4 +1,9 @@
-# 对象与关系搜索
-读取 observe，按 TaskSpec 的当前目标查询 query_scene。target_id 表示任务概念，candidate_uid 表示观测实例。按任务关系选择目标或 anchor，使用 query_viewpoints 获取该实例的观测视点。运动请求使用返回的 ID、当前 revision 和 control_epoch，每次新的运动使用新的 request_id，重试复用原 request_id。任务顺序、数量与穷尽要求由 TaskSpec 决定。没有候选时依据后端提供的探索能力更新观测；能力缺失应报告，保留任务未完成状态。
+# Object and Relation Search
 
-在 baseline_guided 模式中，普通探索由共享房间策略推进，模型仅处理运行时明确提供的语义选择或恢复事件。当前房间仍有可用 frontier 时保留该区域的探索；区域耗尽后再选择下一房间。路径代价与可达性由导航服务提供。
+Read the output of `observe`, then call `query_scene` for the current target in `TaskSpec`. `target_id` identifies a task concept; `candidate_uid` identifies an observed instance. Select the target or anchor according to the task relation, and use `query_viewpoints` to obtain observation viewpoints for that instance.
+
+Use the returned IDs, current `revision`, and `control_epoch` in motion requests. Assign a new `request_id` to each new motion; reuse the original `request_id` when retrying that request.
+
+`TaskSpec` determines task order, quantity, and exhaustive-search requirements. When no candidates are available, obtain further observations through the exploration capabilities exposed by the backend. Report missing capabilities and keep the task incomplete.
+
+In `baseline_guided` mode, the shared room policy handles routine exploration. The model handles only semantic choices or recovery events explicitly presented by the runtime. Continue exploring the current room while it has available frontiers; choose the next room after the current region is exhausted. The navigation service supplies path costs and reachability.

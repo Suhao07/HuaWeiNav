@@ -1,2 +1,12 @@
-# 主动观测
-到达后调用 verify_target，由后端提供满足到达屏障的观测。need_better_view 保留已匹配的对象对，查询同一实例的其他视点再取证。uncertain 表示证据不足；reject_candidate 表示实例反证；reject_relation 仅表示当前对象对不满足关系。使用这些不同结果选择下一次查询，实例计数由领域 reducer 更新。
+# Active Observation
+
+After arrival, call `verify_target`. The backend supplies an observation that satisfies the arrival barrier.
+
+Use the verification result to choose the next query:
+
+- `need_better_view`: Preserve the matched object pair, query alternative viewpoints for the same instance, and collect new evidence.
+- `uncertain`: The available evidence is insufficient.
+- `reject_candidate`: Evidence contradicts the candidate instance.
+- `reject_relation`: The current object pair fails the required relation; this result applies only to that pair.
+
+The domain reducer owns updates to instance counts.
