@@ -38,7 +38,7 @@ def _image_block(path: str) -> dict[str, Any] | None:
 class VLMRelationVerifier:
     """Prompt-first relation verifier used after geometric prefiltering."""
 
-    def __init__(self, vlm: str = "cognav"):
+    def __init__(self, vlm: str = ""):
         self.vlm = vlm
 
     def __call__(
@@ -102,7 +102,7 @@ class VLMRelationVerifier:
 class DynamicRelationService:
     """Geometry-first, VLM-on-demand relation service."""
 
-    def __init__(self, vlm: str = "cognav"):
+    def __init__(self, vlm: str = ""):
         self.edge_verifier = DynamicSemanticEdgeVerifier()
         self.vlm_callback = VLMRelationVerifier(vlm=vlm)
 
