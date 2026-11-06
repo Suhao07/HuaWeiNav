@@ -77,7 +77,7 @@ def main():
     image_id = subprocess.check_output(
         ["docker", "image", "inspect", args.image, "--format", "{{.Id}}"], text=True).strip()
     root = Path(os.environ["STRIVE_ROOT"]).resolve(strict=True)
-    data = args.data_root.absolute()
+    data = args.data_root.resolve(strict=True)
     output = args.output.resolve()
     output.mkdir(exist_ok=False)
     policy_args = args.policy_args[1:] if args.policy_args[:1] == ["--"] else args.policy_args

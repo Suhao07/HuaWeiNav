@@ -69,3 +69,40 @@ def test_language_launcher_binds_frozen_task_and_score(tmp_path, invalid):
         score = language_score(tmp_path, 0, identity, instruction)
         assert score['aggregate_ready'] and score['metrics'] == {'SR': 0, 'SPL': 0, 'distance_to_goal': 2}
         assert score['protocol'] == 'goat_language_single_parent_start_v1'
+
+
+def test_language_launcher_resolves_symlinked_data_mount(tmp_path, monkeypatch):
+    import gzip
+    import json
+    import subprocess
+    import sys
+    from scripts import launch_goat_episode as launcher
+
+    data = tmp_path / 'data'
+    data.mkdir()
+    alias = tmp_path / 'data-link'
+    alias.symlink_to(data, target_is_directory=True)
+    source = tmp_path / 'source'
+    source.mkdir()
+    task = dict(episode_id='val:scene:1:0', scene_id='scene/a.glb',
+                start_position=[0, 0, 0], start_rotation=[0, 0, 0, 1], object_category='chair',
+                info=dict(instruction='the red chair', protocol='goat_language_single_parent_start_v1'))
+    with gzip.open(data / 'tasks.json.gz', 'wt') as stream:
+        json.dump({'episodes': [task]}, stream)
+    output = tmp_path / 'run'
+    monkeypatch.setattr(sys, 'argv', ['launcher', '--output', str(output), '--data-root', str(alias),
+        '--language-task-file', str(alias / 'tasks.json.gz'), '--language-task-index', '0'])
+    for name in ('STRIVE_ROOT', 'HF_HOME_HOST', 'SAM_CHECKPOINT', 'GROUNDING_DINO_CHECKPOINT'):
+        monkeypatch.setenv(name, str(source))
+    monkeypatch.setenv('VLN_LVLM_API_KEY', 'test-only')
+    monkeypatch.setattr(launcher.subprocess, 'check_output', lambda *a, **k: 'sha256:test\n')
+    monkeypatch.setattr(launcher.subprocess, 'run', lambda *a, **k: subprocess.CompletedProcess(a[0], 1))
+    with pytest.raises(SystemExit) as stopped:
+        launcher.main()
+    assert stopped.value.code == 1
+    execution = json.loads((output / 'execution.json').read_text())
+    assert f'{data}:{data}:ro' in execution['command']
+    assert execution['environment']['HM3D_DATA_PATH'] == str(data)
+    argv = execution['command']
+    assert argv[argv.index('--dataset_path') + 1] == str(data / 'tasks.json.gz')
+    assert execution['language_task']['identity']['scene_id'] == str(data / 'scene_datasets/scene/a.glb')
