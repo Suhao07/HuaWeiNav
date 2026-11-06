@@ -1,11 +1,61 @@
 """Launch one isolated GOAT parent episode with the local Qwen service."""
 import argparse
+import csv
 from datetime import datetime
+import gzip
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
+
+
+def language_inputs(task_file, index, data_root, output, max_steps, max_model_calls):
+    with gzip.open(task_file, 'rt') as stream:
+        episodes = json.load(stream)['episodes']
+    if not 0 <= index < len(episodes):
+        raise ValueError('Language task index is outside the frozen subset')
+    selected = episodes[index]
+    if selected['info']['protocol'] != 'goat_language_single_parent_start_v1':
+        raise ValueError('Expected the independent GOAT language subset')
+    identities = [{**{key: row[key] for key in
+                      ('episode_id', 'start_position', 'start_rotation', 'object_category')},
+                   'scene_id': str(data_root / 'scene_datasets' / row['scene_id'])}
+                  for row in episodes]
+    manifest = output / 'runtime_episodes.json'
+    manifest.write_text(json.dumps({'runtime_episodes': identities}) + '\n')
+    argv = ['objnav_benchmark_with_process_obs.py', '--benchmark', 'goat_language',
+            '--benchmark_split', 'val_unseen', '--dataset_path', str(task_file),
+            '--dataset_episodes', str(len(episodes)), '--episode_manifest', str(manifest),
+            '--start_episode', str(index), '--eval_episodes', str(index + 1),
+            '--max_steps', str(max_steps), '--decision_owner', 'baseline_guided',
+            '--agent_max_model_calls', str(max_model_calls), '--vlm', 'self_hosted',
+            '--save_dir', 'task']
+    return argv, identities[index], selected['info']['instruction']
+
+
+def language_score(output, index, expected_identity, instruction):
+    folder = output / 'navigation/task'
+    with (folder / 'metrics.csv').open() as stream:
+        rows = list(csv.DictReader(stream))
+    if len(rows) != 1 or int(rows[0]['Episode']) != index:
+        raise ValueError('Expected exactly the selected language task result')
+    row = rows[0]
+    actual = json.loads((folder / f'episode-{index}/episode_identity.json').read_text())
+    if actual != expected_identity or row['object_goal'] != instruction:
+        raise ValueError('Executed task identity or instruction differs from frozen input')
+    if row['benchmark'] != 'goat_language' or float(row['benchmark_success_distance']) != 0.25:
+        raise ValueError('Language task scoring protocol differs')
+    metrics = {name: float(row[key]) for name, key in
+               (('SR', 'success'), ('SPL', 'spl'), ('distance_to_goal', 'distance_to_goal'))}
+    if row['End'] != '1' or not all(math.isfinite(value) for value in metrics.values()):
+        raise ValueError('Language task metrics are unfinished or undefined')
+    return {'aggregate_ready': True, 'metrics': metrics, 'raw_metrics': row,
+            'protocol': 'goat_language_single_parent_start_v1',
+            'difficulty_status': 'nominal_project_tier_not_empirically_ranked',
+            'runtime_scope': 'project_RGBD_single_goal_not_official_multimodal_Stretch',
+            'termination': json.loads((folder / f'episode-{index}/harness/termination.json').read_text())}
 
 
 def main():
@@ -15,8 +65,15 @@ def main():
     parser.add_argument("--gpu", type=int, default=5)
     parser.add_argument("--model-port", type=int, default=18182)
     parser.add_argument("--image", default="strive-hm3d:local")
+    parser.add_argument("--language-task-file", type=Path)
+    parser.add_argument("--language-task-index", type=int)
+    parser.add_argument("--max-steps-per-task", type=int, default=500)
+    parser.add_argument("--max-model-calls", type=int, default=60)
     parser.add_argument("policy_args", nargs=argparse.REMAINDER)
     args = parser.parse_args()
+    language = args.language_task_file is not None
+    if language != (args.language_task_index is not None) or (language and args.policy_args):
+        parser.error('Language mode requires both task file and index, without continuous policy arguments')
     image_id = subprocess.check_output(
         ["docker", "image", "inspect", args.image, "--format", "{{.Id}}"], text=True).strip()
     root = Path(os.environ["STRIVE_ROOT"]).resolve(strict=True)
@@ -39,7 +96,17 @@ def main():
         "LLM_OFFLINE": "0", "STRIVE_LLM_FALLBACK": "0", "STRIVE_EVIDENCE_REUSE": "0",
         "OMP_NUM_THREADS": "8", "MKL_NUM_THREADS": "8", "MAGNUM_LOG": "quiet", "HABITAT_SIM_LOG": "quiet",
     }
-    run_id = "strive-goat-sequence-" + datetime.now().strftime("%Y%m%d-%H%M%S")
+    prefix = f"strive-goat-language-{args.language_task_index:03d}-" if language else "strive-goat-sequence-"
+    run_id = prefix + datetime.now().strftime("%Y%m%d-%H%M%S")
+    policy = ['scripts/run_goat.py', *policy_args, '--output', str(output / 'episode')]
+    if language:
+        policy, expected_identity, instruction = language_inputs(
+            args.language_task_file.resolve(strict=True), args.language_task_index,
+            data, output, args.max_steps_per_task, args.max_model_calls)
+        policy += ['--run_id', run_id]
+        settings['HM3D_DATA_PATH'] = str(data)
+        settings['MP3D_DATA_PATH'] = str(data)
+        (output / 'navigation').mkdir()
     command = ["docker", "run", "--rm", "--name", run_id, "--gpus", f"device={args.gpu}",
                "--network", "host", "--shm-size=12g", "--entrypoint", "/bin/bash"]
     for name in settings:
@@ -51,8 +118,9 @@ def main():
         f"{os.environ['GROUNDING_DINO_CHECKPOINT']}:{settings['GROUNDING_DINO_CHECKPOINT']}:ro",
     ):
         command += ["-v", mount]
-    command += ["-w", "/workspace/STRIVE", image_id, "-lc", 'exec "$@"', "bash",
-                "python", "scripts/run_goat.py", *policy_args, "--output", str(output / "episode")]
+    if language:
+        command += ['-v', f'{output}/navigation:/workspace/STRIVE/logs']
+    command += ["-w", "/workspace/STRIVE", image_id, "-lc", 'exec "$@"', "bash", "python", *policy]
     receipt = {
         "run_id": run_id, "command": command,
         "environment": {k: v for k, v in settings.items() if "KEY" not in k},
@@ -60,10 +128,23 @@ def main():
                           for p in root.rglob("*.py") if "__pycache__" not in p.parts},
         "image_id": image_id,
     }
+    if language:
+        receipt['language_task'] = {
+            'index': args.language_task_index, 'identity': expected_identity,
+            'source_sha256': hashlib.sha256(args.language_task_file.read_bytes()).hexdigest(),
+            'protocol': 'goat_language_single_parent_start_v1',
+        }
     (output / "execution.json").write_text(json.dumps(receipt, indent=2) + "\n")
     with (output / "policy.log").open("x") as stream:
         process = subprocess.run(command, env=dict(os.environ, **settings), stdout=stream,
                                  stderr=subprocess.STDOUT)
+    if language and process.returncode == 0:
+        try:
+            score = language_score(output, args.language_task_index, expected_identity, instruction)
+        except (OSError, ValueError, KeyError) as error:
+            score = {'aggregate_ready': False, 'metrics': None,
+                     'unavailable_metrics': {'navigation': f'{type(error).__name__}: {error}'}}
+        (output / 'evaluation.json').write_text(json.dumps(score, allow_nan=False, indent=2) + '\n')
     (output / "process_result.json").write_text(json.dumps({
         "run_id": run_id, "exit_code": process.returncode,
         "status": "execution_completed" if process.returncode == 0 else "execution_error",
