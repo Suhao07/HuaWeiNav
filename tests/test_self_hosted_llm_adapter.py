@@ -2,14 +2,19 @@
 
 from types import SimpleNamespace
 
-from pydantic import BaseModel
+import pytest
+from pydantic import BaseModel, ValidationError
 
-from llm_utils.cognav_llm_adapter import get_client_and_model
+from llm_utils.cognav_llm_adapter import _CogNavParsedChat, get_client_and_model
 from llm_utils.self_hosted_llm_adapter import (
     HttpVlmSettings,
     SelfHostedOpenAICompatibleClient,
 )
-from llm_utils.structured_output import extract_json_object, inject_json_schema
+from llm_utils.structured_output import (
+    StructuredOutputError,
+    extract_json_object,
+    inject_json_schema,
+)
 
 
 class _Decision(BaseModel):
@@ -26,6 +31,8 @@ class _FakeCompletions:
     def __init__(self, responses: list[str]) -> None:
         self.responses = list(responses)
         self.requests: list[dict] = []
+        self.finish_reason = "stop"
+        self.refusal = None
 
     def create(self, **kwargs):
         """Return the next scripted chat completion."""
@@ -33,7 +40,8 @@ class _FakeCompletions:
         self.requests.append(kwargs)
         content = self.responses.pop(0)
         return SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
+            choices=[SimpleNamespace(message=SimpleNamespace(content=content, refusal=self.refusal),
+                                     finish_reason=self.finish_reason)]
         )
 
 
@@ -115,10 +123,10 @@ def test_self_hosted_adapter_retries_invalid_json_and_validates_response() -> No
 
 def test_self_hosted_adapter_falls_back_conservatively(monkeypatch) -> None:
     monkeypatch.setenv("STRIVE_LLM_PARSE_FALLBACK", "1")
-    fake, _ = _fake_client(["service returned prose"])
+    fake, completions = _fake_client(["service returned prose"] * 2)
     client = SelfHostedOpenAICompatibleClient(
         base_url="http://lvlm.example/v1",
-        parse_retries=0,
+        parse_retries=1,
         client=fake,
     )
 
@@ -131,6 +139,7 @@ def test_self_hosted_adapter_falls_back_conservatively(monkeypatch) -> None:
     parsed = result.choices[0].message.parsed
     assert parsed.satisfied is False
     assert parsed.decision == "uncertain"
+    assert len(completions.requests) == 2
 
 
 def test_provider_factory_selects_self_hosted_client(monkeypatch) -> None:
@@ -233,17 +242,149 @@ def test_length_retry_increases_budget_and_preserves_candidates():
     assert requests[1]["messages"][:len(requests[0]["messages"])] == requests[0]["messages"]
 
 
-def test_transport_failure_preserves_exception_without_format_retry():
-    """传输失败由传输层处理，格式修复只处理实际返回的响应。"""
-    import pytest
+@pytest.mark.parametrize("failure_type", [ConnectionError, ValueError, PermissionError, OSError])
+@pytest.mark.parametrize("parse_kwargs", [{}, {"parse_retries": 0}])
+def test_transport_failure_preserves_exception_without_format_retry(monkeypatch, failure_type, parse_kwargs):
+    """Transport failures never enter format repair or conservative fallback."""
+    monkeypatch.setenv("STRIVE_LLM_PARSE_FALLBACK", "1")
     calls = []
+    failure = failure_type("transport unavailable")
 
     def create(**kwargs):
         calls.append(kwargs)
-        raise ConnectionError("transport unavailable")
+        raise failure
 
     fake = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
-    client = SelfHostedOpenAICompatibleClient(base_url="http://local/v1", client=fake)
-    with pytest.raises(ConnectionError):
-        client.beta.chat.completions.parse(model="qwen", messages=[], response_format=_Decision)
+    client = SelfHostedOpenAICompatibleClient(base_url="http://local/v1", client=fake, parse_retries=3)
+    with pytest.raises(failure_type) as caught:
+        client.beta.chat.completions.parse(model="qwen", messages=[], response_format=_Decision,
+                                          **parse_kwargs)
+    assert caught.value is failure
     assert len(calls) == 1
+    assert "parse_retries" not in calls[0]
+
+
+def test_structured_output_error_preserves_message_and_content():
+    error = StructuredOutputError("invalid response")
+    assert isinstance(error, ValueError)
+    assert str(error) == "invalid response"
+    assert error.raw_content == ""
+    assert StructuredOutputError("invalid response", " raw response ").raw_content == " raw response "
+
+
+@pytest.mark.parametrize("content,finish_reason,guided", [
+    ("  not JSON\n", "stop", "0"),
+    ('{"satisfied":', "length", "0"),
+    ('{"satisfied":true}', "length", "0"),
+    ('{"satisfied":"not a boolean"}', "stop", "0"),
+    ('{"properties":{"satisfied":true},"type":"object"}', "stop", "0"),
+    ('{"satisfied":true} trailing text', "stop", "1"),
+])
+def test_zero_parse_retries_overrides_repairs_and_fallback(monkeypatch, content, finish_reason, guided):
+    monkeypatch.setenv("STRIVE_LLM_PARSE_FALLBACK", "1")
+    monkeypatch.setenv("VLN_LVLM_GUIDED_JSON", guided)
+    fake, completions = _fake_client([content])
+    completions.finish_reason = finish_reason
+    client = SelfHostedOpenAICompatibleClient(base_url="http://local/v1", client=fake, parse_retries=4)
+
+    with pytest.raises(StructuredOutputError) as caught:
+        client.beta.chat.completions.parse(model="qwen", messages=[], response_format=_Decision,
+                                          parse_retries=0)
+
+    assert caught.value.raw_content == content
+    assert isinstance(caught.value.__cause__, ValueError)
+    assert str(caught.value) == str(caught.value.__cause__)
+    assert len(completions.requests) == 1
+    assert "parse_retries" not in completions.requests[0]
+
+
+def test_per_call_retry_override_does_not_change_configured_default(monkeypatch):
+    monkeypatch.setenv("VLN_LVLM_GUIDED_JSON", "0")
+    fake, completions = _fake_client(["invalid", "invalid", '{"satisfied":true}'])
+    client = SelfHostedOpenAICompatibleClient(base_url="http://local/v1", client=fake, parse_retries=1)
+    with pytest.raises(StructuredOutputError):
+        client.beta.chat.completions.parse(model="qwen", messages=[], response_format=_Decision,
+                                          parse_retries=0)
+    result = client.beta.chat.completions.parse(model="qwen", messages=[], response_format=_Decision)
+    assert result.choices[0].message.parsed.satisfied is True
+    assert len(completions.requests) == 3
+
+
+@pytest.mark.parametrize("content,error_type", [
+    ("not JSON", ValueError),
+    ('{"satisfied":"not a boolean"}', ValidationError),
+])
+def test_default_exhausted_parse_errors_keep_original_type(monkeypatch, content, error_type):
+    monkeypatch.setenv("STRIVE_LLM_PARSE_FALLBACK", "0")
+    fake, completions = _fake_client([content] * 2)
+    client = SelfHostedOpenAICompatibleClient(base_url="http://local/v1", client=fake)
+    with pytest.raises(error_type) as caught:
+        client.beta.chat.completions.parse(model="qwen", messages=[], response_format=_Decision)
+    assert not isinstance(caught.value, StructuredOutputError)
+    assert len(completions.requests) == 2
+
+
+@pytest.mark.parametrize("content", [" not JSON\n", '{"satisfied":', '{"satisfied":"not a boolean"}'])
+def test_cognav_zero_parse_retries_preserves_invalid_content(monkeypatch, content):
+    adapter = _CogNavParsedChat.__new__(_CogNavParsedChat)
+    fake, completions = _fake_client([content])
+    adapter._client = SimpleNamespace(chat_completion=fake.chat.completions.create)
+    monkeypatch.setenv("LLM_OFFLINE", "0")
+    monkeypatch.setenv("STRIVE_LLM_PARSE_FALLBACK", "1")
+
+    with pytest.raises(StructuredOutputError) as caught:
+        adapter.parse(model="cognav", messages=[], response_format=_Decision, parse_retries=0)
+
+    assert caught.value.raw_content == content
+    assert isinstance(caught.value.__cause__, ValueError)
+    assert len(completions.requests) == 1
+    assert "parse_retries" not in completions.requests[0]
+
+
+@pytest.mark.parametrize("parse_kwargs", [{}, {"parse_retries": 0}])
+def test_cognav_transport_value_error_is_not_wrapped(monkeypatch, parse_kwargs):
+    monkeypatch.setenv("LLM_OFFLINE", "0")
+    monkeypatch.setenv("STRIVE_LLM_PARSE_FALLBACK", "1")
+    failure = ValueError("transport rejected request")
+    calls = []
+
+    def fail(**kwargs):
+        calls.append(kwargs)
+        raise failure
+
+    adapter = _CogNavParsedChat.__new__(_CogNavParsedChat)
+    adapter._client = SimpleNamespace(chat_completion=fail)
+    with pytest.raises(ValueError) as caught:
+        adapter.parse(model="cognav", messages=[], response_format=_Decision, **parse_kwargs)
+    assert caught.value is failure
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("provider", ["self_hosted", "cognav"])
+@pytest.mark.parametrize("filtered", [False, True])
+def test_provider_refusals_do_not_enter_semantic_repair(monkeypatch, provider, filtered):
+    monkeypatch.setenv("LLM_OFFLINE", "0")
+    monkeypatch.setenv("STRIVE_LLM_PARSE_FALLBACK", "1")
+    fake, completions = _fake_client(['{"satisfied":true}'])
+    completions.finish_reason = "content_filter" if filtered else "stop"
+    completions.refusal = None if filtered else "provider refusal"
+    if provider == "self_hosted":
+        adapter = SelfHostedOpenAICompatibleClient(base_url="http://local/v1", client=fake,
+                                                   parse_retries=4).beta.chat.completions
+    else:
+        adapter = _CogNavParsedChat.__new__(_CogNavParsedChat)
+        adapter._client = SimpleNamespace(chat_completion=fake.chat.completions.create)
+    with pytest.raises(RuntimeError, match="provider refused"):
+        adapter.parse(model="qwen", messages=[], response_format=_Decision, parse_retries=0)
+    assert len(completions.requests) == 1
+
+
+def test_cognav_default_parse_fallback_is_preserved(monkeypatch):
+    monkeypatch.setenv("LLM_OFFLINE", "0")
+    monkeypatch.setenv("STRIVE_LLM_PARSE_FALLBACK", "1")
+    fake, completions = _fake_client(["invalid JSON"])
+    adapter = _CogNavParsedChat.__new__(_CogNavParsedChat)
+    adapter._client = SimpleNamespace(chat_completion=fake.chat.completions.create)
+    result = adapter.parse(model="cognav", messages=[], response_format=_Decision)
+    assert result.choices[0].message.parsed.satisfied is False
+    assert len(completions.requests) == 1

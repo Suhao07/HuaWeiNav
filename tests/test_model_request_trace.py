@@ -181,3 +181,110 @@ def test_real_sdk_doubao_uses_standard_create_route(tmp_path, monkeypatch):
             response_format=ParsedInstanceCorrespondence)
     assert result.choices[0].message.parsed.outcome == 'fragments'
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize('model', ['test-model', 'doubao-test'])
+@pytest.mark.parametrize('content,finish_reason', [
+    ('  not JSON\n', 'stop'),
+    ('{"satisfied":', 'length'),
+    ('{}', 'length'),
+    ('{"satisfied":"not a boolean"}', 'stop'),
+])
+def test_sdk_zero_retry_preserves_invalid_content(tmp_path, monkeypatch, model, content, finish_reason):
+    import httpx
+    from openai import OpenAI, LengthFinishReasonError
+    from pydantic import ValidationError
+    from llm_utils.cognav_llm_adapter import TracingOpenAICompatibleClient
+    from llm_utils.structured_output import StructuredOutputError
+
+    monkeypatch.setenv('STRIVE_LVLM_TRACE_DIR', str(tmp_path))
+    monkeypatch.setenv('STRIVE_LLM_PARSE_FALLBACK', '1')
+    calls = []
+
+    def handle(request):
+        body = json.loads(request.content)
+        calls.append(body)
+        assert 'parse_retries' not in body
+        return httpx.Response(200, json=dict(id='fixture', model=model, created=0,
+            object='chat.completion', choices=[dict(index=0, finish_reason=finish_reason,
+            message=dict(role='assistant', content=content))]))
+
+    with OpenAI(api_key='fixture-only', base_url='https://fixture.invalid/v1', max_retries=0,
+                http_client=httpx.Client(transport=httpx.MockTransport(handle))) as sdk:
+        with pytest.raises(StructuredOutputError) as caught:
+            TracingOpenAICompatibleClient(sdk).beta.chat.completions.parse(
+                model=model, messages=[], response_format=ParsedVerification, parse_retries=0)
+    assert caught.value.raw_content == content
+    cause_type = LengthFinishReasonError if finish_reason == 'length' else ValidationError
+    assert isinstance(caught.value.__cause__, cause_type)
+    assert len(calls) == 1
+    recorded = json.loads(next(tmp_path.glob('request_*.json')).read_text())
+    assert 'parse_retries' not in recorded['parameters']
+
+
+@pytest.mark.parametrize('model', ['test-model', 'doubao-test'])
+@pytest.mark.parametrize('parse_kwargs', [{}, {'parse_retries': 0}])
+def test_tracing_transport_value_error_is_unchanged(tmp_path, monkeypatch, model, parse_kwargs):
+    monkeypatch.setenv('STRIVE_LVLM_TRACE_DIR', str(tmp_path))
+    monkeypatch.setenv('STRIVE_LLM_PARSE_FALLBACK', '1')
+    failure = ValueError('transport rejected request')
+    calls = []
+
+    def fail(**kwargs):
+        calls.append(kwargs)
+        raise failure
+
+    adapter = _TracingParsedCompletions(SimpleNamespace(
+        with_raw_response=SimpleNamespace(parse=fail, create=fail)))
+    with pytest.raises(ValueError) as caught:
+        adapter.parse(model=model, messages=[], response_format=ParsedVerification, **parse_kwargs)
+    assert caught.value is failure
+    assert len(calls) == 1
+    assert 'parse_retries' not in calls[0]
+
+
+@pytest.mark.parametrize('model', ['test-model', 'doubao-test'])
+@pytest.mark.parametrize('finish_reason', ['stop', 'content_filter'])
+def test_sdk_zero_retry_preserves_refusal_semantics(tmp_path, monkeypatch, model, finish_reason):
+    import httpx
+    from openai import OpenAI, ContentFilterFinishReasonError
+    from llm_utils.cognav_llm_adapter import TracingOpenAICompatibleClient
+
+    monkeypatch.setenv('STRIVE_LVLM_TRACE_DIR', str(tmp_path))
+    calls = []
+
+    def handle(request):
+        calls.append(request)
+        return httpx.Response(200, json=dict(id='fixture', model=model, created=0,
+            object='chat.completion', choices=[dict(index=0, finish_reason=finish_reason,
+            message=dict(role='assistant', content=None, refusal='provider refusal'))]))
+
+    with OpenAI(api_key='fixture-only', base_url='https://fixture.invalid/v1', max_retries=0,
+                http_client=httpx.Client(transport=httpx.MockTransport(handle))) as sdk:
+        parse = TracingOpenAICompatibleClient(sdk).beta.chat.completions.parse
+        kwargs = dict(model=model, messages=[], response_format=ParsedVerification, parse_retries=0)
+        if finish_reason == 'content_filter':
+            with pytest.raises(ContentFilterFinishReasonError):
+                parse(**kwargs)
+        else:
+            message = parse(**kwargs).choices[0].message
+            assert message.refusal == 'provider refusal'
+            assert message.parsed is None
+    assert len(calls) == 1
+
+
+def test_tracing_per_call_retry_budget_is_not_forwarded(tmp_path, monkeypatch):
+    monkeypatch.setenv('STRIVE_LVLM_TRACE_DIR', str(tmp_path))
+    calls = []
+
+    def request(**kwargs):
+        calls.append(kwargs)
+        content = '{}' if len(calls) == 3 else 'invalid'
+        return SimpleNamespace(text=json.dumps({'choices': [{'message': {'content': content},
+            'finish_reason': 'stop'}]}), parse=lambda: ParsedVerification.model_validate_json(content))
+
+    adapter = _TracingParsedCompletions(SimpleNamespace(with_raw_response=SimpleNamespace(parse=request)))
+    result = adapter.parse(model='test', messages=[], response_format=ParsedVerification, parse_retries=2)
+    assert result.decision == 'uncertain'
+    assert len(calls) == 3
+    assert all('parse_retries' not in call for call in calls)

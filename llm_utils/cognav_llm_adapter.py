@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from constants import COGNAV_MODEL_NAME, DEFAULT_VLM, GEMINI_MODEL_NAME, require_gemini_key
 from llm_utils.lvlm_call_tracker import record_call, record_request, record_parse_error
 from llm_utils.structured_output import (
+    StructuredOutputError,
     extract_json_object as _extract_json_object,
     fallback_payload as _fallback_payload,
     inject_json_schema,
@@ -39,6 +40,8 @@ class _CogNavParsedChat:
         self._client = LLMClient(apikey_file=os.getenv("COGNAV_APIKEY_FILE", "./apikey.txt"))
 
     def parse(self, model, messages, response_format, **kwargs):
+        """Validate returned JSON; zero parse retries disables error fallback."""
+        parse_retries = max(0, int(kwargs.pop("parse_retries", 1)))
         # CogNav LLMClient 不原生支持 OpenAI beta.parse。
         # 因此把 Pydantic schema 注入 system prompt，再把返回 JSON 校验回同一 schema。
         if os.getenv("LLM_OFFLINE", "0") in ("1", "true", "True"):
@@ -76,9 +79,16 @@ class _CogNavParsedChat:
                 "latency_ms": (time.perf_counter() - started) * 1000.0,
             },
         )
+        if (getattr(completion.choices[0].message, "refusal", None)
+                or getattr(completion.choices[0], "finish_reason", None) == "content_filter"):
+            raise RuntimeError("Model provider refused the structured response")
         try:
             parsed_payload = _extract_json_object(content)
-        except Exception:
+        except Exception as error:
+            if parse_retries == 0:
+                if isinstance(error, ValueError):
+                    raise StructuredOutputError(str(error), raw_content=content or "") from error
+                raise
             # 解析失败保留原始异常和对应请求记录。
             # 默认传播解析错误；历史兼容实验可显式开启 fallback。
             if os.getenv("STRIVE_LLM_PARSE_FALLBACK", "0").lower() in ("0", "false", "no", "off"):
@@ -88,7 +98,12 @@ class _CogNavParsedChat:
                 f"Raw response prefix={str(content)[:300]!r}"
             )
             parsed_payload = _fallback_payload(response_format)
-        parsed = _validate_model(response_format, parsed_payload)
+        try:
+            parsed = _validate_model(response_format, parsed_payload)
+        except ValueError as error:
+            if parse_retries == 0:
+                raise StructuredOutputError(str(error), raw_content=content or "") from error
+            raise
         return SimpleNamespace(
             choices=[SimpleNamespace(message=SimpleNamespace(parsed=parsed, content=content))]
         )
@@ -115,8 +130,10 @@ class _TracingParsedCompletions:
         self._create_inner = create_inner if create_inner is not None else inner
 
     def parse(self, *args, **kwargs):
-        """Save raw content before SDK validation; regenerate one invalid output.
+        """Save raw content before SDK validation; retry invalid output once by default.
 
+        ``parse_retries`` overrides the repair budget; zero raises
+        StructuredOutputError with the provider's invalid response content.
         重新生成只恢复请求协议，输入观测保持不变。两次校验失败后传播
         原始异常。截断与损坏JSON共享这一次预算；超时、鉴权和拒绝直接传播。
         """
@@ -125,6 +142,7 @@ class _TracingParsedCompletions:
         from openai.lib._parsing import parse_chat_completion
 
         trace_label = kwargs.pop("trace_label", "parse")
+        parse_retries = max(0, int(kwargs.pop("parse_retries", 1)))
         local_schema = kwargs["model"].startswith("doubao-")
         if local_schema:
             # 导航默认采用直接回答；显式请求仍可为复杂任务开启思考。
@@ -135,7 +153,7 @@ class _TracingParsedCompletions:
             kwargs["messages"] = inject_json_schema(kwargs["messages"], kwargs["response_format"])
         original_messages = list(kwargs["messages"])
         retry_of = None
-        for attempt in range(2):
+        for attempt in range(parse_retries + 1):
             request_id = record_request(
                 str(trace_label), model=kwargs["model"], messages=kwargs["messages"],
                 response_format=kwargs["response_format"],
@@ -165,7 +183,11 @@ class _TracingParsedCompletions:
                 return response.parse()
             except (ValidationError, LengthFinishReasonError) as error:
                 record_parse_error(request_id, error, attempt=attempt)
-                if attempt == 1:
+                if attempt >= parse_retries:
+                    if parse_retries == 0:
+                        raise StructuredOutputError(
+                            str(error), raw_content=choice["message"].get("content") or ""
+                        ) from error
                     raise
                 retry_of = request_id
                 details = (

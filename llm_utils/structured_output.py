@@ -13,6 +13,14 @@ import re
 from typing import Any, Iterable, Mapping, get_origin
 
 
+class StructuredOutputError(ValueError):
+    """Report an invalid structured response with its original content."""
+
+    def __init__(self, message: str, raw_content: str = "") -> None:
+        super().__init__(message)
+        self.raw_content = raw_content
+
+
 def inject_json_schema(
     messages: Iterable[Mapping[str, Any]],
     response_format: Any,

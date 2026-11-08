@@ -16,6 +16,7 @@ from typing import Any, Iterable, Mapping, Optional
 
 from llm_utils.lvlm_call_tracker import record_call, record_request
 from llm_utils.structured_output import (
+    StructuredOutputError,
     extract_json_object,
     fallback_payload,
     inject_json_schema,
@@ -178,15 +179,18 @@ class _SelfHostedParsedChat:
             model: Served model name advertised by the remote API.
             messages: OpenAI-compatible text or multimodal messages.
             response_format: Pydantic response model class.
-            **kwargs: Supported generation options plus VLN ``trace_label``.
+            **kwargs: Supported generation options, VLN ``trace_label``, and
+                ``parse_retries`` overriding the configured repair budget.
+                Zero disables both repair calls and conservative fallback.
 
         Returns:
             Completion-like object whose message exposes ``parsed`` and raw
             ``content`` fields.
 
         Raises:
-            Exception: If transport/validation fails and conservative fallback
-                is disabled with ``STRIVE_LLM_PARSE_FALLBACK=0``.
+            StructuredOutputError: If response validation fails with zero retries.
+            Exception: Transport errors propagate unchanged. Validation errors
+                propagate after retries when conservative fallback is disabled.
         """
 
         trace_label = str(
@@ -194,62 +198,68 @@ class _SelfHostedParsedChat:
             or getattr(response_format, "__name__", "")
             or "self_hosted_parse"
         )
+        parse_retries = max(0, int(kwargs.pop("parse_retries", self.parse_retries)))
         normalized = inject_json_schema(messages, response_format)
         json_schema = _response_json_schema(response_format) if _guided_json_enabled() else None
+        fields = _response_json_schema(response_format)["properties"]
         last_content = ""
         last_error: Optional[Exception] = None
 
         generation_kwargs = _generation_kwargs(kwargs)
-        for attempt in range(self.parse_retries + 1):
+        for attempt in range(parse_retries + 1):
             request_messages = normalized if attempt == 0 else _repair_messages(normalized, last_content)
             started = time.perf_counter()
+            if json_schema is not None:
+                generation_kwargs["extra_body"] = {"guided_json": json_schema}
+            request_id = record_request(trace_label, model=model, messages=request_messages,
+                                        response_format=response_format, parameters=generation_kwargs)
+            completion = self.client.chat.completions.create(
+                model=model,
+                messages=request_messages,
+                **generation_kwargs,
+            )
+            last_content = _message_text(completion)
+            finish_reason = getattr(completion.choices[0], "finish_reason", None)
+            usage = getattr(completion, "usage", None)
+            record_call(
+                trace_label,
+                raw_response=last_content,
+                metadata={
+                    "client": "self_hosted_openai_compatible",
+                    "request_id": request_id,
+                    "base_url": self.base_url,
+                    "model": model,
+                    "response_format": getattr(response_format, "__name__", str(response_format)),
+                    "attempt": attempt + 1,
+                    "finish_reason": finish_reason,
+                    "usage": usage.model_dump() if usage is not None else None,
+                    "latency_ms": (time.perf_counter() - started) * 1000.0,
+                },
+            )
+            if getattr(completion.choices[0].message, "refusal", None) or finish_reason == "content_filter":
+                raise RuntimeError("Model provider refused the structured response")
             try:
-                if json_schema is not None:
-                    generation_kwargs["extra_body"] = {"guided_json": json_schema}
-                request_id = record_request(trace_label, model=model, messages=request_messages,
-                                            response_format=response_format, parameters=generation_kwargs)
-                completion = self.client.chat.completions.create(
-                    model=model,
-                    messages=request_messages,
-                    **generation_kwargs,
-                )
-                last_content = _message_text(completion)
-                finish_reason = getattr(completion.choices[0], "finish_reason", None)
-                usage = getattr(completion, "usage", None)
-                record_call(
-                    trace_label,
-                    raw_response=last_content,
-                    metadata={
-                        "client": "self_hosted_openai_compatible",
-                        "request_id": request_id,
-                        "base_url": self.base_url,
-                        "model": model,
-                        "response_format": getattr(response_format, "__name__", str(response_format)),
-                        "attempt": attempt + 1,
-                        "finish_reason": finish_reason,
-                        "usage": usage.model_dump() if usage is not None else None,
-                        "latency_ms": (time.perf_counter() - started) * 1000.0,
-                    },
-                )
                 if finish_reason == "length":
                     generation_kwargs["max_tokens"] = 2 * generation_kwargs.get("max_tokens", 1024)
                     raise ValueError("Output reached its token budget; regenerate the complete JSON")
                 payload = json.loads(last_content) if json_schema is not None else extract_json_object(last_content)
-                fields = _response_json_schema(response_format)["properties"]
                 if not isinstance(payload, dict) or not set(payload).intersection(fields):
                     raise ValueError("Response must contain model fields as a JSON instance")
                 parsed = validate_response_model(response_format, payload)
-                return _parsed_completion(parsed, last_content)
             except ValueError as exc:
                 last_error = exc
-                if attempt >= self.parse_retries:
+                if attempt >= parse_retries:
                     break
+            else:
+                return _parsed_completion(parsed, last_content)
 
+        assert last_error is not None
+        if parse_retries == 0:
+            raise StructuredOutputError(str(last_error), raw_content=last_content) from last_error
         if not _fallback_enabled():
-            assert last_error is not None
             raise last_error
 
-        # 解析或服务失败只能得到保守结果，不能因为 fallback 进入 ACCEPT/STOP。
+        # 解析失败只能得到保守结果，不能因为 fallback 进入 ACCEPT/STOP。
         parsed = validate_response_model(response_format, fallback_payload(response_format))
         return _parsed_completion(parsed, last_content)
 
