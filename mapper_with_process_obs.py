@@ -672,6 +672,7 @@ class Instruct_Mapper:
         return current_pcd
 
     def get_object_entities(self, ori_depth, depth, rgb, classes, boxes, masks, confidences):
+        """Construct object geometry from the current RGB-D camera frame."""
         entities = []
         for ent in self.objects:
             if ent.tag not in self.exist_objects:
@@ -683,6 +684,7 @@ class Instruct_Mapper:
             if cls not in self.exist_objects:
                 self.exist_objects.append(cls)
 
+            mask = np.asarray(mask)
             camera_points = get_pointcloud_from_depth_mask(ori_depth, mask, self.camera_intrinsic)
             world_points = translate_to_world(camera_points, self.current_position,
                                               self.current_rotation)
@@ -692,7 +694,6 @@ class Instruct_Mapper:
                 continue
             object_pcd = gpu_pointcloud_from_array(
                 world_points, point_colors, self.pcd_device).voxel_down_sample(self.pcd_resolution)
-            object_pcd = gpu_cluster_filter(object_pcd)
             if object_pcd.point.positions.shape[0] < 10:
                 continue
 
@@ -711,8 +712,8 @@ class Instruct_Mapper:
             if actual_num < 10:
                 continue
 
-            xyzpos = np.mean(object_pcd.point.positions.cpu().numpy(), axis=0)
-            entity = ObjectNode(object_pcd, cls, score, xyzpos, actual_num, rgb, bbox)
+            xyzpos = np.mean(tmp_object_pcd.point.positions.cpu().numpy(), axis=0)
+            entity = ObjectNode(object_pcd, tmp_object_pcd, cls, score, xyzpos, actual_num, rgb, bbox)
             entities.append(entity)
         return entities
 

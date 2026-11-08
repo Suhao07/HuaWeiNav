@@ -130,7 +130,7 @@ class GuidedNavigation:
                             source="baseline_viewpoint")
                 return True
             self.defer_candidate("available_views_already_attempted")
-        if not agent.scan_complete:
+        if agent.observation_mode == "multi" and not agent.scan_complete:
             run_observation_mapping_cycle(agent, node=agent.mapper.nodes[agent.current_node_idx], episode_idx=episode_idx)
             self.observation_updated()
             return True
@@ -381,9 +381,10 @@ def run_guided_episode(agent, *, episode_idx, max_steps, max_model_calls=100,
                  else Path(agent.save_dir) / f"episode-{episode_idx}" / "harness")
     guided = GuidedNavigation(agent, directory, max_model_calls)
     agent.on_node_flag = True
-    run_observation_mapping_cycle(agent, node=None, episode_idx=episode_idx)
-    state, termination = "select", "episode_limit"
-    while not agent.env.episode_over and agent.episode_steps < max_steps:
+    cycle = run_observation_mapping_cycle(agent, node=None, episode_idx=episode_idx)
+    state = "select"
+    termination = "episode_limit" if cycle.geometry_available else "observation_geometry_unavailable"
+    while cycle.geometry_available and not agent.env.episode_over and agent.episode_steps < max_steps:
         if guided.tools.motion.active_request_id is not None:
             agent.execution.controller.advance()
             feedback = guided.tools.motion.poll_active()
@@ -410,14 +411,24 @@ def run_guided_episode(agent, *, episode_idx, max_steps, max_model_calls=100,
                 node = agent.mapper.nodes[node_index]
                 agent.current_node_idx = node.idx
                 agent.mapper.traj.append(node.idx)
-                run_observation_mapping_cycle(agent, node=node, episode_idx=episode_idx)
+                cycle = run_observation_mapping_cycle(agent, node=node, episode_idx=episode_idx)
+                if not cycle.geometry_available:
+                    termination = "observation_geometry_unavailable"
+                    break
                 guided.observation_updated()
-                if not agent.env.episode_over and agent.scan_complete:
+                if not agent.env.episode_over and (agent.observation_mode == "single" or agent.scan_complete):
                     agent.mapper.change_state(node)
                 state = "select"
             else:
                 agent.object_final = guided.tools.objects[feedback.intent.target_object_uid]
                 state = guided.verify(feedback.intent.goal_pose.position)
+                if agent.observation_mode == "single" and state in {"select", "recovery"} and not agent.env.episode_over:
+                    cycle = run_observation_mapping_cycle(
+                        agent, node=agent.mapper.nodes[agent.current_node_idx], episode_idx=episode_idx)
+                    if not cycle.geometry_available:
+                        termination = "observation_geometry_unavailable"
+                        break
+                    guided.observation_updated()
         elif state == "select":
             if not guided.select(episode_idx):
                 termination = "search_exhausted"
@@ -439,6 +450,7 @@ def run_guided_episode(agent, *, episode_idx, max_steps, max_model_calls=100,
         guided.tools.motion.poll_active()
     result = {
         "reason": termination, "decision_owner": "baseline_guided",
+        "observation_mode": agent.observation_mode,
         "model_calls": guided.runtime.model_calls, "steps": agent.episode_steps,
         "task_complete": agent.task.progress.completed,
     }

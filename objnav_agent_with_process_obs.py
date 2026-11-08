@@ -3,6 +3,7 @@ from task.reducer import apply_verification
 from backends.habitat.query import select_observed_candidate
 import os
 import json
+from functools import partial as bind
 
 import cv2
 import habitat
@@ -58,7 +59,8 @@ from navigation.observation_pipeline import (
     merge_temporary_pointclouds,
     save_observation_pointcloud,
 )
-from navigation.panoramic_detection import build_triplet, filter_center_panel, pose_triplet
+from navigation.panoramic_detection import DetectionSlice, build_triplet, filter_center_panel, pose_triplet
+from mapping_utils.preprocess import preprocess_depth
 from navigation.path_progress import action_after_replan
 from navigation.planner_loop import run_observation_mapping_cycle
 from navigation.view_verification_controller import select_check_again_viewpoint
@@ -74,7 +76,11 @@ class HM3D_Objnav_Agent:
                  relocate=False,
                  gpt_relocate=True,
                  vlm='cognav',
-                 observation_recorder=None):
+                 observation_recorder=None,
+                 observation_mode="single"):
+        if observation_mode not in {"single", "multi"}:
+            raise ValueError("observation_mode must be single or multi")
+        self.observation_mode = observation_mode
         self.env = env
         self.observation_recorder = observation_recorder
         self.mapper = mapper
@@ -236,54 +242,42 @@ class HM3D_Objnav_Agent:
         logger.info("object indices")
         logger.info(self.mapper.current_obj_indices)
 
-    def rotate_segmentation(self, images, depths, positions, rotations, *, partial=False):
-        """Run panoramic object detection and update mapper object memory.
-
-        Parameters are the twelve RGB/depth/pose buffers collected by
-        ``rotate_panoramic``. The method keeps the high-level orchestration in
-        the agent, while detector slicing, artifact writing, instance merging,
-        view projection, and bbox tag refinement live in dedicated modules.
-        """
-
+    def rotate_segmentation(self, images, depths, positions, rotations, *, partial=False, single_view=False):
+        """Detect current-frame or stitched-view objects and update shared object memory."""
         _, w, _ = images[0].shape
         C_objs = []
         step_dir = detection_step_dir(self)
 
         for i in range(len(images)):
-            triplet = build_triplet(images, depths, i, self.mapper.camera_intrinsic, circular=not partial)
+            if single_view:
+                image = images[i]
+                depth_vis = np.clip(depths[i] / 5 * 255, 0, 255).astype(np.uint8)
+                filter_detections = DetectionSlice
+                get_entities = bind(self.mapper.get_object_entities, depths[i],
+                                    preprocess_depth(depths[i].copy(), 0.51, 4.99), image)
+            else:
+                triplet = build_triplet(images, depths, i, self.mapper.camera_intrinsic, circular=not partial)
+                image, depth_vis = triplet.image, triplet.depth_vis
+                current_pos, current_rot, depths_list = pose_triplet(positions, rotations, depths, triplet)
+                filter_detections = bind(filter_center_panel, image_width=w)
+                get_entities = bind(self.mapper.get_object_entities_pano, triplet.depth, image,
+                                    current_pos, current_rot, depth_list=depths_list)
             B_classes, B_boxes, B_masks, B_confidences, \
                 C_classes, C_boxes, C_masks, C_confidences = \
                     self.mapper.object_perceiver.perceive(
-                        triplet.image,
+                        image,
                         target=self.mapper.target,
                         target_list=self.task.detector_terms if self.task is not None else None,
                         save_dir=self.save_dir,
                         episode_idx=self.episode_samples - 1,
                         episode_step=self.episode_steps,
                     )
-            save_combined_view(step_dir, i, triplet.image, triplet.depth_vis)
-
-            current_pos, current_rot, depths_list = pose_triplet(positions, rotations, depths, triplet)
-            B_detection = filter_center_panel(
-                B_classes,
-                B_boxes,
-                B_masks,
-                B_confidences,
-                image_width=w,
-            )
+            save_combined_view(step_dir, i, image, depth_vis)
+            B_detection = filter_detections(B_classes, B_boxes, B_masks, B_confidences)
             if B_detection.has_boxes:
-                save_detection_overlay(step_dir, "B", i, triplet.image, B_detection)
-                B_objs = self.mapper.get_object_entities_pano(
-                    triplet.depth,
-                    triplet.image,
-                    current_pos,
-                    current_rot,
-                    B_detection.classes,
-                    B_detection.boxes,
-                    B_detection.masks,
-                    B_detection.confidences,
-                    depths_list,
-                )
+                save_detection_overlay(step_dir, "B", i, image, B_detection)
+                B_objs = get_entities(B_detection.classes, B_detection.boxes,
+                                     B_detection.masks, B_detection.confidences)
                 self.mapper.objects, obj_indices = self.mapper.associate_object_entities(
                     self.mapper.objects,
                     B_objs,
@@ -291,28 +285,12 @@ class HM3D_Objnav_Agent:
                 self.mapper.current_obj_indices += obj_indices
                 self.mapper.object_pcd = self.mapper.update_object_pcd()
 
-            C_detection = filter_center_panel(
-                C_classes,
-                C_boxes,
-                C_masks,
-                C_confidences,
-                image_width=w,
-            )
+            C_detection = filter_detections(C_classes, C_boxes, C_masks, C_confidences)
             if not C_detection.has_boxes:
                 continue
-
-            save_detection_overlay(step_dir, "C", i, triplet.image, C_detection)
-            C_objs.append(self.mapper.get_object_entities_pano(
-                triplet.depth,
-                triplet.image,
-                current_pos,
-                current_rot,
-                C_detection.classes,
-                C_detection.boxes,
-                C_detection.masks,
-                C_detection.confidences,
-                depths_list,
-            ))
+            save_detection_overlay(step_dir, "C", i, image, C_detection)
+            C_objs.append(get_entities(C_detection.classes, C_detection.boxes,
+                                       C_detection.masks, C_detection.confidences))
 
         save_candidate_object_pointclouds(step_dir, C_objs)
 
@@ -326,7 +304,7 @@ class HM3D_Objnav_Agent:
         from navigation.bbox_refinement import refine_candidates
         candidates = []
         for i, obj in enumerate(real_C_objs):
-            evidence = project_object_view(self, obj, images, rotations, torch, partial=partial)
+            evidence = project_object_view(self, obj, images, rotations, torch, partial=partial or single_view)
             if evidence is None:
                 continue
             save_object_view(step_dir, i, evidence.image, evidence.bbox_xyxy)
@@ -596,7 +574,7 @@ class HM3D_Objnav_Agent:
         # 每个规划周期先做一次全景感知和地图更新。planner_loop 只负责
         # observation->mapping 前缀；目标选择和探索状态机仍在这里显式维护。
         cycle = run_observation_mapping_cycle(self, node=node, episode_idx=idx)
-        if cycle.episode_over:
+        if cycle.episode_over or not cycle.geometry_available:
             return False, False
         step = cycle.step
 
@@ -628,7 +606,7 @@ class HM3D_Objnav_Agent:
 
         # relocate 版本复用相同的感知/建图前缀，只在后半段选择不同探索策略。
         cycle = run_observation_mapping_cycle(self, node=node, episode_idx=idx)
-        if cycle.episode_over:
+        if cycle.episode_over or not cycle.geometry_available:
             return False, False
         step = cycle.step
 

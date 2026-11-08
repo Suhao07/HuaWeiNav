@@ -119,6 +119,8 @@ def get_args():
     parser.add_argument("--no_gpt_relocate", default=False, action="store_true")
     parser.add_argument("--vlm", type=str, default=DEFAULT_VLM)
     parser.add_argument("--decision_owner", choices=("legacy", "agent", "baseline_guided"), default="baseline_guided")
+    parser.add_argument("--observation-mode", "--observation_mode", choices=("single", "multi"), default="single",
+                        help="Current RGB-D frame (default) or the backend's panoramic scan")
     parser.add_argument("--agent_max_model_calls", type=int, default=100)
     parser.add_argument("--custom_instruction", type=str, default="")
     parser.add_argument("--enable_instruction_adapter", default=False, action="store_true")
@@ -238,6 +240,7 @@ if __name__ == "__main__":
             {
                 "clean_save_dir": bool(args.clean_save_dir),
                 "run_id": run_id,
+                "observation_mode": args.observation_mode,
                 "save_dir": args.save_dir,
                 "started_at_local": time.strftime("%Y-%m-%d %H:%M:%S"),
                 "prior_map": {
@@ -281,7 +284,8 @@ if __name__ == "__main__":
                                       do_seg=args.not_do_seg,
                                       relocate=args.relocate,
                                       gpt_relocate=not args.no_gpt_relocate,
-                                      vlm=args.vlm)
+                                      vlm=args.vlm,
+                                      observation_mode=args.observation_mode)
     habitat_agent.run_id = run_id
     # Provider-specific success distance must reach the agent as well as Habitat.
     # 否则 final-stop verifier 和靠近控制会沿用 HM3D 默认 1.0m，

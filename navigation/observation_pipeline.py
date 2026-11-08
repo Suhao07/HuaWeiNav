@@ -99,6 +99,42 @@ def save_observation_pointcloud(agent: Any, pcd: Any, *, episode_idx: int, step:
     o3d.io.write_point_cloud(file_path, save_pcd)
 
 
+def collect_single_observation(agent, *, node=None):
+    """Process the current aligned RGB-D/pose without taking a simulator action."""
+    reset_panoramic_buffers(agent)
+    mapper = agent.mapper
+    if mapper.current_navigable_pcd is None and mapper.current_pcd is None:
+        pcd = gpu_pointcloud_from_array(np.empty((0, 3)), np.empty((0, 3)), mapper.pcd_device)
+    else:
+        pcd = gpu_merge_pointcloud(mapper.current_navigable_pcd, mapper.current_pcd).voxel_down_sample(mapper.pcd_resolution)
+    agent.temporary_pcd.append(pcd)
+    # Room selection can clear local geometry without another sensor update.
+    if mapper.process_nav_pcd.is_empty() or mapper.process_obs_pcd.is_empty():
+        local_pcd = pcd
+        if node is not None and node.pcd is not None and not node.pcd.is_empty():
+            local_pcd = gpu_merge_pointcloud(local_pcd, node.pcd).voxel_down_sample(mapper.pcd_resolution)
+        if not local_pcd.is_empty():
+            if mapper.process_nav_pcd.is_empty():
+                mapper.process_nav_pcd = local_pcd.select_by_index(
+                    (local_pcd.point.positions[:, 2] < mapper.floor_height + 0.2).nonzero()[0])
+            if mapper.process_obs_pcd.is_empty():
+                mapper.process_obs_pcd = local_pcd.clone()
+    agent.angles.append(2 * np.arccos(agent.rotation.w))
+    if agent.do_seg:
+        agent.rotate_segmentation([agent.rgb_trajectory[-1]], [agent.temporary_depths[-1]],
+                                  [mapper.current_position.copy()], [mapper.current_rotation.copy()],
+                                  partial=True, single_view=True)
+    agent.just_come_back = False
+    agent.scan_complete = False
+    import json
+    from pathlib import Path
+    path = Path(agent.save_dir) / f"episode-{agent.episode_samples - 1}" / "observation_cycles.jsonl"
+    with path.open("a") as stream:
+        stream.write(json.dumps({"mode": "single", "start_step": agent.episode_steps,
+                                 "end_step": agent.episode_steps, "views": 1,
+                                 "cycle_complete": True, "complete": False}) + "\n")
+
+
 def collect_adaptive_observations(agent):
     """Observe missing headings in four-view batches, stopping at a target candidate.
 
@@ -151,6 +187,7 @@ def collect_adaptive_observations(agent):
     from pathlib import Path
     path = Path(agent.save_dir) / f"episode-{agent.episode_samples - 1}" / "observation_cycles.jsonl"
     with path.open("a") as stream:
-        stream.write(json.dumps({"start_step": start_step, "end_step": agent.episode_steps,
+        stream.write(json.dumps({"mode": "multi", "cycle_complete": True,
+                                 "start_step": start_step, "end_step": agent.episode_steps,
                                  "views": len(agent.temporary_pcd), "covered_headings": sorted(covered),
                                  "complete": agent.scan_complete}) + "\n")
