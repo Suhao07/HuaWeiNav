@@ -8,9 +8,9 @@
 |---|---|
 | [交付 README](../README.md) | 从零准备数据/权重、Docker、模型、单例运行与交付顺序 |
 | [LVLM 接入](lvlm_server_deployment.md) | 商业 API、独立 Qwen3.5 部署包、可选 ms-swift、认证与错误边界 |
-| [HM3D 操作指南](hm3d_docker_benchmark_guide.md) | 容器路径、固定身份、批次区间、完整重跑/配对与结果诊断 |
+| [HM3D 操作指南](hm3d_docker_benchmark_guide.md) | 简单2,000候选制作、去重与哈希；容器路径、固定身份、完整重跑/配对 |
 | [IntentionNav 部署与评分](intentionnav_integration.md) | Isaac6 资源、六字段输入、官方绑定、运动与独立评分 |
-| [4,000条验收条件](acceptance_4500.md) | 简单2,000 + 需求2,000，困难500子集及固定回归冻结 |
+| [4,000条验收条件](acceptance_4500.md) | 需求2,000与困难500制作、全量复核冻结路径/哈希、复现命令及验收边界 |
 | [Benchmark Provider](benchmark_providers.md) | 数据来源、成功阈值与 GOAT 运动证据评分 |
 | [LangMap 接入](langmap_integration.md) | 保留研究入口，不计入当前交付条件 |
 

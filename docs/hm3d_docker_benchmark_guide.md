@@ -1,6 +1,6 @@
 # HM3D Docker 评测操作指南
 
-从零安装、数据和权重准备、两层 Docker 构建统一见 [交付 README](../README.md#仿真器构建流程)。本文只维护评测输入、运行命令、结果与排障，不再维护第二套 CogNav 基础镜像安装流程。模型先按 [LVLM 部署指南](lvlm_server_deployment.md) 验证。
+从零安装、数据和权重准备、两层 Docker 构建统一见 [交付 README](../README.md#仿真器构建流程)。本文维护简单任务包制作、评测输入、运行命令、结果与排障，不再维护第二套 CogNav 基础镜像安装流程。模型先按 [LVLM 部署指南](lvlm_server_deployment.md) 验证。
 
 ## 1. 环境与路径
 
@@ -67,7 +67,34 @@ bash docker/run_scene_object_nav.sh \
 
 标准 HM3D val 的规模不足以凭 `--eval_episodes 2000` 自动产生2,000个独立任务。需先准备具有足够独立身份的实际 split / 任务包；不要通过重复采样补数。
 
-已准备好任务包与身份清单后，示例：
+### 4.1 制作简单2000候选包
+
+现有制作入口是仓库同级部署工具 [run_hm3d200.py](../../STRIVE-deploy-105/run_hm3d200.py)。这是105专用脚本：源码、数据及批次根目录由脚本的 `SOURCE`、`DATA`、`BATCH` 常量固定，不读取本页运行入口的环境变量。先确认部署机具备 `DATA/objectgoal_hm3d/train/content/*.json.gz`、对应 HM3D 场景文件及 `SOURCE` 源码；它不负责下载原始数据。将脚本部署到该服务器后，在脚本所在目录执行：
+
+```bash
+python run_hm3d200.py prepare \
+  --count 2000 --split train \
+  --batch-name hm3d-train2000-rebuild
+```
+
+批次名必须是不存在的新目录名，不能覆盖旧批次；不要以 `python -O` 关闭脚本断言。`prepare` 只制作数据、记录分片哈希并复制四份源码快照，不启动导航、GPU任务或模型请求。不要把旧脚本的 `run` 子命令及内置 GPU/端口分配当作当前运行授权。
+
+制作规则：
+
+1. 读取 train 原始分片，校验六类别映射一致、对应场景文件存在，保留目标定义。
+2. 以场景、起点、起始朝向、目标类别去重，**不靠不同 episode_id 补足任务数**。
+3. 固定 `seed=20261105`，按来源身份的 SHA256 排序；六类别配额为334、334、333、333、333、333，同类别按固定场景顺序轮转选取。不足2,000个独立任务时报错。
+4. 保留原始 `source_episodes`、分片路径/索引与采样哈希；另存按 Habitat 加载顺序重编号的 `runtime_episodes`，固定执行身份及 worker 分配。
+
+产物位于源码目录同级的 `STRIVE-batches/<batch-name>/`：`dataset/tasks.json.gz`、`dataset/manifest.json`、`source_hashes.json` 和 `sources/w0` 至 `sources/w3`。manifest 记录来源分片哈希、任务包 SHA256、去重/抽样规则、类别/场景分布及原始/运行身份；源码快照哈希不能替代任务包哈希。
+
+已有候选包为 [hm3d-train2000-20261105/tasks.json.gz](../../STRIVE-deploy-105/evidence/hm3d-train2000-20261105/tasks.json.gz)，配套 [manifest.json](../../STRIVE-deploy-105/evidence/hm3d-train2000-20261105/manifest.json)。它包含2,000个独立任务、145个场景：bed/chair各334，plant/sofa/toilet/tv_monitor各333；任务包 SHA256 为 `a081efbfadea563dcbcb4672286880127247d6ba18c440d57d07884920dc93d2`。
+
+2026-11-08制作核验已确认该包哈希、2,000个不依赖 episode_id 的唯一身份，以及逐项 source/runtime 绑定；本次没有重算全部原始分片哈希或重新验收全部场景。**这是 train 类别目标任务包，不是2,000句独立自然语言，也不是 val 成绩。** 当前 [交付配置](../configs/benchmarks/acceptance_4500.json) 的简单组仍为 `pending_unique_HM3D_OVON_selection`：候选包存在不等于正式验收身份选择已确认，本文不擅自将其提升为最终交付集。
+
+### 4.2 使用固定身份运行
+
+已准备好任务包与身份清单、确认交付选择并部署到容器可见位置后，示例：
 
 ```bash
 bash docker/run_hm3d_baseline.sh \
