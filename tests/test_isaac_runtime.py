@@ -131,11 +131,27 @@ def test_client_exact_json_protocol(monkeypatch):
     assert IsaacClient(9466).command("STOP") == {"status": "reached"}
 
 
-def test_last_model_call_motion_executes_before_budget_stop(monkeypatch, tmp_path):
+@pytest.mark.parametrize("settings,mode,configured,effective", [
+    ({}, "single", 4, 1),
+    ({"observation_mode": "single", "panorama_views": 7}, "single", 7, 1),
+    ({"observation_mode": "single", "panorama_views": 0}, "single", 0, 1),
+    ({"observation_mode": "multi"}, "multi", 4, 4),
+    ({"observation_mode": "multi", "panorama_views": 3}, "multi", 3, 3),
+])
+def test_last_model_call_motion_executes_before_budget_stop(
+        monkeypatch, tmp_path, settings, mode, configured, effective):
     from backends.isaac import runtime
 
     client = FakeClient()
-    client.status = "reached"
+    command = client.command
+    move_statuses = iter(["running", "reached"])
+
+    def advance_command(action, **arguments):
+        if action == "move":
+            client.status = next(move_statuses)
+        return command(action, **arguments)
+
+    client.command = advance_command
     from harness.tools import NavigationTools
     from scene.contracts import FrontierSnapshot, SemanticMapSnapshot
 
@@ -161,7 +177,8 @@ def test_last_model_call_motion_executes_before_budget_stop(monkeypatch, tmp_pat
         return tools
     monkeypatch.setattr(runtime, "IsaacNavigationTools", make_tools)
     refreshes = []
-    monkeypatch.setattr(runtime, "refresh_observations", lambda *a: refreshes.append(client.pose.copy()))
+    monkeypatch.setattr(runtime, "refresh_observations", lambda *a, **k: refreshes.append(
+        (client.pose.copy(), a[-1], k["observation_mode"])))
     class LastCallAgent:
         def __init__(self, tools, *a, **k):
             self.tools, self.model_calls = tools, 0
@@ -175,16 +192,49 @@ def test_last_model_call_motion_executes_before_budget_stop(monkeypatch, tmp_pat
     public = {"selection_id": "SEL_TEST", "scene_id": "test", "style": "formal",
               "instruction": "Find a chair.", "start_position": [0., 0., 1.5],
               "start_rotation_quat_wxyz": [1., 0., 0., 0.]}
-    result = runtime.run_episode(public, tmp_path, max_model_calls=1, max_moves=3)
+    original_public = dict(public)
+    result = runtime.run_episode(public, tmp_path, max_model_calls=1, max_moves=3, **settings)
+    assert public == original_public and len(public) == 6
+    assert result["observation_mode"] == mode
+    assert result["panorama_views"] == configured
+    assert result["effective_views"] == effective
+    assert json.loads((tmp_path / "policy_result.json").read_text()) == result
     observation_map_factory.assert_called_once_with(runtime.BACKGROUND_CLASSES, device="cuda:0")
     assert "espresso machine" not in observation_map_factory.call_args.args[0]
     assert result["status"] == "completed"
     assert result["reason"] == "decision_budget_exhausted"
     assert not result["task_complete"]
-    assert result["moves"] == 1
-    assert any(action == "move" for action, _ in client.commands)
+    assert result["moves"] == 2
+    assert sum(action == "move" for action, _ in client.commands) == 2
     assert client.commands[-2][0] == "finish"
-    assert len(refreshes) == 2 and refreshes[0] != refreshes[1]
+    assert len(refreshes) == 3 and refreshes[0][0] != refreshes[1][0]
+    assert [(views, selected) for _, views, selected in refreshes] == [
+        (effective, mode), (1, mode), (effective, mode)]
+
+
+@pytest.mark.parametrize("settings,message", [
+    ({"observation_mode": "panorama"}, "observation_mode"),
+    ({"observation_mode": "multi", "panorama_views": 0}, "panorama_views"),
+    ({"observation_mode": "multi", "panorama_views": 1}, "panorama_views"),
+    ({"observation_mode": "multi", "panorama_views": -1}, "panorama_views"),
+    ({"observation_mode": "multi", "panorama_views": 2.5}, "panorama_views"),
+    ({"max_moves": 0}, "budgets"),
+])
+def test_episode_rejects_invalid_observation_settings_before_resources(monkeypatch, tmp_path, settings, message):
+    from backends.isaac import runtime
+
+    resources = ["IsaacClient", "IsaacObservationMap", "InitialInstructionCompiler", "set_trace_dir"]
+    factories = [Mock(side_effect=AssertionError("must not acquire resources")) for _ in resources]
+    for name, factory in zip(resources, factories):
+        monkeypatch.setattr(runtime, name, factory)
+    public = {"selection_id": "SEL_TEST", "scene_id": "test", "style": "formal",
+              "instruction": "Find a chair.", "start_position": [0., 0., 1.5],
+              "start_rotation_quat_wxyz": [1., 0., 0., 0.]}
+    with pytest.raises(ValueError, match=message):
+        runtime.run_episode(public, tmp_path, **settings)
+    for factory in factories:
+        factory.assert_not_called()
+    assert not list(tmp_path.iterdir())
 
 
 @pytest.mark.parametrize("role,status", [("primary", "reached"), ("primary", "blocked"), ("anchor", "reached")])
@@ -350,13 +400,16 @@ def test_add_reports_only_current_fusion_bindings(monkeypatch, tmp_path, target_
     json.dumps([report, empty], allow_nan=False)
 
 
-@pytest.mark.parametrize("panorama_views", [0, 1, 3])
-def test_refresh_publishes_only_this_batch_and_depth_visible_final_frame(tmp_path, panorama_views):
+@pytest.mark.parametrize("panorama_views,observation_mode", [(0, None), (1, None), (2, None), (3, None), (1, "multi")])
+def test_refresh_publishes_only_this_batch_and_depth_visible_final_frame(
+        tmp_path, capsys, panorama_views, observation_mode):
     observation_map = _surface_map()
+    image_count = 1 if panorama_views == 1 else panorama_views + 1
     packets = [_frame_packet(tmp_path, 40 + i * 7, np.ones((10, 10)))
-               for i in range(panorama_views + 1)]
+               for i in range(image_count)]
     reports = []
-    for i, packet in enumerate(packets[:-1]):
+    mapped_packets = packets[:panorama_views]
+    for i, packet in enumerate(mapped_packets):
         boxes = {} if i % 2 else {"anchor": [4, 3, 9, 7]}
         reports.append({"frame_id": packet["frame"]["frame_id"], "observation_image": {
             "id": str(packet["frame"]["frame_id"]),
@@ -369,23 +422,47 @@ def test_refresh_publishes_only_this_batch_and_depth_visible_final_frame(tmp_pat
         snapshot=SemanticMapSnapshot(0., Pose3D((0., 0., 1.5)),
                                      metadata={"observation_images": old_images}))
     client = FrameClient(packets)
+    client.pose["yaw"] = start_yaw = 1.25
+    packets[-1]["pose"] = {"position": [0.5, 0.25, 1.5], "yaw": start_yaw}
+    packets[-1]["frontiers"] = [{"uid": "fresh", "position": [1., 2., 1.5]}]
     controller = IsaacMotionController(client, client.pose)
-    refresh_observations(session, observation_map, controller, client, tmp_path, panorama_views)
+    refresh_observations(session, observation_map, controller, client, tmp_path, panorama_views,
+                         observation_mode=observation_mode)
     images = session.snapshot.metadata["observation_images"]
-    assert len(images) == panorama_views + 1
-    assert images[:-1] == [report["observation_image"] for report in reports]
+    assert len(images) == image_count
+    assert images[:-1] == ([report["observation_image"] for report in reports] if panorama_views >= 2 else [])
+    assert controller.pose is packets[-1]["pose"]
+    assert session.snapshot.robot_pose == pose_value(packets[-1]["pose"])
+    assert session.snapshot.frontiers == (FrontierSnapshot(**packets[-1]["frontiers"][0]),)
+    assert session.snapshot.objects is observation_map.objects()
+    selected_mode = observation_mode or ("multi" if panorama_views >= 2 else "single")
+    assert session.snapshot.metadata["observation_mode"] == selected_mode
+    assert session.snapshot.metadata["effective_views"] == panorama_views
+    assert session.snapshot.metadata["panorama_views"] == panorama_views
     assert images[-1] == {"id": str(packets[-1]["frame"]["frame_id"]),
         "image_ref": str(tmp_path / packets[-1]["frame"]["rgb_path"]),
         "observed_object_uids": ["candidate", "anchor"],
         "object_boxes": {"candidate": [2, 3, 7, 7], "anchor": [4, 3, 9, 7]}}
     assert old_images[0]["id"] == "old"
-    assert [call.args[0] for call in observation_map.add.call_args_list] == packets[:-1]
+    assert [call.args[0] for call in observation_map.add.call_args_list] == mapped_packets
     assert [call.kwargs for call in observation_map.add.call_args_list] == [
         {"target_list": session.detector_terms}] * panorama_views
     assert [call.args[0] for call in observation_map.points.call_args_list] == [
         obj.uid for obj in observation_map.objects()]
-    assert [action for action, _ in client.commands] == ["look", "observe"] * (panorama_views + 1)
-    assert json.loads((tmp_path / "scene_snapshots.jsonl").read_text())["metadata"]["observation_images"] == images
+    expected_commands = []
+    if panorama_views != 1:
+        for i in range(panorama_views):
+            expected_commands.extend([("look", {"yaw": start_yaw + 2 * np.pi * i / panorama_views}),
+                                      ("observe", {})])
+        expected_commands.append(("look", {"yaw": start_yaw}))
+    expected_commands.append(("observe", {}))
+    assert client.commands == expected_commands
+    logged = [json.loads(line) for line in (tmp_path / "perception.jsonl").read_text().splitlines()] if panorama_views else []
+    assert logged == [{**report, "observation_mode": selected_mode, "effective_views": panorama_views}
+                      for report in reports]
+    assert [json.loads(line) for line in capsys.readouterr().out.splitlines()] == [
+        {"event": "perception", **report} for report in logged]
+    assert json.loads((tmp_path / "scene_snapshots.jsonl").read_text())["metadata"] == session.snapshot.metadata
 
     observation_map.add = Mock(side_effect=AssertionError("unexpected detector call"))
     client.packets = iter([_frame_packet(tmp_path, 99, np.zeros((10, 10)))])
@@ -396,7 +473,8 @@ def test_refresh_publishes_only_this_batch_and_depth_visible_final_frame(tmp_pat
     observation_map.add.assert_not_called()
 
 
-def test_refresh_forwards_replaced_terms_to_actual_observation_map(monkeypatch, tmp_path):
+@pytest.mark.parametrize("panorama_views", [1, 2])
+def test_refresh_forwards_replaced_terms_to_actual_observation_map(monkeypatch, tmp_path, panorama_views):
     """Exercise refresh -> add -> segment, retaining historical labels across term revisions."""
     from instruction_adapter.contracts import InstructionPlan, TargetQuery
     from task.session import TaskSession
@@ -411,7 +489,8 @@ def test_refresh_forwards_replaced_terms_to_actual_observation_map(monkeypatch, 
     observation_map = object.__new__(IsaacObservationMap)
     observation_map.max_depth_m = 6.
     observation_map.entities = [SimpleNamespace(tag="chair")]
-    observation_map.latest = {}
+    historical = {"historical": {"frame_id": 0, "image_ref": str(tmp_path / "old.png")}}
+    observation_map.latest = dict(historical)
     observation_map.objects = lambda: objects
     observation_map.points = lambda uid: points
     observation_map.detector = SimpleNamespace(segment=Mock(return_value=([],) * 7))
@@ -419,23 +498,38 @@ def test_refresh_forwards_replaced_terms_to_actual_observation_map(monkeypatch, 
         InstructionPlan("Find a reading spot.", targets=[TargetQuery(
             "goal", "reading spot", detector_terms=["espresso machine", "table"])]))
     spec, ledger = session.spec, session.verification_ledger
-    packets = [_frame_packet(tmp_path, i, np.ones((10, 10))) for i in range(6)]
+    images_per_refresh = 1 if panorama_views == 1 else panorama_views + 1
+    packets = [_frame_packet(tmp_path, i + 1, np.ones((10, 10))) for i in range(2 * images_per_refresh)]
     client = FrameClient(packets)
     controller = IsaacMotionController(client, client.pose)
-    refresh_observations(session, observation_map, controller, client, tmp_path, panorama_views=2)
+    refresh_observations(session, observation_map, controller, client, tmp_path, panorama_views)
     first_snapshot = session.snapshot
     session.revise_search([{"concept_id": "goal", "detector_terms": ["bookshelf"]}],
         task_revision=session.spec.revision, search_revision=session.search_revision,
         snapshot=session.snapshot)
-    refresh_observations(session, observation_map, controller, client, tmp_path, panorama_views=2)
+    refresh_observations(session, observation_map, controller, client, tmp_path, panorama_views)
     assert session.spec is spec and session.verification_ledger is ledger
     calls = observation_map.detector.segment.call_args_list
     assert [call.kwargs for call in calls] == [
-        {"target": None, "target_list": ["espresso machine", "table"]}] * 2 + [
-        {"target": None, "target_list": ["bookshelf"]}] * 2
+        {"target": None, "target_list": ["espresso machine", "table"]}] * panorama_views + [
+        {"target": None, "target_list": ["bookshelf"]}] * panorama_views
     assert all(np.array_equal(call.args[0][0, 0], [17, 33, 65]) for call in calls)
     assert first_snapshot.objects is objects and session.snapshot.objects is objects
     assert observation_map.entities[0].tag == "chair"
+    assert observation_map.latest == historical
+    assert observation_map.detector.segment.call_count == 2 * panorama_views
+    first_images = first_snapshot.metadata["observation_images"]
+    current_images = session.snapshot.metadata["observation_images"]
+    assert len(first_images) == len(current_images) == images_per_refresh
+    assert first_images[-1]["id"] == str(images_per_refresh)
+    assert current_images[-1]["id"] == str(2 * images_per_refresh)
+    assert first_images[-1]["observed_object_uids"] == current_images[-1]["observed_object_uids"] == ["historical"]
+    assert first_snapshot.objects[0].uid == "historical"
+    reports = [json.loads(line) for line in (tmp_path / "perception.jsonl").read_text().splitlines()]
+    assert all(report["observation_image"]["observed_object_uids"] == [] for report in reports)
+    if panorama_views == 1:
+        assert client.commands == [("observe", {})] * 2
+    assert len((tmp_path / "scene_snapshots.jsonl").read_text().splitlines()) == 2
     geometry.assert_not_called()
 
 
@@ -464,6 +558,7 @@ def test_capture_evidence_publishes_depth_filtered_covisibility_and_raw_image(
         viewpoints=(ViewpointSnapshot("view", Pose3D((1., 0., 1.5)), visible_objects=("candidate",)),),
         frontiers=(FrontierSnapshot("stale", (4., 0., 1.5)),), source="isaac_rgbd_strive_fusion",
         metadata={"observation_images": old_images, "frame_revision": 7, "panorama_views": 3,
+                  "observation_mode": "multi", "effective_views": 3,
                   "semantic_gt_used": False, "frontier_source": "official_freemap_action_proposer"})
     tools.session = SimpleNamespace(spec=SimpleNamespace(revision=4), snapshot=previous)
     journal = tmp_path / "scene_snapshots.jsonl"
@@ -485,7 +580,9 @@ def test_capture_evidence_publishes_depth_filtered_covisibility_and_raw_image(
     snapshot = tools.session.snapshot
     assert snapshot == replace(previous, timestamp=74., robot_pose=pose_value(packet["pose"]),
         frontiers=tuple(FrontierSnapshot(**item) for item in packet["frontiers"]),
-        metadata={**previous.metadata, "observation_images": evidence["observation_images"]})
+        metadata={**previous.metadata, "panorama_views": 1, "effective_views": 1,
+                  "observation_images": evidence["observation_images"]})
+    assert snapshot.metadata["observation_mode"] == "multi"
     assert snapshot.objects is previous.objects and snapshot.viewpoints is previous.viewpoints
     assert snapshot.metadata is not previous.metadata
     assert previous.metadata["observation_images"] == old_images
@@ -526,7 +623,6 @@ def test_guided_frontier_uses_same_current_packet_after_verification(tmp_path, c
     from verification.contracts import VerificationResult
 
     observation_map = _surface_map()
-    panorama = _frame_packet(tmp_path, 40, np.ones((10, 10)))
     refreshed = _frame_packet(tmp_path, 47, np.ones((10, 10)))
     current = _frame_packet(tmp_path, 73, np.full((10, 10), 1. if candidate_visible else 0.))
     refreshed["pose"] = {"position": [1., 0., 1.5], "yaw": 0.}
@@ -537,10 +633,10 @@ def test_guided_frontier_uses_same_current_packet_after_verification(tmp_path, c
             for i in range(1, frontier_count + 1)]
     raw_path = tmp_path / current["frame"]["rgb_path"]
     Image.new("RGB", (10, 10), (120, 80, 40)).save(raw_path)
-    observation_map.add = Mock(return_value={"frame_id": 40, "observation_image": {
-        "id": "40", "image_ref": str(tmp_path / panorama["frame"]["rgb_path"]),
+    observation_map.add = Mock(return_value={"frame_id": 47, "observation_image": {
+        "id": "47", "image_ref": str(tmp_path / refreshed["frame"]["rgb_path"]),
         "observed_object_uids": ["candidate"], "object_boxes": {"candidate": [2, 3, 7, 7]}}})
-    client = FrameClient([panorama, refreshed, current])
+    client = FrameClient([refreshed, current])
     client.status = "reached"
     controller = IsaacMotionController(client, client.pose)
     motion = MotionSupervisor(controller)
@@ -570,7 +666,7 @@ def test_guided_frontier_uses_same_current_packet_after_verification(tmp_path, c
     feedback = motion.poll_active()
     assert not feedback.tracking_active
     refresh_observations(session, observation_map, controller, client, tmp_path, panorama_views=1)
-    assert [image["id"] for image in session.snapshot.metadata["observation_images"]] == ["40", "47"]
+    assert [image["id"] for image in session.snapshot.metadata["observation_images"]] == ["47"]
     guided.motion_finished(feedback)
     assert not session.progress.completed
     tools.evidence_provider.assert_called_once_with("candidate")
@@ -601,9 +697,9 @@ def test_guided_frontier_uses_same_current_packet_after_verification(tmp_path, c
     assert rows[-1]["timestamp"] == observation["timestamp"] > rows[0]["timestamp"]
     assert rows[-1]["frontiers"] == observation["frontiers"]
     assert rows[-1]["metadata"]["observation_images"] == evidence["observation_images"]
-    observation_map.add.assert_called_once_with(panorama, target_list=session.detector_terms)
+    observation_map.add.assert_called_once_with(refreshed, target_list=session.detector_terms)
     assert observation_map.points.call_count == 2 * len(observation_map.objects())
-    assert [action for action, _ in client.commands] == ["move"] + ["look", "observe"] * 3
+    assert [action for action, _ in client.commands] == ["move", "observe", "look", "observe"]
     assert agent.model_calls == 1 and controller.moves == 1
     goal = controller.goals[motion.active_goal_id]
     assert goal.mode == MotionGoalMode.GO_TO_FRONTIER

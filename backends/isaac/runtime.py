@@ -209,7 +209,8 @@ class IsaacNavigationTools(NavigationTools):
         self.session.snapshot = replace(self.session.snapshot, timestamp=time.time(),
             robot_pose=pose_value(packet["pose"]),
             frontiers=tuple(FrontierSnapshot(**item) for item in packet["frontiers"]),
-            metadata={**self.session.snapshot.metadata, "observation_images": evidence["observation_images"]})
+            metadata={**self.session.snapshot.metadata, "panorama_views": 1, "effective_views": 1,
+                      "observation_images": evidence["observation_images"]})
         with (self.output / "scene_snapshots.jsonl").open("a") as stream:
             stream.write(json.dumps(asdict(self.session.snapshot), allow_nan=False) + "\n")
         directory = self.output / "verification"
@@ -227,20 +228,26 @@ class IsaacNavigationTools(NavigationTools):
         return evidence
 
 
-def refresh_observations(session, observation_map, controller, client, output, panorama_views):
-    """Refresh perception at actual camera headings, then publish local action proposals."""
+def refresh_observations(session, observation_map, controller, client, output, panorama_views,
+                         *, observation_mode=None):
+    """Fuse one current frame or N>=2 panoramic views; zero only reprojects the map."""
     start_yaw = controller.pose["yaw"]
+    diagnostics = {"observation_mode": observation_mode or ("multi" if panorama_views >= 2 else "single"),
+                   "effective_views": panorama_views}
     observation_images = []
     for index in range(panorama_views):
-        client.command("look", yaw=start_yaw + 2 * math.pi * index / panorama_views)
+        if panorama_views >= 2:
+            client.command("look", yaw=start_yaw + 2 * math.pi * index / panorama_views)
         packet = client.command("observe")
-        report = observation_map.add(packet, target_list=session.detector_terms)
-        observation_images.append(report["observation_image"])
+        report = {**observation_map.add(packet, target_list=session.detector_terms), **diagnostics}
+        if panorama_views >= 2:
+            observation_images.append(report["observation_image"])
         with (output / "perception.jsonl").open("a") as stream:
             stream.write(json.dumps(report) + "\n")
         print(json.dumps({"event": "perception", **report}), flush=True)
-    client.command("look", yaw=start_yaw)
-    packet = client.command("observe")
+    if panorama_views != 1:
+        client.command("look", yaw=start_yaw)
+        packet = client.command("observe")
     controller.pose = packet["pose"]
     objects = observation_map.objects()
     observation_images.append(_project_observation_image(packet, observation_map, objects))
@@ -249,7 +256,7 @@ def refresh_observations(session, observation_map, controller, client, output, p
         frontiers=tuple(FrontierSnapshot(**item) for item in packet["frontiers"]),
         source="isaac_rgbd_strive_fusion", metadata={"semantic_gt_used": False,
             "frontier_source": "official_freemap_action_proposer", "panorama_views": panorama_views,
-            "observation_images": observation_images})
+            **diagnostics, "observation_images": observation_images})
     with (output / "scene_snapshots.jsonl").open("a") as stream:
         stream.write(json.dumps(asdict(session.snapshot), allow_nan=False) + "\n")
 
@@ -333,7 +340,7 @@ class IsaacGuidedNavigation:
             session.anchor_search_ledger.mark(raw_instruction=session.spec.raw_instruction,
                 concept_id=candidate["target_id"], anchor_uid=uid,
                 status="searched_no_terminal_found", step=self.tools.motion.controller.moves,
-                reason="Reached anchor and acquired a new panorama; continue terminal search.")
+                reason="Reached anchor and refreshed observations; continue terminal search.")
             self.record("anchor_observed", candidate_uid=uid)
             return
         result = self.tools.verify_target(uid, candidate["target_id"], session.spec.revision)
@@ -342,19 +349,25 @@ class IsaacGuidedNavigation:
 
 
 def run_episode(public_episode, output, *, port=9466, vlm="self_hosted", device="cuda:0",
-                max_model_calls=60, max_moves=30, panorama_views=4):
-    """Run bounded guided navigation without loading evaluator metadata."""
+                max_model_calls=60, max_moves=30, panorama_views=4, observation_mode="single"):
+    """Run bounded, single-view-by-default navigation without evaluator metadata."""
     output = Path(output)
     expected = {"selection_id", "scene_id", "style", "instruction", "start_position", "start_rotation_quat_wxyz"}
     if set(public_episode) != expected:
         raise ValueError("Policy input must contain exactly the public episode fields")
-    if min(max_model_calls, max_moves, panorama_views) < 1:
+    if min(max_model_calls, max_moves) < 1:
         raise ValueError("Episode budgets must be positive")
+    if observation_mode not in ("single", "multi"):
+        raise ValueError("observation_mode must be single or multi")
+    if observation_mode == "multi" and (not isinstance(panorama_views, int) or panorama_views < 2):
+        raise ValueError("multi observation mode requires panorama_views to be an integer >= 2")
+    effective_views = 1 if observation_mode == "single" else panorama_views
     client = IsaacClient(port)
     set_trace_dir(str(output / "model_requests"))
     started = time.monotonic()
     termination = {"status": "running", "policy": "strive_isaac_guided", **public_episode,
         "max_model_calls": max_model_calls, "max_moves": max_moves, "panorama_views": panorama_views,
+        "observation_mode": observation_mode, "effective_views": effective_views,
         "motion_semantics": "freemap_checked_kinematic_camera_not_dynamic_robot",
         "frontier_source": "official_freemap_action_proposer", "model_provider": vlm,
         "model_calls_scope": "initial_interpretation_plus_guided_selection_and_review; model_usage counts all recorded model calls",
@@ -388,7 +401,8 @@ def run_episode(public_episode, output, *, port=9466, vlm="self_hosted", device=
         runtime = AgentRuntime(tools, output / "tools.jsonl", max_model_calls=max_model_calls, vlm=vlm)
         guided = IsaacGuidedNavigation(tools, runtime, output)
         termination["predicted_target"] = plan.terminal_targets[0].name
-        refresh_observations(session, observation_map, controller, client, output, panorama_views)
+        refresh_observations(session, observation_map, controller, client, output, effective_views,
+                             observation_mode=observation_mode)
         while True:
             if tools.propose_finish()["accepted"]:
                 reason = "verified_finish"
@@ -400,7 +414,8 @@ def run_episode(public_episode, output, *, port=9466, vlm="self_hosted", device=
                 controller.advance(motion.active_goal_id)
                 feedback = motion.poll_active()
                 refresh_observations(session, observation_map, controller, client, output,
-                                     1 if feedback.tracking_active else panorama_views)
+                                     1 if feedback.tracking_active else effective_views,
+                                     observation_mode=observation_mode)
                 if not feedback.tracking_active:
                     guided.motion_finished(feedback)
                 continue
