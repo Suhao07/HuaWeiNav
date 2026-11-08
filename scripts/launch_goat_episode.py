@@ -9,6 +9,11 @@ import math
 import os
 from pathlib import Path
 import subprocess
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from benchmark.habitat_evaluation import strict_json_loads
 
 
 def language_inputs(task_file, index, data_root, output, max_steps, max_model_calls):
@@ -35,27 +40,41 @@ def language_inputs(task_file, index, data_root, output, max_steps, max_model_ca
     return argv, identities[index], selected['info']['instruction']
 
 
-def language_score(output, index, expected_identity, instruction):
+def language_score(output, index, expected_identity, instruction, independent):
+    """Bind separately computed independent evidence while retaining raw benchmark metrics."""
     folder = output / 'navigation/task'
     with (folder / 'metrics.csv').open() as stream:
         rows = list(csv.DictReader(stream))
     if len(rows) != 1 or int(rows[0]['Episode']) != index:
         raise ValueError('Expected exactly the selected language task result')
     row = rows[0]
-    actual = json.loads((folder / f'episode-{index}/episode_identity.json').read_text())
+    actual = strict_json_loads((folder / f'episode-{index}/episode_identity.json').read_text())
     if actual != expected_identity or row['object_goal'] != instruction:
         raise ValueError('Executed task identity or instruction differs from frozen input')
     if row['benchmark'] != 'goat_language' or float(row['benchmark_success_distance']) != 0.25:
         raise ValueError('Language task scoring protocol differs')
+    if row['End'] != '1':
+        raise ValueError('Language task metrics are unfinished')
+    provenance = independent['provenance']
+    if provenance['schema'] != 'goat_language_viewpoints_v1':
+        raise ValueError('Independent evaluation protocol differs')
+    # Missing evidence may have no identity; any supplied identity must still match.
+    if (independent['status'] == 'available' or 'episode_identity' in provenance):
+        if provenance.get('episode_identity') != expected_identity:
+            raise ValueError('Independent evaluation episode identity differs')
     metrics = {name: float(row[key]) for name, key in
                (('SR', 'success'), ('SPL', 'spl'), ('distance_to_goal', 'distance_to_goal'))}
-    if row['End'] != '1' or not all(math.isfinite(value) for value in metrics.values()):
-        raise ValueError('Language task metrics are unfinished or undefined')
-    return {'aggregate_ready': True, 'metrics': metrics, 'raw_metrics': row,
-            'protocol': 'goat_language_single_parent_start_v1',
-            'difficulty_status': 'nominal_project_tier_not_empirically_ranked',
-            'runtime_scope': 'project_RGBD_single_goal_not_official_multimodal_Stretch',
-            'termination': json.loads((folder / f'episode-{index}/harness/termination.json').read_text())}
+    ready = all(math.isfinite(value) for value in metrics.values())
+    score = {'aggregate_ready': ready, 'metrics': metrics if ready else None, 'raw_metrics': row,
+             'independent_metrics': independent,
+             'protocol': 'goat_language_single_parent_start_v1',
+             'difficulty_status': 'nominal_project_tier_not_empirically_ranked',
+             'runtime_scope': 'project_RGBD_single_goal_not_official_multimodal_Stretch',
+             'termination': strict_json_loads(
+                 (folder / f'episode-{index}/harness/termination.json').read_text())}
+    if not ready:
+        score['reason'] = 'nonfinite_runtime_metrics'
+    return score
 
 
 def main():
@@ -87,6 +106,7 @@ def main():
         "VLN_LVLM_MODEL": "huaweivln-qwen3.5-4b",
         "VLN_LVLM_API_KEY": os.environ["VLN_LVLM_API_KEY"], "VLN_LVLM_GUIDED_JSON": "1",
         "VLN_LVLM_TIMEOUT_S": "180", "VLN_LVLM_PARSE_RETRIES": "1", "STRIVE_VLM_WORKERS": "1",
+        "VLN_LVLM_TRANSPORT_RETRIES": "0",
         "PYTHONNOUSERSITE": "1", "PYTHONDONTWRITEBYTECODE": "1", "PYTHONUNBUFFERED": "1",
         "PYTHONUTF8": "1", "TRANSFORMERS_OFFLINE": "1", "HF_HUB_OFFLINE": "1",
         "HF_HOME": "/root/.cache/huggingface", "SAM_CHECKPOINT": "/weights/sam_vit_h_4b8939.pth",
@@ -140,8 +160,19 @@ def main():
                                  stderr=subprocess.STDOUT)
     if language and process.returncode == 0:
         try:
-            score = language_score(output, args.language_task_index, expected_identity, instruction)
-        except (OSError, ValueError, KeyError) as error:
+            episode_dir = output / f'navigation/task/episode-{args.language_task_index}'
+            scoring_command = [
+                'docker', 'run', '--rm', '--network', 'none', '--entrypoint', 'python',
+                '-e', 'PYTHONDONTWRITEBYTECODE=1', '-e', 'MAGNUM_LOG=quiet',
+                '-e', 'HABITAT_SIM_LOG=quiet',
+                '-v', f'{root}:/workspace/STRIVE:ro', '-v', f'{output}:{output}:ro',
+                '-w', '/workspace/STRIVE', image_id,
+                '-m', 'benchmark.habitat_evaluation', str(episode_dir),
+            ]
+            independent = strict_json_loads(subprocess.check_output(scoring_command, text=True))
+            score = language_score(output, args.language_task_index, expected_identity, instruction,
+                                   independent)
+        except (OSError, ValueError, KeyError, subprocess.CalledProcessError) as error:
             score = {'aggregate_ready': False, 'metrics': None,
                      'unavailable_metrics': {'navigation': f'{type(error).__name__}: {error}'}}
         (output / 'evaluation.json').write_text(json.dumps(score, allow_nan=False, indent=2) + '\n')

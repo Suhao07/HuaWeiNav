@@ -326,6 +326,10 @@ if __name__ == "__main__":
         os.makedirs(episode_dir, exist_ok=True)
         with open(os.path.join(episode_dir, "episode_identity.json"), "w") as stream:
             json.dump(actual_episode, stream, indent=2)
+        if benchmark_spec.benchmark == "goat_language":
+            from benchmark.habitat_evaluation import HabitatEvaluationTrace
+            habitat_agent.execution.controller.evaluation_trace = HabitatEvaluationTrace(
+                habitat_agent.env, episode_dir, provenance=benchmark_spec.provenance)
         if prior_map_runtime is not None:
             prior_map_runtime.begin_episode(episode_dir, i)
         reset_counts()

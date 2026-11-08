@@ -21,6 +21,12 @@ class HabitatMotionController:
         self.waypoint_goal_id = None
         self.observations = {}
         self.statuses = {}
+        self.evaluation_trace = None
+
+    def _step(self, action):
+        if self.evaluation_trace is not None:
+            return self.evaluation_trace.step(action)
+        return self.env.step(action)
 
     def send_goal(self, goal: MotionGoal) -> str:
         """Execute one backend primitive and return its completed request ID."""
@@ -33,7 +39,7 @@ class HabitatMotionController:
             self.waypoint_goal, self.waypoint_goal_id = goal, goal_id
             self.statuses[goal_id] = NavigationStatus(NavigationStatusCode.QUEUED, goal_id=goal_id)
             return goal_id
-        self.observations[goal_id] = self.env.step(goal.action)
+        self.observations[goal_id] = self._step(goal.action)
         self.statuses[goal_id] = NavigationStatus(
             NavigationStatusCode.REACHED, goal_id=goal_id,
             metadata={"completion_scope": "primitive", "action": goal.action},
@@ -83,7 +89,7 @@ class HabitatMotionController:
             elif int(action) == 0:
                 status = NavigationStatusCode.REACHED
             else:
-                self.agent.obs = self.env.step(int(action))
+                self.agent.obs = self._step(int(action))
                 # 原探索器从首次平移起累计沿途点云；出发前原地转向仍属当前节点。
                 if self.waypoint_goal.mode == MotionGoalMode.GO_TO_FRONTIER and int(action) == 1:
                     self.agent.on_node_flag = False

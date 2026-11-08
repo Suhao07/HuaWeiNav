@@ -12,9 +12,26 @@ class Environment:
         return {"action": action, "step": len(self.actions)}
 
 
-def test_habitat_actions_are_executed_once_and_receipts_are_primitive_scoped():
+class EvaluationTrace:
+    """Count recorder delegation without changing the underlying simulator step."""
+    def __init__(self, env):
+        self.env = env
+        self.actions = []
+
+    def step(self, action):
+        """Delegate exactly one simulator step and preserve its observation."""
+        self.actions.append(action)
+        return self.env.step(action)
+
+
+@pytest.mark.parametrize('with_trace', [False, True])
+def test_habitat_actions_are_executed_once_and_receipts_are_primitive_scoped(with_trace):
     env = Environment()
     execution = HabitatExecution(env)
+    assert execution.controller.evaluation_trace is None
+    trace = EvaluationTrace(env)
+    if with_trace:
+        execution.controller.evaluation_trace = trace
     first = execution.step(1, request_id="forward-1")
     assert execution.step(1, request_id="forward-1") == first
     assert env.actions == [1]
@@ -24,6 +41,7 @@ def test_habitat_actions_are_executed_once_and_receipts_are_primitive_scoped():
     execution.step(2)
     execution.step(0)
     assert env.actions == [1, 2, 0]
+    assert trace.actions == ([1, 2, 0] if with_trace else [])
 
 
 def test_habitat_hold_preserves_simulation_state_until_resume():
@@ -38,7 +56,8 @@ def test_habitat_hold_preserves_simulation_state_until_resume():
     assert execution.controller.observations == {}
 
 
-def test_waypoint_execution_pumps_existing_planner_and_polling_is_read_only():
+@pytest.mark.parametrize('with_trace', [False, True])
+def test_waypoint_execution_pumps_existing_planner_and_polling_is_read_only(with_trace):
     from types import SimpleNamespace
     import numpy as np
     from motion.contracts import NavigationIntent, MotionGoalMode, NavigationStatusCode
@@ -48,6 +67,9 @@ def test_waypoint_execution_pumps_existing_planner_and_polling_is_read_only():
     env.episode_over = False
     env.sim = SimpleNamespace(get_agent_state=lambda: SimpleNamespace(position=(0, 1, 0)))
     execution = HabitatExecution(env)
+    trace = EvaluationTrace(env)
+    if with_trace:
+        execution.controller.evaluation_trace = trace
     actions = iter([1, 2, 0])
     planner_points = []
 
@@ -77,6 +99,7 @@ def test_waypoint_execution_pumps_existing_planner_and_polling_is_read_only():
     assert agent.episode_steps == 2
     execution.step(0)
     assert env.actions[-1] == 0
+    assert trace.actions == ([1, 2, 0] if with_trace else [])
 
 
 def test_historical_base_goal_preserves_floor_height_through_motion_owner():
