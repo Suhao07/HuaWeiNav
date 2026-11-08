@@ -6,45 +6,58 @@ model invocation stay in the caller modules so prompt changes remain isolated.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from llm_utils.nav_prompt_room import OBJECT_PROMPT, RELOCATE_PROMPT, ROOM_PROMPT
 
 
+INSTRUCTION_UNDERSTANDING_SKILL = (Path(__file__).resolve().parents[1] / "skills" / "understand_instruction.md").read_text(encoding="utf-8")
+
 #指令解析
 INSTRUCTION_PARSE_PROMPT = """
-You are a semantic compiler for indoor object navigation instructions.
+Interpret the indoor navigation instruction using the instruction-understanding
+skill below. Return only structured JSON matching the supplied schema. There are
+no scene observations at this stage; do not invent observed objects or states.
 
-Return only structured JSON matching the schema. Do not solve navigation and do
-not invent scene-specific facts. Extract what the user asks for:
-- targets: object concepts mentioned or implied by the instruction.
-- terminal=true only for objects that may satisfy the final goal.
-- anchors/support objects must be terminal=false.
-- constraints: room, spatial, sequence, count, area, attribute, co_occurrence.
-- Use hard constraints for explicit requirements in the instruction.
-- Use soft constraints only for hints explicitly present in the instruction.
-- Do not encode common-sense priors such as "TV is in living room" unless the
-  room or context is explicitly stated by the instruction.
-- Preserve explicit prohibitions and all quantity/order requirements. Never
-  turn a prohibition into a search preference. Use avoid_room for forbidden rooms.
-- Set min_count on each target for explicit instance counts. Set ordered for
-  required sequencing. A minimum count alone does not imply exhaustive search;
-  set exhaustive only for an explicit requirement to exhaust the target set.
-- Put unresolved references that change task meaning in unresolved; do not
-  silently choose one interpretation. Missing scene observations are not, by
-  themselves, an ambiguity in the user's intent.
+Represent navigation destinations and actual reference anchors in targets.
+For an explicit object, use its name and equivalent object-name aliases, with
+demand=null. A descriptive clause is not an alias; leave aliases empty rather
+than inserting the object's attributes or relationships as another name.
+For an implied resource, create a terminal=true destination whose name describes
+the resource that enables the activity. Attach demand to that resource target:
+activity, manipulated_objects, required_resource and destination_hypotheses.
+The material being acted on belongs in manipulated_objects, not as the resource
+or an anchor target. Add a material as a navigation target only if the instruction
+separately asks to navigate to it. Facility alternatives are hypotheses, not
+identity aliases. Extract entity-to-entity predicates into constraints before
+writing unary attributes. A noun phrase can describe several entities: a second
+entity's relative placement is a directed relation, not a property of the first
+entity. Resolve the subject and reference of each placement from the wording.
+Attributes contain only unary properties; use {} when none are stated. Represent
+each independent object relation as a separate constraint; do not concatenate
+relation phrases or hide them inside attributes.
 
-Examples:
-Instruction: "Find a cup on the table in the kitchen."
-targets: cup terminal true; table role anchor terminal false.
-constraints: room cup in kitchen hard; spatial cup on table hard verifier vlm.
+Set terminal=false for anchors/support objects. Bind constraint subjects and
+objects consistently to the target names; references to the same object must
+not become independent identities. Preserve explicit constraints as hard, and
+explicit hints as soft. Use room, spatial, sequence, count, area, attribute,
+co_occurrence or affordance as appropriate; use avoid_room for forbidden rooms.
+Set min_count and ordered from explicit counts/sequences; set exhaustive only
+when the user requests exhausting the target set. Record genuinely unresolved
+meaning in unresolved, not missing scene evidence.
 
-Instruction: "I need somewhere to sit."
-targets: object or affordance concept "seat" terminal true, with affordance sitting.
-Do not choose chair/sofa by hard-coded prior; detector grounding will map it.
+Representation examples, not facts about the current instruction:
+- "Find the metal trolley with wheels and a carton underneath": trolley is the
+  destination with material=metal and component=wheels; carton is a nonterminal
+  anchor; a separate hard spatial constraint is (carton, below, trolley).
+  The carton's placement cannot be stored as a trolley attribute or alias.
+- "I need to dry this wet scarf": a terminal drying resource has demand activity
+  drying, manipulated_objects=[scarf], required_resource=a place suitable for
+  drying fabric. A clothesline is a possible search hypothesis, not a required
+  identity; scarf is not the destination. Infer a capability, not a fixed facility.
+Resolve each directed relation in the wording without unnecessary inversion.
 
-Instruction: "First find the bed, then locate the towel."
-targets: bed terminal true; towel terminal true.
-constraints: sequence bed before towel hard.
-"""
+""" + INSTRUCTION_UNDERSTANDING_SKILL
 
 #概念映射
 CONCEPT_GROUNDING_PROMPT = """
@@ -52,14 +65,16 @@ You map an instruction target concept to detector vocabulary for open-vocabulary
 object navigation.
 
 Return JSON only. Choose detector_terms from the provided available classes when
-possible. Include aliases only if they are plausible names for the same target
-concept, not nearby/support objects. Do not include room names or support
-objects as detector terms.
-Also provide a concise semantic description and negative_terms that distinguish
-this concept from related but different concepts.
-Each list contains up to four distinct phrases, each at most 64 characters.
-Use one short sentence for description (up to 240 characters) and reason
-(up to 160 characters). Empty lists are valid when no relevant term exists.
+possible. These are retrieval hints: a broader class may help find candidates but
+does not establish the requested identity. Return only detector_terms and reason;
+do not change the supplied concept, aliases, description or exclusions. Apply
+this retrieval-only boundary to terminal targets and non-terminal anchors.
+Do not include room names or support objects as detector terms.
+For a demand concept, ground its required_resource and activity to possible
+facility classes, not to its manipulated_objects. Alternative realizations
+remain detector hints, never aliases for the functional requirement.
+Use up to four distinct phrases, each at most 64 characters, and one short
+reason (up to 160 characters). An empty list is valid when no relevant term exists.
 """
 
 #执行策略
@@ -81,23 +96,63 @@ Use the concept role carefully:
 - anchor/support concepts are only reference objects for search or relation
   verification and must never be treated as final goal success.
 
-Do not rely on hard-coded synonym tables. Judge whether the observed object can
-play the requested role for this specific instruction. Return strict JSON.
+Separate semantic identity from retrieval compatibility for both targets and
+anchors. Check the concept name against the original instruction. Aliases are
+proposed equivalences, not proof: reject a proposed alias if it changes or
+broadens the requested identity. Detector_terms are retrieval hints and may be
+broader than that identity. A matching detector term or related category is not
+proof of identity. For a demand concept, its name
+is a functional resource, not a fixed facility category. Use demand.activity,
+demand.manipulated_objects and demand.required_resource to consider observed
+facilities, including alternatives absent from the initial detector terms.
+A plausible facility is eligible for inspection; its specific functional
+suitability, requested attributes and current state remain unverified until
+instance-level visual checks. Do not require the manipulated objects to be
+present unless the original instruction asks to find them.
+
+Return matches_concept=true only when the supplied evidence establishes the
+concept identity, false for an incompatible object, and null when identity is
+unknown. With only a broad label, use null rather than guessing true or false.
+Set candidate_eligible=true for a confirmed match or an unresolved but
+semantically compatible candidate worth inspecting; set it false for unrelated
+labels or when there is no evidence of compatibility. Do not turn every unknown
+label into a candidate. Confidence describes the judgment, not an identity gate.
+Set terminal_eligible=true only for an established identity of a terminal
+concept. It does not authorize STOP: instance attributes, relations and final
+view requirements must still be verified. Missing relation anchors alone must
+not negate the candidate's concept identity or retrieval compatibility.
+Do not rely on hard-coded synonym tables. Return strict JSON with
+matches_concept, candidate_eligible, confidence, terminal_eligible and reason.
 """
 
 #关系验证（几何和语义关系）
 RELATION_VERIFIER_PROMPT = """
 You verify one spatial/semantic relation for an indoor navigation robot.
 
-Use only the provided object records, geometry hints, and images. If the
-relation is not visible or cannot be inferred from geometry, return verified
-false or need_better_view true. Do not use generic common-sense priors.
+Use only the provided object records, geometry hints, and images. Each frame's
+object_boxes bind the two instance IDs to pixel regions in that frame only.
+Role-labeled crops show exactly those regions and carry their source frame, box
+and instance ID. Use the crops to assess identity and the full source frames to
+assess spatial relationships; crop placement does not define relative position.
+requested_concept is a task requirement, not proof that the bound instance has
+that identity. detector_label is a fallible observation, not a replacement for
+the requirement. A record with demand describes a functional resource: assess
+visible support for its activity on its manipulated_objects using required_resource,
+not whether the detector names a facility identical to the functional label.
+Do not require the manipulated materials to be visible. A plausible facility label
+alone does not establish functional suitability; missing structural evidence is
+unknown. Records without demand retain their requested object identity.
+Never substitute an unbound object elsewhere in the image.
+Do not use generic common-sense priors.
 
-Return strict JSON:
-- verified: true only when the requested relation clearly holds.
-- confidence: number in [0, 1].
-- need_better_view: true if the pair is plausible but visual evidence is weak.
-- reason: concise visual/geometric explanation.
+Return strict JSON with three separate judgments and confidence in [0, 1]:
+- subject_identity: does the subject region satisfy its requested concept and demand, if present?
+- reference_identity: does the reference region satisfy its requested concept and demand, if present?
+- relation: does the exact requested directed relation hold between those regions?
+Each judgment must contain verdict (true, false, or unknown) and a concise reason
+citing visible evidence for that role. Use false only for a clear contradiction;
+missing evidence is unknown. If either identity is not established, relation must
+be unknown. Proximity to a different visible object cannot establish this relation.
 """
 
 # LVLM最终决策（是否接受当前候选对象作为停靠目标）
@@ -122,6 +177,32 @@ Candidate UIDs are tracking identifiers. Establish category, attributes and
 relations directly from visible structure. For ambiguous background, support
 surfaces or depictions, identify the missing visual evidence. A partial view is
 sufficient when its visible structure distinguishes the required object.
+
+Task.active_target.demand is the immutable requested activity, manipulated_objects
+and required_resource. For every hard affordance in task.visual_predicates, judge
+whether this actual candidate supports that demand, not whether its category is
+a typical destination. Search hypotheses and category typicality are never
+instance proof. Visible functional structure is sufficient for a design
+affordance; do not require performing the activity. Hidden state such as being
+operational or softness cannot be asserted solely from category or appearance
+when the required property is not visually established. Report unknown rather
+than infer an unobserved property. Visible incompatible structure supports false;
+a missing or ambiguous view supports unknown, not false.
+
+When the response schema includes affordance_judgments, return exactly every
+required predicate ID as a key, each with:
+- verdict: "true", "false", or "unknown".
+- reason: a concise visual reason (1-240 characters), identifying observed
+  functional structure or the specific missing evidence.
+- supporting_observation_ids: observation_id strings from actually supplied,
+  candidate-bound images supporting this judgment; use [] for no such evidence.
+True and false require supporting observations of this candidate. Goal reference
+images, unrelated relation views, labels and unsent observations are not support.
+Historical candidate views can support a predicate only with established instance
+correspondence; a current candidate-bound image is always required. If any hard
+affordance is false, reject_candidate; if none is false but any is unknown,
+request need_better_view or return uncertain. Only all true permits semantic
+acceptance. When this field is absent from the schema, do not add it.
 
 Return strict JSON:
 - satisfied: true only when all required visual predicates are established.

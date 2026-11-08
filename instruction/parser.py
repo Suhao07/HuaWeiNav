@@ -8,7 +8,7 @@ from prompting.schemas import HAS_PYDANTIC, ParsedConstraint, ParsedInstruction,
 from prompting.templates import INSTRUCTION_PARSE_PROMPT
 
 from instruction_adapter.contracts import Constraint, ExecutionPolicy, InstructionPlan, SearchPriors, TargetQuery
-from instruction_adapter.ontology import dedupe_terms, normalize_term
+from instruction_adapter.ontology import compact_key, dedupe_terms, normalize_term
 
 
 class InstructionParseUnavailable(RuntimeError):
@@ -88,14 +88,40 @@ def parse_instruction_with_llm(
     if parsed is None:
         return unavailable("empty_llm_parse")
 
+    return plan_from_parsed_instruction(raw, parsed, dataset_target=dataset, strict=strict)
+
+
+def plan_from_parsed_instruction(
+    raw_instruction: str,
+    parsed: ParsedInstruction,
+    *,
+    dataset_target: str = "",
+    strict: bool = True,
+) -> InstructionPlan:
+    """复用已有解析，不再调用模型或改变初始解析语义。"""
+    raw = str(raw_instruction or "").strip()
+    dataset = normalize_term(dataset_target)
+    invalid = []
+    if strict:
+        invalid.extend(f"targets[{index}].name is empty" for index, item in enumerate(parsed.targets)
+                       if not normalize_term(item.name))
+        invalid.extend(f"targets[{index}].min_count must be positive" for index, item in enumerate(parsed.targets)
+                       if item.min_count < 1)
+        invalid.extend(f"constraints[{index}].type is empty" for index, item in enumerate(parsed.constraints)
+                       if not normalize_term(item.type))
     targets = []
+    destination_hypotheses = {}
     for idx, item in enumerate(parsed.targets):
         name = normalize_term(item.name)
         if not name:
             continue
+        target_id = _target_id(name, idx)
+        demand = item.demand.model_dump(exclude={"destination_hypotheses"}) if item.demand else {}
+        if item.demand:
+            destination_hypotheses[target_id] = dedupe_terms(item.demand.destination_hypotheses)
         targets.append(
             TargetQuery(
-                id=_target_id(name, idx),
+                id=target_id,
                 name=name,
                 role=normalize_term(item.role) or "primary",
                 detector_terms=[name],
@@ -104,6 +130,7 @@ def parse_instruction_with_llm(
                 min_count=max(1, int(item.min_count or 1)),
                 terminal=bool(item.terminal),
                 source="llm",
+                demand=demand,
             )
         )
 
@@ -137,17 +164,18 @@ def parse_instruction_with_llm(
     return InstructionPlan(
         raw_instruction=raw,
         dataset_target=dataset,
-        task_type=normalize_term(parsed.task_type) or "object_goal",
-        eval_mode=normalize_term(parsed.eval_mode) or "any_target_success",
+        task_type=compact_key(parsed.task_type) or "object_goal",
+        eval_mode=compact_key(parsed.eval_mode) or "any_target_success",
         targets=targets,
         constraints=constraints,
         search_priors=SearchPriors(
             room_hints=dedupe_terms(parsed.room_hints),
             support_objects=dedupe_terms(parsed.support_objects),
             affordances=dedupe_terms(parsed.affordances),
+            destination_hypotheses=destination_hypotheses,
         ),
         execution=ExecutionPolicy(
-            mode=normalize_term(parsed.eval_mode) or "any_target_success",
+            mode=compact_key(parsed.eval_mode) or "any_target_success",
             ordered=bool(parsed.ordered) or any(c.type == "sequence" for c in constraints),
             exhaustive=bool(parsed.exhaustive),
         ),
@@ -156,5 +184,6 @@ def parse_instruction_with_llm(
             "source": ["llm"],
             "requires_runtime_relation": bool(parsed.requires_runtime_relation),
             "unresolved": list(parsed.unresolved),
+            "invalid": invalid,
         },
     )

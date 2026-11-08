@@ -13,7 +13,9 @@ def runtime_plan(task):
     data = task.as_dict()
     return InstructionPlan(
         raw_instruction=task.raw_instruction,
-        targets=[TargetQuery(**t, source=task.source) for t in data["targets"]],
+        targets=[TargetQuery(**t, source=task.source,
+                             detector_terms=list(data["search_priors"].get("destination_hypotheses", {}).get(t["id"], [])))
+                 for t in data["targets"]],
         constraints=[Constraint(**{k: v for k, v in c.items() if k != "id"})
                      for c in data["constraints"]],
         execution=ExecutionPolicy(mode=task.completion_mode, ordered=task.ordered,

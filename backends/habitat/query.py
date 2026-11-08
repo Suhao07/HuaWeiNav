@@ -5,7 +5,7 @@ from dataclasses import replace
 import json
 from pathlib import Path
 
-from backends.habitat.scene import snapshot_from_mapper
+from backends.habitat.scene import current_observation, snapshot_from_mapper
 from prior_map.simulation import refresh_mapper_prior_map_query
 from harness.tools import query_scene
 
@@ -17,7 +17,8 @@ def refresh_scene(agent):
         agent.mapper, step=agent.episode_steps, nodes=agent.mapper.nodes)
     views = tuple(v for v in previous.viewpoints if v.visible_objects
                   and all(uid in objects for uid in v.visible_objects))
-    agent.task.snapshot = replace(snapshot, viewpoints=snapshot.viewpoints + views)
+    agent.task.snapshot = replace(snapshot, viewpoints=snapshot.viewpoints + views,
+        metadata={**snapshot.metadata, "observation_images": [current_observation(agent)]})
     agent.task.constraint_evaluator.register_mapper_objects(
         mapper=agent.task, step=agent.episode_steps, current_node_idx=agent.current_node_idx)
     return objects

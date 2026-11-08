@@ -1,10 +1,4 @@
-import sys
-import types
-
 import pytest
-
-
-sys.modules.setdefault("cv2", types.SimpleNamespace())
 
 
 @pytest.fixture(autouse=True)

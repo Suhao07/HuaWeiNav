@@ -13,6 +13,7 @@ from PIL import Image, ImageDraw
 from backends.isaac.perception import IsaacObservationMap, visible_projection
 from harness.runtime import AgentRuntime
 from harness.tools import NavigationTools
+from instruction.compiler import InitialInstructionCompiler
 from instruction_adapter.compiler import compile_instruction_plan
 from instruction_adapter.constraints import ConstraintEvaluator
 from instruction_adapter.relation_verifier import DynamicRelationService
@@ -130,6 +131,21 @@ class IsaacEvidenceVerifier:
         return self.final.verify(raw_instruction, instruction_plan, candidate, evidence)
 
 
+def _project_observation_image(packet, observation_map, objects, *, depth=None, object_boxes=None):
+    frame, root = packet["frame"], Path(packet["capture_root"])
+    if depth is None:
+        depth = np.load(root / frame["depth_path"], allow_pickle=False)
+    boxes = dict(object_boxes or {})
+    for obj in objects:
+        if obj.uid not in boxes:
+            boxes[obj.uid], _ = visible_projection(observation_map.points(obj.uid), depth,
+                frame["intrinsics"], frame["camera_to_map"])
+    boxes = {uid: box for uid, box in boxes.items() if box is not None}
+    return {"id": str(frame["frame_id"]),
+            "image_ref": str((root / frame["rgb_path"]).resolve()),
+            "observed_object_uids": list(boxes), "object_boxes": boxes}
+
+
 class IsaacNavigationTools(NavigationTools):
     """Supply observed instance viewpoints and current candidate-bound visual evidence."""
 
@@ -186,7 +202,16 @@ class IsaacNavigationTools(NavigationTools):
                 "projection_failed_in_final_view": bbox is None,
                 "distance_to_object": math.dist(obj.position[:2], packet["pose"]["position"][:2]),
                 "required_stop_distance": 2.0, "bbox_xyxy": bbox},
-            "view_quality_facts": {"visible_projected_points": count}}
+            "view_quality_facts": {"visible_projected_points": count},
+            "observation_images": [_project_observation_image(packet, self.observation_map,
+                self.session.snapshot.objects, depth=depth, object_boxes={candidate_uid: bbox})]}
+        # 即使目标投影缺失，旧全景也不能继续冒充当前观察。
+        self.session.snapshot = replace(self.session.snapshot, timestamp=time.time(),
+            robot_pose=pose_value(packet["pose"]),
+            frontiers=tuple(FrontierSnapshot(**item) for item in packet["frontiers"]),
+            metadata={**self.session.snapshot.metadata, "observation_images": evidence["observation_images"]})
+        with (self.output / "scene_snapshots.jsonl").open("a") as stream:
+            stream.write(json.dumps(asdict(self.session.snapshot), allow_nan=False) + "\n")
         directory = self.output / "verification"
         directory.mkdir(exist_ok=True)
         if bbox is not None:
@@ -205,21 +230,26 @@ class IsaacNavigationTools(NavigationTools):
 def refresh_observations(session, observation_map, controller, client, output, panorama_views):
     """Refresh perception at actual camera headings, then publish local action proposals."""
     start_yaw = controller.pose["yaw"]
+    observation_images = []
     for index in range(panorama_views):
         client.command("look", yaw=start_yaw + 2 * math.pi * index / panorama_views)
         packet = client.command("observe")
-        report = observation_map.add(packet)
+        report = observation_map.add(packet, target_list=session.detector_terms)
+        observation_images.append(report["observation_image"])
         with (output / "perception.jsonl").open("a") as stream:
             stream.write(json.dumps(report) + "\n")
         print(json.dumps({"event": "perception", **report}), flush=True)
     client.command("look", yaw=start_yaw)
     packet = client.command("observe")
     controller.pose = packet["pose"]
+    objects = observation_map.objects()
+    observation_images.append(_project_observation_image(packet, observation_map, objects))
     session.snapshot = SemanticMapSnapshot(time.time(), pose_value(packet["pose"]),
-        objects=observation_map.objects(),
+        objects=objects,
         frontiers=tuple(FrontierSnapshot(**item) for item in packet["frontiers"]),
         source="isaac_rgbd_strive_fusion", metadata={"semantic_gt_used": False,
-            "frontier_source": "official_freemap_action_proposer", "panorama_views": panorama_views})
+            "frontier_source": "official_freemap_action_proposer", "panorama_views": panorama_views,
+            "observation_images": observation_images})
     with (output / "scene_snapshots.jsonl").open("a") as stream:
         stream.write(json.dumps(asdict(session.snapshot), allow_nan=False) + "\n")
 
@@ -270,10 +300,18 @@ class IsaacGuidedNavigation:
             return False
         recommended = min(frontiers, key=lambda item: (item.metadata["explored_density"], -item.score))
         options = [{**asdict(item), "frontier_uid": item.uid} for item in frontiers]
-        selected_uid = (self.runtime.choose_frontier(options, recommended.uid,
-                        {"reason": "no_untried_candidate_view", "query_reason": result["reason"]})
-                        if len(options) > 1 else recommended.uid)
-        self.submit(frontier=next(item for item in frontiers if item.uid == selected_uid))
+        revision = session.spec.revision
+        selected_uid = self.runtime.choose_frontier(options, recommended.uid,
+            {"reason": "no_untried_candidate_view", "query_reason": result["reason"]})
+        if selected_uid is None:
+            changed = session.spec.revision != revision
+            if changed:
+                self.attempted_views.clear()
+            self.record("interpretation_changed" if changed else "decision_reselect",
+                        task_revision=session.spec.revision)
+            return True
+        with self.runtime.choice_guard():
+            self.submit(frontier=next(item for item in frontiers if item.uid == selected_uid))
         return True
 
     def motion_finished(self, feedback):
@@ -319,7 +357,7 @@ def run_episode(public_episode, output, *, port=9466, vlm="self_hosted", device=
         "max_model_calls": max_model_calls, "max_moves": max_moves, "panorama_views": panorama_views,
         "motion_semantics": "freemap_checked_kinematic_camera_not_dynamic_robot",
         "frontier_source": "official_freemap_action_proposer", "model_provider": vlm,
-        "model_calls_scope": "frontier_selection_only; model_usage counts all recorded model calls",
+        "model_calls_scope": "initial_interpretation_plus_guided_selection_and_review; model_usage counts all recorded model calls",
         "moves_scope": "bounded waypoint commands; trajectory records simulator motion increments",
         "semantic_gt_used": False}
     source_root = Path(__file__).resolve().parents[2]
@@ -329,13 +367,17 @@ def run_episode(public_episode, output, *, port=9466, vlm="self_hosted", device=
                      "mapping/object_fusion.py", "instruction_adapter/verifier.py")}
     write_json(output / "policy_result.json", termination)
     motion = runtime = session = controller = None
+    initial_compiler = InitialInstructionCompiler(
+        max_model_calls=max_model_calls, trace_path=output / "initial_interpretation.jsonl", vlm=vlm)
     try:
-        plan = compile_instruction_plan(public_episode["instruction"], available_classes=None, vlm=vlm)
+        plan = compile_instruction_plan(public_episode["instruction"], available_classes=None,
+                                        vlm=vlm, initial_compiler=initial_compiler)
         write_json(output / "instruction_plan.json", plan.as_dict())
         classes = list(dict.fromkeys(list(BACKGROUND_CLASSES) +
             [term for concept in plan.concept_queries for term in concept.detector_terms]))
         write_json(output / "detector_vocabulary.json", {"classes": classes, "source": "generic_context_and_compiled_instruction"})
-        observation_map = IsaacObservationMap(classes, device=device)
+        # 任务检索词不能固化为基础词表，否则修订后旧词仍会参与检测。
+        observation_map = IsaacObservationMap(BACKGROUND_CLASSES, device=device)
         packet = client.command("observe")
         controller = IsaacMotionController(client, packet["pose"])
         session = TaskSession(SemanticMapSnapshot(time.time(), pose_value(packet["pose"])), plan,
@@ -378,7 +420,8 @@ def run_episode(public_episode, output, *, port=9466, vlm="self_hosted", device=
             final_frame=final_packet, task_progress=session.progress.as_dict())
     except Exception as error:
         termination.update(status="error", reason=type(error).__name__, error=str(error),
-            model_calls=runtime.model_calls if runtime else 0, moves=controller.moves if controller else 0,
+            model_calls=runtime.model_calls if runtime else initial_compiler.model_calls,
+            moves=controller.moves if controller else 0,
             task_complete=session.progress.completed if session else False)
         try:
             if motion and motion.active_request_id is not None:

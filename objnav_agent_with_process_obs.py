@@ -256,7 +256,7 @@ class HM3D_Objnav_Agent:
                     self.mapper.object_perceiver.perceive(
                         triplet.image,
                         target=self.mapper.target,
-                        target_list=getattr(self.mapper, "perception_target_list", None) or self.mapper.target_list,
+                        target_list=self.task.detector_terms if self.task is not None else None,
                         save_dir=self.save_dir,
                         episode_idx=self.episode_samples - 1,
                         episode_step=self.episode_steps,
@@ -989,6 +989,8 @@ class HM3D_Objnav_Agent:
     def _build_final_verifier_evidence(self, candidate, bbox, geometry):
         """Persist the image and geometry packet consumed by the final verifier."""
 
+        from backends.habitat.scene import current_observation
+
         episode_idx = self.episode_samples - 1
         out_dir = f'{self.save_dir}/episode-{episode_idx}/final_verifier'
         os.makedirs(out_dir, exist_ok=True)
@@ -1015,6 +1017,7 @@ class HM3D_Objnav_Agent:
 
         evidence = {
             "observation_identity": self._observation_identity(candidate.uid),
+            "observation_images": [current_observation(self)],
             "current_rgb_with_bbox_path": current_path,
             "object_crop_path": crop_path,
             "object_crop_bbox_xyxy": (bbox_np - np.array([x1, y1, x1, y1])).tolist() if crop_path else None,
@@ -1037,7 +1040,10 @@ class HM3D_Objnav_Agent:
     def _attach_view_control_context(self, evidence, candidate):
         """Attach pinned view-control state to final-verifier evidence."""
 
+        from backends.habitat.scene import current_observation
+
         evidence = dict(evidence or {})
+        evidence["observation_images"] = [current_observation(self)]
         if self.view_control_state.active and self.view_control_state.candidate_uid == candidate.uid:
             context = self.view_control_state.as_context()
             context["candidate_uid_matches_current"] = self.view_control_state.candidate_uid == candidate.uid
@@ -1420,7 +1426,7 @@ class HM3D_Objnav_Agent:
             evidence_override = None
         if evidence_override is not None:
             evidence = dict(evidence_override)
-            evidence['geometry'] = self._augment_final_stop_geometry(dict(geometry))
+            evidence['geometry'] = self._augment_final_stop_geometry({**evidence.get('geometry', {}), **geometry})
             evidence.setdefault("relation_evidence_paths", [])
             if plan is not None and target_for_candidate is not None:
                 evidence = self._attach_view_control_context(evidence, candidate)

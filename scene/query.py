@@ -101,41 +101,31 @@ def query_candidates(plan, progress, snapshot: SemanticMapSnapshot, evidence, *,
             result.concept_debug.extend(r.as_dict() for r in rows)
         return matches[concept.id]
 
-    def anchors_available(target, candidate):
-        for concept in anchor_concepts(plan, target):
-            rows = records(concept)
-            if not any(
-                obj.uid != candidate.uid and obj.uid in rows
-                and rows[obj.uid].matches_concept
-                and not anchor_ledger.is_blocked(raw, concept.id, obj.uid)
-                for obj in objects
-            ):
-                return False
-        return True
-
     pending = progress.pending_verified_pair
     pinned = pending.get("candidate_uid") if progress.mode == "better_view_for_verified_pair" else None
     pinned_target = next((t for t in terminals if t.id == pending.get("target_id")), None)
     pinned_obj = snapshot.object_by_uid(pinned) if pinned else None
     if pinned_obj is not None and pinned_target is not None and not evidence.is_hard_rejected(raw, pinned_obj.uid):
-        result.candidates.append(CandidateMatch(pinned_obj, pinned_target.id, pinned_target.name))
-        result.reason = "Continue observation of the same pending verified instance"
-        return result
+        row = records(pinned_target.concept_query()).get(pinned_obj.uid)
+        if row is not None and row.candidate_eligible:
+            result.candidates.append(CandidateMatch(pinned_obj, pinned_target.id, pinned_target.name,
+                                                   record=row.as_dict()))
+            result.reason = "Continue observation of the same pending verified instance"
+            return result
 
     for target in terminals:
         accepted = progress.target_progress[target.id].accepted_candidate_uids
         rows = records(target.concept_query())
         for obj in objects:
             row = rows.get(obj.uid)
-            if row is None or not row.matches_concept or not row.terminal_eligible:
+            # 接近是取证动作，不要求身份及关系已被证实。
+            if row is None or not row.candidate_eligible:
                 continue
             reason = ""
             if obj.uid in accepted:
                 reason = "already_counted_instance"
             elif evidence.is_hard_rejected(raw, obj.uid):
                 reason = "rejected_instance"
-            elif not anchors_available(target, obj):
-                reason = "missing_unblocked_relation_anchor_evidence"
             if reason:
                 result.skipped_objs.append({"uid": obj.uid, "target_id": target.id, "skip_reason": reason})
                 continue
@@ -149,14 +139,14 @@ def query_candidates(plan, progress, snapshot: SemanticMapSnapshot, evidence, *,
             result.concept_debug.extend({"source": "prior_map_target_annotation", "candidate_uid": a.candidate.uid,
                                          **a.metadata.get("prior_map", {})} for a in annotations)
         result.candidates.sort(key=lambda c: (prior_scores.get(c.obj.uid, 0), c.confidence), reverse=True)
-        result.reason = "Observed terminal candidates with matching task concepts"
+        result.reason = "Observed target candidates for instance and constraint verification"
         return result
 
     for concept in anchor_concepts(plan):
         rows = records(concept)
         for obj in objects:
             row = rows.get(obj.uid)
-            if row is not None and row.matches_concept and not anchor_ledger.is_blocked(raw, concept.id, obj.uid):
+            if row is not None and row.candidate_eligible and not anchor_ledger.is_blocked(raw, concept.id, obj.uid):
                 result.candidates.append(CandidateMatch(obj, concept.id, concept.name, "anchor", row.confidence, row.as_dict()))
     result.candidates.sort(key=lambda c: c.confidence, reverse=True)
     result.reason = "Search from a relation anchor" if result.candidates else "No eligible observed candidate"

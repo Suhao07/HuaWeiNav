@@ -21,7 +21,7 @@ class MMDINO_Grounded_SAM:
                  text_threshold=0.25,
                  no_gpt_seg=False,
                  device="cuda"):
-        self.classes = classes
+        self.classes = list(classes)
         self.BOX_THRESHOLD = box_threshold
         self.TEXT_THRESHOLD = text_threshold
         self.DEVICE = device
@@ -74,10 +74,17 @@ class MMDINO_Grounded_SAM:
         return self._predict_masks(img, boxes).numpy().astype(bool)
 
     def initialize(self, target):
+        """Reset cached prompts to the fixed base vocabulary without reloading models."""
+        self._prompt_classes = None
+        self._update_vocabulary()
+
+    def _update_vocabulary(self, target_list=None):
+        """Replace dynamic retrieval terms while retaining base labels and prompt order."""
+        classes = list(dict.fromkeys([*self.classes, *(target_list or ())]))
+        if classes == self._prompt_classes:
+            return
         TEXT_PROMPTs = []
         class_labels = []
-        classes = self.classes.copy()
-        # classes.remove(target)
 
         class_num = len(classes)
         if class_num == 0:
@@ -96,15 +103,17 @@ class MMDINO_Grounded_SAM:
         self.TEXT_PROMPTs = TEXT_PROMPTs
         self.class_labels = class_labels
         self.split = split
+        self._prompt_classes = classes
 
     def segment(self,
                 img,
                 target=None,
-                target_list=[],
+                target_list=None,
                 save_dir="",
                 episode_idx=-1,
                 episode_step=-1):
-        """Segment a uint8 RGB image using vocabulary and optional task target."""
+        """Segment RGB using base classes, current retrieval terms and an optional target."""
+        self._update_vocabulary(target_list)
         self.sam_predictor.set_image(img)
         boxes = []
         confidences = []

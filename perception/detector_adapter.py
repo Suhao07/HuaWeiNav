@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import replace
 from typing import Iterable
@@ -51,6 +52,7 @@ def _llm_ground_terms(concept: ConceptQuery, available_classes: Iterable[str], v
                     f"Concept role: {concept.role}\n"
                     f"Concept terminal: {concept.terminal}\n"
                     f"Target aliases: {concept.aliases}\n"
+                    f"Demand: {json.dumps(concept.demand, ensure_ascii=False)}\n"
                     f"Available detector classes: {list(available_classes or [])}"
                 ),
             },
@@ -67,6 +69,8 @@ def ground_target(
     dataset_target: str = "",
     vlm: str = "cognav",
     strict_available_classes: bool = False,
+    *,
+    allow_model_calls: bool = True,
 ) -> TargetQuery:
     """Ground one semantic target into detector terms.
 
@@ -76,7 +80,8 @@ def ground_target(
 
     available = list(available_classes or [])
     base_concept = target.concept_query()
-    seeds = dedupe_terms([base_concept.name] + list(base_concept.aliases) + list(base_concept.detector_terms))
+    aliases = dedupe_terms(list(target.aliases) + list(base_concept.aliases))
+    seeds = dedupe_terms([base_concept.name] + aliases + list(base_concept.detector_terms))
     dataset = normalize_term(dataset_target)
 
     exact = _exact_or_compact_matches(seeds, available)
@@ -84,14 +89,9 @@ def ground_target(
     description = base_concept.description
     negative_terms = list(base_concept.negative_terms)
 
-    if not detector_terms and available:
+    if not detector_terms and available and allow_model_calls:
         grounded = _llm_ground_terms(base_concept, available, vlm)
         detector_terms = filter_terms_to_available(grounded.detector_terms, available)
-        aliases = dedupe_terms(list(target.aliases) + grounded.aliases + seeds)
-        description = grounded.description or description
-        negative_terms = dedupe_terms(negative_terms + grounded.negative_terms)
-    else:
-        aliases = dedupe_terms(list(target.aliases) + seeds)
 
     if not detector_terms and dataset and target.terminal:
         dataset_matches = _exact_or_compact_matches([dataset], available)
@@ -104,16 +104,17 @@ def ground_target(
         name=target.name,
         role=target.role,
         detector_terms=dedupe_terms(detector_terms),
-        aliases=dedupe_terms(aliases + detector_terms),
+        aliases=aliases,
         description=description,
         negative_terms=dedupe_terms(negative_terms),
         terminal=target.terminal,
+        demand=dict(target.demand),
         source=target.source or "grounding",
     )
     return replace(
         target,
         detector_terms=dedupe_terms(detector_terms),
-        aliases=dedupe_terms(aliases + detector_terms),
+        aliases=aliases,
         concept=concept,
     )
 
@@ -133,7 +134,8 @@ def _constraint_concept_id(name: str, index: int) -> str:
     return f"c{index}_{base}"
 
 
-def _concept_from_constraint(plan: InstructionPlan, constraint: Constraint, index: int, available_classes, vlm: str) -> ConceptQuery | None:
+def _concept_from_constraint(plan: InstructionPlan, constraint: Constraint, index: int, available_classes,
+                             vlm: str, allow_model_calls: bool = True) -> ConceptQuery | None:
     object_name = normalize_term(constraint.object)
     if not object_name and isinstance(constraint.value, str):
         object_name = normalize_term(constraint.value)
@@ -142,7 +144,7 @@ def _concept_from_constraint(plan: InstructionPlan, constraint: Constraint, inde
     existing = _target_by_name_or_id(plan, object_name)
     if existing is not None:
         return existing.concept_query()
-    concept = ConceptQuery(
+    concept = constraint.object_concept or ConceptQuery(
         id=_constraint_concept_id(object_name, index),
         name=object_name,
         role="anchor",
@@ -151,20 +153,12 @@ def _concept_from_constraint(plan: InstructionPlan, constraint: Constraint, inde
         terminal=False,
         source=constraint.source or "constraint",
     )
-    # Reuse the same prompt-first grounding path for constraint anchors.  This
-    # is the key difference from string alias rules: constraint.object is
-    # grounded as a concept just like a TargetQuery.
-    grounded = _llm_ground_terms(concept, available_classes or [], vlm)
+    grounded = (_llm_ground_terms(concept, available_classes, vlm)
+                if available_classes and allow_model_calls else GroundingResult())
     detector_terms = filter_terms_to_available(grounded.detector_terms, available_classes or [])
     if not detector_terms:
         detector_terms = _exact_or_compact_matches([object_name], available_classes or []) or [object_name]
-    return replace(
-        concept,
-        detector_terms=dedupe_terms(detector_terms),
-        aliases=dedupe_terms([object_name] + grounded.aliases + detector_terms),
-        description=grounded.description,
-        negative_terms=dedupe_terms(grounded.negative_terms),
-    )
+    return replace(concept, detector_terms=dedupe_terms(detector_terms))
 
 
 def ground_plan(
@@ -173,6 +167,8 @@ def ground_plan(
     vlm: str = "cognav",
     strict_available_classes: bool = False,
     use_legacy_similarity_fallback: bool = True,
+    *,
+    allow_model_calls: bool = True,
 ) -> InstructionPlan:
     grounded_targets = [
         ground_target(
@@ -181,9 +177,23 @@ def ground_plan(
             dataset_target=plan.dataset_target,
             vlm=vlm,
             strict_available_classes=strict_available_classes,
+            allow_model_calls=allow_model_calls,
         )
         for target in plan.targets
     ]
+    if allow_model_calls and use_legacy_similarity_fallback and len(grounded_targets) == 1:
+        target = grounded_targets[0]
+        if target.terminal and len(target.detector_terms) <= 1 and not _llm_offline():
+            from cv_utils.gpt_utils import ask_gpt_similar_objects
+
+            similar = ask_gpt_similar_objects(list(available_classes or []), target.name, vlm)
+            detector_terms = dedupe_terms(target.detector_terms + similar)
+            # 检索扩展不提供身份证据；先同步概念，再绑定约束引用。
+            grounded_targets[0] = replace(
+                target,
+                detector_terms=detector_terms,
+                concept=replace(target.concept_query(), detector_terms=detector_terms),
+            )
     plan.targets = grounded_targets
 
     concept_queries: list[ConceptQuery] = []
@@ -192,7 +202,8 @@ def ground_plan(
 
     grounded_constraints = []
     for idx, constraint in enumerate(plan.constraints):
-        obj_concept = _concept_from_constraint(plan, constraint, idx, available_classes or [], vlm)
+        obj_concept = _concept_from_constraint(plan, constraint, idx, available_classes or [], vlm,
+                                               allow_model_calls=allow_model_calls)
         subject_target = _target_by_name_or_id(plan, constraint.subject)
         grounded_constraints.append(
             replace(
@@ -205,22 +216,6 @@ def ground_plan(
             concept_queries.append(obj_concept)
     plan.constraints = grounded_constraints
     plan.concept_queries = dedupe_concepts(concept_queries)
-
-    if use_legacy_similarity_fallback and len(grounded_targets) == 1:
-        target = grounded_targets[0]
-        if target.terminal and len(target.detector_terms) <= 1 and not _llm_offline():
-            try:
-                from cv_utils.gpt_utils import ask_gpt_similar_objects
-
-                similar = ask_gpt_similar_objects(list(available_classes or []), target.name, vlm)
-                target = replace(
-                    target,
-                    detector_terms=dedupe_terms(target.detector_terms + similar),
-                    aliases=dedupe_terms(target.aliases + similar),
-                )
-                grounded_targets[0] = target
-            except Exception:
-                pass
 
     plan.valid = bool(plan.terminal_targets and plan.target_detector_prompts)
     plan.diagnostics.setdefault("grounding", {})

@@ -1,9 +1,5 @@
-import sys
 import types
 import pytest
-
-
-sys.modules.setdefault("cv2", types.SimpleNamespace())
 
 from instruction_adapter.verifier import (
     CandidateInstance,
@@ -241,7 +237,7 @@ def test_visual_task_scopes_user_semantics_to_active_target():
     plan = runtime_plan(task).as_dict()
     plan["targets"][1]["detector_terms"] = ["predicted vocabulary"]
     scoped = FinalInstructionVerifier._visual_task(plan, {"target_id": "book"})
-    assert scoped["active_target"] == {"id": "book", "name": "book", "attributes": {}}
+    assert scoped["active_target"] == {"id": "book", "name": "book", "attributes": {}, "demand": {}}
     assert scoped["referenced_targets"] == [{"id": "shelf", "name": "shelf", "attributes": {}}]
     assert scoped["visual_predicates"][0]["relation"] == "on"
     assert "cup" not in str(scoped) and "predicted vocabulary" not in str(scoped)

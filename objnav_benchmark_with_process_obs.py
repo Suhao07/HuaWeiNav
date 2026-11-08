@@ -2,6 +2,7 @@ import argparse
 import csv
 import json
 import os
+from pathlib import Path
 import shutil
 import time
 
@@ -12,6 +13,7 @@ from tqdm import tqdm
 from benchmark import available_benchmarks, get_provider
 from benchmark.episode_selection import select_episode, episode_identity
 from constants import *
+from instruction.compiler import InitialInstructionCompiler
 #指令解析模块
 from instruction_adapter import (
     StriveInstructionParser,
@@ -151,6 +153,7 @@ def _install_instruction_plan(
     episode_info,
     episode_dir,
     source,
+    initial_model_budget=None,
 ):
     """Compile and install the canonical object/instruction plan for one episode.
 
@@ -174,11 +177,17 @@ def _install_instruction_plan(
             use_legacy_similarity_fallback=False,
         )
     else:
+        initial_compiler = (InitialInstructionCompiler(
+            max_model_calls=initial_model_budget,
+            trace_path=Path(episode_dir) / "initial_interpretation.jsonl",
+            vlm=instruction_parser.vlm,
+        ) if initial_model_budget is not None else None)
         instruction_plan = instruction_parser.parse_plan(
             raw_instruction=raw_instruction,
             dataset_target=dataset_target,
             available_classes=habitat_mapper.object_perceiver.classes,
             episode_info=episode_info,
+            initial_compiler=initial_compiler,
         )
     instruction_plan.diagnostics.setdefault("source", [])
     instruction_plan.diagnostics["runtime_source"] = source
@@ -352,6 +361,8 @@ if __name__ == "__main__":
             episode_info=episode_info,
             episode_dir=episode_dir,
             source=plan_source,
+            initial_model_budget=(args.agent_max_model_calls
+                                  if args.decision_owner != "legacy" else None),
         )
 
         logger.info(f"Target: {habitat_mapper.target}")

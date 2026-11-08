@@ -120,3 +120,158 @@ def test_request_signature_tracks_model_schema_and_prompt():
     assert a != request_fingerprint('doubao-other',['prompt'],BBoxObjectLabelResponse,provider='ark')
     assert a != request_fingerprint('doubao-test',['new prompt'],BBoxObjectLabelResponse,provider='ark')
     assert a != request_fingerprint('doubao-test',['prompt'],ParsedVerification,provider='ark')
+
+
+@pytest.mark.parametrize("method", ["match_object", "match_many"])
+@pytest.mark.parametrize("terminal", [True, False])
+def test_name_identity_and_alias_detector_candidates_have_distinct_authority(monkeypatch, method, terminal):
+    from instruction_adapter.concept_matcher import RuntimeConceptMatcher
+    from instruction_adapter.contracts import ConceptQuery
+    monkeypatch.setenv("LLM_OFFLINE", "1")
+    concept = ConceptQuery("goal", "mug", aliases=["coffee mug"],
+                           detector_terms=["container"], terminal=terminal)
+    matcher = RuntimeConceptMatcher()
+    for label in ("mug", " MUG ", "coffee_mug", "container", "wall"):
+        obj = NS(uid=label, tag=label, position=[0, 0, 0], confidence=0.99)
+        args = {"obj": obj} if method == "match_object" else {"objects": [obj]}
+        result = getattr(matcher, method)(raw_instruction="find mug", concept=concept, **args)
+        row = result[0] if method == "match_many" else result
+        identity = label.strip().lower() == "mug"
+        assert row.source == ("exact" if identity else "offline")
+        assert row.matches_concept is (True if identity else None)
+        assert row.terminal_eligible is (identity and terminal)
+        assert row.candidate_eligible is (label != "wall")
+        assert row.as_dict()["verdict"] == ("true" if identity else "unknown")
+        assert obj.tag == label
+
+
+def _scripted_concept_client(monkeypatch, judgments):
+    from instruction_adapter import concept_matcher
+    calls = []
+    def parse(**kwargs):
+        judgment = judgments[len(calls)]
+        calls.append(kwargs)
+        payload = {"object": judgment} if kwargs["trace_label"] == "concept_match_batch" else judgment
+        parsed = kwargs["response_format"](**payload)
+        return NS(choices=[NS(message=NS(parsed=parsed))])
+    client = NS(beta=NS(chat=NS(completions=NS(parse=parse))))
+    monkeypatch.setenv("LLM_OFFLINE", "0")
+    monkeypatch.setattr(concept_matcher, "get_client_and_model", lambda _: (client, "scripted"))
+    return calls
+
+
+@pytest.mark.parametrize("method", ["match_object", "match_many"])
+@pytest.mark.parametrize("verdict,candidate", [(True, False), (False, True), (None, True), (None, False)])
+def test_broad_alias_requires_semantic_judgment_not_exact_identity(monkeypatch, method, verdict, candidate):
+    from instruction_adapter.concept_matcher import RuntimeConceptMatcher
+    from instruction_adapter.contracts import ConceptQuery
+    calls = _scripted_concept_client(monkeypatch, [dict(matches_concept=verdict, confidence=0.9,
+        terminal_eligible=True, candidate_eligible=candidate, reason="Judge the original mug identity.")])
+    concept = ConceptQuery("goal", "mug", aliases=["container"], terminal=True)
+    obj = NS(uid="object", tag="container", position=[0, 0, 0])
+    matcher = RuntimeConceptMatcher()
+    args = {"obj": obj} if method == "match_object" else {"objects": [obj]}
+    result = getattr(matcher, method)(raw_instruction="find a mug", concept=concept, **args)
+    row = result[0] if method == "match_many" else result
+
+    assert len(calls) == 1 and matcher.stats_dict()["exact_matches"] == 0
+    assert row.source == ("llm" if method == "match_object" else "llm_batch")
+    assert row.matches_concept is verdict
+    assert row.terminal_eligible is (verdict is True)
+    assert row.candidate_eligible is (verdict is True or (verdict is None and candidate))
+    payload = json.loads(calls[0]["messages"][1]["content"][0]["text"])
+    assert payload["instruction"] == "find a mug"
+    assert payload["concept"]["name"] == "mug" and payload["concept"]["aliases"] == ["container"]
+    assert obj.tag == "container"
+
+
+@pytest.mark.parametrize("method", ["match_object", "match_many"])
+@pytest.mark.parametrize("verdict", [None, False, True])
+@pytest.mark.parametrize("confidence", [0.01, 0.99])
+def test_explicit_identity_verdict_not_confidence_controls_candidate_authority(monkeypatch, method, verdict, confidence):
+    from instruction_adapter.concept_matcher import RuntimeConceptMatcher
+    from instruction_adapter.contracts import ConceptQuery
+    judgment = dict(matches_concept=verdict, confidence=confidence, terminal_eligible=True,
+                    candidate_eligible=True, reason="Scripted semantic evidence.")
+    calls = _scripted_concept_client(monkeypatch, [judgment])
+    matcher = RuntimeConceptMatcher()
+    obj = NS(uid="object", tag="vessel", position=[0, 0, 0])
+    args = {"obj": obj} if method == "match_object" else {"objects": [obj]}
+    result = getattr(matcher, method)(raw_instruction="find mug", concept=ConceptQuery(
+        "goal", "mug", terminal=True), **args)
+    row = result[0] if method == "match_many" else result
+    assert row.matches_concept is verdict
+    assert row.candidate_eligible is (verdict is not False)
+    assert row.terminal_eligible is (verdict is True)
+    assert row.confidence == confidence and len(calls) == 1
+
+
+@pytest.mark.parametrize("method", ["match_object", "match_many"])
+def test_unknown_without_compatibility_evidence_is_not_a_candidate(monkeypatch, method):
+    from instruction_adapter.concept_matcher import RuntimeConceptMatcher
+    from instruction_adapter.contracts import ConceptQuery
+    _scripted_concept_client(monkeypatch, [dict(matches_concept=None, confidence=0.99,
+        terminal_eligible=False, candidate_eligible=False, reason="No compatibility evidence.")])
+    obj = NS(uid="object", tag="unidentified", position=[0, 0, 0])
+    args = {"obj": obj} if method == "match_object" else {"objects": [obj]}
+    result = getattr(RuntimeConceptMatcher(), method)(raw_instruction="find mug",
+        concept=ConceptQuery("goal", "mug", detector_terms=["container"]), **args)
+    row = result[0] if method == "match_many" else result
+    assert row.matches_concept is None and not row.candidate_eligible
+
+
+@pytest.mark.parametrize("method", ["match_object", "match_many"])
+def test_unknown_can_be_reconsidered_without_a_cached_false_identity(monkeypatch, method):
+    from instruction_adapter.concept_matcher import RuntimeConceptMatcher
+    from instruction_adapter.contracts import ConceptQuery
+    calls = _scripted_concept_client(monkeypatch, [
+        dict(matches_concept=None, confidence=0.99, terminal_eligible=False,
+             candidate_eligible=True, reason="Compatible but identity unresolved."),
+        dict(matches_concept=True, confidence=0.01, terminal_eligible=True,
+             candidate_eligible=True, reason="Identity established.")])
+    matcher = RuntimeConceptMatcher()
+    obj = NS(uid="object", tag="vessel", position=[0, 0, 0])
+    args = {"obj": obj} if method == "match_object" else {"objects": [obj]}
+    def match():
+        result = getattr(matcher, method)(raw_instruction="find mug", concept=ConceptQuery(
+            "goal", "mug", terminal=True), **args)
+        return result[0] if method == "match_many" else result
+    assert match().matches_concept is None
+    assert not matcher.label_cache
+    assert match().matches_concept is True
+    assert match().matches_concept is True
+    assert len(calls) == 2
+    if method == "match_many":
+        obj.uid = "another-instance"
+        assert match().matches_concept is True
+        assert len(calls) == 2
+
+
+def test_batch_budget_keeps_bound_unknown_candidates_but_not_unrelated_labels(monkeypatch):
+    from instruction_adapter.concept_matcher import RuntimeConceptMatcher
+    from instruction_adapter.contracts import ConceptQuery
+    monkeypatch.setenv("LLM_OFFLINE", "1")
+    monkeypatch.setenv("STRIVE_CONCEPT_MATCH_MAX_BATCH", "1")
+    concept = ConceptQuery("goal", "mug", detector_terms=["container"], terminal=True)
+    objects = [NS(uid=label, tag=label, confidence=confidence, position=[0, 0, 0])
+               for label, confidence in (("wall", 0.99), ("container", 0.01))]
+    rows = {r.object_uid: r for r in RuntimeConceptMatcher().match_many(
+        raw_instruction="find mug", concept=concept, objects=objects)}
+    assert rows["container"].source == "prefiltered"
+    assert rows["container"].matches_concept is None and rows["container"].candidate_eligible
+    assert not rows["container"].terminal_eligible
+    assert not rows["wall"].candidate_eligible
+
+
+def test_detector_binding_changes_expire_unknown_candidate_eligibility(monkeypatch):
+    from instruction_adapter.concept_matcher import RuntimeConceptMatcher
+    from instruction_adapter.contracts import ConceptQuery
+    monkeypatch.setenv("LLM_OFFLINE", "1")
+    matcher = RuntimeConceptMatcher()
+    concept = ConceptQuery("goal", "mug", detector_terms=["container"], terminal=True)
+    obj = NS(uid="object", tag="container", position=[0, 0, 0])
+    args = dict(raw_instruction="find mug", concept=concept, objects=[obj])
+    assert matcher.match_many(**args)[0].candidate_eligible
+    concept.detector_terms = []
+    row = matcher.match_many(**args)[0]
+    assert row.matches_concept is None and not row.candidate_eligible

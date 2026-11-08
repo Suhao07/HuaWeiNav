@@ -50,9 +50,13 @@ class GuidedNavigation:
 
     def record(self, event, **fields):
         """Append the actual state transition without hiding execution errors."""
+        record = {"step": self.agent.episode_steps, "event": event,
+                  "task_revision": self.agent.task.spec.revision, **fields}
         with (self.directory / "decisions.jsonl").open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps({"step": self.agent.episode_steps, "event": event,
-                                     **fields}, ensure_ascii=False) + "\n")
+            stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+        if event in {"submitted", "motion_terminal", "verified", "candidate_deferred",
+                     "candidate_evidence_updated", "anchor_searched"}:
+            self.runtime.record_event(record)
 
     def submit(self, position, *, candidate_uid=None, node=None, source):
         """Submit a domain-selected waypoint through the existing supervisor."""
@@ -111,7 +115,6 @@ class GuidedNavigation:
             deferred_uids=self.deferred_candidates)
         self.tools.refresh_scene()
         if agent.found_goal:
-            self.search_review_step = agent.episode_steps
             key = (agent.task.spec.revision, agent.object_final.uid)
             agent.view_control_state = self.candidate_view_states.setdefault(key, ViewControlState())
             agent.found_goal_position = agent.mapper.current_position.copy()
@@ -137,8 +140,14 @@ class GuidedNavigation:
             self.record("search_exhausted", decision_source=source)
             return False
         node, source = self.review_search_branch(node, source, episode_idx)
+        if source in {"interpretation_changed", "decision_reselect"}:
+            return True
         # selected 由 active goal 表达；观察完成后才更新地图的 explored 状态。
-        self.submit(node.position, node=node, source=source)
+        if source == "agent_search_review":
+            with self.runtime.choice_guard():
+                self.submit(node.position, node=node, source=source)
+        else:
+            self.submit(node.position, node=node, source=source)
         return True
 
     @staticmethod
@@ -210,11 +219,7 @@ class GuidedNavigation:
         return node, source, [row for row in rows if math.isfinite(row["raw_distance_m"])]
 
     def review_search_branch(self, node, source, episode_idx):
-        """Review prolonged target search over the baseline options plus the prior branch.
-
-        触发条件为距上次发现候选/搜索复议的动作步数达到配置间隔。
-        普通局部推进继续使用默认分支；复议只选择现有可达节点的 ID。
-        """
+        """Finding an unverified candidate must not postpone periodic search review."""
         agent = self.agent
         if (agent.episode_steps - self.search_review_step < self.search_review_interval
                 or self.runtime.model_calls >= self.runtime.max_model_calls):
@@ -225,14 +230,20 @@ class GuidedNavigation:
             rows = [row for row in agent.mapper.prior_map_last_chosen_frontier["candidates"]
                     if math.isfinite(row["raw_distance_m"])]
         options = [{**row, "frontier_uid": f"node:{row['node_idx']}"} for row in rows]
-        if len(options) <= 1:
+        if not options:
             return node, source
         recommended = f"node:{node.idx}"
+        revision = agent.task.spec.revision
         selected = self.runtime.choose_frontier(options, recommended, {
             "reason": "prolonged_target_search",
-            "steps_since_review_or_candidate": agent.episode_steps - self.search_review_step,
+            "steps_since_review": agent.episode_steps - self.search_review_step,
         })
         self.search_review_step = agent.episode_steps
+        if selected is None:
+            event = "interpretation_changed" if agent.task.spec.revision != revision else "decision_reselect"
+            self.record(event, decision_source="agent_search_review",
+                        task_revision=agent.task.spec.revision)
+            return None, event
         selected_index = next(row["node_idx"] for row in options if row["frontier_uid"] == selected)
         self.record("search_review", decision_source="agent", baseline_uid=recommended,
                     selected_uid=selected, options=options)
@@ -272,6 +283,21 @@ class GuidedNavigation:
                     "heading_offset_deg": float(heading_offset),
                     "pitch_deg": float(np.degrees(camera_pitch(np.asarray(agent.mapper.current_rotation))))}
         complete = agent.final_instruction_check(evidence_override=agent.last_check_again_evidence)
+        if agent.selected_candidate.role == "anchor":
+            self.record("anchor_searched", anchor_uid=agent.object_final.uid,
+                        concept_id=agent.selected_candidate.target_id,
+                        status="searched_no_terminal_found", pose_gap=pose_gap)
+            if not tilt_camera(agent, 0.0):
+                return "episode_limit"
+            if (agent.episode_steps - self.search_review_step >= self.search_review_interval
+                    and self.runtime.model_calls < self.runtime.max_model_calls):
+                self.recovery_context = {
+                    "reason": "prolonged_target_search", "anchor_uid": agent.object_final.uid,
+                    "concept_id": agent.selected_candidate.target_id,
+                    "anchor_status": "searched_no_terminal_found",
+                    "steps_since_review": agent.episode_steps - self.search_review_step}
+                return "recovery"
+            return "select"
         self.record("verified", candidate_uid=agent.object_final.uid,
                     decision=agent.final_stop_decision, task_complete=complete, pose_gap=pose_gap)
         if complete:
@@ -279,6 +305,13 @@ class GuidedNavigation:
         # 复核结束后恢复水平相机，后续移动与建图沿用水平观测。
         if not tilt_camera(agent, 0.0):
             return "episode_limit"
+        if (agent.episode_steps - self.search_review_step >= self.search_review_interval
+                and self.runtime.model_calls < self.runtime.max_model_calls):
+            self.recovery_context = {
+                "reason": "prolonged_unverified_candidate", "candidate_uid": agent.object_final.uid,
+                "decision": agent.final_stop_decision,
+                "steps_since_review": agent.episode_steps - self.search_review_step}
+            return "recovery"
         if agent.need_check_again or agent._continue_better_view_control():
             views = self.tools.publish_object_viewpoints(agent.object_final.uid)
             key = (agent.task.spec.revision, agent.object_final.uid)
@@ -303,7 +336,7 @@ class GuidedNavigation:
         """Choose one executable view or exploration action, then return to the driver.
 
         Agent 的输出空间是领域候选集合 U(s)，不是任意工具序列。
-        查询、提交与等待终态由同一个确定性循环推进；|U|=1 时直接执行。
+        单一合法动作仍可复议检索假设；执行与 STOP 仍由领域控制器负责。
         """
         agent = self.agent
         self.tools.refresh_scene()
@@ -318,22 +351,26 @@ class GuidedNavigation:
                     options.append({**view, "action_uid": view["uid"], "kind": "viewpoint",
                                     "candidate_uid": uid})
         if not options:
-            return "search_exhausted"
-        selected = options[0]["action_uid"]
-        source = "default_recovery"
-        if len(options) > 1:
-            if self.runtime.model_calls >= self.runtime.max_model_calls:
-                return "decision_budget_exhausted"
-            selected = self.runtime.choose_recovery(options, reason)
-            source = "agent_recovery"
-            self.record("agent_intervention", reason=reason, decision_source=source,
-                        selected_uid=selected, options=options)
+            return "select" if reason.get("anchor_uid") is not None else "search_exhausted"
+        if self.runtime.model_calls >= self.runtime.max_model_calls:
+            return "decision_budget_exhausted"
+        revision = agent.task.spec.revision
+        selected = self.runtime.choose_recovery(options, reason)
+        self.search_review_step = agent.episode_steps
+        source = "agent_recovery"
+        if selected is None:
+            event = "interpretation_changed" if agent.task.spec.revision != revision else "decision_reselect"
+            self.record(event, decision_source=source, task_revision=agent.task.spec.revision)
+            return "select"
+        self.record("agent_intervention", reason=reason, decision_source=source,
+                    selected_uid=selected, options=options)
         choice = next(row for row in options if row["action_uid"] == selected)
-        if choice["kind"] == "viewpoint":
-            self.submit(choice["pose"]["position"], candidate_uid=uid, source=source)
-        else:
-            node = agent.mapper.nodes[choice["node_idx"]]
-            self.submit(node.position, node=node, source=source)
+        with self.runtime.choice_guard():
+            if choice["kind"] == "viewpoint":
+                self.submit(choice["pose"]["position"], candidate_uid=uid, source=source)
+            else:
+                node = agent.mapper.nodes[choice["node_idx"]]
+                self.submit(node.position, node=node, source=source)
         return "moving"
 
 
@@ -354,6 +391,9 @@ def run_guided_episode(agent, *, episode_idx, max_steps, max_model_calls=100,
                 continue
             guided.motion_finished(feedback)
             guided.record("motion_terminal", status=feedback.status.status.value,
+                          candidate_uid=feedback.intent.target_object_uid,
+                          position=feedback.intent.goal_pose.position,
+                          task_revision=feedback.intent.metadata["task_revision"],
                           metadata=feedback.intent.metadata)
             if not feedback.status.succeeded():
                 guided.recovery_context = {"reason": "motion_terminal_failure",

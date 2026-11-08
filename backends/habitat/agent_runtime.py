@@ -7,6 +7,8 @@ from pathlib import Path
 from harness.runtime import AgentRuntime
 from harness.tools import NavigationTools
 from instruction_adapter.verifier import candidate_from_object
+from instruction_adapter.view_control import ViewControlState
+from prior_map.simulation import invalidate_mapper_task_prior
 from scene.contracts import Pose3D, ViewpointSnapshot
 from verification.contracts import VerificationResult
 
@@ -57,6 +59,38 @@ class HabitatNavigationTools(NavigationTools):
         self.deferred_candidates = set()
         super().__init__(agent.task, agent.execution.motion, HabitatEvidenceVerifier(agent), self.capture_evidence)
         agent.execution.controller.agent = agent
+
+    def install_interpretation(self, plan, *, task_revision, search_revision, snapshot, record):
+        """Adopt the shared revision before invalidating Habitat's task-local choices."""
+        result = super().install_interpretation(
+            plan, task_revision=task_revision, search_revision=search_revision,
+            snapshot=snapshot, record=record)
+        agent = self.agent
+        active = self.session.progress.active_target()
+        agent.mapper.target = active.name
+        agent.mapper.target_list = list(self.session.detector_terms)
+        agent.mapper.target_aliases = list(dict.fromkeys([active.name, *active.aliases]))
+        invalidate_mapper_task_prior(agent.mapper)
+        self.deferred_candidates.clear()
+        agent.selected_candidate = agent.object_final = None
+        agent.found_goal = agent.need_check_again = False
+        agent.final_instruction_accepted_this_step = False
+        agent.instruction_success = agent.final_stop_success = False
+        agent.instruction_decision = agent.final_stop_decision = agent.final_stop_mode = ""
+        agent.instruction_accept_step = agent.final_stop_accept_step = None
+        agent.accepted_candidate_uid = ""
+        agent.accepted_relation_edge = {}
+        agent.accepted_distance_to_target = None
+        agent.accepted_distance_source = ""
+        agent.found_goal_position = agent.waypoint = agent.confirmed_target_waypoint = None
+        agent.approach_viewpoint = agent.check_again_postion = None
+        # Replace, rather than mutate, the state retained in revision-keyed history.
+        agent.view_control_state = ViewControlState()
+        agent.last_check_again_evidence = agent.current_surface_evidence = None
+        agent.last_check_again_image_path = ""
+        # Heading coverage is already revision-keyed; only its cached summary is stale.
+        agent.scan_complete = False
+        return result
 
     def refresh_scene(self):
         """Publish observed geometry after a perception cycle or physical motion."""
@@ -125,6 +159,7 @@ class HabitatNavigationTools(NavigationTools):
         agent.object_final = self.objects[candidate_uid]
         if not rotate_toward_object_for_recheck(agent):
             raise RuntimeError("Episode ended during evidence capture")
+        self.refresh_scene()
         candidate = candidate_from_object(agent.object_final, step=agent.episode_steps)
         bbox, geometry = agent._project_object_bbox_on_current_view()
         if bbox is None:
@@ -152,6 +187,7 @@ class HabitatNavigationTools(NavigationTools):
             agent.accepted_candidate_uid = candidate_uid
         else:
             tilt_camera(agent, 0.0)
+            self.refresh_scene()
         return result
 
 

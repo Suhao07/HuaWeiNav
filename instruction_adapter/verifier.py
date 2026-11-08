@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from copy import deepcopy
 from pathlib import Path
 from verification.images import image_input
 from typing import Any
@@ -11,7 +12,7 @@ import numpy as np
 
 from llm_utils.cognav_llm_adapter import get_client_and_model
 from prompting.registry import FINAL_VERIFY
-from prompting.schemas import HAS_PYDANTIC, ParsedVerification
+from prompting.schemas import HAS_PYDANTIC, affordance_verification_response_model
 from prompting.templates import FINAL_VERIFIER_PROMPT
 
 from .ontology import normalize_term
@@ -101,6 +102,23 @@ def _nested_image_path(payload: dict[str, Any], *keys: str) -> str:
             return ""
         cur = cur.get(key)
     return str(cur or "")
+
+
+def _candidate_observation_id(identity, bbox, candidate_uid, revision):
+    """Only a located candidate in a frame from this task revision can support a predicate."""
+    if (not isinstance(identity, dict) or identity.get("candidate_uid") != candidate_uid
+            or identity.get("task_revision") != revision
+            or not isinstance(identity.get("observation_id"), str)
+            or not identity["observation_id"].strip()):
+        return None
+    try:
+        box = np.asarray(bbox, dtype=float).reshape(-1)
+        if (box.size == 4 and np.isfinite(box).all()
+                and box[2] > box[0] and box[3] > box[1]):
+            return identity["observation_id"]
+    except (TypeError, ValueError):
+        pass
+    return None
 
 
 def hard_stop_constraints_from_evidence(evidence: dict[str, Any] | None) -> dict[str, Any]:
@@ -270,7 +288,7 @@ class FinalInstructionVerifier:
         visual, domain = [], []
         for condition in predicates:
             projected = {key: condition[key] for key in (
-                "type", "subject", "relation", "object", "value", "hardness", "verifier") if key in condition}
+                "id", "type", "subject", "relation", "object", "value", "hardness", "verifier") if key in condition}
             projected.setdefault("verifier", "planner")
             is_delegated = any(all(condition.get(key) == item.get(key) for key in (
                 "type", "subject", "relation", "object", "value")) for item in delegated)
@@ -279,13 +297,13 @@ class FinalInstructionVerifier:
             else:
                 domain.append(projected)
         anchors = {condition.get("object") for condition in visual}
-        return {
-            "active_target": {key: active[key] for key in ("id", "name", "attributes") if key in active},
+        return deepcopy({
+            "active_target": {key: active[key] for key in ("id", "name", "attributes", "demand") if key in active},
             "visual_predicates": visual,
             "domain_predicates": domain,
             "referenced_targets": [{key: target[key] for key in ("id", "name", "attributes") if key in target}
                                    for target in targets if target.get("id") in anchors or target.get("name") in anchors],
-        }
+        })
 
     def verify(
         self,
@@ -304,13 +322,20 @@ class FinalInstructionVerifier:
         if not HAS_PYDANTIC:
             return self._fallback("pydantic_unavailable")
 
-        plan_dict = instruction_plan.as_dict() if hasattr(instruction_plan, "as_dict") else instruction_plan
+        plan_dict = (instruction_plan.as_dict() if hasattr(instruction_plan, "as_dict") else instruction_plan) or {}
+        semantic = plan_dict.get("diagnostics", {}).get("task_spec", plan_dict)
+        revision = semantic.get("revision", 1)
         evidence = dict(evidence or {})
         evidence.setdefault("hard_stop_constraints", hard_stop_constraints_from_evidence(evidence))
         # V(I, task) 与 G(pose, map) 独立求值；预测标签和接近距离不参与视觉判定。
         payload = {"raw_instruction": raw_instruction,
                    "task": self._visual_task(plan_dict or {}, evidence),
                    "candidate": {"uid": candidate.uid}}
+        affordance_ids = [predicate.get("id") for predicate in payload["task"].get("visual_predicates", [])
+                          if predicate.get("type") == "affordance" and predicate.get("hardness", "hard") == "hard"]
+        response_model = affordance_verification_response_model(affordance_ids)
+        sent_current_ids: set[str] = set()
+        sent_candidate_ids: set[str] = set()
         content: list[dict[str, Any]] = [
             {"type": "text", "text": json.dumps(payload, ensure_ascii=False, indent=2)},
         ]
@@ -318,8 +343,8 @@ class FinalInstructionVerifier:
         image_refs = {}
         image_dependencies = {}
 
-        def load_image(path):
-            if not path:
+        def load_image(path, missing_ok=False):
+            if not path or (missing_ok and not Path(path).is_file()):
                 return None
             block, reference, digest = image_input(path, self.evidence_dir)
             image_refs[path] = reference
@@ -330,11 +355,18 @@ class FinalInstructionVerifier:
             path = str(evidence.get(key) or "")
             if path in seen_image_paths:
                 continue
-            block = load_image(path)
+            bbox = (evidence.get("object_crop_bbox_xyxy") if key == "object_crop_path"
+                    else evidence.get("geometry", {}).get("bbox_xyxy"))
+            observation_id = _candidate_observation_id(
+                evidence.get("observation_identity"), bbox, candidate.uid, revision)
+            if affordance_ids and observation_id is None:
+                continue
+            block = load_image(path, missing_ok=bool(affordance_ids))
             if block is not None:
                 seen_image_paths.add(path)
-                bbox = (evidence.get("object_crop_bbox_xyxy") if key == "object_crop_path"
-                        else evidence.get("geometry", {}).get("bbox_xyxy"))
+                if observation_id is not None:
+                    sent_current_ids.add(observation_id)
+                    sent_candidate_ids.add(observation_id)
                 content.append({"type": "text", "text": json.dumps({
                     "role": "current_candidate_observation", "image_kind": key,
                     "observation_identity": evidence.get("observation_identity", {}),
@@ -367,9 +399,16 @@ class FinalInstructionVerifier:
                     or identity["task_revision"] != current_identity.get("task_revision")):
                 excluded_history.append({"image_path": image_path, "reason": "observation_binding_mismatch"})
                 continue
-            block = load_image(image_path)
+            observation_id = _candidate_observation_id(
+                identity, visual_packet.get("geometry", {}).get("bbox_xyxy"), candidate.uid, revision)
+            if affordance_ids and observation_id is None:
+                excluded_history.append({"image_path": image_path, "reason": "observation_binding_mismatch"})
+                continue
+            block = load_image(image_path, missing_ok=bool(affordance_ids))
             if block is not None:
                 seen_image_paths.add(image_path)
+                if observation_id is not None:
+                    sent_candidate_ids.add(observation_id)
                 content.append({"type": "text", "text": json.dumps({
                     "role": "earlier_candidate_observation",
                     "observation_identity": identity,
@@ -400,29 +439,52 @@ class FinalInstructionVerifier:
             }, ensure_ascii=False)})
             content.append(block)
 
-        # 请求异常交由运行时记录和处置，保留原始异常及调用栈。
-        client, model = get_client_and_model(self.vlm)
-        from llm_utils.structured_output import request_fingerprint
-        from llm_utils.lvlm_call_tracker import record_cache_hit
-        messages = [{"role": "system", "content": FINAL_VERIFIER_PROMPT},
-                    {"role": "user", "content": content}]
-        # 缓存只复用视觉判断 V(E,r)，当前 G_t 与任务进度继续由下方代码求值。
-        revision = plan_dict.get("diagnostics", {}).get("task_spec", {}).get("revision", 1)
-        key = request_fingerprint(model, [messages, revision, evidence.get("observation_identity"),
-            evidence.get("dependencies", {})], ParsedVerification, provider=self.vlm)
-        reuse = os.getenv("STRIVE_EVIDENCE_REUSE", "0") == "1"
-        parsed = self.evidence_store.visual_judgments.get(key) if reuse else None
-        if parsed is None:
-            completion = client.beta.chat.completions.parse(
-                model=model, messages=messages, response_format=ParsedVerification,
-                trace_label=FINAL_VERIFY.trace_label)
-            parsed = completion.choices[0].message.parsed
-            if parsed is None:
-                raise ValueError("Final verifier response has no structured judgment")
-            if reuse:
-                self.evidence_store.visual_judgments[key] = parsed
+        if affordance_ids and not sent_current_ids:
+            image_refs.clear()
+            image_dependencies.clear()
+            sent_candidate_ids.clear()
+            parsed = response_model(
+                decision="need_better_view", view_sufficient_for_stop=False,
+                reason="Hard affordances require a current candidate-bound image.",
+                affordance_judgments={uid: {
+                    "verdict": "unknown", "reason": "No current candidate-bound image was sent.",
+                    "supporting_observation_ids": [],
+                } for uid in affordance_ids})
         else:
-            record_cache_hit("final_visual_judgment")
+            # Provider errors propagate; only exact visual judgments are cached.
+            client, model = get_client_and_model(self.vlm)
+            from llm_utils.structured_output import request_fingerprint
+            from llm_utils.lvlm_call_tracker import record_cache_hit
+            messages = [{"role": "system", "content": FINAL_VERIFIER_PROMPT},
+                        {"role": "user", "content": content}]
+            key = request_fingerprint(model, [messages, revision, evidence.get("observation_identity"),
+                evidence.get("dependencies", {})], response_model, provider=self.vlm)
+            reuse = os.getenv("STRIVE_EVIDENCE_REUSE", "0") == "1"
+            parsed = self.evidence_store.visual_judgments.get(key) if reuse else None
+            if parsed is None:
+                completion = client.beta.chat.completions.parse(
+                    model=model, messages=messages, response_format=response_model,
+                    trace_label=FINAL_VERIFY.trace_label)
+                parsed = completion.choices[0].message.parsed
+                if parsed is None:
+                    raise ValueError("Final verifier response has no structured judgment")
+                if reuse:
+                    self.evidence_store.visual_judgments[key] = parsed
+            else:
+                record_cache_hit("final_visual_judgment")
+
+        affordance_judgments = {}
+        if affordance_ids:
+            parsed = response_model.model_validate(parsed.model_dump())
+            affordance_judgments = parsed.affordance_judgments.model_dump()
+            for judgment in affordance_judgments.values():
+                supporting = judgment["supporting_observation_ids"]
+                if judgment["verdict"] != "unknown" and (
+                        not sent_current_ids or not supporting
+                        or not set(supporting).issubset(sent_candidate_ids) or not judgment["reason"].strip()):
+                    judgment["reported_verdict"] = judgment["verdict"]
+                    judgment["verdict"] = "unknown"
+                    judgment["validation_reason"] = "Missing visual reason or actually-sent candidate-bound observation support."
 
         decision = normalize_term(getattr(parsed, "decision", "")).replace(" ", "_")
         allowed = {"accept", "reject_candidate", "need_better_view", "need_relation_check", "uncertain"}
@@ -432,6 +494,15 @@ class FinalInstructionVerifier:
         semantic_satisfied = bool(getattr(parsed, "semantic_satisfied", False))
         view_sufficient = bool(getattr(parsed, "view_sufficient_for_stop", True))
         parsed_satisfied = bool(getattr(parsed, "satisfied", False))
+        affordance_false = [uid for uid, judgment in affordance_judgments.items() if judgment["verdict"] == "false"]
+        affordance_unknown = [uid for uid, judgment in affordance_judgments.items() if judgment["verdict"] == "unknown"]
+        if affordance_false or affordance_unknown:
+            semantic_satisfied = parsed_satisfied = False
+            if affordance_false:
+                decision = "reject_candidate"
+            else:
+                decision = "uncertain" if decision == "uncertain" else "need_better_view"
+                view_sufficient = False
         hard_constraints = dict(evidence.get("hard_stop_constraints") or hard_stop_constraints_from_evidence(evidence))
         planner_infeasible, planner_infeasible_reason = _planner_hard_constraint_infeasible(hard_constraints)
         if decision == "accept" and not (semantic_satisfied and view_sufficient):
@@ -441,6 +512,11 @@ class FinalInstructionVerifier:
             parsed_satisfied = False
         view_guidance, view_guidance_goal = self._view_guidance(evidence)
         failed_constraints = list(getattr(parsed, "failed_constraints", []) or [])
+        satisfied_constraints = list(getattr(parsed, "satisfied_constraints", []) or [])
+        if affordance_ids:
+            failed_constraints = [uid for uid in failed_constraints if uid not in affordance_ids] + affordance_false
+            satisfied_constraints = [uid for uid in satisfied_constraints if uid not in affordance_ids] + [
+                uid for uid, judgment in affordance_judgments.items() if judgment["verdict"] == "true"]
         if decision == "need_better_view" and not bool(hard_constraints.get("satisfied", True)):
             for item in hard_constraints.get("failed", []) or []:
                 name = str(item.get("name") or "hard_stop_constraint")
@@ -449,6 +525,9 @@ class FinalInstructionVerifier:
         view_feedback = str(getattr(parsed, "view_feedback", "") or "")
         preferred_view_goal = str(getattr(parsed, "preferred_view_goal", "") or "")
         reason = str(getattr(parsed, "reason", "") or "")
+        if affordance_false or affordance_unknown:
+            reason = "; ".join(filter(None, [reason, "Hard affordances not established: " + ", ".join(
+                affordance_false + affordance_unknown)]))
         if view_guidance and not view_feedback and decision == "need_better_view":
             view_feedback = "; ".join(view_guidance)
         if view_guidance_goal and not preferred_view_goal and decision == "need_better_view":
@@ -493,7 +572,7 @@ class FinalInstructionVerifier:
             evidence_ids=sorted(set(image_refs.values())),
             dependencies={**evidence.get("dependencies", {}), **image_dependencies,
                           "observation_identity": json.dumps(evidence.get("observation_identity"), sort_keys=True)},
-            task_revision=plan_dict.get("diagnostics", {}).get("task_spec", {}).get("revision", 1),
+            task_revision=revision,
             decision=decision,
             confidence=confidence,
             semantic_satisfied=semantic_satisfied,
@@ -503,16 +582,19 @@ class FinalInstructionVerifier:
                 "planner_infeasible": planner_infeasible,
                 "planner_infeasible_reason": planner_infeasible_reason,
             },
-            satisfied_constraints=list(getattr(parsed, "satisfied_constraints", []) or []),
+            satisfied_constraints=satisfied_constraints,
             failed_constraints=failed_constraints,
             view_feedback=view_feedback,
             preferred_view_goal=preferred_view_goal,
             view_objective=view_objective,
             reason=reason,
             diagnostics={
-                "source": "vlm",
+                "source": "missing_candidate_image" if affordance_ids and not sent_current_ids else "vlm",
                 "image_sources": image_refs,
                 "excluded_history": excluded_history,
+                **({"affordance_judgments": affordance_judgments,
+                    "sent_current_observation_ids": sorted(sent_current_ids),
+                    "sent_candidate_observation_ids": sorted(sent_candidate_ids)} if affordance_ids else {}),
                 "model_provider": self.vlm,
                 "view_guidance": {
                     "facts": view_guidance,

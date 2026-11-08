@@ -6,6 +6,9 @@ from types import MappingProxyType
 from typing import Any, Mapping
 
 
+RELATION_CONSTRAINT_TYPES = frozenset({"spatial", "relation", "object relation", "co occurrence"})
+
+
 def _freeze(value):
     if isinstance(value, Mapping):
         return MappingProxyType({k: _freeze(v) for k, v in value.items()})
@@ -37,12 +40,17 @@ class TargetSpec:
     min_count: int = 1
     aliases: tuple[str, ...] = ()
     attributes: Any = None
+    demand: Any = None
 
     def __post_init__(self):
         if not self.id or not self.name or self.min_count < 1:
             raise ValueError("Target requires an ID, concept and positive count")
         object.__setattr__(self, "aliases", tuple(self.aliases))
         object.__setattr__(self, "attributes", _freeze(self.attributes or {}))
+        object.__setattr__(self, "demand", _freeze(self.demand or {}))
+        if self.demand and (not self.terminal or not self.demand.get("activity")
+                            or not self.demand.get("required_resource")):
+            raise ValueError("Demand requires a terminal resource target and an activity")
 
 
 @dataclass(frozen=True)
@@ -98,6 +106,27 @@ class TaskSpec:
             "targets": tuple(TargetSpec(**t) for t in data["targets"]),
             "constraints": tuple(ConstraintSpec(**c) for c in data["constraints"]),
         })
+
+
+def interpretation_changes(current: TaskSpec | None, proposed: TaskSpec) -> dict[str, Any]:
+    def obligations(task):
+        if task is None:
+            return {}
+        data = task.as_dict()
+        references = {target.id: f"target_{index}" for index, target in enumerate(task.targets)}
+        values = {f"target_{index}": {key: value for key, value in target.items() if key != "id"}
+                  for index, target in enumerate(data["targets"])}
+        for index, constraint in enumerate(data["constraints"]):
+            item = {key: value for key, value in constraint.items() if key not in {"id", "source"}}
+            for key in ("subject", "object"):
+                item[key] = references.get(item[key], item[key])
+            values[f"constraint_{index}"] = item
+        values.update({key: data[key] for key in ("ordered", "exhaustive", "completion_mode")})
+        return values
+
+    before, after = obligations(current), obligations(proposed)
+    return {key: {"before": before.get(key), "after": after.get(key)}
+            for key in dict.fromkeys([*before, *after]) if before.get(key) != after.get(key)}
 
 
 @dataclass(frozen=True)

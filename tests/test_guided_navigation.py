@@ -1,4 +1,5 @@
 """Verify baseline ordering and purpose-specific execution without a simulator."""
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace as NS
 from unittest.mock import Mock
 import pytest
@@ -82,6 +83,7 @@ def test_directed_verification_reuses_feedback_without_panorama(monkeypatch):
     # 光轴 f=-R[:,2] 指向 +x；目标中心在 (2,2)，残余偏角 45°。
     camera = np.array([[0, 0, -1], [-1, 0, 0], [0, 1, 0]], dtype=float)
     agent = NS(episode_steps=20, task=NS(spec=NS(revision=1)), need_check_again=False,
+               selected_candidate=NS(role="primary"),
                object_final=NS(uid="obj", position=np.array([2., 2., 1.])),
                mapper=NS(current_position=np.zeros(3), current_rotation=camera),
                _observation_identity=lambda uid: {"observation_id": "0:20"},
@@ -94,6 +96,7 @@ def test_directed_verification_reuses_feedback_without_panorama(monkeypatch):
     agent.final_instruction_check = verify
     guided = GuidedNavigation.__new__(GuidedNavigation)
     guided.agent, guided.record, guided.submit = agent, Mock(), Mock()
+    guided.search_review_step, guided.search_review_interval = 0, 100
     guided.candidate_motion_goals = {}
     guided.view_attempted = lambda *args: False
     guided.tools = NS(publish_object_viewpoints=lambda uid: [NS(
@@ -124,7 +127,7 @@ def test_terminal_event_dispatches_observation_or_verification_once(monkeypatch,
     agent.execution = NS(controller=NS(advance=lambda: events.append("advance")), step=step)
     agent.update_trajectory = lambda: None
     monkeypatch.setattr(runtime, "run_observation_mapping_cycle", lambda *a, **kw: events.append("observe"))
-    metadata = {"node_index": 0} if kind != "object" else {}
+    metadata = {"task_revision": 1, **({"node_index": 0} if kind != "object" else {})}
     status = NavigationStatusCode.BLOCKED if kind == "blocked" else NavigationStatusCode.REACHED
     feedback = NS(tracking_active=False, status=NavigationStatus(status),
                   intent=NS(metadata=metadata, target_object_uid="obj", goal_pose=NS(position=(1, 2, 0))))
@@ -250,20 +253,89 @@ def test_recovery_selects_untried_approach_once_and_returns_to_driver(monkeypatc
     guided.tools = NS(refresh_scene=Mock(), query_viewpoints=Mock(return_value=views),
                       objects={"u": NS(rgb=None, bbox=None)})
     guided.candidate_motion_goals = {(1,"u",None): {(1,0,0): "REACHED"}}
-    guided.runtime = NS(model_calls=0, max_model_calls=3,
+    guided.runtime = NS(model_calls=0, max_model_calls=3, choice_guard=nullcontext,
                         choose_recovery=Mock(return_value="approach"), step=Mock())
     guided.record, guided.submit = Mock(), Mock()
     monkeypatch.setattr(module, "select_baseline_exploration_node", lambda *a, **kw:
                         (nodes[0] if nodes else None, "current_room"))
     monkeypatch.setattr(module, "select_prior_region_node", lambda agent: None)
     assert guided.recover({"candidate_uid": "u", "reason": "view_options_exhausted"}, 0) == "moving"
-    guided.submit.assert_called_once_with((2,0,0), candidate_uid="u",
-                                          source="agent_recovery" if frontiers else "default_recovery")
-    assert guided.runtime.choose_recovery.call_count == int(frontiers > 0)
-    if frontiers:
-        options = guided.runtime.choose_recovery.call_args.args[0]
-        assert {o["action_uid"] for o in options} == {"approach", "frontier:0", "frontier:1"}
+    guided.submit.assert_called_once_with((2,0,0), candidate_uid="u", source="agent_recovery")
+    assert guided.runtime.choose_recovery.call_count == 1
+    assert guided.search_review_step == guided.agent.episode_steps
+    options = guided.runtime.choose_recovery.call_args.args[0]
+    assert {o["action_uid"] for o in options} == ({"approach", "frontier:0", "frontier:1"}
+                                                if frontiers else {"approach"})
     guided.runtime.step.assert_not_called()
+
+
+def test_candidate_discovery_does_not_postpone_search_review(monkeypatch):
+    import numpy as np
+    import backends.habitat.guided_runtime as module
+    node = NS(idx=0, position=(5., 0., 0.))
+    obj = NS(uid="candidate")
+    agent = NS(episode_steps=80, task=NS(spec=NS(revision=1)), scan_complete=True,
+               mapper=NS(current_position=np.zeros(3), nodes=[node],
+                   prior_map_last_chosen_frontier={"candidates": [
+                       {"node_idx": 0, "raw_distance_m": 5.}]}),
+               find_final_waypoint=Mock(), whether_to_check_again=Mock())
+    guided = GuidedNavigation.__new__(GuidedNavigation)
+    guided.agent, guided.record, guided.submit = agent, Mock(), Mock()
+    guided.search_review_step, guided.search_review_interval = 0, 100
+    guided.deferred_candidates, guided.candidate_view_states = set(), {}
+    guided.view_attempted = lambda *args: False
+    guided.tools = NS(refresh_scene=Mock(), publish_object_viewpoints=lambda uid: [NS(
+        pose=NS(position=(1., 0., 0.)), metadata={"recommended": True})])
+    guided.runtime = NS(model_calls=0, max_model_calls=5, choice_guard=nullcontext,
+                        choose_frontier=Mock(return_value="node:0"))
+    monkeypatch.setattr(module, "select_observed_candidate", Mock(side_effect=[
+        (True, obj), (True, obj), (False, None)]))
+    monkeypatch.setattr(module, "select_exploration_node", lambda *a, **kw: (node, "current_room"))
+    assert guided.select(66)
+    agent.episode_steps = 99
+    assert guided.select(66)
+    assert guided.search_review_step == 0
+    guided.runtime.choose_frontier.assert_not_called()
+    agent.episode_steps = 100
+    assert guided.select(66)
+    assert guided.search_review_step == 100
+    guided.runtime.choose_frontier.assert_called_once()
+    guided.submit.assert_called_with(node.position, node=node, source="agent_search_review")
+
+
+@pytest.mark.parametrize("step,calls,complete,expected", [
+    (99, 0, False, "select"), (100, 0, False, "recovery"),
+    (100, 5, False, "select"), (100, 0, True, "verified_finish"),
+])
+def test_unverified_candidate_enters_periodic_review_without_authorizing_stop(
+        monkeypatch, step, calls, complete, expected):
+    import sys
+    import numpy as np
+    from instruction_adapter.view_control import ViewControlState
+    monkeypatch.setitem(sys.modules, "navigation.goal_approach_controller", NS(
+        rotate_toward_object_for_recheck=lambda agent: True, tilt_camera=lambda agent, pitch: True))
+    agent = NS(episode_steps=step, task=NS(spec=NS(revision=1)),
+               selected_candidate=NS(role="primary"),
+               object_final=NS(uid="candidate", position=np.ones(3)),
+               mapper=NS(current_position=np.zeros(3), current_rotation=np.eye(3)[:, ::-1]),
+               _observation_identity=lambda uid: {"observation_id": f"66:{step}"},
+               check_again=Mock(), last_check_again_evidence={},
+               final_stop_decision="need_relation_check", view_control_state=ViewControlState(),
+               final_instruction_check=Mock(return_value=complete),
+               _continue_better_view_control=lambda: False)
+    guided = GuidedNavigation.__new__(GuidedNavigation)
+    guided.agent, guided.record, guided.defer_candidate = agent, Mock(), Mock()
+    guided.search_review_step, guided.search_review_interval = 0, 100
+    guided.runtime = NS(model_calls=calls, max_model_calls=5)
+    assert guided.verify((0., 0., 0.)) == expected
+    assert guided.runtime.model_calls == calls and guided.search_review_step == 0
+    if expected == "recovery":
+        assert guided.recovery_context == {
+            "reason": "prolonged_unverified_candidate", "candidate_uid": "candidate",
+            "decision": "need_relation_check", "steps_since_review": 100}
+        guided.defer_candidate.assert_not_called()
+    elif expected == "select":
+        guided.defer_candidate.assert_called_once_with("need_relation_check")
 
 
 def test_prior_region_adds_its_branch_without_pruning_baseline_options(monkeypatch):
@@ -283,15 +355,40 @@ def test_prior_region_adds_its_branch_without_pruning_baseline_options(monkeypat
     monkeypatch.setattr(module, "select_baseline_exploration_node", baseline)
     monkeypatch.setattr(module, "select_prior_region_node", prior)
     guided = GuidedNavigation.__new__(GuidedNavigation)
-    guided.agent = NS(episode_steps=36, mapper=mapper)
+    guided.agent = NS(episode_steps=36, mapper=mapper, task=NS(spec=NS(revision=1)))
     guided.tools = NS(refresh_scene=Mock())
-    guided.runtime = NS(model_calls=0, max_model_calls=3, choose_recovery=Mock(return_value="frontier:1"))
+    guided.runtime = NS(model_calls=0, max_model_calls=3, choice_guard=nullcontext,
+                        choose_recovery=Mock(return_value="frontier:1"))
     guided.record, guided.submit = Mock(), Mock()
     assert guided.recover({"reason": "blocked"}, 0) == "moving"
     options = guided.runtime.choose_recovery.call_args.args[0]
     assert [o["action_uid"] for o in options] == ["frontier:1", "frontier:2", "frontier:0"]
     assert [o.get("prior_region_recommended", False) for o in options] == [False, False, True]
     guided.submit.assert_called_once_with(nodes[1].position, node=nodes[1], source="agent_recovery")
+
+
+@pytest.mark.parametrize("frontiers", [False, True])
+def test_completed_anchor_review_excludes_anchor_views_and_reselects_when_empty(frontiers):
+    node = NS(idx=2, position=(2., 0., 0.))
+    guided = GuidedNavigation.__new__(GuidedNavigation)
+    guided.agent = NS(episode_steps=104, task=NS(spec=NS(revision=1)), mapper=NS(nodes=[None, None, node]))
+    guided.tools = NS(refresh_scene=Mock(), query_viewpoints=Mock())
+    guided.runtime = NS(model_calls=0, max_model_calls=5, choice_guard=nullcontext,
+                        choose_recovery=Mock(return_value="frontier:2"))
+    guided.record, guided.submit = Mock(), Mock()
+    rows = [{"node_idx": 2, "raw_distance_m": 2.}] if frontiers else []
+    guided.exploration_options = lambda index: (None, "baseline", rows)
+    reason = {"reason": "prolonged_target_search", "anchor_uid": "anchor",
+              "concept_id": "reference", "anchor_status": "searched_no_terminal_found"}
+    assert guided.recover(reason, 0) == ("moving" if frontiers else "select")
+    guided.tools.query_viewpoints.assert_not_called()
+    if frontiers:
+        options = guided.runtime.choose_recovery.call_args.args[0]
+        assert [row["action_uid"] for row in options] == ["frontier:2"]
+        guided.submit.assert_called_once_with(node.position, node=node, source="agent_recovery")
+    else:
+        guided.runtime.choose_recovery.assert_not_called()
+        guided.submit.assert_not_called()
 
 
 def test_feedback_retains_initial_motion_attempt_in_view_history(monkeypatch):
@@ -305,6 +402,7 @@ def test_feedback_retains_initial_motion_attempt_in_view_history(monkeypatch):
     state = ViewControlState()
     state.start("u", {}, {})
     agent = NS(episode_steps=20, task=NS(spec=NS(revision=1)), object_final=NS(uid="u", position=np.ones(3)),
+               selected_candidate=NS(role="primary"),
                mapper=NS(current_position=np.zeros(3), current_rotation=np.eye(3)[:, ::-1]),
                _observation_identity=lambda uid: {"observation_id": "0:20"},
                check_again=Mock(), last_check_again_evidence={}, final_stop_decision="need_better_view",
@@ -312,6 +410,7 @@ def test_feedback_retains_initial_motion_attempt_in_view_history(monkeypatch):
                final_instruction_check=Mock(return_value=False))
     guided = GuidedNavigation.__new__(GuidedNavigation)
     guided.agent, guided.record, guided.submit, guided.defer_candidate = agent, Mock(), Mock(), Mock()
+    guided.search_review_step, guided.search_review_interval = 0, 100
     guided.candidate_motion_goals = {(1,"u",None): {(1,0,0): "REACHED"}}
     agent.planner = NS(_goal_radius=.25)
     guided.tools = NS(objects={"u": NS(rgb=None,bbox=None)}, publish_object_viewpoints=lambda uid: [NS(
@@ -356,3 +455,157 @@ def test_selected_region_drives_existing_navigation(monkeypatch):
     actual, source = select_exploration_node(agent, episode_idx=0, step=10)
     assert actual is node and source == 'prior_region_policy'
     choose.assert_called_once_with(mapper, [node])
+
+
+@pytest.mark.parametrize("entry", ["search_review", "recovery_frontier", "recovery_viewpoint"])
+@pytest.mark.parametrize("outcome", ["installed", "unchanged", "invalid", "guard_refused"])
+def test_interpretation_handoff_reselects_without_stale_motion(monkeypatch, entry, outcome):
+    """A semantic repair is a decision turn, not an old-revision motion attempt."""
+    from dataclasses import replace
+    import numpy as np
+    import backends.habitat.guided_runtime as module
+    from instruction.contracts import TaskSpec, TargetSpec
+    from instruction_adapter.task_compat import runtime_plan
+    from instruction_adapter.view_control import ViewControlState
+    from motion.supervisor import MotionSupervisor
+    from scene.contracts import Pose3D, SemanticMapSnapshot, ViewpointSnapshot
+    from task.session import TaskSession
+
+    spec = TaskSpec("Find somewhere to sit.", (TargetSpec("goal", "chair"),))
+    session = TaskSession(SemanticMapSnapshot(12., Pose3D((0., 0., 0.))), runtime_plan(spec))
+    revised = runtime_plan(replace(spec, revision=2, targets=(TargetSpec("goal", "sofa"),)))
+    node = NS(idx=0, position=(5., 0., 0.), state=0)
+    obj = NS(uid="object", rgb=None, bbox=None)
+    view = ViewpointSnapshot("view", Pose3D((1., 0., 0.)), visible_objects=(obj.uid,),
+                             metadata={"recommended": True})
+    mapper = NS(nodes=[node], current_position=np.zeros(3), change_state=Mock(),
+                prior_map_last_chosen_frontier={"candidates": [{"node_idx": 0, "raw_distance_m": 5.}]})
+    agent = NS(task=session, mapper=mapper, episode_steps=125, travel_distance=8., scan_complete=True,
+               planner=NS(_goal_radius=.25), find_final_waypoint=Mock(), whether_to_check_again=Mock())
+    controller = NS(send_goal=Mock(return_value="goal"), moves=7, advance=Mock())
+    motion = MotionSupervisor(controller)
+    guided = GuidedNavigation.__new__(GuidedNavigation)
+    guided.agent, guided.sequence, guided.record = agent, 4, Mock()
+    guided.tools = NS(motion=motion, objects={obj.uid: obj}, refresh_scene=Mock(),
+                      publish_object_viewpoints=Mock(return_value=(view,)),
+                      query_viewpoints=Mock(return_value=[{
+                          "uid": "approach", "pose": {"position": (2., 0., 0.)}}]))
+    guided.deferred_candidates, guided.deferred_evidence = set(), {(1, obj.uid): {None}}
+    old_state = ViewControlState()
+    old_state.start(obj.uid, {}, {"observation_identity": {"task_revision": 1}})
+    old_state.exhausted = True
+    guided.candidate_view_states = {(1, obj.uid): old_state}
+    guided.candidate_motion_goals = {(1, obj.uid, None): {view.pose.position: "REACHED"}}
+    guided.search_review_step, guided.search_review_interval = 0, 100
+    guided.runtime = NS(model_calls=2, max_model_calls=5)
+    queried = []
+
+    def query(current, **kwargs):
+        queried.append((session.spec.revision, session.progress.active_target().name))
+        return (True, obj) if session.spec.revision == 2 else (False, None)
+
+    no_choice = outcome == "invalid"
+    selected_uid = {"search_review": "node:0", "recovery_frontier": "frontier:0",
+                    "recovery_viewpoint": "approach"}[entry]
+
+    def choose(options, *args):
+        guided.runtime.model_calls += 1
+        assert motion.active_request_id is None
+        if outcome == "installed":
+            session.install_plan(revised)
+            return None
+        if no_choice:
+            return None
+        key = "frontier_uid" if entry == "search_review" else "action_uid"
+        assert selected_uid in {option[key] for option in options}
+        return selected_uid
+
+    guard_events = []
+
+    @contextmanager
+    def choice_guard():
+        guard_events.append("enter")
+        try:
+            if outcome == "guard_refused":
+                raise ValueError("choice refused")
+            yield
+        finally:
+            guard_events.append("exit")
+
+    original_submit = guided.submit
+
+    def submit(*args, **kwargs):
+        if kwargs["source"] in {"agent_search_review", "agent_recovery"}:
+            assert guard_events == ["enter"]
+        return original_submit(*args, **kwargs)
+
+    guided.submit = Mock(side_effect=submit)
+    guided.runtime.choice_guard = Mock(side_effect=choice_guard)
+    guided.runtime.choose_frontier = guided.runtime.choose_recovery = Mock(side_effect=choose)
+    monkeypatch.setattr(module, "select_observed_candidate", query)
+    monkeypatch.setattr(module, "select_exploration_node", lambda *a, **kw: (node, "current_room"))
+    guided.exploration_options = lambda idx: (node, "current_room", mapper.prior_map_last_chosen_frontier["candidates"])
+    observe = Mock(side_effect=AssertionError("Decision handoff must not move or observe"))
+    monkeypatch.setattr(module, "run_observation_mapping_cycle", observe)
+
+    def decide():
+        if entry == "search_review":
+            return guided.select(0)
+        reason = {"reason": "blocked"}
+        if entry == "recovery_viewpoint":
+            reason["candidate_uid"] = obj.uid
+        return guided.recover(reason, 0)
+
+    if outcome == "guard_refused":
+        with pytest.raises(ValueError, match="choice refused"):
+            decide()
+    else:
+        result = decide()
+        assert result is True if entry == "search_review" else result == (
+            "select" if outcome == "installed" or no_choice else "moving")
+    if outcome == "installed" or no_choice:
+        assert guided.sequence == 4 and motion.active_request_id is None
+        guided.submit.assert_not_called()
+        controller.send_goal.assert_not_called()
+        guided.record.assert_called_with("interpretation_changed" if outcome == "installed" else "decision_reselect",
+            decision_source="agent_search_review" if entry == "search_review" else "agent_recovery",
+            task_revision=2 if outcome == "installed" else 1)
+    if outcome == "installed":
+        assert session.spec.revision == 2
+        assert guided.select(0)
+        assert queried[-1] == (2, "sofa")
+        assert motion.active_intent.target_object_uid == obj.uid
+        assert motion.active_intent.metadata["task_revision"] == 2
+        assert agent.view_control_state is not old_state
+        assert not agent.view_control_state.active
+    else:
+        assert session.spec == spec
+        assert all(call.args[0] != "interpretation_changed" for call in guided.record.call_args_list)
+        if outcome == "unchanged":
+            assert motion.active_intent.metadata["task_revision"] == 1
+            if entry == "recovery_viewpoint":
+                assert motion.active_intent.target_object_uid == obj.uid
+                assert motion.active_intent.goal_pose.position == (2., 0., 0.)
+            else:
+                assert motion.active_intent.metadata["node_index"] == node.idx
+        else:
+            assert motion.active_request_id is None
+            guided.submit.assert_not_called()
+            controller.send_goal.assert_not_called()
+    submitted = int(outcome in {"installed", "unchanged"})
+    assert guided.sequence == 4 + submitted and controller.send_goal.call_count == submitted
+    if outcome in {"unchanged", "guard_refused"}:
+        guided.runtime.choice_guard.assert_called_once_with()
+        assert guard_events == ["enter", "exit"]
+    else:
+        guided.runtime.choice_guard.assert_not_called()
+        assert guard_events == []
+    assert agent.episode_steps == 125 and agent.travel_distance == 8. and controller.moves == 7
+    assert guided.runtime.model_calls == 3 and guided.runtime.max_model_calls == 5
+    guided.runtime.choose_frontier.assert_called_once()
+    assert guided.candidate_view_states[(1, obj.uid)] is old_state and old_state.exhausted
+    assert guided.candidate_motion_goals == {(1, obj.uid, None): {view.pose.position: "REACHED"}}
+    assert guided.deferred_evidence == {(1, obj.uid): {None}}
+    mapper.change_state.assert_not_called()
+    controller.advance.assert_not_called()
+    observe.assert_not_called()

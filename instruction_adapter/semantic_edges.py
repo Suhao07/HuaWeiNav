@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from .ontology import normalize_term
@@ -40,6 +41,15 @@ class SemanticEdge:
     source: str = "unknown"
     evidence_view_ids: list[str] = field(default_factory=list)
     reason: str = ""
+    need_better_view: bool = False
+    evidence_key: str = ""
+    identity_judgments: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+    @property
+    def verdict(self) -> str:
+        if self.need_better_view:
+            return "unknown"
+        return "true" if self.verified else "false"
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -110,14 +120,6 @@ class RelationPairLedger:
         reason: str = "",
         evidence_view_ids: list[str] | None = None,
     ) -> RelationPairRecord:
-        key = (str(instruction_hash), str(subject_id), normalize_relation(relation), str(object_id))
-        existing = self.records.get(key)
-        if (
-            existing is not None
-            and existing.status == "accepted_relation"
-            and status == "rejected_relation"
-        ):
-            return existing
         record = RelationPairRecord(
             instruction_hash=str(instruction_hash),
             subject_id=str(subject_id),
@@ -147,24 +149,6 @@ class SemanticEdgeCache:
 
     def put(self, edge: SemanticEdge) -> SemanticEdge:
         query = RelationQuery(edge.subject_id, edge.relation, edge.object_id)
-        existing = self._edges.get(query.key)
-        if (
-            existing is not None
-            and existing.verified
-            and not edge.verified
-            and edge.source in ("geometry", "geometry_prefilter")
-        ):
-            # 已有强视觉证据确认的动态语义边不能被后续点云/投影噪声降级。
-            # 几何仍可阻止新 pair 进入 VLM，但不能覆盖 accepted VLM edge。
-            return existing
-        if existing is not None and existing.verified and edge.verified:
-            merged_ids = list(dict.fromkeys(list(existing.evidence_view_ids) + list(edge.evidence_view_ids)))
-            if edge.confidence >= existing.confidence:
-                edge.evidence_view_ids = merged_ids
-                self._edges[query.key] = edge
-                return edge
-            existing.evidence_view_ids = merged_ids
-            return existing
         self._edges[query.key] = edge
         return edge
 
@@ -209,6 +193,15 @@ def _stable_view_ids(evidence_views: list[dict[str, Any]]) -> list[str]:
     return ids
 
 
+def relation_view_is_bound(view: dict[str, Any], subject_id: str, object_id: str) -> bool:
+    boxes = view.get("object_boxes", {})
+    path = view.get("rgb_path") or view.get("image_ref") or view.get("path")
+    return bool(view.get("id") and path and Path(path).is_file() and all(
+        uid in view.get("observed_object_uids", []) and len(boxes.get(uid, [])) == 4
+        for uid in (subject_id, object_id)
+    ))
+
+
 class DynamicSemanticEdgeVerifier:
     """Lazy semantic edge verifier following the SysNav split.
 
@@ -239,54 +232,45 @@ class DynamicSemanticEdgeVerifier:
     ) -> SemanticEdge:
         relation = normalize_relation(relation)
         query = RelationQuery(str(subject.get("id", "")), relation, str(object_.get("id", "")))
-        evidence = list(evidence_views or [])
-        allow_visual_override = any(bool(view.get("allow_vlm_despite_geometry")) for view in evidence)
+        evidence = [view for view in evidence_views or []
+                    if relation_view_is_bound(view, query.subject_id, query.object_id)]
+        image_hashes = []
+        for view in evidence:
+            path = view.get("rgb_path") or view.get("image_ref") or view.get("path")
+            image_hashes.append(hashlib.sha256(Path(path).read_bytes()).hexdigest()
+                                if path and Path(path).is_file() else None)
+        evidence_key = hashlib.sha256(json.dumps(
+            [subject, relation, object_, evidence, image_hashes, vlm_callback is not None],
+            sort_keys=True, default=str,
+        ).encode("utf-8")).hexdigest()
         cached = self.cache.get(query)
-        if cached is not None:
-            if not (allow_visual_override and not cached.verified and cached.source == "geometry"):
-                return cached
+        if cached is not None and cached.evidence_key == evidence_key:
+            return cached
 
-        if not self._geometry_allows(subject, relation, object_):
-            # 小物体点云高度有时不稳定。若调用方提供了
-            # check_again 这类明确的视觉复核图，可以让 VLM 覆盖几何预筛；
-            # 否则仍保持几何硬约束，避免无根据地验证所有对象对。
-            if allow_visual_override and vlm_callback is not None:
-                prompt = self._build_vlm_prompt(subject, relation, object_)
-                result = vlm_callback(relation, subject, object_, evidence, prompt)
-                edge = self._coerce_vlm_result(query, evidence, result)
-                if not edge.reason:
-                    edge.reason = "Geometry prefilter failed, but visual evidence override was used."
-                return self.cache.put(edge)
-            return self.cache.put(
-                SemanticEdge(
-                    subject_id=query.subject_id,
-                    relation=relation,
-                    object_id=query.object_id,
-                    confidence=0.0,
-                    verified=False,
-                    source="geometry",
-                    evidence_view_ids=_stable_view_ids(evidence),
-                    reason="Rejected by geometric hard constraint.",
-                )
+        allow_visual_override = any(bool(view.get("allow_vlm_despite_geometry")) for view in evidence)
+        if not evidence:
+            edge = SemanticEdge(
+                subject_id=query.subject_id, relation=relation, object_id=query.object_id,
+                source="missing_observation", need_better_view=True,
+                reason="No shared instance-bound observation is available.",
             )
-
-        if vlm_callback is None:
-            return self.cache.put(
-                SemanticEdge(
-                    subject_id=query.subject_id,
-                    relation=relation,
-                    object_id=query.object_id,
-                    confidence=0.5,
-                    verified=False,
-                    source="geometry_prefilter",
-                    evidence_view_ids=_stable_view_ids(evidence),
-                    reason="Geometry passed; VLM callback was not provided.",
-                )
+        elif not self._geometry_allows(subject, relation, object_) and not allow_visual_override:
+            edge = SemanticEdge(
+                subject_id=query.subject_id, relation=relation, object_id=query.object_id,
+                source="geometry", evidence_view_ids=_stable_view_ids(evidence),
+                reason="Rejected by geometric hard constraint.",
             )
-
-        prompt = self._build_vlm_prompt(subject, relation, object_)
-        result = vlm_callback(relation, subject, object_, evidence, prompt)
-        edge = self._coerce_vlm_result(query, evidence, result)
+        elif vlm_callback is None:
+            edge = SemanticEdge(
+                subject_id=query.subject_id, relation=relation, object_id=query.object_id,
+                source="geometry_prefilter", evidence_view_ids=_stable_view_ids(evidence),
+                need_better_view=True, reason="Visual relation verification is unavailable.",
+            )
+        else:
+            prompt = self._build_vlm_prompt(subject, relation, object_)
+            result = vlm_callback(relation, subject, object_, evidence, prompt)
+            edge = self._coerce_vlm_result(query, evidence, result)
+        edge.evidence_key = evidence_key
         return self.cache.put(edge)
 
     def _geometry_allows(self, subject: dict[str, Any], relation: str, object_: dict[str, Any]) -> bool:
@@ -330,12 +314,20 @@ class DynamicSemanticEdgeVerifier:
 
     @staticmethod
     def _build_vlm_prompt(subject: dict[str, Any], relation: str, object_: dict[str, Any]) -> str:
-        subject_name = subject.get("name") or subject.get("tag") or subject.get("id")
-        object_name = object_.get("name") or object_.get("tag") or object_.get("id")
         return (
-            "Decide whether the spatial relation is visible in the provided views. "
-            "Return whether the relation is true, a confidence in [0,1], and a short reason.\n"
-            f"Subject: {subject_name}\nRelation: {relation}\nObject: {object_name}"
+            "Verify this exact directed relation between the two bound instances. "
+            "Requested concepts are requirements, not established identities; detector labels "
+            "are fallible observations. Do not substitute another visible object or relation. "
+            "Use only each frame's object_boxes for its instance regions.\n"
+            f"Subject instance: {subject['id']}\n"
+            f"Required subject concept: {subject['requested_concept']}\n"
+            f"Subject detector label: {subject['detector_label']}\n"
+            f"Subject demand: {json.dumps(subject.get('demand', {}), ensure_ascii=False)}\n"
+            f"Required relation: {relation}\n"
+            f"Reference instance: {object_['id']}\n"
+            f"Required reference concept: {object_['requested_concept']}\n"
+            f"Reference detector label: {object_['detector_label']}\n"
+            f"Reference demand: {json.dumps(object_.get('demand', {}), ensure_ascii=False)}"
         )
 
     @staticmethod
@@ -356,13 +348,16 @@ class DynamicSemanticEdgeVerifier:
             verified = bool(result)
             confidence = 1.0 if verified else 0.0
             reason = ""
+        need_better_view = bool(result.get("need_better_view", False)) if isinstance(result, dict) else False
         return SemanticEdge(
             subject_id=query.subject_id,
             relation=query.relation,
             object_id=query.object_id,
             confidence=max(0.0, min(1.0, confidence)),
-            verified=verified,
+            verified=verified and not need_better_view,
             source="vlm",
             evidence_view_ids=_stable_view_ids(evidence_views),
             reason=reason,
+            need_better_view=need_better_view,
+            identity_judgments=result.get("identity_judgments", {}) if isinstance(result, dict) else {},
         )

@@ -44,13 +44,28 @@ class ReasoningStep(BaseModel):
     output: str = ""
 
 
+class ParsedDemand(BaseModel):
+    activity: str = Field(description="The activity the user intends to perform.")
+    manipulated_objects: list[str] = Field(default_factory=list,
+        description="Materials acted on during the activity, not the destination resource.")
+    required_resource: str = Field(
+        description="The resource or capability needed to perform the activity on those materials.")
+    destination_hypotheses: list[str] = Field(default_factory=list,
+        description="Possible facilities providing the resource; search hypotheses, not required identities.")
+
+
 class ParsedTarget(BaseModel):
-    name: str = ""
+    demand: ParsedDemand | None = Field(default=None,
+        description="For an implicit destination, infer the activity and needed resource before naming its target. Null for explicit objects and reference anchors.")
+    name: str = Field(default="",
+        description="The requested object identity, or the functional resource described by demand.required_resource; not the manipulated material.")
     role: str = Field(default="primary", description="primary, secondary, anchor, or support")
     aliases: list[str] = Field(default_factory=list)
-    attributes: dict[str, Any] = Field(default_factory=dict)
+    attributes: dict[str, Any] = Field(default_factory=dict,
+        description="Unary properties of this object. Another entity's relative placement belongs in constraints, even when described among this object's features.")
     min_count: int = 1
-    terminal: bool = True
+    terminal: bool = Field(default=True,
+        description="True for a navigation destination, including a demanded resource; false only for reference anchors or support objects.")
 
 
 class ParsedConstraint(BaseModel):
@@ -66,8 +81,9 @@ class ParsedConstraint(BaseModel):
 class ParsedInstruction(BaseModel):
     task_type: str = "object_goal"
     eval_mode: str = "any_target_success"
+    constraints: list[ParsedConstraint] = Field(default_factory=list,
+        description="Extract each directed entity-to-entity relation separately before assigning unary target properties, including relative placements embedded in noun phrases.")
     targets: list[ParsedTarget] = Field(default_factory=list)
-    constraints: list[ParsedConstraint] = Field(default_factory=list)
     room_hints: list[str] = Field(default_factory=list)
     support_objects: list[str] = Field(default_factory=list)
     affordances: list[str] = Field(default_factory=list)
@@ -80,10 +96,10 @@ class ParsedInstruction(BaseModel):
 class GroundingResult(BaseModel):
     """A small detector vocabulary proposal, with bounded phrases and explanations."""
     detector_terms: list[constr(max_length=64)] = Field(default_factory=list, max_items=4)
-    aliases: list[constr(max_length=64)] = Field(default_factory=list, max_items=4)
-    description: str = Field(default="", max_length=240)
-    negative_terms: list[constr(max_length=64)] = Field(default_factory=list, max_items=4)
     reason: str = Field(default="", max_length=160)
+
+    class Config:
+        extra = "forbid"
 
 
 class ExecutionStrategyResult(BaseModel):
@@ -94,18 +110,21 @@ class ExecutionStrategyResult(BaseModel):
 
 
 class ParsedConceptMatch(BaseModel):
-    matches_concept: bool = False
+    """身份判断显式允许 null（未知），取证候选资格独立表达。"""
+    matches_concept: bool | None = Field(...)
     confidence: float = 0.0
     terminal_eligible: bool = False
     reason: str = ""
+    candidate_eligible: bool = False
 
 
 class CandidateConceptJudgment(BaseModel):
-    """Required label-compatibility judgment; absence is distinct from a negative match."""
-    matches_concept: bool
+    """身份判断必填；仅语义相容只能允许取证，不能判定成功。"""
+    matches_concept: bool | None = Field(...)
     confidence: float = Field(ge=0, le=1)
     terminal_eligible: bool
     reason: str = Field(max_length=160)
+    candidate_eligible: bool = False
 
     class Config:
         extra = 'forbid'
@@ -122,11 +141,22 @@ def concept_batch_response_model(object_uids):
                         **{uid: (CandidateConceptJudgment, ...) for uid in object_uids})
 
 
+class RelationJudgment(BaseModel):
+    verdict: Literal["true", "false", "unknown"]
+    reason: str = Field(min_length=1)
+
+    class Config:
+        extra = "forbid"
+
+
 class ParsedRelationResult(BaseModel):
-    verified: bool = False
-    confidence: float = 0.0
-    need_better_view: bool = False
-    reason: str = ""
+    subject_identity: RelationJudgment
+    reference_identity: RelationJudgment
+    relation: RelationJudgment
+    confidence: float = Field(ge=0, le=1)
+
+    class Config:
+        extra = "forbid"
 
 
 class ParsedViewObjective(BaseModel):
@@ -151,6 +181,32 @@ class ParsedVerification(BaseModel):
     preferred_view_goal: str = ""
     view_objective: ParsedViewObjective = Field(default_factory=ParsedViewObjective)
     reason: str = ""
+
+
+class AffordanceJudgment(BaseModel):
+    """Instance-level visual evidence for one hard affordance predicate."""
+
+    verdict: Literal["true", "false", "unknown"]
+    reason: str = Field(min_length=1, max_length=240)
+    supporting_observation_ids: list[str]
+
+    class Config:
+        extra = "forbid"
+
+
+def affordance_verification_response_model(predicate_ids):
+    """Require exactly one judgment per active hard affordance ID, if any."""
+    if not predicate_ids:
+        return ParsedVerification
+    if any(not isinstance(uid, str) or not uid for uid in predicate_ids) or len(set(predicate_ids)) != len(predicate_ids):
+        raise ValueError("Hard affordance predicates require unique nonempty IDs")
+    from pydantic import create_model
+    judgments = create_model(
+        "AffordanceJudgments", __config__={"extra": "forbid"},
+        **{uid: (AffordanceJudgment, ...) for uid in predicate_ids})
+    return create_model(
+        "AffordanceVerification", __base__=ParsedVerification,
+        affordance_judgments=(judgments, ...))
 
 
 class ParsedRoomSemantic(BaseModel):

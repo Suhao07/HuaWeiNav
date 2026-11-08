@@ -45,17 +45,19 @@ class IsaacObservationMap:
         self.entities = []
         self.latest = {}
 
-    def add(self, packet):
-        """Fuse a real rendered frame through the maintained STRIVE overlap policy."""
+    def add(self, packet, target_list=None):
+        """Detect with current retrieval terms and fuse through the STRIVE overlap policy."""
         from mapping.object_fusion import associate_object_entities
         from mapping_utils.geometry import gpu_cluster_filter, gpu_pointcloud_from_array
         from mapping_utils.representation import ObjectNode
 
         root, frame = Path(packet["capture_root"]), packet["frame"]
-        rgb = np.asarray(Image.open(root / frame["rgb_path"]).convert("RGB"))
+        image_ref = str((root / frame["rgb_path"]).resolve())
+        rgb = np.asarray(Image.open(image_ref).convert("RGB"))
         depth = np.load(root / frame["depth_path"], allow_pickle=False)
         valid = np.isfinite(depth) & (depth > 0) & (depth <= self.max_depth_m)
-        boxes, scores, labels, masks, _, _, _ = self.detector.segment(rgb, target=None)
+        boxes, scores, labels, masks, _, _, _ = self.detector.segment(
+            rgb, target=None, target_list=target_list)
         observed, details = [], []
         for index, (box, score, label, mask) in enumerate(zip(boxes, scores, labels, masks)):
             mask = mask.cpu().numpy().astype(bool)
@@ -78,14 +80,19 @@ class IsaacObservationMap:
                                 int(cloud.point.positions.shape[0]), rgb, bbox.tolist())
             entity.uid = f"observed:{frame['frame_id']}:{index}"
             observed.append(entity)
-            details.append({"image_ref": str(root / frame["rgb_path"]), "frame_id": frame["frame_id"],
+            details.append({"image_ref": image_ref, "frame_id": frame["frame_id"],
                             "bbox": bbox.tolist(), "detector_label": str(label), "score": float(score)})
         self.entities, indices = associate_object_entities(
             self.entities, observed, target="", is_target_tag=lambda tag: False)
+        object_boxes = {}
         for index, detail in zip(indices, details):
-            self.latest[self.entities[index].uid] = detail
+            uid = self.entities[index].uid
+            self.latest[uid] = detail
+            object_boxes[uid] = detail["bbox"]
         return {"frame_id": frame["frame_id"], "detected": len(labels),
-                "admitted": len(observed), "map_objects": len(self.entities)}
+                "admitted": len(observed), "map_objects": len(self.entities),
+                "observation_image": {"id": str(frame["frame_id"]), "image_ref": image_ref,
+                    "observed_object_uids": list(object_boxes), "object_boxes": object_boxes}}
 
     def objects(self):
         """Publish fused instance identities and their observed image references."""

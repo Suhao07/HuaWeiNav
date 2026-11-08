@@ -275,7 +275,9 @@ class PriorMapSimulationRuntime:
         self._ensure_episode_dir(mapper, episode_idx)
         if self.last_query_step == int(step) and self.last_query_result is not None:
             return self.last_query_result
-        self.last_observation = self.memory.update_from_mapper(mapper, step=step)
+        # 任务先验失效不代表产生了新的物理观察。
+        if self.last_observation is None or self.last_observation.metadata.get("step") != int(step):
+            self.last_observation = self.memory.update_from_mapper(mapper, step=step)
         self.last_room_semantics = self._classify_runtime_rooms(mapper, step=int(step))
         self._publish_shared_snapshot(mapper, step=int(step))
         result = self.query_service.query(plan, mapper, self.memory)
@@ -796,6 +798,33 @@ def configure_mapper_prior_map(mapper: Any, runtime: Optional[PriorMapSimulation
     setattr(mapper, "prior_map_current_step", None)
 
 
+def invalidate_mapper_task_prior(mapper: Any) -> None:
+    """Drop task-dependent priors without querying or changing observed map memory.
+
+    Args:
+        mapper: Mapper carrying the optional simulation prior-map runtime.
+    """
+    mapper.search_prior_result = None
+    mapper.prior_map_prompt_context = None
+    mapper.prior_map_high_level_selection = None
+    mapper.prior_map_last_chosen_frontier = None
+    mapper.prior_map_current_step = None
+    runtime = getattr(mapper, "prior_map_runtime", None)
+    if runtime is None:
+        return
+    runtime.last_query_result = None
+    runtime.last_query_step = None
+    runtime.last_prompt_context = None
+    runtime.last_multimodal_context = None
+    runtime.last_chosen_frontier = None
+    runtime.last_high_level_selection = None
+    runtime.last_high_level_step = None
+    # 区域几何仍有效，但旧任务的选择不能复用。
+    runtime.last_region_signature = None
+    if runtime.shared_snapshot:
+        runtime.shared_snapshot = {**runtime.shared_snapshot, "selection": None}
+
+
 def refresh_mapper_prior_map_query(
     mapper: Any,
     *,
@@ -860,5 +889,6 @@ __all__ = [
     "PriorMapSimulationRuntime",
     "build_prior_map_simulation_runtime",
     "configure_mapper_prior_map",
+    "invalidate_mapper_task_prior",
     "refresh_mapper_prior_map_query",
 ]

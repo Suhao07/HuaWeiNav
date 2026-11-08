@@ -42,7 +42,9 @@ class _ScriptedStructuredClient:
                             terminal_eligible=False, reason="Different role.")
             parsed = schema(anchor_1=judgment, distractor_1=judgment)
         elif schema is ParsedRelationResult:
-            parsed = ParsedRelationResult(verified=False, confidence=0.5, need_better_view=True)
+            unknown = {"verdict": "unknown", "reason": "No bound instance evidence."}
+            parsed = ParsedRelationResult(subject_identity=unknown, reference_identity=unknown,
+                                          relation=unknown, confidence=0.5)
         elif schema is ParsedVerification:
             parsed = ParsedVerification(
                 satisfied=False,

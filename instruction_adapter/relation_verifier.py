@@ -1,8 +1,14 @@
 from __future__ import annotations
 
-import base64
+import hashlib
 import json
 import os
+from io import BytesIO
+from pathlib import Path
+
+from PIL import Image, ImageDraw
+
+from verification.images import image_input
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -11,7 +17,7 @@ from prompting.registry import RELATION_VERIFY
 from prompting.schemas import HAS_PYDANTIC, ParsedRelationResult
 from prompting.templates import RELATION_VERIFIER_PROMPT
 
-from .semantic_edges import DynamicSemanticEdgeVerifier, SemanticEdge
+from .semantic_edges import DynamicSemanticEdgeVerifier, SemanticEdge, relation_view_is_bound
 
 
 @dataclass
@@ -25,14 +31,6 @@ class RelationVerificationRequest:
         data = asdict(self)
         data["object"] = data.pop("object_")
         return data
-
-
-def _image_block(path: str) -> dict[str, Any] | None:
-    if not path or not os.path.exists(path):
-        return None
-    with open(path, "rb") as f:
-        data = base64.b64encode(f.read()).decode("utf-8")
-    return {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{data}"}}
 
 
 class VLMRelationVerifier:
@@ -50,53 +48,104 @@ class VLMRelationVerifier:
         prompt: str,
     ) -> dict[str, Any]:
         if os.getenv("STRIVE_RELATION_VERIFIER", "auto").lower() in ("0", "false", "no", "off"):
-            return {"verified": False, "confidence": 0.0, "reason": "relation verifier disabled"}
+            return {"verified": False, "confidence": 0.0, "need_better_view": True, "reason": "relation verifier disabled"}
         if os.getenv("LLM_OFFLINE", "0").lower() in ("1", "true", "yes", "on"):
-            return {"verified": False, "confidence": 0.0, "reason": "llm offline"}
+            return {"verified": False, "confidence": 0.0, "need_better_view": True, "reason": "llm offline"}
         if not HAS_PYDANTIC:
-            return {"verified": False, "confidence": 0.0, "reason": "pydantic unavailable"}
+            return {"verified": False, "confidence": 0.0, "need_better_view": True, "reason": "pydantic unavailable"}
 
-        request = RelationVerificationRequest(
-            relation=relation,
-            subject=subject,
-            object_=object_,
-            evidence_views=evidence_views,
-        )
-        content: list[dict[str, Any]] = [
+        views, images = [], []
+        for view in evidence_views:
+            if not relation_view_is_bound(view, subject["id"], object_["id"]):
+                continue
+            path = view.get("rgb_path") or view.get("image_ref") or view.get("path")
+            block, archived, digest = image_input(path, Path(path).parent / "relation_evidence")
+            bound = {**view, "rgb_path": archived, "image_sha256": digest, "regions": []}
+            region_blocks = []
+            with Image.open(archived) as frame:
+                for role, obj in (("subject", subject), ("reference", object_)):
+                    box = list(view["object_boxes"][obj["id"]])
+                    crop = frame.crop(box).convert("RGB")
+                    buffer = BytesIO()
+                    crop.save(buffer, format="PNG")
+                    source_crop_digest = hashlib.sha256(buffer.getvalue()).hexdigest()
+                    width = max(360, crop.width)
+                    canvas = Image.new("RGB", (width, crop.height + 80), "white")
+                    title = Image.new("RGB", (120, 16), "white")
+                    ImageDraw.Draw(title).text((2, 2), role.upper(), fill="black")
+                    canvas.paste(title.resize((360, 48), resample=Image.NEAREST), (0, 0))
+                    draw = ImageDraw.Draw(canvas)
+                    draw.text((6, 48), "Frame " + view["id"], fill="black")
+                    draw.text((6, 62), obj["id"], fill="black")
+                    x, y = (width - crop.width) // 2, 80
+                    canvas.paste(crop, (x, y))
+                    buffer = BytesIO()
+                    canvas.save(buffer, format="PNG")
+                    data = buffer.getvalue()
+                    crop_path = Path(archived).parent / (hashlib.sha256(data).hexdigest() + ".png")
+                    if not crop_path.exists():
+                        crop_path.write_bytes(data)
+                    crop_block, crop_archive, crop_digest = image_input(str(crop_path), crop_path.parent)
+                    region = {"role": role, "instance_id": obj["id"],
+                              "requested_concept": obj["requested_concept"], "demand": obj.get("demand", {}),
+                              "source_frame_id": view["id"], "source_image_sha256": digest,
+                              "bbox_xyxy_in_source": box, "rgb_path": crop_archive,
+                              "image_sha256": crop_digest,
+                              "presentation": {"source_crop_sha256": source_crop_digest,
+                                               "unscaled_crop_box_in_image": [x, y, x + crop.width, y + crop.height],
+                                               "outside_crop_role_caption": role}}
+                    bound["regions"].append(region)
+                    region_blocks.extend([{"type": "text", "text": json.dumps(region, ensure_ascii=False)}, crop_block])
+            views.append(bound)
+            images.extend([{"type": "text", "text": json.dumps(bound, ensure_ascii=False)}, block, *region_blocks])
+        if not views:
+            return {"verified": False, "confidence": 0.0, "need_better_view": True,
+                    "reason": "No readable frame with both instance regions bound to it."}
+        request = RelationVerificationRequest(relation, subject, object_, views)
+        content = [
             {"type": "text", "text": prompt},
             {"type": "text", "text": json.dumps(request.as_dict(), ensure_ascii=False, indent=2)},
+            *images,
         ]
-        for view in evidence_views:
-            block = _image_block(str(view.get("rgb_path") or view.get("path") or ""))
-            if block is not None:
-                content.append({"type": "text", "text": f"evidence_view: {view.get('id', '')}"})
-                content.append(block)
-
-        try:
-            client, model = get_client_and_model(self.vlm)
-            completion = client.beta.chat.completions.parse(
-                model=model,
-                messages=[
-                    {"role": "system", "content": RELATION_VERIFIER_PROMPT},
-                    {"role": "user", "content": content},
-                ],
-                response_format=ParsedRelationResult,
-                trace_label=RELATION_VERIFY.trace_label,
-            )
-            parsed = completion.choices[0].message.parsed
-            return {
-                "verified": bool(getattr(parsed, "verified", False)),
-                "confidence": max(0.0, min(1.0, float(getattr(parsed, "confidence", 0.0) or 0.0))),
-                "need_better_view": bool(getattr(parsed, "need_better_view", False)),
-                "reason": str(getattr(parsed, "reason", "") or ""),
-            }
-        except Exception as exc:
-            return {
-                "verified": False,
-                "confidence": 0.0,
-                "need_better_view": False,
-                "reason": f"relation vlm failed: {exc}",
-            }
+        client, model = get_client_and_model(self.vlm)
+        completion = client.beta.chat.completions.parse(
+            model=model,
+            messages=[
+                {"role": "system", "content": RELATION_VERIFIER_PROMPT},
+                {"role": "user", "content": content},
+            ],
+            response_format=ParsedRelationResult,
+            trace_label=RELATION_VERIFY.trace_label,
+        )
+        parsed = completion.choices[0].message.parsed
+        if parsed is None:
+            return {"verified": False, "confidence": 0.0, "need_better_view": True,
+                    "reason": "Relation verifier returned no parsed judgment."}
+        identities = (parsed.subject_identity.verdict, parsed.reference_identity.verdict)
+        if "false" in identities:
+            verdict = "false"
+        elif identities == ("true", "true"):
+            verdict = parsed.relation.verdict
+        else:
+            verdict = "unknown"
+        judgments = (("subject_identity", parsed.subject_identity),
+                     ("reference_identity", parsed.reference_identity), ("relation", parsed.relation))
+        return {
+            "verified": verdict == "true",
+            "confidence": float(parsed.confidence),
+            "need_better_view": verdict == "unknown",
+            "identity_judgments": {
+                role: {"verdict": judgment.verdict, "reason": judgment.reason,
+                       "instance_id": obj["id"], "requested_concept": obj["requested_concept"],
+                       "demand": obj.get("demand", {}),
+                       "source_crop_sha256": sorted({region["presentation"]["source_crop_sha256"]
+                           for view in views for region in view["regions"] if region["role"] == role})}
+                for role, obj, judgment in (("subject", subject, parsed.subject_identity),
+                                            ("reference", object_, parsed.reference_identity))
+            },
+            "reason": "; ".join(f"{role}={judgment.verdict}: {judgment.reason}"
+                                for role, judgment in judgments),
+        }
 
 
 class DynamicRelationService:

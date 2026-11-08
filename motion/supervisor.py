@@ -4,6 +4,7 @@
 请求超时保留占有权，查询和取消用于确认实际执行状态。
 """
 from __future__ import annotations
+from contextlib import contextmanager
 from dataclasses import dataclass
 from threading import RLock
 from typing import Any, TYPE_CHECKING
@@ -113,6 +114,21 @@ class MotionSupervisor:
             self._requests[request_id] = (signature, goal_id)
             self.phase = "accepted"
             return goal_id
+
+    @contextmanager
+    def submission_guard(self):
+        # 校验与占位共用锁；幂等重试仍由 submit 裁决。
+        with self._lock:
+            yield
+
+    @contextmanager
+    def idle_guard(self, *, control_epoch=None):
+        with self._lock:
+            if self.active_request_id is not None or self.held:
+                raise RuntimeError("Task revision requires idle, unheld motion")
+            if control_epoch is not None and control_epoch != self.control_epoch:
+                raise RuntimeError("Task revision has an outdated control epoch")
+            yield
 
     def poll_active(self):
         """Query the owned goal and release ownership on backend termination."""

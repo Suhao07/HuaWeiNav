@@ -15,12 +15,22 @@ def query_scene(session: TaskSession, *, step: int | None = None) -> CandidateSe
         Ranked observed candidates and matching/exclusion evidence. Querying
         leaves task progress and motion ownership unchanged.
     """
-    return query_candidates(
+    session.constraint_evaluator.register_mapper_objects(mapper=session, step=step)
+    result = query_candidates(
         session.plan, session.progress, session.snapshot, session.verification_ledger,
         matcher=session.concept_matcher, anchor_ledger=session.anchor_search_ledger,
         step=step, prior_adapter=session.prior_map_policy_adapter,
         prior_result=session.prior_result,
     )
+    demands = {target.id for target in session.spec.targets if target.demand}
+    session.destination_hypotheses = [
+        {"target_id": candidate.target_id, "candidate_uid": candidate.obj.uid,
+         "facility_concept": candidate.obj.label, "status": "requires_instance_verification",
+         "task_revision": session.spec.revision, "observation_timestamp": session.snapshot.timestamp,
+         "reason": candidate.record.get("reason", "")}
+        for candidate in result.candidates if candidate.target_id in demands
+    ]
+    return result
 
 
 class NavigationTools:
@@ -48,20 +58,50 @@ class NavigationTools:
         self.last_goal_id = None
 
     def observe(self):
-        """Project observed scene facts and authoritative state into model input."""
+        """Project task state, scoped stored judgments and backend observations.
+
+        Only snapshot.metadata['observation_images'] publishes current camera
+        frames. No capture, verification or historical-object image fallback is
+        performed; the returned image metadata is detached from the snapshot.
+        """
+        from copy import deepcopy
         from dataclasses import asdict
+        from verification.store import instruction_hash
         snapshot = self.session.snapshot
+        spec = self.session.spec
+        task_hash = instruction_hash(spec.raw_instruction)
         return {
-            "task": self.session.spec.as_dict(),
+            "task": spec.as_dict(),
             "progress": self.session.progress.as_dict(),
+            "destination_hypotheses": deepcopy(self.session.destination_hypotheses),
+            "search_context": {
+                "revision": self.session.search_revision,
+                "concepts": list({concept.id: concept.as_dict()
+                                  for concept in self.session.search_concepts}.values()),
+                "hypotheses": deepcopy(list(self.session.search_hypotheses.values())),
+            },
+            # Stored judgments retain their predicate/pair/dependency scope; no
+            # query or new verification is performed to fill missing evidence.
+            "verification_records": [record.as_dict()
+                                     for record in self.session.verification_ledger.records.values()
+                                     if record.instruction_hash == task_hash
+                                     and record.task_revision == spec.revision],
+            "observation_images": deepcopy(snapshot.metadata.get("observation_images", [])),
             "timestamp": snapshot.timestamp,
             "robot_pose": snapshot.robot_pose.as_dict(),
             # 地图按发现顺序追加对象；截取前缀会永久隐藏后来发现的目标。
             "objects": [obj.concept_payload() for obj in snapshot.objects],
             "frontiers": [asdict(item) for item in snapshot.frontiers],
             "motion": {"phase": self.motion.phase, "held": self.motion.held,
-                       "control_epoch": self.motion.control_epoch},
+                       "control_epoch": self.motion.control_epoch,
+                       "active_request_id": self.motion.active_request_id},
         }
+
+    def install_interpretation(self, plan, *, task_revision, search_revision, snapshot, record):
+        with self.motion.idle_guard(control_epoch=record["control_epoch"]):
+            return self.session.adopt_interpretation(
+                plan, task_revision=task_revision, search_revision=search_revision,
+                snapshot=snapshot, record=record)
 
     def query_scene(self):
         """Return domain-ranked candidates without choosing a motion."""
@@ -88,35 +128,36 @@ class NavigationTools:
                       candidate_uid=None, viewpoint_uid=None, frontier_uid=None):
         """Submit an observed viewpoint through the sole motion owner."""
         from motion.contracts import MotionGoalMode, NavigationIntent
-        if task_revision != self.session.spec.revision:
-            raise ValueError("Motion proposal belongs to another task revision")
-        if frontier_uid is not None:
-            from scene.contracts import Pose3D
-            if candidate_uid is not None or viewpoint_uid is not None:
-                raise ValueError("Choose either a frontier or an object viewpoint")
-            frontier = next(f for f in self.session.snapshot.frontiers if f.uid == frontier_uid)
+        with self.motion.submission_guard():
+            if task_revision != self.session.spec.revision:
+                raise ValueError("Motion proposal belongs to another task revision")
+            if frontier_uid is not None:
+                from scene.contracts import Pose3D
+                if candidate_uid is not None or viewpoint_uid is not None:
+                    raise ValueError("Choose either a frontier or an object viewpoint")
+                frontier = next(f for f in self.session.snapshot.frontiers if f.uid == frontier_uid)
+                intent = NavigationIntent(
+                    mode=MotionGoalMode.GO_TO_FRONTIER,
+                    goal_pose=Pose3D(frontier.position, frame_id=frontier.metadata["frame_id"]),
+                    metadata={"task_revision": task_revision, "frontier_uid": frontier_uid},
+                )
+                goal_id = self.motion.submit(intent, intent.to_motion_goal(), request_id=request_id,
+                                             control_epoch=control_epoch)
+                self.last_goal_id = goal_id
+                return {"goal_id": goal_id, "phase": self.motion.phase}
+            views = NavigationTools.query_viewpoints(self, candidate_uid)
+            if viewpoint_uid not in {v["uid"] for v in views}:
+                raise ValueError("Viewpoint is not associated with the observed instance")
+            viewpoint = next(v for v in self.session.snapshot.viewpoints if v.uid == viewpoint_uid)
             intent = NavigationIntent(
-                mode=MotionGoalMode.GO_TO_FRONTIER,
-                goal_pose=Pose3D(frontier.position, frame_id=frontier.metadata["frame_id"]),
-                metadata={"task_revision": task_revision, "frontier_uid": frontier_uid},
+                mode=MotionGoalMode.GO_TO_OBJECT, target_object_uid=candidate_uid,
+                goal_pose=viewpoint.pose,
+                metadata={"task_revision": task_revision, "viewpoint_uid": viewpoint_uid},
             )
             goal_id = self.motion.submit(intent, intent.to_motion_goal(), request_id=request_id,
                                          control_epoch=control_epoch)
             self.last_goal_id = goal_id
             return {"goal_id": goal_id, "phase": self.motion.phase}
-        views = NavigationTools.query_viewpoints(self, candidate_uid)
-        if viewpoint_uid not in {v["uid"] for v in views}:
-            raise ValueError("Viewpoint is not associated with the observed instance")
-        viewpoint = next(v for v in self.session.snapshot.viewpoints if v.uid == viewpoint_uid)
-        intent = NavigationIntent(
-            mode=MotionGoalMode.GO_TO_OBJECT, target_object_uid=candidate_uid,
-            goal_pose=viewpoint.pose,
-            metadata={"task_revision": task_revision, "viewpoint_uid": viewpoint_uid},
-        )
-        goal_id = self.motion.submit(intent, intent.to_motion_goal(), request_id=request_id,
-                                     control_epoch=control_epoch)
-        self.last_goal_id = goal_id
-        return {"goal_id": goal_id, "phase": self.motion.phase}
 
     def motion_status(self):
         """Poll actual execution feedback; polling never submits another goal."""

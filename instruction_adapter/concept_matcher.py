@@ -22,6 +22,8 @@ from .verifier import candidate_from_object, instruction_hash
 
 @dataclass
 class ConceptMatchRecord:
+    """身份判断与接近取证资格分离，不授予 STOP。"""
+
     instruction_hash: str
     concept_id: str
     object_uid: str
@@ -31,6 +33,7 @@ class ConceptMatchRecord:
     terminal_eligible: bool = False
     source: str = "unknown"
     reason: str = ""
+    candidate_eligible: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         return {**asdict(self), "verdict": (
@@ -48,6 +51,7 @@ class RuntimeConceptMatcher:
 
     def __init__(self, vlm: str = "cognav"):
         self.vlm = vlm
+        self.identity_resolver = None
         self.records: dict[tuple[str, ...], ConceptMatchRecord] = {}
         self.label_cache: dict[tuple[str, str, str], ConceptMatchRecord] = {}
         self.stats = {
@@ -80,6 +84,10 @@ class RuntimeConceptMatcher:
         dependency = json.dumps([_safe_confidence(getattr(obj, "confidence", 0.0)),
                                  _safe_list(getattr(obj, "position", [])), _safe_size(obj), visual], sort_keys=True)
         key = (inst_hash, _concept_signature(concept), candidate.uid, observed_label, hashlib.sha256(dependency.encode()).hexdigest())
+        identity = self._identity_match(raw_instruction, concept, candidate.uid, observed_label)
+        if identity is not None:
+            self.records[key] = identity
+            return identity
         cached = self.records.get(key)
         if cached is not None and cached.matches_concept is not None:
             self.stats["cache_hits"] += 1
@@ -117,6 +125,11 @@ class RuntimeConceptMatcher:
             candidate = candidate_from_object(obj, canonical_label=concept.name, step=step)
             observed_label = normalize_term(getattr(obj, "tag", candidate.detector_label))
             key = (inst_hash, _concept_signature(concept), candidate.uid, observed_label)
+            identity = self._identity_match(raw_instruction, concept, candidate.uid, observed_label)
+            if identity is not None:
+                self.records[key] = identity
+                out.append(identity)
+                continue
             cached = self.records.get(key)
             if cached is not None and cached.matches_concept is not None:
                 self.stats["cache_hits"] += 1
@@ -134,6 +147,7 @@ class RuntimeConceptMatcher:
                     matches_concept=label_cached.matches_concept,
                     confidence=label_cached.confidence,
                     terminal_eligible=label_cached.terminal_eligible,
+                    candidate_eligible=label_cached.candidate_eligible,
                     source=label_cached.source,
                     reason=label_cached.reason,
                 )
@@ -172,6 +186,7 @@ class RuntimeConceptMatcher:
                     object_uid=object_uid,
                     observed_label=observed_label,
                     source="prefiltered",
+                    candidate_eligible=_retrieval_compatible(concept, observed_label),
                     reason=(
                         "Skipped by generic concept-match budget. Exact matches are "
                         "handled before this filter; non-exact low-priority objects "
@@ -189,6 +204,7 @@ class RuntimeConceptMatcher:
                     object_uid=object_uid,
                     observed_label=observed_label,
                     source="offline",
+                    candidate_eligible=_retrieval_compatible(concept, observed_label),
                     reason="LLM matcher unavailable and no exact match.",
                 )
                 self.records[(inst_hash, _concept_signature(concept), object_uid, observed_label)] = record
@@ -202,6 +218,12 @@ class RuntimeConceptMatcher:
         )
         out.extend(batch_records)
         return out
+
+    def _identity_match(self, raw_instruction, concept, object_uid, observed_label):
+        if self.identity_resolver is None:
+            return None
+        return self.identity_resolver(raw_instruction=raw_instruction, concept=concept,
+                                      object_uid=object_uid, observed_label=observed_label)
 
     def _compute_match(
         self,
@@ -230,6 +252,7 @@ class RuntimeConceptMatcher:
                 object_uid=object_uid,
                 observed_label=observed_label,
                 source="offline",
+                candidate_eligible=_retrieval_compatible(concept, observed_label),
                 reason="LLM matcher unavailable and no exact match.",
             )
 
@@ -268,9 +291,11 @@ class RuntimeConceptMatcher:
             concept_id=concept.id,
             object_uid=object_uid,
             observed_label=observed_label,
-            matches_concept=bool(parsed.matches_concept),
+            matches_concept=parsed.matches_concept,
             confidence=max(0.0, min(1.0, float(parsed.confidence or 0.0))),
-            terminal_eligible=bool(parsed.terminal_eligible and concept.terminal),
+            terminal_eligible=bool(parsed.matches_concept is True and parsed.terminal_eligible and concept.terminal),
+            candidate_eligible=(parsed.matches_concept is True or
+                                (parsed.matches_concept is None and parsed.candidate_eligible)),
             source="llm",
             reason=str(parsed.reason or ""),
         )
@@ -290,8 +315,7 @@ class RuntimeConceptMatcher:
         observed_label: str,
     ) -> ConceptMatchRecord | None:
         inst_hash = instruction_hash(raw_instruction)
-        concept_terms = {normalize_term(x) for x in concept.match_terms if normalize_term(x)}
-        if observed_label and observed_label in concept_terms:
+        if observed_label and observed_label == normalize_term(concept.name):
             return ConceptMatchRecord(
                 instruction_hash=inst_hash,
                 concept_id=concept.id,
@@ -300,8 +324,9 @@ class RuntimeConceptMatcher:
                 matches_concept=True,
                 confidence=1.0,
                 terminal_eligible=bool(concept.terminal),
+                candidate_eligible=True,
                 source="exact",
-                reason="Observed label exactly matches a grounded concept term.",
+                reason="Observed label exactly matches the concept name.",
             )
         return None
 
@@ -327,8 +352,10 @@ class RuntimeConceptMatcher:
             "task": (
                 "For each observed object, decide whether it satisfies the concept "
                 "for the requested role. Return a JSON object keyed by every supplied uid, "
-                "each containing matches_concept, confidence, terminal_eligible and a concise reason. "
-                "Include negative judgments for incompatible labels."
+                "each containing matches_concept (true/false/null), candidate_eligible, "
+                "confidence, terminal_eligible and a concise reason. Use null for "
+                "compatible broad labels that do not establish identity, and false "
+                "for incompatible labels."
             ),
         }
         completion = client.beta.chat.completions.parse(
@@ -354,9 +381,11 @@ class RuntimeConceptMatcher:
                 concept_id=concept.id,
                 object_uid=object_uid,
                 observed_label=observed_label,
-                matches_concept=bool(item.matches_concept),
+                matches_concept=item.matches_concept,
                 confidence=max(0.0, min(1.0, float(item.confidence or 0.0))),
-                terminal_eligible=bool(item.terminal_eligible and concept.terminal),
+                terminal_eligible=bool(item.matches_concept is True and item.terminal_eligible and concept.terminal),
+                candidate_eligible=(item.matches_concept is True or
+                                    (item.matches_concept is None and item.candidate_eligible)),
                 source="llm_batch",
                 reason=str(item.reason or ""),
             )
@@ -468,23 +497,16 @@ def _concept_match_batch_limit() -> int:
 
 
 def _should_cache_label_match(record: ConceptMatchRecord) -> bool:
-    """Cache confident prompt results at role-aware label granularity.
+    """仅缓存明确类别判断，未知身份仍允许后续补证。"""
+    return bool(record.observed_label and record.matches_concept is not None
+                and record.source in ("llm_batch", "exact"))
 
-    The cache key includes instruction hash and concept id, so this does not
-    become a global synonym table. It only prevents repeated LVLM calls when
-    mapper uid churn creates multiple instances with the same observed label
-    under the same instruction concept.
-    """
 
-    if not record.observed_label:
-        return False
-    try:
-        threshold = float(os.getenv("STRIVE_CONCEPT_LABEL_CACHE_CONF", "0.75"))
-    except Exception:
-        threshold = 0.75
-    if record.source not in ("llm_batch", "exact"):
-        return False
-    return float(record.confidence or 0.0) >= threshold
+def _retrieval_compatible(concept: ConceptQuery, observed_label: str) -> bool:
+    """检索词和待核同义词只授予取证资格，不能证明身份。"""
+    return bool(observed_label and observed_label in {
+        normalize_term(term) for term in [*concept.detector_terms, *concept.aliases]
+    })
 
 
 def _object_image_blocks(obj: Any) -> list[dict[str, Any]]:

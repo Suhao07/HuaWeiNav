@@ -1,9 +1,3 @@
-import sys
-import types
-
-
-sys.modules.setdefault("cv2", types.SimpleNamespace())
-
 from instruction_adapter.view_control import ViewControlState
 
 

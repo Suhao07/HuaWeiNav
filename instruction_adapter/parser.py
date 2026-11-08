@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from typing import Any, Iterable
 
+from instruction.compiler import InitialInstructionCompiler
 from .compiler import compile_instruction_plan
 from .contracts import InstructionPlan, StriveInstructionSpec
 from .ontology import normalize_term
@@ -41,6 +42,8 @@ class StriveInstructionParser:
         dataset_target: str = "",
         available_classes: Iterable[str] | None = None,
         episode_info: dict[str, Any] | None = None,
+        *,
+        initial_compiler: InitialInstructionCompiler | None = None,
     ) -> InstructionPlan:
         return compile_instruction_plan(
             raw_instruction=raw_instruction,
@@ -50,6 +53,7 @@ class StriveInstructionParser:
             backend=self.backend,
             vlm=self.vlm,
             strict_available_classes=self.strict_available_classes,
+            initial_compiler=initial_compiler,
         )
 
     def parse(

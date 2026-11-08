@@ -37,13 +37,15 @@ class ConceptQuery:
     negative_terms: list[str] = field(default_factory=list)
     terminal: bool = False
     source: str = ""
+    demand: dict[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
 
     @property
     def match_terms(self) -> list[str]:
-        return _dedupe_text([self.name] + list(self.detector_terms) + list(self.aliases))
+        """仅含语义名及真实别名；检测词只用于检索。"""
+        return _dedupe_text([self.name] + list(self.aliases))
 
 
 @dataclass
@@ -65,13 +67,15 @@ class TargetQuery:
     terminal: bool = True
     source: str = ""
     concept: ConceptQuery | None = None
+    demand: dict[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
 
     @property
     def match_terms(self) -> list[str]:
-        terms = [self.name] + list(self.detector_terms) + list(self.aliases)
+        """目标身份名称不包含宽泛检测词。"""
+        terms = [self.name] + list(self.aliases)
         if self.concept is not None:
             terms.extend(self.concept.match_terms)
         return _dedupe_text(terms)
@@ -87,6 +91,7 @@ class TargetQuery:
             aliases=list(self.aliases),
             terminal=self.terminal,
             source=self.source,
+            demand=dict(self.demand),
         )
 
 
@@ -121,6 +126,7 @@ class SearchPriors:
     room_hints: list[str] = field(default_factory=list)
     support_objects: list[str] = field(default_factory=list)
     affordances: list[str] = field(default_factory=list)
+    destination_hypotheses: dict[str, list[str]] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -260,6 +266,5 @@ class StriveInstructionSpec:
         """
 
         terms = [self.canonical_target]
-        terms.extend(self.target_detector_prompts)
         terms.extend(self.target_aliases)
         return _dedupe_text(terms)
