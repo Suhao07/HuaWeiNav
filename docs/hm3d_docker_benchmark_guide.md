@@ -50,6 +50,37 @@ bash docker/run_scene_object_nav.sh \
 
 该入口筛选并物化单 episode，适合调试；正式数据来源应通过显式 benchmark / split 固定，见 [Benchmark Provider](benchmark_providers.md)。
 
+### 观测模式与对照口径
+
+`--observation-mode single` 为新默认值（主 Python 入口也接受 `--observation_mode`）。每轮只检测当前原始 RGB-D 帧，使用同一帧的位姿投影，保留地图、对象融合及历史证据，不执行用于凑齐输入视角的自动转向。检测与最终定向验证共用原有任务合同，不放宽 STOP 条件；信息不足仍可能由后续导航和定向复核补看，不承诺单帧覆盖整间房。
+
+单视角不会为了补齐无效深度而自动环视。临时建图缓存被房间选择或前序任务清空时，先用当前观测和传入节点的历史点云补齐，不把缓存清理误判为地图失效。当前回合若仍没有可用于建图的可通行几何（例如首帧深度全部无效），guided/agent 以 `observation_geometry_unavailable` 结束，legacy 返回规划失败；不伪造动作、访问状态或成功结果。A/B 统计应保留这些失败，而不是只比较能启动移动的回合。
+
+`--observation-mode multi` 保留历史采集路径：`baseline_guided` 每批4方向，看到候选可提前结束，最多覆盖12方向；显式 `agent` / `legacy` 是12方向全景。它不是“只把发给 VLM 的图像张数改多”：Habitat 上层 Agent 请求仍使用当前图像，地图已融合扫描证据。无任务 `collect_hm3d_patrol.py` 保留全景采集。
+
+在上面的同一条命令中分别添加 `--observation-mode single` / `--observation-mode multi`，并指定不同 `save_dir`；完整可复制示例见 [交付 README](../README.md#3-单视角默认模式与多视角对照)。GOAT 连续导航与语言子集启动器也支持该开关，启动器参数放在 `--` 分隔符前。
+
+运行根目录 `run_manifest.json` 和 guided/agent 的 `harness/termination.json` 记录 `observation_mode`；单帧与 guided 自适应扫描的 `episode-*/observation_cycles.jsonl` 记录 `mode`、`views`、起止 step 和完成状态。`cycle_complete=true` 只代表这一批处理结束，`complete` 仍表示全景覆盖完成：单视角为 false，不能把节点已访问解释为360°已扫描。全景 legacy/agent 的帧数与动作从 RGB/轨迹产物核对。
+
+A/B 使用相同冻结源码、完整任务身份（尤其起点与朝向）、模型/权重、预算、先验图与评分协议。除了 SR/SPL，分别核对实际转向/动作、处理帧数、感知/验证/Agent 调用和耗时；同样的环境步预算下，multi 扫描本身会消耗转向步。旧版本结果若没有模式字段，按其冻结源码认定，不能按新默认值补写成 single。CPU 测试只验证接口和状态机，性能与导航成功率需真实仿真对照，不能由单个 smoke 外推。
+
+#### 2026-11-09本机功能验证
+
+使用 RTX 3090、`strive-hm3d:local`、本机 Qwen2.5-VL-3B（BF16、32K上下文、vLLM 0.17.1），图像不外发。测试服务只将 `guided_json` 转为 vLLM 新版 `structured_outputs.json`，保留原 JSON schema，关闭离线与解析回退；该服务不是生产 Qwen3.5 服务。源码、权重、镜像标识及失败尝试保存在本机忽略目录 `logs/view_mode_smoke_20261109/`，以 `source_freeze_bounded80.json`、`execution_bounded80.json`、`acceptance_summary.json` 为80步配对依据，不提交运行图片或模型请求。
+
+场景为 `wcojb4TFT35`，类别 `tv`，rank 0，两组起点、朝向及源码哈希一致。单场景入口的 `auto` 实际选中了本机 `hm3d_ovon/val_seen_complex_balanced_2k` 分片，来源 episode 为 `instr_0418_begin_your_journey_by_entering_the_entra_base_6951`，运行指令按类别适配成 `Find tv`；这不是官方 ObjectNav 全量评测，也不是原复杂语言指令评测。复现实验须显式绑定相同来源，不能只靠 `auto`。两组预算均为80环境步、20次高层模型调用。
+
+| 观测模式 | 终止 | 环境步 / 行程 | 建图采集帧 / 额外采集动作 | 全部模型调用 | 基准 success / SPL |
+|---|---|---|---|---|---|
+| single | `episode_limit`，未接受目标 | 80 / 11.25m | 6轮各1帧 / 0步 | 8 | 0 / 0 |
+| multi | 内部 `verified_finish`，已发STOP | 40 / 5.00m | 1轮8帧 / 7步 | 6 | 0 / 0 |
+
+single 到达了5个 frontier，6轮采集均满足 `start_step == end_step`，地图继续增长，没有用额外转向补齐输入。multi 最终距基准目标10.84m，画面为镜面/椅子区域，内部模型接受不能算成功；single 距目标0.85m也因没有合法STOP而仍为失败。这里的采集帧数不含运动和定向复核帧，实际 RGB 轨迹分别为80/40帧；本入口没有完整逐动作类型账本，不从这些数字推算全部转向次数。进程耗时分别约143/73秒，包含加载和产物保存，仅供本机排障，不作效率排名。
+
+此前120步同源码对照中，single 在周期复议时收到修改不可变 ObjectNav 目标的模型提案，被 `Only language interpretations may be revised` 拒绝；multi 在52步内部接受并STOP，但基准 success/SPL 仍为0。更早的无约束解释超长、8K上下文不足和主动停止的预跑也保留，未混入80步结果。80步补测只覆盖有界观测/运动链路，不消除120步暴露的模型协议问题或视觉误接受，后续正式评测仍需解决并复验。
+
+667项定向回归全部覆盖：主环境658通过、9项Open3D用例跳过；9项均由现有真实CPU Open3D环境补测通过。回归还覆盖锚点复核后发现新目标、临时缓存清空后的连续任务，以及有效深度与饱和深度混合时保留原始投影证据。Isaac与实机效果不在本次仿真验收范围内。
+
 ## 3. 自然语言与数据集目标
 
 ```bash

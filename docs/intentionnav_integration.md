@@ -86,6 +86,32 @@ start_rotation_quat_wxyz
 
 六字段逐项与官方任务核对。场景、原文、风格、起点或朝向不匹配时，该运行可以作为非官方输入实验保留，但 `evaluation_binding` 为 unavailable，相关指标为 null，不能继承官方目标与最短路评分。策略容器不挂载官方目标元数据或场景真值，仅评测端读取。
 
+### 观测模式
+
+`launch_intentionnav_episode.py` 与直接策略入口 `run_intentionnav.py` 均默认 `--observation-mode single`。每轮只做一次当前 RGB-D observe 和感知；不先转向、不恢复朝向后重复采集，当前图像也会投影地图里历史对象的可见部分。历史地图持续积累，目标定向取证仍保留。
+
+多视角对照需显式指定 `--observation-mode multi --panorama-views 4`。静止决策观测按4方向感知后恢复原朝向，再发布一帧当前投影，所以是 **4次感知 / 5帧图像**，并非4帧；N可调整但 multi 要求N≥2。运动跟踪刷新和定向取证仍用单视角；single 模式忽略方向数量配置，以实际记录的帧数为准。
+
+```bash
+python scripts/launch_intentionnav_episode.py \
+  --selection-id SEL_001 --style formal \
+  --sim-gpu 0 --policy-gpu 1 --port 9466 --model-port 18182 \
+  --max-moves 30 --max-model-calls 60 \
+  --observation-mode single \
+  --output outputs/intentionnav/view-single
+
+python scripts/launch_intentionnav_episode.py \
+  --selection-id SEL_001 --style formal \
+  --sim-gpu 0 --policy-gpu 1 --port 9466 --model-port 18182 \
+  --max-moves 30 --max-model-calls 60 \
+  --observation-mode multi --panorama-views 4 \
+  --output outputs/intentionnav/view-multi
+```
+
+两条命令顺序运行，使用相同六字段公开输入、冻结源码/模型、freemap及预算，输出目录必须不同且未存在。模式是运行参数，不写入六字段任务文件，不改变官方评分绑定。启动和策略回执保存配置；`scene_snapshots.jsonl` / `perception.jsonl` 可核对实际图像与感知次数。比较 SR/SPL 同时列出视角/转向、移动、模型调用与耗时，不能将运动学相机结果解释为实体机器人安全或效率。
+
+当前完成的是 CPU 协议与回归验证；2026-11-09本机缺少完整 Isaac 运行时与数据，未运行新的 IntentionNav 仿真。同期 Habitat 功能对照不能替代这里的 single/multi 导航效果验收，原历史结果不重标、不覆盖。
+
 ## 4. 运动与评分
 
 [启动器](../scripts/launch_intentionnav_episode.py) 冻结源码与镜像 ID，保存命令及公开输入哈希；运动、STOP和退出后评分保持分离。freemap 按官方 `==1` 表达可行走，不把全部非零值当可行走。错误任务/控制版本拒绝执行，不替模型修改参数。

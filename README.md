@@ -403,6 +403,37 @@ bash docker/run_hm3d_baseline.sh \
 
 离线检查先运行 preflight 和回归测试。`LLM_OFFLINE` / `STRIVE_LLM_FALLBACK` 是显式兼容选项，不保证当前严格语义链路能完成导航；缺少验证证据不能自动接受目标，离线 smoke 也不能替代真实模型或导航验收。
 
+### 3. 单视角默认模式与多视角对照
+
+导航观测默认是 `--observation-mode single`：每轮直接处理当前一帧 RGB-D，不为收集输入固定原地环视，地图与历史对象记忆继续积累。导航转向、接近目标后的定向复核仍可获取新视角；这不是无深度、无地图的纯 RGB 方法，也不是禁止机器人转动。
+
+| 参数 | Habitat / GOAT 导航 | Isaac / IntentionNav 导航 |
+|---|---|---|
+| `--observation-mode single`（默认） | 当前原始图像检测、单帧深度投影，不拼三联图 | 一次 observe / 感知，只发布一个当前传感器图像，不补拍同朝向重复帧 |
+| `--observation-mode multi` | `baseline_guided` 保留每批4方向、最多12方向的自适应扫描；`agent` / `legacy` 保留12方向全景 | 默认4方向感知，再恢复起始朝向发布当前帧；可用 `--panorama-views N` 调整（N≥2） |
+
+例如保持同一 Habitat 任务与预算，仅切换观测模式、分开输出目录：
+
+```bash
+bash docker/run_hm3d_baseline.sh \
+  --benchmark hm3d_objectnav --start_episode 0 --eval_episodes 1 \
+  --decision_owner baseline_guided --observation-mode single \
+  --agent_max_model_calls 100 --max_steps 500 \
+  --vlm self_hosted --save_dir hm3d_view_single
+
+bash docker/run_hm3d_baseline.sh \
+  --benchmark hm3d_objectnav --start_episode 0 --eval_episodes 1 \
+  --decision_owner baseline_guided --observation-mode multi \
+  --agent_max_model_calls 100 --max_steps 500 \
+  --vlm self_hosted --save_dir hm3d_view_multi
+```
+
+Habitat 主入口也接受 `--observation_mode`。`scripts/run_goat.py`、`scripts/launch_goat_episode.py` 使用同一连字符开关，GOAT 启动器参数放在 `--` 分隔符之前；历史参考图像不计作当前传感器视角。无任务巡采仍保持完整全景，实物 ROS 实时观测入口不受此仿真开关影响。
+
+恢复旧观测策略必须显式指定 `multi`，但不代表恢复旧代码所有行为。对照需固定源码、任务身份/起点/朝向、模型、预算和评分，统计成功率/SPL、动作（含转向）、感知帧数及模型调用/耗时，不只比较 Agent 请求的图片数。Habitat 高层决策仍主要使用当前图像，多视角信息经地图进入决策。配置与产物说明见 [HM3D 观测对照](docs/hm3d_docker_benchmark_guide.md#观测模式与对照口径) 和 [IntentionNav 观测模式](docs/intentionnav_integration.md#观测模式)。
+
+本功能已完成代码接线、667项定向回归（含真实 CPU Open3D）及2026-11-09本机 Habitat 小规模功能对照：single 的6轮单帧建图未额外消耗动作，能连续到达 frontier 并按预算结束。该80步同任务对照两组基准 success/SPL 均为0，multi 的内部验证通过也不等于基准成功；120步 single 另暴露模型非法修改固定目标而被拒绝的问题，失败记录保留。完整口径见上述 HM3D 观测对照，不能据此声称导航成功率、时延、Isaac或实机效果已验收。既有运行任务与冻结源码不会因本地默认值改变而自动切换。
+
 ### 指定场景和目标物
 
 推荐使用单场景入口：
