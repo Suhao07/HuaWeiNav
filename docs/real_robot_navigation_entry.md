@@ -1,12 +1,12 @@
 # 正式实物模式一键入口
 
-**实物模式：已完成（2026-11-05，bridge-off 规划与速度输出验收）。** 已验证真实输入下为前方 chair 的接近目标生成局部轨迹和限幅速度；未实际行驶或到达。默认 bridge 关闭。详细参数、迁移方法及停止阈值与到达容差的配合见 [实物参数调节说明](real_robot_parameter_tuning.md)。
+**实物模式：已实现。** 正式输入、目标接近、Action、规划/跟踪及安全速度输出链路已接通，并于 2026-11-05 完成 bridge-off 验证；实际行驶与到达仍为独立现场验收项。默认 bridge 关闭。常用参数为停止 **0.5 m**、到达 **1.0 m**、前视/减速 **1.0 m**；完整参数及迁移方法见 [实物参数调节说明](real_robot_parameter_tuning.md)。
 
 ## 后续停止阈值修复（本地离线验证，待更新部署镜像）
 
 按用户要求，正式默认 **停止距离 0.5 m、Action 到达容差 1.0 m**；前视距离 1.0 m、减速距离 1.0 m。新增 `NAV_FOLLOWER_STOP_DISTANCE_M`、`NAV_FOLLOWER_LOOKAHEAD_M`、`NAV_FOLLOWER_SLOWDOWN_DISTANCE_M`。入口拒绝非有限/非正数、停止距离不小于容差或前视距离的组合。`--check` 可查看有效值，不会开启 bridge。
 
-旧 0.20/0.10 m 组合的提前停止条件已离线复现；69 项相关测试通过。见 [诊断及离线证据](real_robot_stop_distance_diagnosis.md)。下文 0.10 m 容差和镜像 ID 的验收数据属于此前正式实测，未被本次离线修复覆盖。当前车端旧镜像不包含新参数接线；需将本次源码和 `real_robot/navigation_parameters.py` 纳入构建、重建 ROS 安装目录，并使用新镜像后才会生效。本轮未构建车端镜像、未启动组件或运动。
+旧 0.20/0.10 m 组合的提前停止条件已离线复现；69 项相关测试通过。见 [参数手册中的诊断及离线证据](real_robot_parameter_tuning.md#停止距离离线诊断)。下文 0.10 m 容差和镜像 ID 的验收数据属于此前正式实测，未被本次离线修复覆盖。当前车端旧镜像不包含新参数接线；需将本次源码和 `real_robot/navigation_parameters.py` 纳入构建、重建 ROS 安装目录，并使用新镜像后才会生效。本轮未构建车端镜像、未启动组件或运动。
 
 1.0 m 是到接近点的容差，standoff 仍为 0.8 m；容差内候选不派发 Action，不强行绑定或宣称语义成功。
 
@@ -89,6 +89,8 @@ docker cp huawei-vln-navigation:/workspace/STRIVE/output/runtime/navigation/. lo
 6. 合同还必须填写 `agilex_rosbridge.hardware_state` 的 `allowed_control_modes`、`ready_base_states`、`ready_fault_codes`、`telemetry_timeout_s`；不要把未核定的故障码（包括此前的 128）加入 ready 列表。
 7. 同步合同与 `NAV_MAX_*` 的速度/加速度/超时限制，以及下表话题。合同或 bridge 自检失败时不得放宽故障码绕过。
 
+遥测失效、过期或选源失败会撤销授权；恢复遥测不等于恢复自动运动，必须重新显式授权。桥接器发出零速不能证明网络断开后底盘已停止，底盘 watchdog 和人工接管须独立实测。
+
 合同中的关键接口须与 live 入口一致：
 
 | 项目 | live 值 |
@@ -125,6 +127,8 @@ bash scripts/run_real_robot_navigation.sh
 一次车端复测遇到外部 LIO 进程存活但停止发布的故障；preview 因没有定位与对象输入保持 WAIT/零速度，没有把该窗口记为规划成功。用户确认车位未变后，单独恢复同一保存地图的 Point-LIO 并使用之前验证过的初值。这个恢复步骤不加入自动一键入口：未知车位时不能自动复用旧初值。
 
 DDS 传输：正式入口设置 `FASTRTPS_DEFAULT_PROFILES_FILE=/workspace/STRIVE/real_robot/config/fastdds_udp.xml`，明确使用 UDPv4，关闭共享内存传输。宿主 Point-LIO 也使用同一配置内容；本次通过 tmux `livox_odom` 会话环境设置。若重新创建该传感器会话/改为 systemd 服务，需要在定位进程启动前设置宿主配置路径，不能只在导航容器内设置。相机/雷达自身的启动和地图初值仍由传感器部署维护。
+
+维护外部 LIO 时保留原启动命令的全部已核定参数、地图初值及会话归属，确认只有一个定位实例；漏参或重复启动不能作为恢复办法。需要崩溃诊断时，仅针对明确归属的 PID，修改系统级 core/驱动配置另需授权；持续运行正常、冷启动定位与接管恢复应分别验收。
 
 ## 最终部署回执（2026-11-05）
 

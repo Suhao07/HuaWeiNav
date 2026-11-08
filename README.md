@@ -1,9 +1,13 @@
 # VLN
 
-VLN 是面向 HM3D ObjectNav 和实物机器人部署的语义导航框架。
+VLN 是面向 HM3D / Habitat、IntentionNav / Isaac 与实物机器人的语义导航框架。
 
-- HM3D / Habitat 仿真评测：`objnav_benchmark_with_process_obs.py`
-- SysNav 实物机器人适配与部署：`real_robot/`
+本文是交付的**从零部署统一入口**；数据、权重、镜像的原有部署步骤继续保留，新增模型服务、指令合同和评测流程在下文接入。命令默认在 STRIVE 仓库根目录执行，路径与 GPU 分配由部署者设置。
+
+- Habitat 默认使用 `baseline_guided`；`legacy` 和自由 `agent` 是显式对照模式。
+- 自然语言编译为不可变 `TaskSpec`；候选检索、任务验证、运动回执和外部评分各自保留职责。
+- IntentionNav 使用独立 Isaac 入口，不等同于 Habitat 默认模式或官方 Isaac 4.5 复现。
+- 实物模式已实现，默认 bridge-off；调试参数见文末速查，实际行驶与到达另行验收。
 
 
 ## 目录
@@ -14,6 +18,7 @@ VLN 是面向 HM3D ObjectNav 和实物机器人部署的语义导航框架。
 - [推荐环境](#推荐环境)
 - [仿真器构建流程](#仿真器构建流程)
 - [运行 HM3D 仿真评测](#运行-hm3d-仿真评测)
+- [新增能力与交付验收](#新增能力与交付验收)
 - [本地源码安装备选方案](#本地源码安装备选方案)
 - [环境变量](#环境变量)
 - [输出结果](#输出结果)
@@ -361,18 +366,42 @@ python docker/preflight.py
 
 ## 运行 HM3D 仿真评测
 
-### 离线 smoke 测试
+### 1. 配置模型客户端
 
-不调用真实 LLM，只验证 Habitat、检测、分割、建图、规划和产物保存链路：
+先按 [LVLM 接入与部署基础](docs/lvlm_server_deployment.md) 验证实际图像与结构化请求。商业 API 可沿用下方 Ark 示例；已部署的 Qwen3.5 服务使用：
 
 ```bash
-LLM_OFFLINE=1 STRIVE_LLM_FALLBACK=1 \
+export LLM_PROVIDER=self_hosted
+export STRIVE_LLM_CLIENT=self_hosted
+export VLN_LVLM_BASE_URL="http://127.0.0.1:18182/v1"
+export VLN_LVLM_MODEL="huaweivln-qwen3.5-4b"
+export VLN_LVLM_GUIDED_JSON=1
+export VLN_LVLM_TIMEOUT_S=180
+export VLN_LVLM_TRANSPORT_RETRIES=0
+export VLN_LVLM_PARSE_RETRIES=1
+export LLM_OFFLINE=0
+export STRIVE_LLM_FALLBACK=0
+```
+
+`VLN_LVLM_API_KEY` 通过私有环境注入，不写入命令历史或仓库。上述回环地址仅适用于模型与使用 host 网络的容器在同一台机器；跨机使用经过认证的 HTTPS endpoint。`GUIDED_JSON=1` 只表示客户端发送 JSON schema，请求是否被约束解码取决于服务端，不能据此宣称启用了 XGrammar。
+
+### 2. 运行一例真实模型 smoke
+
+```bash
 bash docker/run_hm3d_baseline.sh \
+  --benchmark hm3d_objectnav \
   --eval_episodes 1 \
   --start_episode 0 \
-  --save_dir hm3d_strive_offline_smoke \
-  --vlm ark
+  --decision_owner baseline_guided \
+  --agent_max_model_calls 100 \
+  --max_steps 500 \
+  --save_dir hm3d_self_hosted_smoke \
+  --vlm self_hosted
 ```
+
+初始指令解释与 Agent 调用共用 `agent_max_model_calls`；感知、关系及最终验证调用仍分别统计，不把它当成全部模型调用总上限。ObjectNav 类别输入可以确定性编译，不需要额外语言解析。
+
+离线检查先运行 preflight 和回归测试。`LLM_OFFLINE` / `STRIVE_LLM_FALLBACK` 是显式兼容选项，不保证当前严格语义链路能完成导航；缺少验证证据不能自动接受目标，离线 smoke 也不能替代真实模型或导航验收。
 
 ### 指定场景和目标物
 
@@ -420,18 +449,57 @@ bash docker/run_scene_object_nav.sh \
   --custom_instruction "find the television in the scene"
 ```
 
-如果只想使用规则解析，不调用 LLM：
+普通 ObjectNav 不需要开启 adapter；`--instruction_adapter_backend rules` 是旧的数据集目标兼容路径，不是任意自然语言的规则解析器，也不代表运行时不调用模型。当前非 legacy 指令入口使用有界初始编译，解析失败不得悄悄改成数据集目标。配置 self-hosted 后，将上述命令的 `--vlm ark` 改成 `--vlm self_hosted`。
 
-```bash
---instruction_adapter_backend rules
-```
+批量数据选择、身份清单、重跑配对与日志诊断统一见 [HM3D 评测操作指南](docs/hm3d_docker_benchmark_guide.md)。每次使用新输出目录，不通过清空历史结果来混合新旧版本。
 
 HM3D 语义先验地图的生成、批量构建、运行接入和有/无先验对比评测见
 [HM3D 语义先验地图与对比评测](docs/hm3d_prior_map_evaluation.md)。
 
+## 新增能力与交付验收
+
+### 指令、检索与完成合同
+
+- 原始任务义务保存在 `TaskSpec`，活动/材料/资源需求不会被搜索设施假设替代；检索词更新与任务语义修订分别计版本。
+- 动态检索词进入现有 DINO/SAM 感知链路；模型允许接近某候选，不等于该实例已被验证。
+- 关系判断分别检查目标身份、参照身份和有方向的关系；功能条件需候选绑定的图像证据与观测 ID，不能靠常识猜测完成。
+- 当前图像、稳定实例、几何依赖与任务/控制版本进入准入；任务进度只经 reducer 更新，运动到达、任务接受和外部评分分别记录。
+
+具体接口见 [指令与证据合同](docs/instruction_adapter.md) 和 [Harness 运行合同](docs/harness_refactor_design.md)，历史实现和小样本诊断移入 [文档归档](docs/archive/README.md)。
+
+### 评测入口与范围
+
+| 用途 | 当前入口 | 结果边界 |
+|---|---|---|
+| HM3D 简单指令 | [HM3D 操作指南](docs/hm3d_docker_benchmark_guide.md) | 同一冻结清单重跑，报告 evaluator SR/SPL 和工程状态 |
+| 需求指令 / Isaac | [IntentionNav 部署与评分](docs/intentionnav_integration.md) | 公开输入与官方任务精确匹配后才给官方评分 |
+| 交付条件与困难子集 | [4,000 条验收口径](docs/acceptance_4500.md) | 简单2,000 + 需求2,000；困难500是需求组子集 |
+| GOAT / LangMap 研究 | [Benchmark 协议](docs/benchmark_providers.md)、[LangMap 接入](docs/langmap_integration.md) | 保留研究入口，不计入当前交付条件 |
+| 实物机器人 | [正式一键入口](docs/real_robot_navigation_entry.md) | 已实现；bridge-off 规划/速度输出已验证，实车行驶独立验收 |
+
+GOAT 语言派生任务新增基于冻结运行 NavMesh 与实际运动轨迹的独立评分；IntentionNav 新增公开输入快照及官方身份绑定。代码接入、数据冻结、纯 Python 回归通过都不等于批量导航通过。
+
+### 交付验证顺序
+
+1. 固定源码、镜像 ID、数据/权重版本与模型服务配置，不仅记录镜像标签或 Git HEAD。
+2. 完成容器 preflight、模型图像/结构化 smoke；确认错误和超时不会变成目标接受。
+3. 运行一例完整 episode，核对身份、当前图像、动作/STOP 回执和独立 evaluator。
+4. 通过固定回归集后，再按授权运行批量清单。分母保留失败与异常，未知分数不伪装成0或排除。
+5. 新旧版本只对同一身份的已完成样本配对；没有完整结果时不发布全量 SR/SPL。
+
+CPU 回归可在安装好测试依赖的开发环境执行，例如：
+
+```bash
+PYTHONPATH="$PWD" PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+  python -B -m pytest -q -p no:cacheprovider --capture=sys \
+  tests/test_episode_selection.py tests/test_lvlm_smoke_client.py
+```
+
+这些测试不启动真实模型或仿真器；导航与实物验收仍需对应运行证据。
+
 ## 本地源码安装备选方案
 
-如果不使用 Docker，可以本地安装。但这条路径更容易受 CUDA、Habitat、MMDetection 版本影响，推荐只用于开发调试。
+如果不使用 Docker，可以本地安装。但这条路径更容易受 CUDA、Habitat、MMDetection 版本影响，推荐只用于开发调试。下列 Python 3.12 开发环境不是上文 Python 3.9 Docker 镜像的等价替代；正式复现实验应使用冻结镜像 ID，并记录实际 Habitat/Lab/Sim 版本。
 
 ### 1. 创建 Conda 环境
 
@@ -537,36 +605,56 @@ metrics.csv
 run_manifest.json
 episode-*/rgb/
 episode-*/frontier_map/
+episode-*/episode_identity.json
 episode-*/instruction_adapter/
+episode-*/initial_interpretation.jsonl   # 发生初始语言编译时
+episode-*/harness/
+episode-*/lvlm_calls/
 episode-*/final_verifier/
+episode-*/evidence_blobs/
 episode-*/prior_map/
+episode-*/evaluation/                   # GOAT 语言独立评分证据
 ```
 
 先验地图运行产物、动态 BEV、room/frontier 语义选择和 A/B 对比指标见独立文档。
 
 ## 实物机器人入口
 
-**实物模式已完成（bridge-off 规划与速度输出验收）**：真实输入下，为前方 chair 的接近点生成局部轨迹与限幅速度，默认不启动底盘 bridge。未实际行驶或到达。见 [正式一键入口](docs/real_robot_navigation_entry.md) 和 [重要参数调节与迁移说明](docs/real_robot_parameter_tuning.md)。
+**实物模式：已实现。** 正式一键入口已接入真实感知、底盘位姿、目标接近点、Action、原生规划/跟踪和安全速度输出；2026-11-05 已完成 bridge-off 验证。默认 `preview`、底盘 bridge 关闭；真实行驶、到达与最终视觉 STOP 另行现场验收，不改变软件功能已实现的标记。
 
-实物机器人模式的输入输出、数据流、控制流和可插拔接口见
-[docs/real_robot_framework.md](docs/real_robot_framework.md)。独立 LVLM 推理服务器
-及 VLN 客户端配置见 [docs/lvlm_server_deployment.md](docs/lvlm_server_deployment.md)。
-当前完成边界和现场执行顺序见
-[docs/real_robot_deployment_todo.md](docs/real_robot_deployment_todo.md)。
+### 实物调试参数速查
 
-常用入口：
+下表是当前源码默认值，不是重新读取的车端配置；距离单位为米。完整语义、迁移方法和故障排查见 [参数手册](docs/real_robot_parameter_tuning.md)。
+
+| 调试项 | 环境变量 | 默认值与注意事项 |
+|---|---|---|
+| 跟踪停止距离 | `NAV_FOLLOWER_STOP_DISTANCE_M` | **0.5**，相对当前路径跟踪点，不是直接到物体的距离 |
+| Action 到达容差 | `NAV_GOAL_TOLERANCE_M` | **1.0**，相对 standoff 接近点，不是物体中心/表面 |
+| 前视 / 末端减速距离 | `NAV_FOLLOWER_LOOKAHEAD_M` / `NAV_FOLLOWER_SLOWDOWN_DISTANCE_M` | **1.0 / 1.0** |
+| 对象接近距离 | `NAV_STANDOFF_M` | **0.8**，到对象中心；接近点已在到达容差内时不派发 Action |
+| 车体长 / 宽 | `NAV_VEHICLE_LENGTH_M` / `NAV_VEHICLE_WIDTH_M` | `0.6 / 0.6`，按实际外廓核定，同时检查路径库碰撞假设 |
+| 雷达到底盘外参 | `NAV_BASE_X_M` / `NAV_BASE_Y_M` / `NAV_BASE_YAW_RAD` | `-0.2 / 0 / -1.5708`，最后一项为弧度，换车必须标定 |
+| 线 / 角速度上限 | `NAV_MAX_SPEED_MPS` / `NAV_MAX_ANGULAR_RPS` | `0.15 m/s / 0.35 rad/s`；follower 的 `NAV_FOLLOWER_YAW_DEG_S=20.0` 使用度/秒 |
+| 线 / 角加速度上限 | `NAV_MAX_ACCEL_MPS2` / `NAV_MAX_ANGULAR_ACCEL_RPS2` | `0.15 m/s² / 0.3 rad/s²` |
+| 指令 / 无进展超时 | `NAV_COMMAND_TIMEOUT_S` / `NAV_NO_PROGRESS_TIMEOUT_S` | `0.25 / 12.0` 秒；不能通过放宽保护掩盖停更或无运动授权 |
+
+四项停止/到达/前视/减速距离必须是有限正数，且 `stop < goal_tolerance`、`stop < lookahead`。先在仓库根目录检查配置（**不启动 Docker、ROS 或 bridge**）：
 
 ```bash
-SUDO_STDIN_PASSWORD=1 ./docker_en.sh start
-SUDO_STDIN_PASSWORD=1 ./docker_en.sh enter
-SUDO_STDIN_PASSWORD=1 ./docker_en.sh smoke
+STRIVE_EXECUTION_MODE=preview \
+NAV_FOLLOWER_STOP_DISTANCE_M=0.5 NAV_GOAL_TOLERANCE_M=1.0 \
+NAV_FOLLOWER_LOOKAHEAD_M=1.0 NAV_FOLLOWER_SLOWDOWN_DISTANCE_M=1.0 \
+bash scripts/run_real_robot_navigation.sh --check
 ```
 
-当前实物链路原则：
+`--check` 输出四项距离与模式，不校验整车几何、在线 ROS 参数或硬件状态。新增距离参数已完成本地接线及离线验证；此前车端镜像尚未包含修复，必须更新镜像、重建 ROS 安装目录并核对实际参数，不能只设置环境变量。
 
-```text
-VLN 不直接发布 /cmd_vel。
-VLN 对底层控制器的正常输出是 MotionGoal -> RosWaypointController -> /way_point。
-dry_run=true 或 lower_controller_enabled=false 时，不向真实 /way_point 交接。
-FinalInstructionVerifier 只在 NavigationStatus.REACHED 后消费 ViewEvidence。
+传感器与定位就绪、镜像更新后，使用正式入口启动 bridge-off 链路：
+
+```bash
+STRIVE_EXECUTION_MODE=preview bash scripts/run_real_robot_navigation.sh
 ```
+
+正式链路为 `InstructionRuntime → StandoffGoalResolver → ExecuteWaypoint Action → MotionServer → localPlanner → pathFollower → SafetyVelocityMux`；只由 MotionServer 发布原生目标，Action 终止先取消目标并 hold。当前正式入口 `LLM_OFFLINE=1`、最终视觉 verifier 关闭；不因实现状态更新而启用模型或实物运动。
+
+启动/停止、日志、live 授权与控制合同见 [正式一键入口](docs/real_robot_navigation_entry.md)；部署记录见 [实物状态](docs/real_robot_deployment_todo.md)，整体接口见 [实物框架](docs/real_robot_framework.md)。

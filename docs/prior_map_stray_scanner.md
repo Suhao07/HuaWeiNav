@@ -1,6 +1,6 @@
 # Stray Scanner → 统一先验地图采集协议
 
-状态：已实现导入器及格式/视频/坐标/竖正测试；已导入首份真实扫描 d655a5ce86（iPhone 17 Pro，App版本未记录），几何验收见 `prior_map_capture_progress.md` 的 C 阶段记录。无卷尺真值，绝对尺度未验证。输入适配不等于机器人重定位或导航已完成。
+状态：已实现导入器及格式/视频/坐标/竖正测试；已导入首份真实扫描 d655a5ce86（iPhone 17 Pro，App版本未记录），几何验收见 `archive/prior_map_capture_progress.md` 的 C 阶段记录。无卷尺真值，绝对尺度未验证。输入适配不等于机器人重定位或导航已完成。
 
 ## 核对的上游版本
 

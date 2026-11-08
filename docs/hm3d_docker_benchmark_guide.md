@@ -1,483 +1,141 @@
-# Docker Benchmark 指令文档
+# HM3D Docker 评测操作指南
 
-本文档记录从零创建本地 Docker 镜像、复用 CogNav_ObjNav 数据和 LLM client、配置权重、运行 HM3D ObjectNav baseline benchmark 的完整流程。
+从零安装、数据和权重准备、两层 Docker 构建统一见 [交付 README](../README.md#仿真器构建流程)。本文只维护评测输入、运行命令、结果与排障，不再维护第二套 CogNav 基础镜像安装流程。模型先按 [LVLM 部署指南](lvlm_server_deployment.md) 验证。
 
-本文件中的 `run_hm3d_baseline.sh` 只用于 ObjectNav benchmark。如果目标是从 HM3D
-生成 room-only `floorplan.json` 和语义 BEV bundle，请使用
-`docker/run_hm3d_floorplan_layout.sh`；它不需要 SAM、GroundingDINO 或 episode
-权重/标注，具体命令见 `docs/prior_map_mode.md`。
+## 1. 环境与路径
 
-## 1. 前置条件
+命令在 STRIVE 根目录执行。`STRIVE_DATA_ROOT` / `HM3D_DATA_ROOT` 优先于 `configs/strive_weights.yaml`；迁移时不要依赖开发机的 CogNav 绝对目录。容器挂载为：
 
-默认项目路径：
+| 宿主内容 | 容器路径 | 约束 |
+|---|---|---|
+| STRIVE 源码及输出 | `/workspace/STRIVE` | 正式运行应使用冻结副本 |
+| 数据根目录 | `/workspace/data` | 只读 |
+| SAM / GroundingDINO 权重 | `/weights` 下对应文件 | 只读 |
 
-```bash
-cd "/home/ubuntu/WorkSpace/project/Huawei Nav/Code/STRIVE"
-```
-
-依赖的 CogNav 仓库路径：
-
-```bash
-export COGNAV_ROOT=/home/ubuntu/WorkSpace/research/code/Navigation/CogNav_ObjNav
-```
-
-本方案复用 CogNav 仓库中的：
-
-- Habitat/HM3D 数据：`$COGNAV_ROOT/data`
-- CogNav LLM client：`$COGNAV_ROOT/utils/llm_client.py`
-- 权重目录：`$COGNAV_ROOT/model/pretrained_model`
-
-本机需要已经可用：
-
-- NVIDIA GPU 和 Docker GPU runtime
-- 基础镜像 `cognav-vln:1.0`
-- HM3D 场景数据：`$COGNAV_ROOT/data/scene_datasets/hm3d_v0.2`
-- ObjectNav episode 数据：`$COGNAV_ROOT/data/objectgoal_hm3d/val/val.json.gz` 或 `$COGNAV_ROOT/data/objectnav_hm3d_v2/val/val.json.gz`
-
-## 2. 从零构建镜像
-
-默认构建镜像名为 `strive-hm3d:local`：
-
-```bash
-bash docker/build.sh
-```
-
-如果需要指定基础镜像或输出镜像名：
-
-```bash
-COGNAV_BASE_IMAGE=cognav-vln:1.0 IMAGE_TAG=strive-hm3d:local bash docker/build.sh
-```
-
-Dockerfile 会在 CogNav 基础环境上补齐 VLN HM3D baseline 需要的依赖：
-
-- `mmengine`
-- `mmcv`
-- `mmdet`
-- `segment-anything`
-- `pathfinding`
-- `bresenham`
-- `supervision`
-
-构建完成后检查镜像：
-
-```bash
-docker images strive-hm3d:local
-```
-
-## 3. 权重配置
-
-启动脚本会读取仓库内 `configs/strive_weights.yaml` 中的本机数据集和权重路径。
-环境变量优先级更高：`STRIVE_DATA_ROOT`/`HM3D_DATA_ROOT` 可覆盖 `data_root`，
-`SAM_CHECKPOINT` 和 `GROUNDING_DINO_CHECKPOINT` 可覆盖对应权重路径。搜索不到权重时
-才可按需下载。YAML 只记录路径，不会把模型文件复制进 Git。
-
-当前工作区的 HM3D 数据复用 CogNav_ObjNav：
-
-```text
-configs/strive_weights.yaml:data_root ->
-/home/ubuntu/WorkSpace/research/code/Navigation/CogNav_ObjNav/data
-```
-
-该目录必须同时包含 `scene_datasets/` 和 ObjectNav 回合数据。迁移到其他机器时，
-只需修改 `data_root`，或显式设置：
-
-```bash
-STRIVE_DATA_ROOT=/path/to/CogNav_ObjNav/data bash docker/run_hm3d_baseline.sh
-```
-
-### 3.1 SAM
-
-当前本机配置：
-
-```text
-configs/strive_weights.yaml ->
-/home/ubuntu/3rdparty/Grounded-Segment-Anything/sam_vit_h_4b8939.pth
-```
-
-如果迁移到其他机器，只修改 YAML，或设置 `SAM_CHECKPOINT` 覆盖它。
-
-手动指定：
-
-```bash
-SAM_CHECKPOINT=/path/to/sam_vit_h_4b8939.pth bash docker/run_hm3d_baseline.sh
-```
-
-### 3.2 GroundingDINO
-
-VLN 当前 mmdet 配置使用 Swin-L 权重：
-
-```text
-grounding_dino_swin-l_pretrain_obj365_goldg-34dcdc53.pth
-```
-
-当前本机配置：
-
-```text
-configs/strive_weights.yaml ->
-/home/ubuntu/WorkSpace/research/code/Navigation/CogNav_ObjNav/model/pretrained_model/grounding_dino_swin-l_pretrain_obj365_goldg-34dcdc53.pth
-```
-
-如果迁移到其他机器，只修改 YAML，或设置 `GROUNDING_DINO_CHECKPOINT` 覆盖它。
-
-如果本机没有，可以允许脚本下载到 CogNav 权重目录：
-
-```bash
-STRIVE_DOWNLOAD_WEIGHTS=1 bash docker/preflight.sh
-```
-
-或：
-
-```bash
-STRIVE_DOWNLOAD_WEIGHTS=1 bash docker/run_hm3d_baseline.sh
-```
-
-手动指定：
-
-```bash
-GROUNDING_DINO_CHECKPOINT=/path/to/grounding_dino_swin-l_pretrain_obj365_goldg-34dcdc53.pth \
-  bash docker/run_hm3d_baseline.sh
-```
-
-## 4. Preflight 检查
-
-运行：
+`--dataset_path` 和 `--episode_manifest` 由容器内 Python 读取，必须使用容器可见路径。数据放在挂载之外时，仅设置宿主绝对路径不会使容器看到它。
 
 ```bash
 bash docker/preflight.sh
 ```
 
-检查内容包括：
+成功的 preflight 只验证依赖，不证明模型服务、指令理解或导航成功。
 
-- CogNav 数据路径是否存在
-- SAM 和 GroundingDINO 权重是否存在
-- Habitat/Habitat-Sim 是否可 import
-- PyTorch CUDA 是否可用
-- mmdet DetInferencer 是否可用
-- SAM builder 是否可用
-- CogNav LLMClient 是否可 import
-- HM3D config 和相机内参是否能生成
+## 2. 单例 smoke 与模式选择
 
-成功时会输出：
-
-```text
-preflight OK
-```
-
-## 5. 运行 HM3D Benchmark
-
-### 5.1 离线 smoke 测试
-
-不调用真实 LLM，只验证 Habitat、检测、分割、建图、规划、保存结果的主链路：
-
-```bash
-LLM_OFFLINE=1 STRIVE_LLM_FALLBACK=1 \
-  bash docker/run_hm3d_baseline.sh \
-  --eval_episodes 1 \
-  --start_episode 0 \
-  --save_dir hm3d_cognav_offline_smoke \
-  --vlm cognav
-```
-
-说明：
-
-- `LLM_OFFLINE=1`：CogNav LLMClient 走离线模式。
-- `STRIVE_LLM_FALLBACK=1`：LLM JSON 为空或不可解析时，使用保守结构化默认值继续跑通管线。
-- 该模式只适合工程 smoke，不代表真实策略效果。
-
-### 5.2 真实 Ark LLM 测试
-
-不要把 key 写入仓库文件，建议只在当前 shell 中导出：
-
-```bash
-export LLM_PROVIDER=ark
-export ARK_API_KEY="<your-ark-api-key>"
-export LLM_MODEL=doubao-seed-2-0-lite-260428
-export LLM_API_BASE_URL=https://ark.cn-beijing.volces.com/api/v3
-```
-
-如果后续流程需要地图服务，也可传入：
-
-```bash
-export MAP_PROVIDER=Amap
-export AMAP_KEY="<your-amap-key>"
-```
-
-运行 1 个 episode：
+配置模型变量和私有密钥后：
 
 ```bash
 bash docker/run_hm3d_baseline.sh \
-  --eval_episodes 1 \
-  --start_episode 0 \
-  --save_dir hm3d_cognav_real_llm_smoke \
-  --vlm cognav
+  --benchmark hm3d_objectnav \
+  --eval_episodes 1 --start_episode 0 \
+  --decision_owner baseline_guided \
+  --agent_max_model_calls 100 --max_steps 500 \
+  --vlm self_hosted --save_dir hm3d_single_smoke
 ```
 
-运行多个 episode：
+- `baseline_guided` 为默认：领域探索/接近策略与按需语义选择共用运动所有者。
+- `legacy` 为历史路径；`agent` 为自由工具决策对照。报告必须注明模式，不能把不同策略的结果解释为纯结构消融。
+- 初始语言编译与 Agent 决策共享 `agent_max_model_calls`；感知与验证调用另列。
+- `--max_steps` 是环境步预算；达到预算、模型预算耗尽、工程错误和验证完成是不同终止原因。
+- `LLM_OFFLINE=1` / `STRIVE_LLM_FALLBACK=1` 不属于正式评测配置；不得用离线默认值绕过严格完成条件。
 
-```bash
-bash docker/run_hm3d_baseline.sh \
-  --eval_episodes 10 \
-  --start_episode 0 \
-  --save_dir hm3d_cognav_real_llm_eval10 \
-  --vlm cognav
-```
-
-从指定 episode 继续：
-
-```bash
-bash docker/run_hm3d_baseline.sh \
-  --eval_episodes 20 \
-  --start_episode 10 \
-  --save_dir hm3d_cognav_real_llm_eval20 \
-  --vlm cognav
-```
-
-### 5.3 指定场景和目标物导航
-
-推荐使用专门入口，不需要手工改 dataset 或 `HM3D_DATASET_PATH`：
+单场景调试可用：
 
 ```bash
 bash docker/run_scene_object_nav.sh \
-  --scene_id wcojb4TFT35 \
-  --object_category tv \
-  --save_dir hm3d_wcojb4TFT35_tv_real_llm \
-  --vlm cognav
+  --scene_id wcojb4TFT35 --object_category tv --episode_rank 0 \
+  --decision_owner baseline_guided --vlm self_hosted \
+  --save_dir hm3d_scene_smoke
 ```
 
-这个脚本会在容器内自动完成：
+该入口筛选并物化单 episode，适合调试；正式数据来源应通过显式 benchmark / split 固定，见 [Benchmark Provider](benchmark_providers.md)。
 
-- 从 CogNav 数据目录查找 `wcojb4TFT35.json.gz`。
-- 筛出 `object_category=tv` 的 episode。
-- 生成单 episode 文件到 `logs/datasets/wcojb4TFT35_tv_rank0.json.gz`。
-- 将 `HM3D_DATASET_PATH` 指向这个临时 dataset，再启动 benchmark。
-
-可选参数：
-
-```bash
---episode_rank 1
-```
-
-用于选择同一场景和目标物下的第 N 个匹配 episode。`--scene_id_contains` 和 `--object_category` 仍可直接传给 `run_hm3d_baseline.sh`，但精确跑单个场景/物体时推荐 `run_scene_object_nav.sh`，因为它不依赖 Habitat iterator 的内部采样顺序。
-
-### 5.4 启用自然语言指令适配器
-
-默认 ObjectNav 仍按数据集目标运行。需要让 agent 接收自然语言或 CogNav instruction metadata 时，打开 adapter：
+## 3. 自然语言与数据集目标
 
 ```bash
 bash docker/run_scene_object_nav.sh \
-  --scene_id wcojb4TFT35 \
-  --object_category tv \
-  --save_dir hm3d_wcojb4TFT35_tv_instruction \
-  --vlm cognav \
+  --scene_id wcojb4TFT35 --object_category tv \
   --enable_instruction_adapter \
-  --custom_instruction "find the television in the scene"
+  --custom_instruction "find the television in the scene" \
+  --decision_owner baseline_guided --vlm self_hosted \
+  --save_dir hm3d_instruction_smoke
 ```
 
-adapter 的默认 backend 是 `llm`：
+不开 adapter 的 ObjectNav 按数据集目标确定性编译。非 legacy 的自然语言入口使用有界初始解释，保存原文和编译诊断，不在失败后悄悄改成数据集类别。`rules` 是历史数据集兼容路径，不是通用自然语言规则解析器。任务义务、动态检索词和当前验证的职责见 [指令合同](instruction_adapter.md)。
 
-```text
-CogNav episode.info -> LLM structured parse -> dataset target fallback
-```
+## 4. 固定清单与批量重跑
 
-如果只想复用数据集目标、不调用 LLM，可显式传：
+标准 HM3D val 的规模不足以凭 `--eval_episodes 2000` 自动产生2,000个独立任务。需先准备具有足够独立身份的实际 split / 任务包；不要通过重复采样补数。
+
+已准备好任务包与身份清单后，示例：
 
 ```bash
---instruction_adapter_backend rules
-```
-
-注意这里的 `rules` 只是兼容 fallback 名称，不再使用目标常识硬编码表。解析结果会保存到：
-
-```text
-logs/<save_dir>/episode-*/instruction_adapter/plan.json
-logs/<save_dir>/episode-*/instruction_adapter/spec.json
-```
-
-### 5.5 CogNav 指令模式自治 Benchmark
-
-CogNav 已生成的 instruction benchmark 是 Habitat-compatible ObjectNav split，episode 仍由 Habitat 驱动，指令语义在 `episode.info` 中。VLN 运行时打开 `--enable_instruction_adapter` 后，会优先从 `episode.info` 编译 `InstructionPlan`，再交给 mapper/agent 自治导航。
-
-运行前建议先导出真实 LLM 配置。metadata 足够时解析不需要调用 LLM，但导航过程中的 room/viewpoint 选择仍可能使用 CogNav LLM client：
-
-```bash
-export LLM_PROVIDER=ark
-export ARK_API_KEY="<your-ark-api-key>"
-export LLM_MODEL=doubao-seed-2-0-lite-260428
-export LLM_API_BASE_URL=https://ark.cn-beijing.volces.com/api/v3
-```
-
-Demand instruction benchmark：
-
-```bash
-HM3D_DATASET_PATH=/home/ubuntu/WorkSpace/research/code/Navigation/CogNav_ObjNav/data/datasets/objectnav/hm3d_ovon/v1/val_seen_instruction_balanced_3k \
 bash docker/run_hm3d_baseline.sh \
-  --eval_episodes 10 \
-  --start_episode 0 \
-  --save_dir hm3d_instruction_adapter_10ep \
-  --vlm cognav \
-  --enable_instruction_adapter \
-  --instruction_adapter_backend llm
+  --benchmark hm3d_objectnav \
+  --dataset_path /workspace/data/datasets/hm3d_simple_2000/tasks.json.gz \
+  --episode_manifest /workspace/data/datasets/hm3d_simple_2000/manifest.json \
+  --dataset_episodes 2000 --eval_episodes 2000 --start_episode 0 \
+  --decision_owner baseline_guided --agent_max_model_calls 100 \
+  --max_steps 500 --vlm self_hosted --save_dir hm3d_simple_2000_new
 ```
 
-Complex instruction benchmark：
+上述路径是部署示例，不会自动生成或下载数据。清单是包含 `runtime_episodes` 数组的 JSON，每项使用 [episode_identity](../benchmark/episode_selection.py) 的完整身份；不要将需求筛选的 JSONL 清单直接传给这个参数。reset 后入口保存并核对场景、原始 episode、起点、朝向和目标类别。
+
+**区间语义：**入口循环是 `range(start_episode, eval_episodes)`，后者是结束索引而非“从起点再跑多少例”。例如从100跑到199应设置 `--start_episode 100 --eval_episodes 200`，并固定原始 `--dataset_episodes` 与同一清单。
+
+正式比较要求：
+
+1. 冻结完整源码（含需要交付的未提交文件时，另存清单）、镜像 ID、数据/权重哈希、模型版本、参数与种子。
+2. 新旧运行目录分离；完整重跑2,000条不等于只补跑旧批次缺失条目。
+3. 优先安排旧批次已有结果的身份以尽早配对；其余任务仍保留在总清单，不重复、不遗漏。
+4. 并发 worker 领取不相交的身份集合，保存每例命令、退出回执、完整身份、轨迹和评分。
+5. “文件已生成”“进程已结束”“评分可用”分别核验。先报告完成数/异常数/待完成数，再计算具有有效评分的子集指标并明确分母；最终交付总指标不得通过剔除工程失败美化。
+6. 旧代码若跨多个版本，按版本分层；配对只比较身份相同且双方评分可用的样本。并发耗时不直接作为延迟提升证据。
+
+当前交付的分组和困难子集定义见 [验收口径](acceptance_4500.md)，不将实时进度数字写进部署说明。
+
+## 5. 运行产物与评分
+
+输出默认在 `logs/<save_dir>/`：
+
+| 产物 | 用途 |
+|---|---|
+| `run_manifest.json`、`benchmark_spec.json` | 运行参数、数据来源与成功阈值 |
+| `metrics.csv` | Habitat 指标、内部验证与模型调用统计 |
+| `episode-*/episode_identity.json` | reset 后实际任务身份 |
+| `episode-*/initial_interpretation.jsonl` | 初始语言解释及有界修正（发生时） |
+| `episode-*/instruction_adapter/` | 任务合同、兼容投影与进度诊断 |
+| `episode-*/harness/` | 决策、工具、终止回执 |
+| `episode-*/lvlm_calls/` | 实际模型请求和响应追溯 |
+| `episode-*/final_verifier/`、`evidence_blobs/` | 验证结果与归档图像 |
+| `episode-*/rgb/`、视频、`frontier_map/` | 观测和路径诊断 |
+
+`success` / `spl` 是外部 evaluator 结果；`instruction_success`、`final_stop_success` 是内部任务/验证结果，不能相互替代。`accepted_distance_to_target` 是接受实例的证据距离，不等同于 GT `distance_to_goal`。`lvlm_call_count_by_type` 记录调用与缓存命中；`lvml_call_count_by_type` 是历史拼写别名。
+
+GOAT 语言独立评分另见 [运动证据与评分](benchmark_providers.md#运动证据与独立评分)，普通 ObjectNav 不自动生成那套证据。模型请求、图像及响应可能含敏感数据，应限制输出目录访问，不提交 Git 或复制进文档。
+
+每次使用新 `save_dir`。`--clean_save_dir` 会删除旧目录内容，不用于正式批次的续跑或配对复核。
+
+## 6. 常见问题
+
+- **Docker socket / GPU 权限**：由部署者确认 Docker 与 NVIDIA runtime 权限，不改业务代码绕过。
+- **缺权重**：检查 YAML 与环境覆盖；确需下载时显式使用 `STRIVE_DOWNLOAD_WEIGHTS=1`，不要在每个 worker 中重复下载。
+- **模型401 / 错误模型名**：检查变量是否存在，以及模型名与 endpoint 是否匹配，不打印密钥。
 
 ```bash
-HM3D_DATASET_PATH=/home/ubuntu/WorkSpace/research/code/Navigation/CogNav_ObjNav/data/datasets/objectnav/hm3d_ovon/v1/val_seen_complex_balanced_2k \
-bash docker/run_hm3d_baseline.sh \
-  --eval_episodes 10 \
-  --start_episode 0 \
-  --save_dir hm3d_complex_instruction_adapter_10ep \
-  --vlm cognav \
-  --enable_instruction_adapter \
-  --instruction_adapter_backend llm
+python - <<'PY'
+import os
+names = ("ARK_API_KEY", "LLM_MODEL", "LLM_API_BASE_URL",
+         "VLN_LVLM_API_KEY", "VLN_LVLM_MODEL", "VLN_LVLM_BASE_URL")
+print({name: bool(os.getenv(name)) for name in names})
+PY
 ```
 
-常用调整：
+- **连接正常但结构化失败**：分别排查传输/服务端错误和实际非法响应，保留原始原因。不能增加静默字段过滤或自动接受来让批次“跑完”。
+- **导航进程异常**：保留退出状态和最后一次动作/请求，不把不完整记录伪装为正常预算终止。
 
-```bash
---eval_episodes 1      # 快速 smoke
---eval_episodes 100    # 扩大评测
---start_episode 50     # 从指定 episode 继续
---max_steps 150        # 限制单 episode 最大步数
-```
-
-输出目录：
-
-```text
-logs/hm3d_instruction_adapter_10ep/
-logs/hm3d_complex_instruction_adapter_10ep/
-```
-
-每个 episode 的指令解析结果：
-
-```text
-logs/<save_dir>/episode-*/instruction_adapter/plan.json
-logs/<save_dir>/episode-*/instruction_adapter/spec.json
-```
-
-## 6. 输出结果
-
-输出目录在：
-
-```text
-logs/<save_dir>/
-```
-
-例如：
-
-```text
-logs/hm3d_cognav_real_llm_smoke/
-```
-
-关键文件：
-
-```text
-logs/<save_dir>/metrics.csv
-logs/<save_dir>/episode-0/fps.mp4
-logs/<save_dir>/episode-0/depth.mp4
-logs/<save_dir>/episode-0/metrics.mp4
-```
-
-说明：
-
-- `metrics.csv`：每个 episode 的成功率、SPL、距离目标、步数等指标。
-- `fps.mp4`：第一视角 RGB 过程，可视化主结果。
-- `depth.mp4`：深度图过程。
-- `metrics.mp4`：top-down map 和导航指标过程。
-
-指令模式下，`metrics.csv` 会额外包含：
-
-```text
-instruction_success
-instruction_decision
-instruction_accept_step
-accepted_candidate_uid
-accepted_relation_edge
-accepted_distance_to_target
-accepted_distance_source
-lvlm_call_count_by_type
-lvml_call_count_by_type
-```
-
-`success` 仍是 Habitat 原始 ObjectNav 指标；复杂自然语言指令应优先看
-`instruction_success`。例如空间关系任务可能已经通过 final verifier 和动态语义边
-确认，但官方 `success` 仍因原始单目标指标显示为 0。距离分析应优先看
-`accepted_distance_to_target`；`distance_to_goal` 是 Habitat 原始 GT 距离，可能不是
-自然语言最终接受的 terminal instance。
-
-可审计日志：
-
-```text
-logs/<save_dir>/episode-*/lvlm_calls/                 # raw LLM/LVLM response
-logs/<save_dir>/episode-*/instruction_adapter/        # plan/spec/runtime_state
-logs/<save_dir>/episode-*/final_verifier/             # final evidence/result
-logs/<save_dir>/episode-*/detection/object_box_cache.json
-```
-
-`lvlm_call_count_by_type` 是 JSON 字符串，记录真实调用次数和缓存命中；其中
-`concept_match_batch` 表示一次批量 concept-instance grounding 请求，不等于
-候选 object 的数量。`lvml_call_count_by_type` 是兼容旧拼写的同内容别名。
-
-VS Code 中可以在 Explorer 里直接点击 mp4 预览；如果不能播放，右键选择 `Open With...` 再选择内置视频预览器。
-
-## 7. 进入容器调试
-
-进入容器 shell：
+进入同一镜像调试：
 
 ```bash
 bash docker/run_hm3d_baseline.sh bash
 ```
-
-进入后常用检查：
-
-```bash
-cd /workspace/STRIVE
-python -m py_compile objnav_benchmark_with_process_obs.py
-python docker/preflight.py
-```
-
-## 8. 常见问题
-
-### 8.1 Docker socket permission denied
-
-说明当前用户或沙箱不能访问 Docker daemon。需要在允许 Docker 的环境中运行，或使用具有 Docker 权限的终端。
-
-### 8.2 缺少 GroundingDINO 权重
-
-运行：
-
-```bash
-STRIVE_DOWNLOAD_WEIGHTS=1 bash docker/preflight.sh
-```
-
-或者显式设置：
-
-```bash
-export GROUNDING_DINO_CHECKPOINT=/path/to/grounding_dino_swin-l_pretrain_obj365_goldg-34dcdc53.pth
-```
-
-### 8.3 LLM 401
-
-检查：
-
-```bash
-echo "$ARK_API_KEY"
-echo "$LLM_MODEL"
-echo "$LLM_API_BASE_URL"
-```
-
-确保 `ARK_API_KEY` 是真实 key，且 `LLM_MODEL` 和 base URL 对应当前 Ark 服务。
-
-### 8.4 AMap key 未进入容器
-
-脚本已透传：
-
-```bash
-MAP_PROVIDER
-AMAP_KEY
-```
-
-运行前在宿主机 shell 中导出即可。
-
-### 8.5 mp4 保存失败，提示帧尺寸不一致
-
-代码已在 `objnav_agent_with_process_obs.py::save_trajectory` 中统一 resize 三路视频帧尺寸。若未来改动 top-down map 生成逻辑，仍需保证同一个视频 writer 接收的 frame 尺寸一致。

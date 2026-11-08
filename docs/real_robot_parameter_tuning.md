@@ -2,7 +2,7 @@
 
 ## 状态与适用范围
 
-**实物模式已完成：按 2026-11-05 约定的 bridge-off 规划与速度输出口径验收。**
+**实物模式：已实现。** 2026-11-05 已按约定完成 bridge-off 规划与速度输出验证；下述现场验收边界不改变软件已实现状态。
 真实相机、点云和定位输入已接入正式 runtime → Action → MotionServer → 原生规划/跟踪 → 安全 mux；默认不启动底盘 bridge。启动方式见 [正式入口](real_robot_navigation_entry.md)。
 
 “规划到目标”在此指为前方 chair 的接近点生成局部轨迹和速度，不是车辆已到达，也不保证完整轨迹一次覆盖到目标。正式记录含 1 个 waypoint、1,151 条有效路径，最长约 0.34 m、最多 35 点；最终速度峰值 0.0525 m/s、0.0494 rad/s。车辆静止，最终为 `blocked/no_progress`，没有 `REACHED`，之后持续零速 11.51 s。证据：[validation.json](../logs/diagnostics/formal-navigation-validation/validation.json)。这些是已保存的测试结果，不是当前在线状态。
@@ -31,6 +31,8 @@
 | `FASTRTPS_DEFAULT_PROFILES_FILE` | 容器 `/workspace/STRIVE/real_robot/config/fastdds_udp.xml` | 当前使用 UDP-only DDS；外部 LIO 服务启动前也需对应配置。容器重启回归通过一次，不代表长期稳定性已证明 |
 
 底盘适配器目前仅显式配置固定 XY/yaw，不是任意六自由度外参接口。新平台若有明显高度、横滚或俯仰安装差异，应扩展变换并验证，不要挤进 XY 参数。原生 `sensorOffsetX/Y` 当前为 0；已有底盘 odom 转换时不要再次补同一外参。
+
+迁移验收还须区分输入量级与几何正确性：有限且量级合理的 odometry 不能证明对象投影或外参正确；异常位姿/速度样本应由质量门拒绝，阈值以实际机器人配置为准，不直接沿用历史诊断数值。viewpoint 的点云/里程计必须在同一世界系并满足实际时间配对门限，相机高度需现场标定；若使用外部 viewpoint 生产者，不应再并行启动内置生产者。
 
 ## 2. 车体尺寸、障碍与接近距离
 
@@ -69,7 +71,40 @@
 
 **距离语义：** 此处 1.0 m 到达容差针对 standoff 接近点，不是到椅子表面或中心的距离；standoff 仍为 0.8 m。理想共线情况下容差边界可能距对象中心约 1.8 m，不能由“数值对齐”推断与仿真对象成功距离完全等价。源码可核对仿真 `success_distance=1.0`，但仿真停止还使用其他比例/几何条件，本次 0.5 m 明确按用户要求设置。
 
-接近点已在 1.0 m 容差内时，现有 resolver 不再派发短程目标，也不伪造语义成功。先前约 0.34 m 的接近目标因此可能不再产生 Action，这是新容差下的预期过滤。验证规划应选择接近点在容差外的目标，不能为输出轨迹强行派发。离线记录、对照表和限制见 [停止距离诊断](real_robot_stop_distance_diagnosis.md)。
+接近点已在 1.0 m 容差内时，现有 resolver 不再派发短程目标，也不伪造语义成功。先前约 0.34 m 的接近目标因此可能不再产生 Action，这是新容差下的预期过滤。验证规划应选择接近点在容差外的目标，不能为输出轨迹强行派发。
+
+### 停止距离离线诊断
+
+以下合并自 2026-11-05 诊断记录，不是本次新跑结果。短路径的跟踪点可能成为路径末端；follower 的 `dis > stopDisThre` 与 Action 的目标距离判定独立，因此存在“跟踪器已减速、Action 尚未到达”的区间，也可能出现微小速度振荡。此前实车 bridge-off 的 `no_progress` 本身由未驱动车辆产生，不能反过来归因于此参数冲突。
+
+对照测试直接抽取生产 C++ 的速度选择、转向限幅、减速与加速度步进代码编译，合成运动反馈交给实际 `RosNavigationStatusProvider`。假设 100 Hz 理想积分、1 cm 末端离散、0.75 m 局部路径上限、零航向误差、无障碍；不包含完整规划器、ROS/DDS、mux 或底盘动力学。进展阈值 0.05 m、无进展时限 12 s、到达速度阈值 0.08 m/s、稳定时间 0.2 s 保持不变。
+
+| 初始目标距离 | 旧停止 0.20 / 到达 0.10 m | 诊断停止 0.05 / 到达 0.10 m |
+|---|---|---|
+| 0.15 m | 12.00 s blocked，余距 0.150 m | 3.00 s reached，余距 0.0971 m |
+| 0.34 m | 26.14 s blocked，余距 0.1804 m | 8.55 s reached，余距 0.0970 m |
+| 0.45 m | 17.70 s blocked，余距 0.1881 m | 10.47 s reached，余距 0.0970 m |
+
+0.05 m 仅用于辨别冲突，不是交付配置。最终停止 0.5 / 到达 1.0 m、前视/减速 1.0 m 的同类测试结果如下：
+
+| 初始目标距离 | 结果 | 到达判定时速度 |
+|---|---|---|
+| 1.2 m | 6.82 s reached，余距 0.5242 m | 0.0765 m/s |
+| 1.6 m | 10.40 s reached，余距 0.5241 m | 0.0765 m/s |
+| 2.0 m | 13.98 s reached，余距 0.5241 m | 0.0765 m/s |
+
+`reached` 满足既有速度/稳定时间合同，不代表速度严格为零；Action 终止仍撤销目标并 hold，真实制动距离未测。位置固定、目标在容差外的负对照仍为 blocked；未修改控制算法、放宽碰撞检查或伪造进展。
+
+历史记录为 69 项回归通过，涵盖上述对照、非法配置拒绝、主机/容器检查、Docker/launch 接线、容差内候选过滤及终止隔离。具备项目测试依赖的 Python 环境可在仓库根目录复现：
+
+```bash
+PYTHONPATH="$PWD" PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -B -m pytest -q \
+  -p no:cacheprovider --capture=sys \
+  tests/test_navigation_stop_distance.py tests/test_real_navigation.py \
+  tests/test_sysnav_ros_adapters.py tests/test_shadow_approach.py
+```
+
+原始输出保留于 `logs/diagnostics/navigation-stop-distance/pytest-requested-defaults.txt`，配置与源码哈希见同目录 `receipt.json`；本次仅合并文档，不覆盖这些证据，也不更新车端旧镜像。
 
 ## 4. 速度、加速度与时间保护
 

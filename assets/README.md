@@ -13,4 +13,4 @@ that file into both CLIP's default cache and Ultralytics' default
 `/workspace/STRIVE/weights/clip/` cache, so initialization needs no download.
 The candidate image tag is separate and must be built before use. This profile
 does not replace the default model or authorize physical motion; see
-`docs/real_robot_chair_detection_diagnosis_20261105.md` for its evidence limits.
+`docs/archive/real_robot_chair_detection_diagnosis_20261105.md` for its evidence limits.

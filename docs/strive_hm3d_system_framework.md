@@ -1,6 +1,8 @@
 # VLN HM3D Baseline 框架文档
 
-本文档面向代码维护和二次开发，说明本项目 HM3D ObjectNav baseline 的主要模块、输入输出、数据流、核心模型和关键公式。
+> **原始 baseline 算法背景，不是当前部署或接口合同。** 本文保留旧版的数据流与公式；其中 `InstructionExecutionState`、`VerificationLedger`、canonical `InstructionPlan` 和 CogNav 部署描述属于历史接口，已被任务进度/reducer、EvidenceStore、TaskSpec 与独立部署入口替代。当前实现以 [指令合同](instruction_adapter.md)、[Harness 合同](harness_refactor_design.md) 和 [交付 README](../README.md) 为准，不按本文旧接口直接开发或部署。
+
+本文用于理解原始 HM3D ObjectNav baseline 的主要模块、输入输出、核心模型和关键公式，不将旧版能力或调用次数作为当前验收结论。
 
 ## 1. 总体目标
 

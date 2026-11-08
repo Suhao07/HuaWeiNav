@@ -65,4 +65,4 @@ bash evidence-candidate-build/start_static.sh
 当前精确绑定仍 matched=false。运行目录 `prior_map/correspondence_session.json` 给出当前
 进程身份；重启后必须重新采集并准备与该会话一致的包，不能给旧包改 session 字段冒充新证据。
 
-用户已授权并完成一次冻结证据的真实 Doubao 判定，结果为 fragments，未绑定；该次授权已使用。车端仍保持 LLM_OFFLINE=1。后续离线掩码核查确认历史混合和模型解释问题并存；SDK 修复与 masked-RGB 输入修复仅在本地，未进入上述车端镜像。详见 `real_robot_correspondence_mask_diagnosis_20261105.md`。底盘语义、受限控制合同、低速及异常停车、真实行驶→新鲜视觉核验→STOP 仍待分别完成，自主运动仍未授权。
+用户已授权并完成一次冻结证据的真实 Doubao 判定，结果为 fragments，未绑定；该次授权已使用。车端仍保持 LLM_OFFLINE=1。后续离线掩码核查确认历史混合和模型解释问题并存；SDK 修复与 masked-RGB 输入修复仅在本地，未进入上述车端镜像。详见 `archive/real_robot_correspondence_mask_diagnosis_20261105.md`。底盘语义、受限控制合同、低速及异常停车、真实行驶→新鲜视觉核验→STOP 仍待分别完成，自主运动仍未授权。

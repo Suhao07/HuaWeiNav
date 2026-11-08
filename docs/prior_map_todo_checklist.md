@@ -48,7 +48,7 @@ summary，不能直接发布导航目标或绕过 final verifier。
 | 完成 | C6 | 区域布局 | A1，`capture_free_cells`与`resolve_capture_viewpoints`增加同一置信度阈值 | conf≥1（r=0.10、h=1.5）：可通行503格（全部深度342格，conf0近距飞点堵死桌间通道；=2为570格但放开5个多视角持续障碍格）；1个区域，clearance 0.25–0.55均为1；三处分支对应桌间过道；南侧y<−4有窗、柜（conf2深度支撑），其地面不与轨迹连通、不在可达区；是否隔着玻璃未核实；窄通道（x≈1.2）为采集者实际走过 |
 | 完成（位置误差豁免） | C7 | 导出、换进程重载、查询 | compact bundle与loader | compact 78MB/697观察；新进程查询sofa/refrigerator/printer/monitor均有命中（含重载0.3s）。证据人工核对：refrigerator正确；sofa、printer首个对象混入相邻面板；monitor首个命中是墙上红色标牌（真实显示器标为tv）。refrigerator的2个A2候选在可通行地面、距1.1/2.0m、朝向误差15°/29°；位置误差无真值。`-conf1-labels`重查：monitor 12个候选，真实显示器（多数票tv）进入候选但排在检测器标为monitor的标牌之后，由现场核验排除 |
 | 完成 | C8 | 可视化与成本 | 现有visualizer | 采集57.5s；建图345帧1062s（3.1s/帧）、GPU峰值9.4GB（含其他进程约1.4GB）；布局0.8s；完整包113MB、compact 78MB；重载+查询0.3s。图：`outputs/prior_diagnostics/phone-d655a5ce86-*` |
-| 完成 | C9 | 更新清单与进度文档 | — | 见`prior_map_capture_progress.md` 2026-11-02各节；手机地图尚未在机器人上使用（D）；绝对尺度与物体位置误差未经真值验证（用户豁免） |
+| 完成 | C9 | 更新清单与进度文档 | — | 见`archive/prior_map_capture_progress.md` 2026-11-02各节；手机地图尚未在机器人上使用（D）；绝对尺度与物体位置误差未经真值验证（用户豁免） |
 
 **D. 后置：实物部署** —— 人工初始化T^M_O=T^M_B,human·(T^O_B)⁻¹；ROS快照驱动先验查询；现有运动所有者执行，现场取证核验后STOP。
 
