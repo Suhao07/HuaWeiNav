@@ -27,8 +27,10 @@ def command(port, action):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--selection-id", default="SEL_001")
-    parser.add_argument("--style", default="formal")
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument("--selection-id", default="SEL_001")
+    source.add_argument("--public-episode", type=Path)
+    parser.add_argument("--style")
     parser.add_argument("--port", type=int, default=9466)
     parser.add_argument("--sim-gpu", type=int, default=7)
     parser.add_argument("--policy-gpu", type=int, default=5)
@@ -38,17 +40,41 @@ def main():
     parser.add_argument("--max-model-calls", type=int, default=60)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
-    image_id = subprocess.check_output(
-        ["docker", "image", "inspect", args.image, "--format", "{{.Id}}"], text=True).strip()
+    if args.public_episode is not None and args.style is not None:
+        parser.error("--style cannot override --public-episode")
     root = Path(os.environ["STRIVE_ROOT"])
     data_root = Path(os.environ["INTENTIONNAV_DATA_ROOT"])
     official_root = Path(os.environ["INTENTIONNAV_ROOT"])
     isaac_root = Path(os.environ["ISAACSIM_ROOT"])
     sys.path.insert(0, str(root))
     from benchmark.intentionnav import load_episode, score_trajectory
+    from scripts.serve_intentionnav import load_public_episode
 
-    episode = load_episode(data_root, args.selection_id, args.style)
-    run_id = "strive-" + episode.selection_id + "-guided-isaac6-" + datetime.now().strftime("%Y%m%d-%H%M%S")
+    episode = None
+    binding = {"status": "matched", "source": "official_dataset"}
+    if args.public_episode is None:
+        episode = load_episode(data_root, args.selection_id, "formal" if args.style is None else args.style)
+        public_input = episode.policy_input()
+        run_label = episode.selection_id
+    else:
+        public_input = load_public_episode(args.public_episode)
+        run_label = "public-" + hashlib.sha256(
+            json.dumps(public_input, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()[:12]
+        try:
+            candidate = load_episode(data_root, public_input["selection_id"], public_input["style"])
+        except (OSError, ValueError) as error:
+            binding = {"status": "unavailable", "reason": "official_episode_unavailable: " + str(error)}
+        else:
+            original = json.loads(json.dumps(candidate.policy_input()))
+            mismatched = [field for field in original if original[field] != public_input[field]]
+            if mismatched:
+                binding = {"status": "unavailable", "reason": "public_episode_mismatch",
+                           "mismatched_fields": mismatched}
+            else:
+                episode = candidate
+    image_id = subprocess.check_output(
+        ["docker", "image", "inspect", args.image, "--format", "{{.Id}}"], text=True).strip()
+    run_id = "strive-" + run_label + "-guided-isaac6-" + datetime.now().strftime("%Y%m%d-%H%M%S")
     output = args.output.resolve() if args.output else data_root / "results" / run_id
     output.mkdir(exist_ok=False)
     print(f"RUN_ROOT={output}", flush=True)
@@ -63,7 +89,10 @@ def main():
     for path in root.glob("*.py"):
         shutil.copy2(path, source / path.name)
     public = output / "public_episode.json"
-    write_json(public, episode.policy_input())
+    public.write_text(json.dumps(public_input, ensure_ascii=False, allow_nan=False, separators=(",", ":")),
+                      encoding="utf-8")
+    load_public_episode(public)
+    public_hash = hashlib.sha256(public.read_bytes()).hexdigest()
     write_json(output / "source_manifest.json", {str(p.relative_to(source)): hashlib.sha256(p.read_bytes()).hexdigest()
                for p in source.rglob("*") if p.is_file()})
     server_env = dict(os.environ, PYTHONNOUSERSITE="1")
@@ -77,6 +106,7 @@ def main():
     policy_started = False
     policy_finished = False
     result = {"run_id": run_id, "status": "starting", "policy": "strive_isaac_guided",
+              "public_episode_sha256": public_hash, "evaluation_binding": binding,
               "mode_equivalence": "not_default_baseline_guided_or_official_isaac45",
               "motion_semantics": "freemap_checked_kinematic_camera_not_dynamic_robot"}
     with (output / "simulator.log").open("w") as simulator_log:
@@ -100,6 +130,7 @@ def main():
                 "VLN_LVLM_BASE_URL": f"http://127.0.0.1:{args.model_port}/v1", "VLN_LVLM_MODEL": "huaweivln-qwen3.5-4b",
                 "VLN_LVLM_API_KEY": os.environ["VLN_LVLM_API_KEY"], "VLN_LVLM_GUIDED_JSON": "1",
                 "VLN_LVLM_TIMEOUT_S": "180", "VLN_LVLM_PARSE_RETRIES": "1", "STRIVE_VLM_WORKERS": "1",
+                "VLN_LVLM_TRANSPORT_RETRIES": "0",
                 "PYTHONNOUSERSITE": "1", "PYTHONDONTWRITEBYTECODE": "1", "PYTHONUNBUFFERED": "1", "PYTHONUTF8": "1",
                 "TRANSFORMERS_OFFLINE": "1", "HF_HUB_OFFLINE": "1", "HF_HOME": "/root/.cache/huggingface",
                 "SAM_CHECKPOINT": "/weights/sam_vit_h_4b8939.pth", "GROUNDING_DINO_PATH": "/opt/mmdetection",
@@ -122,6 +153,7 @@ def main():
                        "--max-model-calls", str(args.max_model_calls), "--max-moves", str(args.max_moves),
                        "--panorama-views", "4"]
             write_json(output / "execution.json", {"run_id": run_id, "image_id": image_id,
+                       "public_episode_sha256": public_hash, "evaluation_binding": binding,
                        "server_command": server_cmd, "policy_command": docker,
                        "policy_env": {k: v for k, v in settings.items() if "KEY" not in k},
                        "policy_mounts_exclude_dataset_and_scene": True})
@@ -145,20 +177,28 @@ def main():
             if (trajectory[-1]["action"] != "STOP" or trajectory[-1]["position"] != final_pose["position"]
                     or trajectory[-1]["yaw"] != final_pose["yaw"]):
                 raise RuntimeError("Final observation and STOP trajectory disagree")
-            scored = score_trajectory(episode, trajectory, official_root,
-                prediction_target=policy["predicted_target"], tier="strive_isaac_guided",
-                model=settings["VLN_LVLM_MODEL"], radius_m=2.0, dataset_root=data_root / "dataset",
-                scene_summary_root=data_root / "metadata/kujiale_scene_summary")
+            if episode is not None:
+                scored = score_trajectory(episode, trajectory, official_root,
+                    prediction_target=policy["predicted_target"], tier="strive_isaac_guided",
+                    model=settings["VLN_LVLM_MODEL"], radius_m=2.0, dataset_root=data_root / "dataset",
+                    scene_summary_root=data_root / "metadata/kujiale_scene_summary")
+                scored.update(episode_meta=episode._evaluation_meta, dataset_sha256=episode.source_sha256)
+            else:
+                names = ("IM", "SR_hit", "OSR_hit", "SPL", "G", "GSR_hit")
+                scored = {"metrics": dict.fromkeys(names), "aggregate_ready": False,
+                          "unavailable_metrics": dict.fromkeys(names, binding["reason"]),
+                          "protocol": {"name": "unscored_public_episode"}}
             result["trajectory_sha256"] = trajectory_hash
-            scene = data_root / "scenes" / episode.scene_id / "start_result_navigation.usd"
-            freemap = data_root / "metadata/metadata_train" / episode.scene_id / "freemap.npy"
-            write_json(output / "evaluation.json", {**scored, "episode_meta": episode._evaluation_meta,
+            scene = data_root / "scenes" / public_input["scene_id"] / "start_result_navigation.usd"
+            freemap = data_root / "metadata/metadata_train" / public_input["scene_id"] / "freemap.npy"
+            write_json(output / "evaluation.json", {**scored,
+                "public_episode_sha256": public_hash, "evaluation_binding": binding,
                 "trajectory_sha256": trajectory_hash, "trajectory_steps": len(trajectory),
-                "dataset_sha256": episode.source_sha256,
                 "scene_sha256": hashlib.sha256(scene.read_bytes()).hexdigest(),
                 "freemap_sha256": hashlib.sha256(freemap.read_bytes()).hexdigest(),
                 "policy_termination": policy["reason"], "task_complete": policy["task_complete"]})
-            result.update(status="completed", metrics=scored["metrics"], termination=policy["reason"],
+            result.update(status="completed", metrics=scored["metrics"],
+                          aggregate_ready=scored["aggregate_ready"], termination=policy["reason"],
                           task_complete=policy["task_complete"], model_calls=policy["model_calls"], moves=policy["moves"])
         except Exception as error:
             result.update(status="error", error_type=type(error).__name__, error=str(error))

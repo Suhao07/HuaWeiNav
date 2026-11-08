@@ -2,9 +2,9 @@
 
 **目标：在完整下载的单场景先跑通 STRIVE 闭环，场景下载独立推进。**
 
-## 当前状态（2026-11-05 20:48 CST）
+## 当前状态（2026-11-05，单episode评分后）
 
-**105 的初始化/渲染阻塞已通过独立安装并固定 Isaac Sim 6.0.1 解决。官方空场景、原场景 RGB-D、三视角几何和默认入口复跑通过；不是修复了 4.5 二进制，也不是完成导航评测。**
+**105 的初始化/渲染阻塞已通过独立安装并固定 Isaac Sim 6.0.1 解决。STRIVE tool-agent 已完成一轮有界运行、真实 STOP 和官方评分，但导航失败：SR=0、SPL=0，60次重复查询后预算耗尽，未发生平移。不能宣称有效导航闭环或全量 benchmark 已验收。**
 
 | 必要步骤 | 状态 | 证据与下一步 |
 |---|---|---|
@@ -12,8 +12,37 @@
 | 选择完整场景 | 完成 | `SEL_001` / `kujiale_0262`，875个资产已校验；本次再次核对入口 USD 的冻结哈希 |
 | RGB-D共享协议适配 | 单场景运行验收通过 | 768×768 RGB/光学Z深度、实际位姿/内参及三视角重投影通过；复用现有导出代码 |
 | Isaac真实渲染 | **6.0.1通过** | 官方空场景30次更新与正式首帧入口均退出0；4.5保留，仍有原生崩溃 |
-| STRIVE任务、感知、运动闭环 | 待实现与验收 | 绑定现有TaskSession、感知/融合、MotionSupervisor及最终验证 |
-| 单episode结果 | **尚无结果** | 导航步数、SR、SPL均为不可用；渲染验收不等于导航成功 |
+| STRIVE任务、感知、运动闭环 | 已接线，有效导航仍待验收 | 实际TaskSession、DINO/SAM、共享融合、MotionSupervisor及STOP；最新完整运行未提交移动 |
+| 单episode结果 | **已有失败结果** | SEL_001：SR=0、OSR=0、SPL=0，终点距离2.3m，路径0m；正常预算终止不等于导航成功 |
+
+## 首次有界运行与官方评分（2026-11-05）
+
+- Run ID：`strive-SEL_001-tool-agent-isaac6-20261105-221624`。
+- 105原件：`/mnt/nvme0/haosu/IntentionNav/results/strive-SEL_001-tool-agent-isaac6-20261105-221624`。
+- SEL_001 / kujiale_0262 / formal，官方原始指令与起点未改；策略输入仅包含selection_id、scene_id、style、instruction、start_position、start_rotation_quat_wxyz六字段。目标类别、实例、位置、房间及照片不从GT注入策略；评估私有元数据在策略退出后写入。
+- Isaac实际版本 `6.0.1-rc.7+release.42383.32955d8d.gl`，GPU7渲染、GPU5真实DINO/SAM感知，复用已有Qwen服务；没有重启模型服务或改驱动。
+- 模式为 `strive_tool_agent`，不是默认 `baseline_guided`，也不是官方Isaac4.5等价复现；动作是freemap检查后的运动学相机位移，不是动态物理机器人。
+
+| 项目 | 实际结果 |
+|---|---|
+| 官方SR / OSR / SPL | 0 / 0 / 0.0 |
+| 终点 / 最小目标XY距离 | 2.3m / 2.3m |
+| 实际XY路径 / 官方最短路 | 0.0m / 3.897m |
+| 停止原因 / 任务完成 | `decision_budget_exhausted` / false |
+| 决策调用 / 全部模型调用 | 60 / 66 |
+| 移动命令 | 0；60次工具调用全部为 `query_scene`，均无合格候选 |
+| RGB-D | 7帧，768×768，深度与实际位姿审计通过 |
+| 评分steps / 最终轨迹行 | 7 / 9；评分后shutdown额外追加一条无位移STOP，steps不是移动次数 |
+| 策略耗时 / 退出码 | 407.07秒；策略和模拟器均为0 |
+| 停止回执 | STOP及shutdown均确认zero_velocity |
+
+独立审计复算官方 `nav_metrics` 与落盘评分一致，并检查六字段输入、容器挂载、模型输入中的私有ID、源码哈希、逐段碰撞及真实RGB-D。零移动轨迹的碰撞检查不构成非零运动能力验收。191项本地回归通过；语义完成、GSR及目标可见性成功未验收。
+
+证据：[结果与完整日志包](../../STRIVE-deploy-105/evidence/strive-SEL_001-tool-agent-isaac6-20261105-221624-results.tar.gz)、[官方评分](../../STRIVE-deploy-105/evidence/strive-SEL_001-tool-agent-isaac6-20261105-221624/evaluation.json)、[轨迹](../../STRIVE-deploy-105/evidence/strive-SEL_001-tool-agent-isaac6-20261105-221624/trajectory.jsonl)、[工具决策](../../STRIVE-deploy-105/evidence/strive-SEL_001-tool-agent-isaac6-20261105-221624/tools.jsonl)、[审计](../../STRIVE-deploy-105/evidence/strive-SEL_001-tool-agent-isaac6-20261105-221624/audit.json)。日志包含完整模型请求/响应、动作、感知、场景快照、7帧RGB-D和源码哈希清单；源码快照保留在105原件中。
+
+此前两个异常尝试分别保留在 `20261105-220708`（freemap原始编码0/1/2误按二值校验）与 `20261105-220855`（实际移动2次后模型使用错误control_epoch而退出）对应run目录，均未伪装成完整评分结果。已按官方仅 `==1` 可行走语义修正加载；错误任务/控制版本现在返回拒绝回执，不代改参数、不放宽运动所有权检查。最新运行没有提出移动，因此没有在真实运行中触发该拒绝恢复路径。
+
+**下一步先解决无候选时反复查询、不探索的策略停滞，再在同一完整episode内验收有效移动和目标验证；不能仅因评分程序正常返回就启动或宣称全量benchmark验收。**
 
 ## 共享观测协议
 
@@ -126,7 +155,7 @@ export CUDA_VISIBLE_DEVICES=0
 - 场景日志仍有 `limpopo_golf_course_4k.hdr` 缺失/上传失败，以及多Physics Scene步进、PhysX读写重叠等警告/错误；没有将其过滤或当作已修复。RGB-D验证通过不能代替物理仿真验收。
 - 首次冷启动RGB的地面呈蓝色网格，后续热启动三视角与默认复跑显示地毯；存在材质就绪差异，尚未系统定位或修复，不能声称冷/热启动图像等价。
 - 仅验收SEL_001/kujiale_0262，不外推全部176场景；资源覆盖量未在本次刷新。
-- 后续仍需接现有STRIVE任务/感知/运动/STOP闭环并产出单episode结果。结果必须标注Isaac6.0.1，不能与官方4.5环境等同；目前无SR/SPL。
+- 已接入STRIVE并取得一轮失败评分，见本文单episode结果；反复查询、不探索的停滞仍未解决，有效移动和目标验证需在同一完整episode内验收。必须标注Isaac6.0.1，不能与官方4.5环境等同。
 
 ### 4.5 清洁环境最小对照（历史记录）
 

@@ -714,3 +714,387 @@ def test_batch_lock_prevents_concurrent_launch(navigation_batch):
         assert "batch is locked" in invoke([make("locked")], code=2)
         assert not list(output.glob("*/receipt.json"))
     assert invoke()["completed"] == 1
+
+
+@pytest.fixture
+def launcher_case(dataset, fake_official, monkeypatch):
+    """Run main with local protocol artifacts; no simulator, policy or scorer process."""
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from scripts import launch_intentionnav_episode as launcher
+    from scripts import serve_intentionnav as server_module
+
+    root, meta, intent = dataset
+    project = root / "launcher project"
+    project.mkdir()
+    (root / "results").mkdir()
+    environment = {
+        "STRIVE_ROOT": str(project), "INTENTIONNAV_DATA_ROOT": str(root),
+        "INTENTIONNAV_ROOT": str(fake_official), "ISAACSIM_ROOT": str(root / "fake isaac"),
+        "VLN_LVLM_API_KEY": "fixture-only-key", "HF_HOME_HOST": str(root / "fake cache"),
+        "SAM_CHECKPOINT": str(root / "fake sam"),
+        "GROUNDING_DINO_CHECKPOINT": str(root / "fake dino"),
+        "PYTHONPATH": "fixture-pythonpath", "PYTHONHOME": "fixture-pythonhome",
+        "LD_LIBRARY_PATH": "fixture-libraries", "LD_PRELOAD": "fixture-preload",
+        "CUDA_VISIBLE_DEVICES": "fixture-gpu", "LLM_OFFLINE": "1",
+    }
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    assets = {}
+    for scene_id in (meta["scene_id"], "kujiale_changed"):
+        scene = root / "scenes" / scene_id / "start_result_navigation.usd"
+        freemap = root / "metadata/metadata_train" / scene_id / "freemap.npy"
+        for path in (scene, freemap):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(f"fixture-only {scene_id}/{path.name}".encode())
+        assets[scene_id] = (scene, freemap)
+
+    case = SimpleNamespace(
+        root=root, source=root / "public input.json", output=root / "launcher output",
+        public={"selection_id": meta["selection_id"], "scene_id": meta["scene_id"],
+                "style": "formal", "instruction": intent["formal_en"],
+                "start_position": list(meta["start_position"]),
+                "start_rotation_quat_wxyz": list(meta["start_rotation_quat_wxyz"])},
+        assets=assets, consumers=[], events=[], snapshot_writes=[], public_supplied=False,
+        mutate_source=False, server_exit=None,
+        scorer_reply={"metrics": dict.fromkeys(("IM", "SR_hit", "OSR_hit", "SPL", "G", "GSR_hit"), 0),
+                      "unavailable_metrics": {}, "visibility": {}},
+    )
+
+    def option(command, name):
+        return command[command.index(name) + 1]
+
+    def consume(command):
+        path = Path(option(command, "--public-episode"))
+        case.output = Path(option(command, "--output"))
+        contents = path.read_bytes()
+        case.consumers.append((path, contents))
+        assert path == case.output / "public_episode.json"
+        return json.loads(contents)
+
+    def inspect_image(command, **kwargs):
+        if case.public_supplied:
+            assert [call.args[0] for call in case.validate.call_args_list] == [case.source]
+        case.events.append("image_inspect")
+        assert command == ["docker", "image", "inspect", "strive-hm3d:local", "--format", "{{.Id}}"]
+        assert kwargs == {"text": True}
+        return "sha256:fixture-only-image\n"
+
+    def wait_server(timeout):
+        assert timeout == 60
+        case.server_exit = 0
+        return 0
+
+    server = SimpleNamespace(pid=424242, poll=lambda: case.server_exit,
+                             wait=Mock(side_effect=wait_server))
+
+    def start_server(command, **kwargs):
+        case.events.append("server_start")
+        public = consume(command)
+        assert command[0] == str(root / "fake isaac/python.sh")
+        assert Path(command[1]) == case.output / "source/scripts/serve_intentionnav.py"
+        assert option(command, "--data-root") == str(root)
+        assert kwargs["cwd"] == case.output / "source"
+        assert kwargs["start_new_session"] is True
+        assert not set(("PYTHONPATH", "PYTHONHOME", "LD_LIBRARY_PATH", "LD_PRELOAD",
+                        "CUDA_VISIBLE_DEVICES")) & kwargs["env"].keys()
+        case.ready = {"pid": server.pid, "port": int(option(command, "--port")),
+                      "isaac_version": "fixture-only-not-loaded",
+                      "start_pose": {"position": public["start_position"], "yaw": 0.0}}
+        (case.output / "server_ready.json").write_text(json.dumps(case.ready), encoding="utf-8")
+        if case.mutate_source:
+            case.source.write_text('{"private_field": "changed after simulator launch"}', encoding="utf-8")
+        return server
+
+    def run_process(command, **kwargs):
+        if command[0] == "docker":
+            case.events.append("policy_run")
+            assert command[:3] == ["docker", "run", "--rm"]
+            assert "scripts/run_intentionnav.py" in command
+            assert kwargs["timeout"] == 7200
+            assert kwargs["env"]["VLN_LVLM_API_KEY"] == environment["VLN_LVLM_API_KEY"]
+            public = consume(command)
+            final = list(public["start_position"])
+            final[0] += 0.25
+            case.trajectory = [
+                {"step": 0, "action": "observe", "position": public["start_position"], "yaw": 0.0},
+                {"step": 1, "action": "move", "position": final, "yaw": 0.25},
+                {"step": 2, "action": "STOP", "position": final, "yaw": 0.25},
+            ]
+            trajectory_bytes = ("\n".join(json.dumps(row) for row in case.trajectory) + "\n").encode()
+            (case.output / "trajectory.jsonl").write_bytes(trajectory_bytes)
+            case.policy = {
+                "status": "completed", "reason": "max_moves", "task_complete": False,
+                "predicted_target": "fixture-only prediction", "model_calls": 0, "moves": 1,
+                "stop_receipt": {"trajectory_sha256": hashlib.sha256(trajectory_bytes).hexdigest()},
+                "final_frame": {"pose": {"position": final, "yaw": 0.25}},
+            }
+            (case.output / "policy_result.json").write_text(json.dumps(case.policy), encoding="utf-8")
+            return subprocess.CompletedProcess(command, 0)
+        case.events.append("score")
+        assert command[:3] == [sys.executable, "-B", "-c"]
+        assert Path(command[-1]) == fake_official / "eval/aggregate/compute_metrics.py"
+        assert kwargs["check"] is kwargs["text"] is kwargs["capture_output"] is True
+        assert kwargs["timeout"] == 30
+        case.score_payload = json.loads(kwargs["input"])
+        return subprocess.CompletedProcess(command, 0, stdout=json.dumps(case.scorer_reply))
+
+    def shutdown(port, action):
+        case.events.append("shutdown")
+        assert (port, action) == (case.ready["port"], "shutdown")
+        return {"action": "shutdown", "fixture_only": True}
+
+    case.processes = SimpleNamespace(check_output=Mock(side_effect=inspect_image),
+        Popen=Mock(side_effect=start_server), run=Mock(side_effect=run_process), STDOUT=subprocess.STDOUT)
+    monkeypatch.setattr(launcher, "subprocess", case.processes)
+    monkeypatch.setattr(intentionnav, "subprocess", case.processes)
+    monkeypatch.setattr(launcher, "shutil", SimpleNamespace(
+        copytree=Mock(), copy2=Mock(), ignore_patterns=shutil.ignore_patterns))
+    monkeypatch.setattr(launcher, "command", Mock(side_effect=shutdown))
+    monkeypatch.setattr(launcher.os, "killpg", Mock(side_effect=AssertionError("unexpected process signal")))
+    monkeypatch.setattr(launcher.time, "sleep", Mock(side_effect=AssertionError("unexpected readiness wait")))
+    case.load = Mock(wraps=load_episode)
+    case.score = Mock(wraps=score_trajectory)
+    case.validate = Mock(wraps=server_module.load_public_episode)
+    monkeypatch.setattr(intentionnav, "load_episode", case.load)
+    monkeypatch.setattr(intentionnav, "score_trajectory", case.score)
+    monkeypatch.setattr(server_module, "load_public_episode", case.validate)
+    original_open = Path.open
+
+    def track_open(path, mode="r", *args, **kwargs):
+        if path.name == "public_episode.json" and any(flag in mode for flag in "wax+"):
+            case.snapshot_writes.append(path)
+        return original_open(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", track_open)
+
+    def invoke(*args, public=None, default_output=False, mutate_source=False):
+        command = ["launch_intentionnav_episode.py", *args]
+        case.public_supplied = public is not None
+        if public is not None:
+            case.source.write_text(json.dumps(public, ensure_ascii=False), encoding="utf-8")
+            command += ["--public-episode", str(case.source)]
+        if not default_output:
+            command += ["--output", str(case.output)]
+        case.mutate_source = mutate_source
+        monkeypatch.setattr(sys, "argv", command)
+        assert launcher.main() is None
+        for name in ("execution", "evaluation", "run_result"):
+            setattr(case, name, json.loads((case.output / (name + ".json")).read_text()))
+        return case
+
+    case.invoke = invoke
+    return case
+
+
+def _assert_launcher_completed(case, expected_public, *, scored):
+    result, execution, evaluation = case.run_result, case.execution, case.evaluation
+    assert result["status"] == "completed"
+    assert result["policy_exit_code"] == result["server_exit_code"] == 0
+    assert result["server"] == case.ready
+    assert result["shutdown_receipt"] == {"action": "shutdown", "fixture_only": True}
+    assert result["task_complete"] is evaluation["task_complete"] is False
+    assert result["termination"] == evaluation["policy_termination"] == "max_moves"
+    assert result["model_calls"] == 0 and result["moves"] == 1
+    assert execution["run_id"] == result["run_id"]
+    assert execution["policy_command"][execution["policy_command"].index("--name") + 1] == result["run_id"]
+    assert "VLN_LVLM_API_KEY" not in execution["policy_env"]
+    assert len(case.consumers) == 2 and case.consumers[0] == case.consumers[1]
+    snapshot, contents = case.consumers[0]
+    assert snapshot.read_bytes() == contents
+    assert json.loads(contents) == expected_public
+    assert set(expected_public) == {"selection_id", "scene_id", "style", "instruction",
+                                    "start_position", "start_rotation_quat_wxyz"}
+    assert case.snapshot_writes == [snapshot]
+    if case.public_supplied:
+        assert [call.args[0] for call in case.validate.call_args_list].count(case.source) == 1
+    assert {artifact["public_episode_sha256"] for artifact in (execution, evaluation, result)} == {
+        hashlib.sha256(contents).hexdigest()}
+    trajectory_hash = hashlib.sha256((case.output / "trajectory.jsonl").read_bytes()).hexdigest()
+    assert result["trajectory_sha256"] == evaluation["trajectory_sha256"] == trajectory_hash
+    assert result["stop_receipt"] == case.policy["stop_receipt"] == {"trajectory_sha256": trajectory_hash}
+    assert evaluation["trajectory_steps"] == len(case.trajectory)
+    assert case.trajectory[-1]["action"] == "STOP"
+    assert {key: case.trajectory[-1][key] for key in ("position", "yaw")} == case.policy["final_frame"]["pose"]
+    scene, freemap = case.assets[expected_public["scene_id"]]
+    assert evaluation["scene_sha256"] == hashlib.sha256(scene.read_bytes()).hexdigest()
+    assert evaluation["freemap_sha256"] == hashlib.sha256(freemap.read_bytes()).hexdigest()
+    binding = result["evaluation_binding"]
+    assert binding == evaluation["evaluation_binding"] == execution["evaluation_binding"]
+    assert result["metrics"] == evaluation["metrics"]
+    assert result["aggregate_ready"] is evaluation["aggregate_ready"] is scored
+    assert case.events == ["image_inspect", "server_start", "policy_run", *(["score"] if scored else []), "shutdown"]
+    if scored:
+        assert binding == {"status": "matched", "source": "official_dataset"}
+        case.score.assert_called_once()
+        episode = case.score.call_args.args[0]
+        assert episode._evaluation_meta == evaluation["episode_meta"]
+        assert evaluation["dataset_sha256"] == episode.source_sha256
+        assert case.score_payload["record"] == evaluation["record"]
+        assert evaluation["record"]["trajectory"] == case.trajectory
+        assert evaluation["record"]["prediction"] == {"target": case.policy["predicted_target"]}
+        assert case.score_payload["options"] == {
+            "radius_m": 2.0, "dataset_root": str(case.root / "dataset"),
+            "scene_summary_root": str(case.root / "metadata/kujiale_scene_summary"),
+        }
+        assert evaluation["protocol"]["radius_m"] == 2.0
+        assert evaluation["metrics"] == case.scorer_reply["metrics"]
+    else:
+        case.score.assert_not_called()
+        assert binding["status"] == "unavailable" and binding["reason"]
+        assert evaluation["metrics"] == dict.fromkeys(("IM", "SR_hit", "OSR_hit", "SPL", "G", "GSR_hit"))
+        assert set(evaluation["unavailable_metrics"]) == set(evaluation["metrics"])
+        assert all(evaluation["unavailable_metrics"].values())
+        assert not {"episode_meta", "dataset_sha256", "source_sha256", "record"} & evaluation.keys()
+
+
+@pytest.mark.parametrize("explicit", [False, True], ids=["default", "explicit-selection-style"])
+def test_launcher_golden_protocol_preserves_dataset_selection(launcher_case, dataset, explicit):
+    root, meta, intent = dataset
+    case = launcher_case
+    args = []
+    expected = copy.deepcopy(case.public)
+    if explicit:
+        other_meta = dict(meta, selection_id="SEL_OTHER")
+        other_intent = dict(intent, selection_id="SEL_OTHER", natural_en="  A different instruction.\n")
+        _write_dataset(root, [meta, other_meta], [intent, other_intent])
+        args = ["--selection-id", "SEL_OTHER", "--style", "natural"]
+        expected.update(selection_id="SEL_OTHER", style="natural", instruction=other_intent["natural_en"])
+    case.invoke(*args)
+    _assert_launcher_completed(case, expected, scored=True)
+    case.load.assert_called_once_with(root, expected["selection_id"], expected["style"])
+    assert case.score.call_args.args[0]._evaluation_meta == (other_meta if explicit else meta)
+    assert case.run_result["run_id"].startswith(f"strive-{expected['selection_id']}-guided-isaac6-")
+
+
+@pytest.mark.parametrize("style", ["formal", "natural"])
+def test_launcher_matching_public_uses_original_gt_and_frozen_input(launcher_case, dataset, style):
+    root, meta, intent = dataset
+    intent[style + "_en"] = "  请找个地方休息。\nKeep this exact text.  "
+    _write_dataset(root, [meta], [intent])
+    case = launcher_case
+    public = dict(case.public, style=style, instruction=intent[style + "_en"])
+    case.invoke(public=public, mutate_source=True)
+    _assert_launcher_completed(case, public, scored=True)
+    case.load.assert_called_once_with(root, "SEL_001", style)
+    episode = case.score.call_args.args[0]
+    assert isinstance(episode.start_position, tuple)
+    assert isinstance(public["start_position"], list)
+    assert episode._evaluation_meta == meta
+    assert case.source.read_bytes() != case.consumers[0][1]
+
+
+@pytest.mark.parametrize("field,value", [
+    ("instruction", "  A changed instruction.\n不要重写。  "),
+    ("scene_id", "kujiale_changed"),
+    ("start_position", [3.0, 4.0, 1.5]),
+    ("start_rotation_quat_wxyz", [1.0, 0.0, 0.0, 0.0]),
+    ("style", "casual"),
+    ("selection_id", "SEL_UNKNOWN"),
+])
+def test_launcher_changed_public_completes_without_gt_scoring(launcher_case, field, value):
+    case = launcher_case
+    public = dict(case.public, **{field: value})
+    case.invoke(public=public, mutate_source=True)
+    _assert_launcher_completed(case, public, scored=False)
+    case.load.assert_called_once_with(case.root, public["selection_id"], public["style"])
+    assert case.source.read_bytes() != case.consumers[0][1]
+    if field != "selection_id":
+        binding = case.evaluation["evaluation_binding"]
+        assert binding["reason"] == "public_episode_mismatch"
+        assert binding["mismatched_fields"] == (["instruction"] if field == "style" else [field])
+
+
+@pytest.mark.parametrize("original_dataset", ["missing", "invalid", "unreadable"])
+def test_launcher_public_runs_without_usable_original_dataset(launcher_case, original_dataset):
+    case = launcher_case
+    if original_dataset == "missing":
+        for path in (case.root / "dataset").iterdir():
+            path.unlink()
+        (case.root / "dataset").rmdir()
+    elif original_dataset == "invalid":
+        (case.root / "dataset/episodes.jsonl").write_text("{invalid json\n", encoding="utf-8")
+    else:
+        case.load.side_effect = PermissionError("fixture-only dataset permission failure")
+    case.invoke(public=case.public)
+    _assert_launcher_completed(case, case.public, scored=False)
+    assert case.run_result["evaluation_binding"]["reason"].startswith("official_episode_unavailable:")
+
+
+def test_launcher_public_snapshot_stays_within_consumer_size_limit(launcher_case):
+    from backends.isaac.environment import MAX_BODY_BYTES
+
+    case = launcher_case
+    public = dict(case.public, instruction="")
+    overhead = len(json.dumps(public, ensure_ascii=False).encode("utf-8"))
+    public["instruction"] = "x" * (MAX_BODY_BYTES - overhead)
+    case.invoke(public=public)
+    _assert_launcher_completed(case, public, scored=False)
+    assert len(case.source.read_bytes()) == MAX_BODY_BYTES
+    assert len(case.consumers[0][1]) <= MAX_BODY_BYTES
+    assert case.validate.call_args_list[-1].args == (case.consumers[0][0],)
+
+
+@pytest.mark.parametrize("option", ["--selection-id", "--style"])
+def test_launcher_empty_dataset_selector_is_not_replaced_by_a_default(launcher_case, option):
+    case = launcher_case
+    with pytest.raises(ValueError):
+        case.invoke(option, "")
+    for process in (case.processes.check_output, case.processes.Popen, case.processes.run):
+        process.assert_not_called()
+    assert not case.output.exists()
+
+
+def test_launcher_public_run_id_and_asset_hash_use_validated_input(launcher_case):
+    case = launcher_case
+    public = dict(case.public, selection_id="../../unvalidated-selection", scene_id="kujiale_changed",
+                  instruction="  原文保留。\nNo rewriting.  ")
+    case.invoke(public=public, default_output=True, mutate_source=True)
+    _assert_launcher_completed(case, public, scored=False)
+    input_hash = hashlib.sha256(json.dumps(public, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+    run_id = case.run_result["run_id"]
+    assert run_id.startswith(f"strive-public-{input_hash[:12]}-guided-isaac6-")
+    assert "/" not in run_id and ".." not in run_id and "unvalidated-selection" not in run_id
+    assert case.output == case.root / "results" / run_id
+    assert case.source.read_bytes() != case.consumers[0][1]
+    original_scene, original_freemap = case.assets[case.public["scene_id"]]
+    assert case.evaluation["scene_sha256"] != hashlib.sha256(original_scene.read_bytes()).hexdigest()
+    assert case.evaluation["freemap_sha256"] != hashlib.sha256(original_freemap.read_bytes()).hexdigest()
+
+
+@pytest.mark.parametrize("args", [("--selection-id", "SEL_001"), ("--style", "formal")])
+def test_launcher_public_cli_conflicts_fail_before_subprocess(launcher_case, capsys, args):
+    case = launcher_case
+    with pytest.raises(SystemExit) as error:
+        case.invoke(*args, public=case.public)
+    assert error.value.code == 2
+    assert args[0] in capsys.readouterr().err
+    case.validate.assert_not_called()
+    case.load.assert_not_called()
+    case.score.assert_not_called()
+    for process in (case.processes.check_output, case.processes.Popen, case.processes.run):
+        process.assert_not_called()
+    assert not case.output.exists()
+
+
+@pytest.mark.parametrize("change,message", [
+    ({"target_position": [8.0, 9.0, 1.0]}, "six public fields"),
+    ({"scene_id": "../scene"}, "safe scene name"),
+    ({"start_position": [1, 2]}, "start_position"),
+    ({"start_rotation_quat_wxyz": [0, 0, 0, 0]}, "unit quaternion"),
+    ({"instruction": " \n"}, "nonempty text"),
+])
+def test_launcher_invalid_public_fails_before_subprocess(launcher_case, change, message):
+    from backends.isaac.environment import CommandError
+
+    case = launcher_case
+    with pytest.raises(CommandError, match=message):
+        case.invoke(public=dict(case.public, **change))
+    case.validate.assert_called_once_with(case.source)
+    case.load.assert_not_called()
+    case.score.assert_not_called()
+    for process in (case.processes.check_output, case.processes.Popen, case.processes.run):
+        process.assert_not_called()
+    assert not case.output.exists()
