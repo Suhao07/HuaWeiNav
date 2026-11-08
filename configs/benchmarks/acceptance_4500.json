@@ -1,7 +1,7 @@
 {
-  "name": "navigation_acceptance_4500",
+  "name": "navigation_acceptance_4000",
   "values_are": "acceptance_targets_not_measurements",
-  "aggregation": "micro_average_over_instruction_conditions_with_dataset_and_style_breakdowns",
+  "aggregation": "micro_average_over_unique_instruction_conditions_with_separate_subset_scores",
   "max_steps_per_task": 500,
   "groups": [
     {
@@ -17,52 +17,55 @@
       "count": 2000,
       "target_sr": 0.51,
       "target_spl": 0.24,
-      "source_status": "frozen_instruction_manifests",
-      "instruction_type": "mixed_stratified_implicit_need_and_explicit_description",
-      "independence_rule": "IntentionNav: 500 geometric tasks x 2 styles; LangMap: 1000 unique tasks",
+      "source_status": "frozen_intentionnav_2000_manifest",
+      "manifest": "../STRIVE-deploy-105/evidence/intentionnav-complex-20261108T0517Z/demand_2000.jsonl",
+      "manifest_sha256": "ca07522f36e4b365ff54206ad86578fcbbb7f12a225561dad609170c9095dad4",
+      "instruction_type": "implicit_need",
+      "independence_rule": "IntentionNav: 500 geometric tasks x 4 styles; hard_instruction is a 500-condition subset",
       "subgroups": [
         {
           "benchmark": "intentionnav",
-          "count": 1000,
+          "count": 2000,
           "geometric_tasks": 500,
           "styles": [
+            "formal_en",
             "natural_en",
+            "casual_en",
             "emotional_en"
           ],
           "report_by_style": true
-        },
-        {
-          "benchmark": "langmap",
-          "count": 1000,
-          "report_separately": true
         }
       ],
       "subgroup_counts": {
-        "intentionnav": 1000,
-        "langmap": 1000
-      },
-      "manifest_directory": "configs/benchmarks/demand_2000"
+        "intentionnav": 2000
+      }
     },
     {
       "id": "hard_instruction",
       "count": 500,
       "target_sr": 0.31,
       "target_spl": 0.17,
-      "source": "GOAT-Bench val_unseen description subtasks",
-      "benchmark": "goat_language",
-      "protocol": "goat_language_single_parent_start_v1",
-      "seed": 20261105,
-      "dataset_path_105": "/mnt/nvme0/haosu/strive/data/datasets/goat_language_single_500/tasks.json.gz",
-      "task_file_sha256": "7aea09faa6837eb646269235c976d13e975736561e184cc260ff9ba897cd76de",
-      "source_status": "frozen_500_unique_tasks",
-      "difficulty_status": "nominal_project_tier_not_empirically_ranked"
+      "source": "IntentionNav",
+      "benchmark": "intentionnav",
+      "source_status": "frozen_model_assisted_hard_500",
+      "difficulty_status": "complex_conditions_ranked_with_partial_direct_text_review",
+      "manifest_directory": "../STRIVE-deploy-105/evidence/intentionnav-complex-20261108T0517Z/manifests-final",
+      "selection_receipt": "selection_receipt.json",
+      "semantic_review": "87 conditions directly reviewed; fixed regression10 reviewed; not all 500 independently reviewed",
+      "subset_of": "demand_instruction",
+      "include_in_overall": false
     }
   ],
   "overall": {
-    "count": 4500,
+    "source_status": "pending_manifest_freeze",
+    "groups": [
+      "simple_objectnav",
+      "demand_instruction"
+    ],
+    "count": 4000,
     "target_sr": 0.57,
     "target_spl": 0.25,
-    "weighted_group_target_sr": 0.5722222222222222,
-    "weighted_group_target_spl": 0.2544444444444444
+    "weighted_group_target_sr": 0.605,
+    "weighted_group_target_spl": 0.265
   }
 }
