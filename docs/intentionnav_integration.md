@@ -88,29 +88,19 @@ start_rotation_quat_wxyz
 
 ### 观测模式
 
-`launch_intentionnav_episode.py` 与直接策略入口 `run_intentionnav.py` 均默认 `--observation-mode single`。每轮只做一次当前 RGB-D observe 和感知；不先转向、不恢复朝向后重复采集，当前图像也会投影地图里历史对象的可见部分。历史地图持续积累，目标定向取证仍保留。
-
-多视角对照需显式指定 `--observation-mode multi --panorama-views 4`。静止决策观测按4方向感知后恢复原朝向，再发布一帧当前投影，所以是 **4次感知 / 5帧图像**，并非4帧；N可调整但 multi 要求N≥2。运动跟踪刷新和定向取证仍用单视角；single 模式忽略方向数量配置，以实际记录的帧数为准。
+`main` 恢复历史增强源码后，`launch_intentionnav_episode.py` 与 `run_intentionnav.py` 使用默认4方向的多视角感知，不提供 `--observation-mode`。启动器固定向策略传入4方向；`--panorama-views` 仅由直接策略入口 `run_intentionnav.py` 接受，不是启动器参数。静止决策观测按4方向感知后恢复原朝向，再发布当前投影；运动跟踪刷新和定向取证仍保留当前帧处理。完整全文 Agent 开发及其设备隔离改动位于独立 `agent` 分支，不能与这里的历史 Isaac guided 入口混称。
 
 ```bash
 python scripts/launch_intentionnav_episode.py \
   --selection-id SEL_001 --style formal \
   --sim-gpu 0 --policy-gpu 1 --port 9466 --model-port 18182 \
   --max-moves 30 --max-model-calls 60 \
-  --observation-mode single \
-  --output outputs/intentionnav/view-single
-
-python scripts/launch_intentionnav_episode.py \
-  --selection-id SEL_001 --style formal \
-  --sim-gpu 0 --policy-gpu 1 --port 9466 --model-port 18182 \
-  --max-moves 30 --max-model-calls 60 \
-  --observation-mode multi --panorama-views 4 \
-  --output outputs/intentionnav/view-multi
+  --output outputs/intentionnav/guided-multiview
 ```
 
-两条命令顺序运行，使用相同六字段公开输入、冻结源码/模型、freemap及预算，输出目录必须不同且未存在。模式是运行参数，不写入六字段任务文件，不改变官方评分绑定。启动和策略回执保存配置；`scene_snapshots.jsonl` / `perception.jsonl` 可核对实际图像与感知次数。比较 SR/SPL 同时列出视角/转向、移动、模型调用与耗时，不能将运动学相机结果解释为实体机器人安全或效率。
+每次使用新的输出目录，冻结六字段公开输入、源码、模型、freemap及预算；`scene_snapshots.jsonl` / `perception.jsonl` 可核对实际图像与感知次数。比较 SR/SPL 时单列视角/转向、移动、调用与耗时，不能将运动学相机结果解释为实体机器人安全或效率。
 
-当前完成的是 CPU 协议与回归验证；2026-11-09本机缺少完整 Isaac 运行时与数据，未运行新的 IntentionNav 仿真。同期 Habitat 功能对照不能替代这里的 single/multi 导航效果验收，原历史结果不重标、不覆盖。
+IntentionNav 与 Habitat 分别验收，不能以另一后端的验证替代；交付分组、SR/SPL目标及汇总方式沿用 [正式验收口径](acceptance_4500.md)，部署文档不收录临时测试成绩。
 
 ## 4. 运动与评分
 
@@ -136,4 +126,4 @@ SPL=S\frac{L^*}{\max(L^*,\sum_t\|x_t-x_{t-1}\|_{xy})}.
 
 先完成场景/渲染 → 实际模型请求 → 同一 episode 的有效移动与目标验证 → STOP及独立评分，再运行已授权的固定回归集合。30次移动、60次模型调用是示例预算，不代表完整交付协议；同批比较必须固定预算。
 
-历史2026-11-05单例60次查询后预算耗尽、路径0、SR/SPL均0，保留为失败；后续代码变更不能把历史结果改称成功。新版本是否改善只能由新冻结运行判断，不能把代码接线、RGB-D检查或评分程序返回当作全量导航通过。
+新版本是否改善只能由同任务的新冻结运行判断，不能把代码接线、RGB-D检查或评分程序返回当作全量导航通过；历史运行证据独立保存，不重标、不覆盖。
