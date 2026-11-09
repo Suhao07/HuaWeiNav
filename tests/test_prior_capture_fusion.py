@@ -57,16 +57,18 @@ class CaptureFusionTest(unittest.TestCase):
         self.assertEqual(agent.episode_steps, 1)
 
     def test_viewpoint_visibility_uses_actual_image_dimensions(self):
-        from unittest.mock import patch
+        from types import SimpleNamespace
         from planning.viewpoint_policy import build_check_again_viewpoints
-        # 8 个实例点都在光轴前方，其中 6 个落入 320x240 画面。
-        projected = np.array([[80, 240, 80, 240, 80, 240, 400, 400],
-                              [60, 180, 180, 60, 60, 180, 120, 120], [1] * 8])
-        with patch('planning.viewpoint_policy.project_to_camera', return_value=projected):
-            proposals, _ = build_check_again_viewpoints(object_node=_entity(),
-                camera_intrinsic=np.eye(3), mapper_initial_position=np.zeros(3),
-                habitat_path_points=[[1, 0, 1], [.5, 0, 1]], target_height=0,
-                success_distance=1., stop_criterion=.7, image_width=320, image_height=240)
+        pixels = np.array([[80, 60], [240, 180], [80, 180], [240, 60],
+                           [80, 60], [240, 180], [400, 120], [400, 120]])
+        points = np.column_stack((np.full(8, 2.), 1 + (pixels[:, 0] - 160) / 100,
+                                  -(pixels[:, 1] - 120) / 100))
+        obj = SimpleNamespace(position=np.array([2., 1., 0.]), bbox=[80, 60, 240, 180],
+                              pcd=SimpleNamespace(point=SimpleNamespace(positions=torch.tensor(points))))
+        proposals, _ = build_check_again_viewpoints(object_node=obj,
+            camera_intrinsic=np.array([[100., 0., 160.], [0., 100., 121.], [0., 0., 1.]]),
+            mapper_initial_position=np.zeros(3), habitat_path_points=[[1, 0, 1], [1, 0, 1]], target_height=0,
+            success_distance=2., stop_criterion=1., image_width=320, image_height=240)
         assert proposals
         for proposal in proposals:
             self.assertAlmostEqual(proposal['visible_ratio'], 6/8)
