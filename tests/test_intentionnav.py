@@ -716,15 +716,13 @@ def test_batch_lock_prevents_concurrent_launch(navigation_batch):
     assert invoke()["completed"] == 1
 
 
-@pytest.mark.parametrize("args,mode,views", [
-    ([], "single", 4),
-    (["--observation-mode", "single", "--panorama-views", "7"], "single", 7),
-    (["--panorama-views", "0"], "single", 0),
-    (["--observation-mode", "multi"], "multi", 4),
-    (["--observation-mode", "multi", "--panorama-views", "2"], "multi", 2),
-    (["--observation-mode", "multi", "--panorama-views", "6"], "multi", 6),
+@pytest.mark.parametrize("args,views", [
+    ([], 4),
+    (["--panorama-views", "2"], 2),
+    (["--panorama-views", "3"], 3),
+    (["--panorama-views", "6"], 6),
 ])
-def test_policy_cli_forwards_observation_mode_without_changing_public_input(dataset, monkeypatch, capsys, args, mode, views):
+def test_policy_cli_forwards_panorama_views_without_changing_public_input(dataset, monkeypatch, capsys, args, views):
     from types import SimpleNamespace
     from unittest.mock import Mock
     from scripts import run_intentionnav as runner
@@ -742,18 +740,20 @@ def test_policy_cli_forwards_observation_mode_without_changing_public_input(data
                                     "--output", str(output), *args])
     runner.main()
     run.assert_called_once_with(public, output, port=9466, vlm="self_hosted", device="cuda:0",
-                                max_model_calls=60, max_moves=30, panorama_views=views, observation_mode=mode)
+                                max_model_calls=60, max_moves=30, panorama_views=views)
     assert len(run.call_args.args[0]) == 6
     assert json.loads(source.read_text()) == public
     assert json.loads(capsys.readouterr().out) == run.return_value
 
 
 @pytest.mark.parametrize("args,message", [
-    (["--observation-mode", "panorama"], "--observation-mode"),
-    (["--observation-mode", "multi", "--panorama-views", "0"], "--panorama-views"),
-    (["--observation-mode", "multi", "--panorama-views", "1"], "--panorama-views"),
-    (["--observation-mode", "multi", "--panorama-views", "-2"], "--panorama-views"),
-    (["--observation-mode", "multi", "--panorama-views", "2.5"], "--panorama-views"),
+    (["--panorama-views", "0"], "--panorama-views"),
+    (["--panorama-views", "1"], "--panorama-views"),
+    (["--panorama-views", "-2"], "--panorama-views"),
+    (["--panorama-views", "2.5"], "--panorama-views"),
+    (["--observation-mode", "single"], "unrecognized arguments: --observation-mode"),
+    (["--observation-mode", "multi"], "unrecognized arguments: --observation-mode"),
+    (["--observation-mode=multi"], "unrecognized arguments: --observation-mode"),
     (["--max-moves", "0"], "budgets"),
     (["--max-model-calls", "0"], "budgets"),
 ])
@@ -799,6 +799,7 @@ def launcher_case(dataset, fake_official, monkeypatch):
         "PYTHONPATH": "fixture-pythonpath", "PYTHONHOME": "fixture-pythonhome",
         "LD_LIBRARY_PATH": "fixture-libraries", "LD_PRELOAD": "fixture-preload",
         "CUDA_VISIBLE_DEVICES": "fixture-gpu", "LLM_OFFLINE": "1",
+        "UNRELATED_SERVICE_API_KEY": "fixture-only-unrelated-key",
     }
     for name, value in environment.items():
         monkeypatch.setenv(name, value)
@@ -819,7 +820,7 @@ def launcher_case(dataset, fake_official, monkeypatch):
                 "start_position": list(meta["start_position"]),
                 "start_rotation_quat_wxyz": list(meta["start_rotation_quat_wxyz"])},
         assets=assets, consumers=[], events=[], snapshot_writes=[], public_supplied=False,
-        mutate_source=False, server_exit=None,
+        mutate_source=False, server_exit=None, environment=environment,
         scorer_reply={"metrics": dict.fromkeys(("IM", "SR_hit", "OSR_hit", "SPL", "G", "GSR_hit"), 0),
                       "unavailable_metrics": {}, "visibility": {}},
     )
@@ -851,6 +852,12 @@ def launcher_case(dataset, fake_official, monkeypatch):
     server = SimpleNamespace(pid=424242, poll=lambda: case.server_exit,
                              wait=Mock(side_effect=wait_server))
 
+    def resolve_gpu(index):
+        case.simulator_gpu = {"physical_index": index,
+                              "uuid": f"GPU-00112233-4455-6677-8899-{index:012x}",
+                              "pci_bus_id": f"00000000:{index + 1:02X}:00.0"}
+        return dict(case.simulator_gpu)
+
     def start_server(command, **kwargs):
         case.events.append("server_start")
         public = consume(command)
@@ -859,10 +866,18 @@ def launcher_case(dataset, fake_official, monkeypatch):
         assert option(command, "--data-root") == str(root)
         assert kwargs["cwd"] == case.output / "source"
         assert kwargs["start_new_session"] is True
-        assert not set(("PYTHONPATH", "PYTHONHOME", "LD_LIBRARY_PATH", "LD_PRELOAD",
-                        "CUDA_VISIBLE_DEVICES")) & kwargs["env"].keys()
+        assert not set(("PYTHONPATH", "PYTHONHOME", "LD_LIBRARY_PATH", "LD_PRELOAD")) & kwargs["env"].keys()
+        case.gpu_identity.assert_called_once_with(int(option(command, "--gpu")))
+        assert kwargs["env"]["CUDA_VISIBLE_DEVICES"] == case.simulator_gpu["uuid"]
+        assert kwargs["env"]["PYTHONNOUSERSITE"] == "1"
+        assert kwargs["env"] is not os.environ
+        assert all(os.environ[name] == value for name, value in environment.items())
+        gpu_receipt = {**case.simulator_gpu, "cuda_device_count": 1,
+                       "cuda_uuid": case.simulator_gpu["uuid"], "physics_cuda_device": 0,
+                       "renderer_active_gpu": case.simulator_gpu["physical_index"]}
         case.ready = {"pid": server.pid, "port": int(option(command, "--port")),
-                      "isaac_version": "fixture-only-not-loaded",
+                      "isaac_version": "fixture-only-not-loaded", "gpu": gpu_receipt,
+                      "initial_observation_frame_id": 0,
                       "start_pose": {"position": public["start_position"], "yaw": 0.0}}
         (case.output / "server_ready.json").write_text(json.dumps(case.ready), encoding="utf-8")
         if case.mutate_source:
@@ -922,6 +937,8 @@ def launcher_case(dataset, fake_official, monkeypatch):
     monkeypatch.setattr(intentionnav, "load_episode", case.load)
     monkeypatch.setattr(intentionnav, "score_trajectory", case.score)
     monkeypatch.setattr(server_module, "load_public_episode", case.validate)
+    case.gpu_identity = Mock(side_effect=resolve_gpu)
+    monkeypatch.setattr(server_module, "gpu_identity", case.gpu_identity)
     original_open = Path.open
 
     def track_open(path, mode="r", *args, **kwargs):
@@ -950,18 +967,105 @@ def launcher_case(dataset, fake_official, monkeypatch):
     return case
 
 
-def _assert_launcher_completed(case, expected_public, *, scored, observation_mode="single", panorama_views=4):
+@pytest.mark.parametrize("sim_gpu,policy_gpu", [(7, 5), (0, 7), (3, 1)])
+def test_launcher_gpu_environments_are_scoped_and_keys_are_not_published(launcher_case, capsys, sim_gpu, policy_gpu):
+    """Mask only the simulator child and publish no synthetic environment credentials."""
+    case = launcher_case.invoke("--sim-gpu", str(sim_gpu), "--policy-gpu", str(policy_gpu))
+    case.gpu_identity.assert_called_once_with(sim_gpu)
+    assert case.run_result["simulator_gpu"] == case.simulator_gpu
+    assert case.simulator_gpu["physical_index"] == sim_gpu
+    server_call = case.processes.Popen.call_args
+    server_env = server_call.kwargs["env"]
+    policy_call = next(entry for entry in case.processes.run.call_args_list if entry.args[0][0] == "docker")
+    policy_env = policy_call.kwargs["env"]
+    assert server_env is not policy_env and server_env is not os.environ and policy_env is not os.environ
+    assert server_env["CUDA_VISIBLE_DEVICES"] == case.simulator_gpu["uuid"]
+    assert policy_env["CUDA_VISIBLE_DEVICES"] == case.environment["CUDA_VISIBLE_DEVICES"]
+    assert policy_env["LLM_OFFLINE"] == "0" and server_env["LLM_OFFLINE"] == "1"
+    for name in ("PYTHONPATH", "PYTHONHOME", "LD_LIBRARY_PATH", "LD_PRELOAD"):
+        assert name not in server_env
+        assert policy_env[name] == case.environment[name]
+    assert all(os.environ[name] == value for name, value in case.environment.items())
+    policy_command = policy_call.args[0]
+    assert policy_command[policy_command.index("--gpus") + 1] == f"device={policy_gpu}"
+    assert "CUDA_VISIBLE_DEVICES" not in policy_command
+    assert "UNRELATED_SERVICE_API_KEY" not in policy_command
+    assert case.execution["server_command"] == server_call.args[0]
+    assert case.execution["policy_command"] == policy_command
+    assert all("KEY" not in name for name in case.execution["policy_env"])
+    captured = capsys.readouterr()
+    published = captured.out + captured.err + "".join(
+        path.read_text() for path in case.output.iterdir() if path.suffix in {".json", ".log"})
+    assert "UNRELATED_SERVICE_API_KEY" not in published
+    for name in ("VLN_LVLM_API_KEY", "UNRELATED_SERVICE_API_KEY"):
+        assert case.environment[name] not in published
+
+
+@pytest.mark.parametrize("gpu", [0, 5, 7])
+def test_launcher_rejects_shared_simulator_and_policy_gpu(launcher_case, gpu):
+    """Never start either workload on a shared physical GPU, even with inherited masking."""
+    case = launcher_case
+    with pytest.raises(ValueError, match="require separate GPUs"):
+        case.invoke("--sim-gpu", str(gpu), "--policy-gpu", str(gpu))
+    case.processes.Popen.assert_not_called()
+    case.processes.run.assert_not_called()
+    case.score.assert_not_called()
+    assert not (case.output / "server_ready.json").exists()
+    assert not (case.output / "execution.json").exists()
+    assert all(os.environ[name] == value for name, value in case.environment.items())
+
+
+def test_launcher_preserves_startup_error_without_ready_or_policy(launcher_case, capsys):
+    """Retain a pre-ready simulator failure instead of launching policy or claiming readiness."""
+    from scripts import launch_intentionnav_episode as launcher
+
+    case = launcher_case
+    start = case.processes.Popen.side_effect
+
+    def exit_before_ready(command, **kwargs):
+        process = start(command, **kwargs)
+        (case.output / "server_ready.json").unlink()
+        kwargs["stdout"].write("fixture-only initial RGB-D capture failure\n")
+        process.returncode = case.server_exit = 17
+        return process
+
+    case.processes.Popen.side_effect = exit_before_ready
+    with pytest.raises(RuntimeError, match="Isaac exited before readiness: 17"):
+        case.invoke()
+    result = json.loads((case.output / "run_result.json").read_text())
+    assert result["status"] == "error"
+    assert result["error_type"] == "RuntimeError"
+    assert result["error"] == "Isaac exited before readiness: 17"
+    assert result["server_exit_code"] == 17
+    assert result["simulator_gpu"] == case.simulator_gpu
+    assert "server" not in result and "policy_exit_code" not in result
+    assert not (case.output / "server_ready.json").exists()
+    assert not (case.output / "execution.json").exists()
+    assert (case.output / "simulator.log").read_text() == "fixture-only initial RGB-D capture failure\n"
+    case.processes.run.assert_not_called()
+    case.score.assert_not_called()
+    launcher.command.assert_not_called()
+    assert all(os.environ[name] == value for name, value in case.environment.items())
+    captured = capsys.readouterr()
+    assert "simulator_ready" not in captured.out
+    assert json.loads(captured.out.splitlines()[-1]) == result
+    assert all(case.environment[name] not in captured.out + captured.err
+               for name in ("VLN_LVLM_API_KEY", "UNRELATED_SERVICE_API_KEY"))
+
+def _assert_launcher_completed(case, expected_public, *, scored, panorama_views=4):
     result, execution, evaluation = case.run_result, case.execution, case.evaluation
-    settings = {"observation_mode": observation_mode, "panorama_views": panorama_views,
-                "effective_views": 1 if observation_mode == "single" else panorama_views}
+    settings = {"observation_mode": "multi", "panorama_views": panorama_views,
+                "effective_views": panorama_views}
     for artifact in (result, execution, evaluation):
         assert {key: artifact[key] for key in settings} == settings
     policy_command = execution["policy_command"]
-    assert policy_command[policy_command.index("--observation-mode") + 1] == observation_mode
+    assert not any(arg.startswith("--observation-mode") for arg in policy_command)
     assert policy_command[policy_command.index("--panorama-views") + 1] == str(panorama_views)
     assert result["status"] == "completed"
     assert result["policy_exit_code"] == result["server_exit_code"] == 0
     assert result["server"] == case.ready
+    assert result["simulator_gpu"] == case.simulator_gpu
+    assert all(case.ready["gpu"][key] == value for key, value in case.simulator_gpu.items())
     assert result["shutdown_receipt"] == {"action": "shutdown", "fixture_only": True}
     assert result["task_complete"] is evaluation["task_complete"] is False
     assert result["termination"] == evaluation["policy_termination"] == "max_moves"
@@ -1034,33 +1138,33 @@ def test_launcher_golden_protocol_preserves_dataset_selection(launcher_case, dat
     _assert_launcher_completed(case, expected, scored=True)
     case.load.assert_called_once_with(root, expected["selection_id"], expected["style"])
     assert case.score.call_args.args[0]._evaluation_meta == (other_meta if explicit else meta)
-    assert case.run_result["run_id"].startswith(f"strive-{expected['selection_id']}-guided-isaac6-")
+    assert case.run_result["run_id"].startswith(f"strive-{expected['selection_id']}-fulltext-agent-isaac6-")
 
 
-@pytest.mark.parametrize("args,mode,views", [
-    ([], "single", 4),
-    (["--observation-mode", "single", "--panorama-views", "7"], "single", 7),
-    (["--panorama-views", "0"], "single", 0),
-    (["--observation-mode", "multi"], "multi", 4),
-    (["--observation-mode", "multi", "--panorama-views", "2"], "multi", 2),
-    (["--observation-mode", "multi", "--panorama-views", "6"], "multi", 6),
+@pytest.mark.parametrize("args,views", [
+    ([], 4),
+    (["--panorama-views", "2"], 2),
+    (["--panorama-views", "3"], 3),
+    (["--panorama-views", "6"], 6),
 ])
 @pytest.mark.parametrize("scored", [True, False])
-def test_launcher_forwards_observation_mode_and_records_effective_views(launcher_case, args, mode, views, scored):
+def test_launcher_forwards_panorama_views_and_records_effective_views(launcher_case, args, views, scored):
     case = launcher_case
     public = dict(case.public)
     if not scored:
         public["instruction"] = "A different task."
     case.invoke(*args, public=public)
-    _assert_launcher_completed(case, public, scored=scored, observation_mode=mode, panorama_views=views)
+    _assert_launcher_completed(case, public, scored=scored, panorama_views=views)
 
 
 @pytest.mark.parametrize("args,message", [
-    (["--observation-mode", "panorama"], "--observation-mode"),
-    (["--observation-mode", "multi", "--panorama-views", "0"], "--panorama-views"),
-    (["--observation-mode", "multi", "--panorama-views", "1"], "--panorama-views"),
-    (["--observation-mode", "multi", "--panorama-views", "-2"], "--panorama-views"),
-    (["--observation-mode", "multi", "--panorama-views", "2.5"], "--panorama-views"),
+    (["--panorama-views", "0"], "--panorama-views"),
+    (["--panorama-views", "1"], "--panorama-views"),
+    (["--panorama-views", "-2"], "--panorama-views"),
+    (["--panorama-views", "2.5"], "--panorama-views"),
+    (["--observation-mode", "single"], "unrecognized arguments: --observation-mode"),
+    (["--observation-mode", "multi"], "unrecognized arguments: --observation-mode"),
+    (["--observation-mode=multi"], "unrecognized arguments: --observation-mode"),
     (["--max-moves", "0"], "budgets"),
     (["--max-model-calls", "0"], "budgets"),
 ])
@@ -1164,7 +1268,7 @@ def test_launcher_public_run_id_and_asset_hash_use_validated_input(launcher_case
     _assert_launcher_completed(case, public, scored=False)
     input_hash = hashlib.sha256(json.dumps(public, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
     run_id = case.run_result["run_id"]
-    assert run_id.startswith(f"strive-public-{input_hash[:12]}-guided-isaac6-")
+    assert run_id.startswith(f"strive-public-{input_hash[:12]}-fulltext-agent-isaac6-")
     assert "/" not in run_id and ".." not in run_id and "unvalidated-selection" not in run_id
     assert case.output == case.root / "results" / run_id
     assert case.source.read_bytes() != case.consumers[0][1]

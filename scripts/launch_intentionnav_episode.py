@@ -38,19 +38,16 @@ def main():
     parser.add_argument("--image", default="strive-hm3d:local")
     parser.add_argument("--max-moves", type=int, default=30)
     parser.add_argument("--max-model-calls", type=int, default=60)
-    parser.add_argument("--observation-mode", choices=("single", "multi"), default="single",
-                        help="single current view (default), or an explicit multi-view panorama")
     parser.add_argument("--panorama-views", type=int, default=4,
-                        help="number of headings in multi mode (>= 2); ignored in single mode")
+                        help="number of panoramic headings (>= 2; default: 4)")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     if min(args.max_model_calls, args.max_moves) < 1:
         parser.error("episode budgets must be positive")
-    if args.observation_mode == "multi" and args.panorama_views < 2:
-        parser.error("--observation-mode multi requires --panorama-views >= 2")
-    observation_settings = {"observation_mode": args.observation_mode,
-                            "panorama_views": args.panorama_views,
-                            "effective_views": 1 if args.observation_mode == "single" else args.panorama_views}
+    if args.panorama_views < 2:
+        parser.error("--panorama-views must be >= 2")
+    observation_settings = {"observation_mode": "multi", "panorama_views": args.panorama_views,
+                            "effective_views": args.panorama_views}
     if args.public_episode is not None and args.style is not None:
         parser.error("--style cannot override --public-episode")
     root = Path(os.environ["STRIVE_ROOT"])
@@ -85,7 +82,7 @@ def main():
                 episode = candidate
     image_id = subprocess.check_output(
         ["docker", "image", "inspect", args.image, "--format", "{{.Id}}"], text=True).strip()
-    run_id = "strive-" + run_label + "-guided-isaac6-" + datetime.now().strftime("%Y%m%d-%H%M%S")
+    run_id = "strive-" + run_label + "-fulltext-agent-isaac6-" + datetime.now().strftime("%Y%m%d-%H%M%S")
     output = args.output.resolve() if args.output else data_root / "results" / run_id
     output.mkdir(exist_ok=False)
     print(f"RUN_ROOT={output}", flush=True)
@@ -119,10 +116,10 @@ def main():
     owned_server = False
     policy_started = False
     policy_finished = False
-    result = {"run_id": run_id, "status": "starting", "policy": "strive_isaac_guided",
+    result = {"run_id": run_id, "status": "starting", "policy": "strive_isaac_full_instruction_agent",
               **observation_settings, "simulator_gpu": simulator_gpu,
               "public_episode_sha256": public_hash, "evaluation_binding": binding,
-              "mode_equivalence": "not_default_baseline_guided_or_official_isaac45",
+              "mode_equivalence": "not_official_isaac45",
               "motion_semantics": "freemap_checked_kinematic_camera_not_dynamic_robot"}
     with (output / "simulator.log").open("w") as simulator_log:
         server = subprocess.Popen(server_cmd, cwd=source, env=server_env, stdout=simulator_log,
@@ -166,7 +163,6 @@ def main():
                        "python", "scripts/run_intentionnav.py", "--public-episode", str(public),
                        "--output", str(output), "--port", str(args.port),
                        "--max-model-calls", str(args.max_model_calls), "--max-moves", str(args.max_moves),
-                       "--observation-mode", args.observation_mode,
                        "--panorama-views", str(args.panorama_views)]
             write_json(output / "execution.json", {"run_id": run_id, "image_id": image_id,
                        **observation_settings,
@@ -196,7 +192,7 @@ def main():
                 raise RuntimeError("Final observation and STOP trajectory disagree")
             if episode is not None:
                 scored = score_trajectory(episode, trajectory, official_root,
-                    prediction_target=policy["predicted_target"], tier="strive_isaac_guided",
+                    prediction_target=policy["predicted_target"], tier="strive_isaac_full_instruction_agent",
                     model=settings["VLN_LVLM_MODEL"], radius_m=2.0, dataset_root=data_root / "dataset",
                     scene_summary_root=data_root / "metadata/kujiale_scene_summary")
                 scored.update(episode_meta=episode._evaluation_meta, dataset_sha256=episode.source_sha256)

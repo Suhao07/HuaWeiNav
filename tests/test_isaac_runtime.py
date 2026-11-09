@@ -1,5 +1,4 @@
 import base64
-from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, replace
 import json
 import os
@@ -131,15 +130,104 @@ def test_client_exact_json_protocol(monkeypatch):
     assert IsaacClient(9466).command("STOP") == {"status": "reached"}
 
 
-@pytest.mark.parametrize("settings,mode,configured,effective", [
-    ({}, "single", 4, 1),
-    ({"observation_mode": "single", "panorama_views": 7}, "single", 7, 1),
-    ({"observation_mode": "single", "panorama_views": 0}, "single", 0, 1),
-    ({"observation_mode": "multi"}, "multi", 4, 4),
-    ({"observation_mode": "multi", "panorama_views": 3}, "multi", 3, 3),
+def _action(name, **arguments):
+    return {"action": {"name": name, "arguments": arguments, "reason": "Offline agent decision"}}
+
+
+def _replay_episode(monkeypatch, tmp_path, actions, *, initial_calls=1, client=None, spec=None):
+    """Use the real agent/tool/session contracts with deterministic local model responses."""
+    from backends.isaac import runtime
+    from harness.runtime import AgentRuntime
+    from instruction.contracts import CompileResult, TargetSpec, TaskSpec
+    from task.session import TaskSession
+    from verification.contracts import VerificationResult
+
+    public = {"selection_id": "SEL_TEST", "scene_id": "test", "style": "formal",
+              "instruction": "Find a chair.", "start_position": [0., 0., 1.5],
+              "start_rotation_quat_wxyz": [1., 0., 0., 0.]}
+    spec = spec or TaskSpec(public["instruction"], (TargetSpec("t1", "chair"),))
+    public["instruction"] = spec.raw_instruction
+    initial = SimpleNamespace(model_calls=initial_calls, compile=Mock(return_value=CompileResult("success", spec)))
+    client = client or FakeClient()
+    state = SimpleNamespace(public=public, client=client, initial=initial, refreshes=[], contexts=[])
+    commands = client.command
+
+    def command(action, **arguments):
+        if action == "viewpoints":
+            client.commands.append((action, arguments))
+            return [{"position": [float(i), 0., 1.5], "yaw": float(i),
+                     "source": "observed_freemap", "path_length": float(i)} for i in (1, 2)]
+        return commands(action, **arguments)
+
+    client.command = command
+    objects = tuple(ObjectNodeSnapshot(uid, "chair", (float(i), 0., 1.5))
+                    for i, uid in enumerate(("first", "second"), 1))
+    frontiers = tuple(FrontierSnapshot(f"f:{i}", (float(i), 2., 1.5), score=float(i),
+        metadata={"frame_id": "map", "explored_density": 0.}) for i in (1, 2))
+
+    def session_factory(snapshot, plan, **kwargs):
+        assert kwargs["constraint_evaluator"].relation_service.vlm_callback.vlm == "self_hosted"
+        state.session = TaskSession(replace(snapshot, objects=objects, frontiers=frontiers), plan, **kwargs)
+        return state.session
+
+    def tools_factory(session, motion, *args):
+        tools = IsaacNavigationTools(session, motion, *args)
+        tools.query_scene = Mock(return_value={"candidates": [
+            {"candidate_uid": obj.uid, "target_id": "t1", "role": "primary"} for obj in objects],
+            "reason": "observed"})
+        tools.evidence_provider = Mock(return_value={})
+        tools.verifier = SimpleNamespace(verify=Mock(side_effect=lambda **kwargs: VerificationResult(
+            True, "accept", task_revision=session.spec.revision, target_uid=kwargs["candidate"].uid,
+            semantic_satisfied=True, view_sufficient_for_stop=True,
+            diagnostics={"original_instruction_review": {
+                "coverage_complete": True, "interpretation_consistent": True, "task_satisfied": True}})))
+        tools.dispatch = Mock(wraps=tools.dispatch)
+        state.tools, state.motion, state.controller = tools, motion, motion.controller
+        return tools
+
+    def refresh(session, observation_map, controller, client, output, views):
+        state.refreshes.append((dict(controller.pose), views, list(session.detector_terms)))
+        session.snapshot = replace(session.snapshot, robot_pose=pose_value(controller.pose))
+
+    responses = iter(actions)
+
+    def parse(**kwargs):
+        context = json.loads(kwargs["messages"][1]["content"][0]["text"])
+        state.contexts.append(context)
+        response = next(responses)
+        if callable(response):
+            response = response(state, context)
+        parsed = kwargs["response_format"](**response)
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(parsed=parsed))])
+
+    state.parse = Mock(side_effect=parse)
+    model = SimpleNamespace(beta=SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(parse=state.parse))))
+
+    def agent_factory(tools, trace_path, **kwargs):
+        state.agent = AgentRuntime(tools, trace_path, client_model=(model, "offline-replay"), **kwargs)
+        return state.agent
+
+    state.observation_map_factory = Mock(return_value=object())
+    monkeypatch.setattr(runtime, "IsaacClient", lambda port: client)
+    monkeypatch.setattr(runtime, "InitialInstructionCompiler", Mock(return_value=initial))
+    monkeypatch.setattr(runtime, "IsaacObservationMap", state.observation_map_factory)
+    monkeypatch.setattr(runtime, "TaskSession", session_factory)
+    monkeypatch.setattr(runtime, "IsaacNavigationTools", tools_factory)
+    monkeypatch.setattr(runtime, "AgentRuntime", agent_factory)
+    monkeypatch.setattr(runtime, "refresh_observations", refresh)
+    monkeypatch.setenv("STRIVE_LVLM_TRACE_DIR", str(tmp_path / "model_requests"))
+    state.run = lambda **kwargs: runtime.run_episode(public, tmp_path, **kwargs)
+    return state
+
+
+@pytest.mark.parametrize("settings,views", [
+    ({}, 4),
+    ({"panorama_views": 2}, 2),
+    ({"panorama_views": 3}, 3),
+    ({"panorama_views": 7}, 7),
 ])
 def test_last_model_call_motion_executes_before_budget_stop(
-        monkeypatch, tmp_path, settings, mode, configured, effective):
+        monkeypatch, tmp_path, settings, views):
     from backends.isaac import runtime
 
     client = FakeClient()
@@ -152,72 +240,60 @@ def test_last_model_call_motion_executes_before_budget_stop(
         return command(action, **arguments)
 
     client.command = advance_command
-    from harness.tools import NavigationTools
-    from scene.contracts import FrontierSnapshot, SemanticMapSnapshot
-
-    plan = SimpleNamespace(as_dict=lambda: {},
-        concept_queries=[SimpleNamespace(detector_terms=["espresso machine"])],
-        terminal_targets=[SimpleNamespace(name="chair")])
-    progress = SimpleNamespace(completed=False, as_dict=lambda: {"completed": False})
-    session = SimpleNamespace(progress=progress, spec=SimpleNamespace(revision=1),
-        snapshot=SemanticMapSnapshot(0., Pose3D((0., 0., 1.5)), frontiers=tuple(
-            FrontierSnapshot(f"f:{i}", (float(i), 0., 1.5), score=float(i),
-                             metadata={"frame_id": "map", "explored_density": 0.}) for i in (1, 2))))
-    monkeypatch.setattr(runtime, "IsaacClient", lambda port: client)
-    monkeypatch.setattr(runtime, "compile_instruction_plan", lambda *a, **k: plan)
-    observation_map_factory = Mock(return_value=object())
-    monkeypatch.setattr(runtime, "IsaacObservationMap", observation_map_factory)
-    def task_session(*args, **kwargs):
-        assert kwargs["constraint_evaluator"].relation_service.vlm_callback.vlm == "self_hosted"
-        return session
-    monkeypatch.setattr(runtime, "TaskSession", task_session)
-    def make_tools(s, m, *args):
-        tools = NavigationTools(s, m, None, None)
-        tools.query_scene = lambda: {"candidates": [], "reason": "no_observed_candidate"}
-        return tools
-    monkeypatch.setattr(runtime, "IsaacNavigationTools", make_tools)
-    refreshes = []
-    monkeypatch.setattr(runtime, "refresh_observations", lambda *a, **k: refreshes.append(
-        (client.pose.copy(), a[-1], k["observation_mode"])))
-    class LastCallAgent:
-        def __init__(self, tools, *a, **k):
-            self.tools, self.model_calls = tools, 0
-        def choose_frontier(self, options, recommended_uid, reason):
-            self.model_calls += 1
-            return recommended_uid
-        def choice_guard(self):
-            return nullcontext()
-    monkeypatch.setattr(runtime, "AgentRuntime", LastCallAgent)
-    monkeypatch.setenv("STRIVE_LVLM_TRACE_DIR", str(tmp_path / "model_requests"))
-    public = {"selection_id": "SEL_TEST", "scene_id": "test", "style": "formal",
-              "instruction": "Find a chair.", "start_position": [0., 0., 1.5],
-              "start_rotation_quat_wxyz": [1., 0., 0., 0.]}
-    original_public = dict(public)
-    result = runtime.run_episode(public, tmp_path, max_model_calls=1, max_moves=3, **settings)
-    assert public == original_public and len(public) == 6
-    assert result["observation_mode"] == mode
-    assert result["panorama_views"] == configured
-    assert result["effective_views"] == effective
+    state = _replay_episode(monkeypatch, tmp_path, [_action("submit_motion", task_revision=1,
+        control_epoch=0, request_id="last-call", frontier_uid="f:2")], initial_calls=0, client=client)
+    original_public = dict(state.public)
+    result = state.run(max_model_calls=1, max_moves=3, **settings)
+    assert state.public == original_public and len(state.public) == 6
+    assert result["observation_mode"] == "multi"
+    assert result["panorama_views"] == result["effective_views"] == views
     assert json.loads((tmp_path / "policy_result.json").read_text()) == result
-    observation_map_factory.assert_called_once_with(runtime.BACKGROUND_CLASSES, device="cuda:0")
-    assert "espresso machine" not in observation_map_factory.call_args.args[0]
+    state.observation_map_factory.assert_called_once_with(runtime.BACKGROUND_CLASSES, device="cuda:0")
+    assert "espresso machine" not in state.observation_map_factory.call_args.args[0]
     assert result["status"] == "completed"
     assert result["reason"] == "decision_budget_exhausted"
     assert not result["task_complete"]
     assert result["moves"] == 2
     assert sum(action == "move" for action, _ in client.commands) == 2
     assert client.commands[-2][0] == "finish"
-    assert len(refreshes) == 3 and refreshes[0][0] != refreshes[1][0]
-    assert [(views, selected) for _, views, selected in refreshes] == [
-        (effective, mode), (1, mode), (effective, mode)]
+    assert len(state.refreshes) == 3 and state.refreshes[0][0] != state.refreshes[1][0]
+    assert [count for _, count, _ in state.refreshes] == [views, 0, views]
+    assert result["policy"] == "strive_isaac_full_instruction_agent"
+    assert result["semantic_authority"] == "raw_instruction"
+    assert result["structured_interpretation"] == "revisable_execution_aid"
+    assert "each_agent_tool_decision" in result["model_calls_scope"]
+    assert {"prompting/templates.py", "prompting/schemas.py", "instruction/compiler.py",
+            "instruction_adapter/constraints.py", "instruction_adapter/relation_verifier.py"} <= set(result["source_sha256"])
+    assert result["final_frame"]["pose"] == client.pose == state.controller.pose
+    assert state.motion.active_request_id is None
+    assert state.tools.movement_budget_remaining == 1
+    feedback = [event for event in state.agent.history if event.get("event") == "motion_feedback"]
+    assert [event["status"]["status"] for event in feedback] == ["running", "reached"]
+    assert [event["tracking_active"] for event in feedback] == [True, False]
+    assert [event["active_request_id"] for event in feedback] == ["last-call", None]
+    assert [event["moves"] for event in feedback] == [1, 2]
+    for index, event in enumerate(feedback, 1):
+        assert event["request_id"] == "last-call" and event["goal_id"] == "motion:0"
+        assert event["control_epoch"] == 0 and not event["held"]
+        assert event["goal"]["mode"] == "go_to_frontier"
+        assert event["intent"]["metadata"]["frontier_uid"] == "f:2"
+        assert event["robot_pose"] == json.loads(json.dumps(event["status"]["current_pose"]))
+        assert event["status"]["metadata"]["receipt"]["pose"] == state.refreshes[index][0]
+    assert not any(call.args[0] == "propose_finish" for call in state.tools.dispatch.call_args_list)
+    state.tools.evidence_provider.assert_not_called()
+    state.tools.query_scene.assert_not_called()
 
 
 @pytest.mark.parametrize("settings,message", [
-    ({"observation_mode": "panorama"}, "observation_mode"),
-    ({"observation_mode": "multi", "panorama_views": 0}, "panorama_views"),
-    ({"observation_mode": "multi", "panorama_views": 1}, "panorama_views"),
-    ({"observation_mode": "multi", "panorama_views": -1}, "panorama_views"),
-    ({"observation_mode": "multi", "panorama_views": 2.5}, "panorama_views"),
+    ({"panorama_views": 0}, "panorama_views"),
+    ({"panorama_views": 1}, "panorama_views"),
+    ({"panorama_views": -1}, "panorama_views"),
+    ({"panorama_views": 2.5}, "panorama_views"),
+    ({"panorama_views": 2.0}, "panorama_views"),
+    ({"panorama_views": "4"}, "panorama_views"),
+    ({"panorama_views": None}, "panorama_views"),
+    ({"panorama_views": True}, "panorama_views"),
+    ({"panorama_views": False}, "panorama_views"),
     ({"max_moves": 0}, "budgets"),
 ])
 def test_episode_rejects_invalid_observation_settings_before_resources(monkeypatch, tmp_path, settings, message):
@@ -237,41 +313,164 @@ def test_episode_rejects_invalid_observation_settings_before_resources(monkeypat
     assert not list(tmp_path.iterdir())
 
 
-@pytest.mark.parametrize("role,status", [("primary", "reached"), ("primary", "blocked"), ("anchor", "reached")])
-def test_guided_candidate_verification_and_recovery(tmp_path, role, status):
-    from backends.isaac.runtime import IsaacGuidedNavigation
-    from harness.tools import NavigationTools
-    from instruction_adapter.concept_matcher import AnchorSearchLedger
-    from scene.contracts import ObjectNodeSnapshot, SemanticMapSnapshot, ViewpointSnapshot
+@pytest.mark.parametrize("mode", ["single", "multi"])
+def test_observation_mode_is_not_a_runtime_parameter(tmp_path, mode):
+    """Removed mode keywords must fail at binding, even for the former multi default."""
+    from inspect import signature
+    from backends.isaac import runtime
 
+    for function, args in ((runtime.run_episode, (None, tmp_path)),
+                           (refresh_observations, (None, None, None, None, tmp_path, 4))):
+        assert "observation_mode" not in signature(function).parameters
+        with pytest.raises(TypeError, match="observation_mode"):
+            function(*args, observation_mode=mode)
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("destination", ["second_candidate", "frontier"])
+@pytest.mark.parametrize("status", ["reached", "blocked"])
+def test_agent_selects_candidate_and_view_or_ignores_candidates_without_auto_verify(
+        monkeypatch, tmp_path, destination, status):
     client = FakeClient()
     client.status = status
-    controller = IsaacMotionController(client, client.pose)
-    motion = MotionSupervisor(controller)
-    progress = SimpleNamespace(completed=False)
-    session = SimpleNamespace(spec=SimpleNamespace(revision=1, raw_instruction="Find a chair."),
-        progress=progress, anchor_search_ledger=AnchorSearchLedger(), snapshot=SemanticMapSnapshot(
-            0., Pose3D((0., 0., 1.5)), objects=(ObjectNodeSnapshot("obj", "chair", (2., 0., 1.5)),),
-            viewpoints=(ViewpointSnapshot("view", Pose3D((1., 0., 1.5)), visible_objects=("obj",)),)))
-    tools = NavigationTools(session, motion, None, None)
-    tools.query_scene = lambda: {"candidates": [{"candidate_uid": "obj", "target_id": "t1",
-                                                 "role": role}], "reason": "observed"}
-    verified = []
-    def verify(*args):
-        verified.append(args)
-        progress.completed = True
-        return {"decision": "accept"}
-    tools.verify_target = verify
-    guided = IsaacGuidedNavigation(tools, SimpleNamespace(model_calls=0), tmp_path)
-    assert guided.select()
-    controller.advance(motion.active_goal_id)
-    guided.motion_finished(motion.poll_active())
-    assert bool(verified) == (role == "primary" and status == "reached")
-    assert progress.completed == bool(verified)
-    if role == "anchor":
-        assert session.anchor_search_ledger.is_blocked("Find a chair.", "t1", "obj")
-    assert not guided.select()
-    assert motion.active_request_id is None
+    actions = [_action("query_scene")]
+    if destination == "second_candidate":
+        actions += [_action("query_viewpoints", candidate_uid="second"),
+                    _action("submit_motion", task_revision=1, control_epoch=0, request_id="chosen",
+                            candidate_uid="second", viewpoint_uid="second:view:1:1")]
+    else:
+        actions += [_action("submit_motion", task_revision=1, control_epoch=0,
+                            request_id="chosen", frontier_uid="f:1")]
+
+    def observe_arrival(state, context):
+        state.tools.evidence_provider.assert_not_called()
+        assert state.motion.active_request_id is None
+        assert not state.session.progress.completed
+        feedback = context["recent_tools"][-1]
+        assert feedback["event"] == "motion_feedback" and feedback["status"]["status"] == status
+        assert feedback["candidate_uid"] == ("second" if destination == "second_candidate" else None)
+        return _action("observe")
+
+    actions.append(observe_arrival)
+    state = _replay_episode(monkeypatch, tmp_path, actions, client=client)
+    result = state.run(max_model_calls=len(actions) + 1, max_moves=3)
+    assert result["reason"] == "decision_budget_exhausted" and result["moves"] == 1
+    assert not result["task_complete"] and result["model_calls"] == len(actions) + 1
+    state.tools.query_scene.assert_called_once_with()
+    state.tools.evidence_provider.assert_not_called()
+    assert not any(call.args[0] == "propose_finish" for call in state.tools.dispatch.call_args_list)
+    assert len(state.refreshes) == 2
+    goal, = state.controller.goals.values()
+    if destination == "second_candidate":
+        assert goal.target_object_uid == "second" and goal.goal_pose.position == (2., 0., 1.5)
+        assert goal.metadata["viewpoint_uid"] == "second:view:1:1"
+        assert [args for action, args in client.commands if action == "viewpoints"] == [{"position": [2., 0., 1.5]}]
+    else:
+        assert goal.mode == MotionGoalMode.GO_TO_FRONTIER
+        assert goal.metadata["frontier_uid"] == "f:1"
+        assert not any(action == "viewpoints" for action, _ in client.commands)
+    assert client.commands[-2][0] == "finish" and client.commands[-1][0] == "observe"
+
+
+@pytest.mark.parametrize("finish", [False, True])
+def test_verify_requires_explicit_agent_finish_even_after_last_move(monkeypatch, tmp_path, finish):
+    client = FakeClient()
+    client.status = "reached"
+
+    def verify(state, context):
+        assert state.tools.movement_budget_remaining == 0 and state.motion.active_request_id is None
+        assert not context["observation"]["progress"]["completed"]
+        return _action("verify_target", candidate_uid="second", target_id="t1", task_revision=1)
+
+    actions = [_action("submit_motion", task_revision=1, control_epoch=0, request_id="last-move", frontier_uid="f:1"), verify]
+    if finish:
+        def propose(state, context):
+            assert context["observation"]["progress"]["completed"]
+            assert not any(call.args[0] == "propose_finish" for call in state.tools.dispatch.call_args_list)
+            return _action("propose_finish")
+        actions.append(propose)
+    state = _replay_episode(monkeypatch, tmp_path, actions, client=client)
+    result = state.run(max_model_calls=len(actions) + 1, max_moves=1)
+    assert result["task_complete"] == finish and result["moves"] == 1
+    assert result["structured_task_complete"]
+    assert result["prediction_task_revision"] == 1 and result["predicted_target_id"] == "t1"
+    assert result["prediction_source"] == "current_full_instruction_verification"
+    assert result["reason"] == ("verified_finish" if finish else "movement_budget_exhausted")
+    assert sum(call.args[0] == "propose_finish" for call in state.tools.dispatch.call_args_list) == int(finish)
+    state.tools.evidence_provider.assert_called_once_with("second")
+    assert len(state.controller.goals) == 1 and state.motion.active_request_id is None
+    assert len(state.refreshes) == 2
+    assert all(args["max_distance"] == 1.7 for action, args in client.commands if action == "move")
+    assert result["stop_receipt"]["zero_velocity"]
+    assert result["final_frame"]["pose"] == state.controller.pose
+
+
+def test_rejected_agent_finish_does_not_stop_episode(monkeypatch, tmp_path):
+    state = _replay_episode(monkeypatch, tmp_path, [_action("propose_finish"), _action("observe")])
+    result = state.run(max_model_calls=3)
+    assert result["reason"] == "decision_budget_exhausted" and not result["task_complete"]
+    assert state.parse.call_count == 2 and result["moves"] == 0
+    assert [call.args for call in state.tools.dispatch.call_args_list if call.args[0] == "propose_finish"] == [
+        ("propose_finish", {})]
+    assert len(state.refreshes) == 1
+
+
+@pytest.mark.parametrize("last_call", [False, True])
+def test_running_motion_cancels_at_move_budget_with_terminal_feedback(monkeypatch, tmp_path, last_call):
+    state = _replay_episode(monkeypatch, tmp_path, [_action("submit_motion", task_revision=1,
+        control_epoch=0, request_id="budget", frontier_uid="f:1")])
+    result = state.run(max_model_calls=2 if last_call else 8, max_moves=2)
+    assert result["reason"] == "movement_budget_exhausted" and result["moves"] == 2
+    assert state.parse.call_count == 1 and state.tools.movement_budget_remaining == 0
+    assert state.motion.active_request_id is None and state.motion.control_epoch == 1
+    assert [event["status"]["status"] for event in state.agent.history if event.get("event") == "motion_feedback"] == ["running", "running", "preempted"]
+    terminal = state.agent.history[-1]
+    assert not terminal["tracking_active"] and terminal["request_id"] == "budget"
+    assert terminal["control_epoch"] == 1 and terminal["phase"] == "terminated"
+    assert terminal["status"]["metadata"]["receipt"]["zero_velocity"]
+    assert [action for action, _ in state.client.commands] == ["observe", "move", "move", "STOP", "finish", "observe"]
+    state.tools.evidence_provider.assert_not_called()
+    assert not any(call.args[0] == "propose_finish" for call in state.tools.dispatch.call_args_list)
+
+
+def test_idle_exhausted_budget_rejects_new_motion_but_still_allows_finish(monkeypatch, tmp_path):
+    client = FakeClient()
+    client.status = "reached"
+    actions = [_action("submit_motion", task_revision=1, control_epoch=0, request_id="last", frontier_uid="f:1"),
+               _action("submit_motion", task_revision=1, control_epoch=0, request_id="over-budget", frontier_uid="f:2"),
+               _action("verify_target", candidate_uid="second", target_id="t1", task_revision=1),
+               _action("propose_finish")]
+    state = _replay_episode(monkeypatch, tmp_path, actions, client=client)
+    result = state.run(max_model_calls=5, max_moves=1)
+    assert result["reason"] == "verified_finish" and result["moves"] == 1
+    assert len(state.controller.goals) == 1 and state.motion.active_request_id is None
+    rows = [json.loads(line) for line in (tmp_path / "tools.jsonl").read_text().splitlines()]
+    rejected = next(row["result"] for row in rows if row.get("event") == "returned"
+                    and row.get("arguments", {}).get("request_id") == "over-budget")
+    assert rejected["accepted"] is False and rejected["reason"] == "movement_budget_exhausted"
+    assert state.parse.call_count == 4
+
+
+@pytest.mark.parametrize("failure", ["model", "move"])
+def test_episode_propagates_original_failure_and_quiesces_owner(monkeypatch, tmp_path, failure):
+    error = ConnectionError("offline injected failure")
+
+    def fail(*args, **kwargs):
+        raise error
+
+    state = _replay_episode(monkeypatch, tmp_path, [fail] if failure == "model" else [
+        _action("submit_motion", task_revision=1, control_epoch=0, request_id="failed", frontier_uid="f:1")])
+    if failure == "move":
+        command = state.client.command
+        state.client.command = lambda action, **kwargs: fail() if action == "move" else command(action, **kwargs)
+    with pytest.raises(ConnectionError) as raised:
+        state.run(max_model_calls=2)
+    assert raised.value is error
+    result = json.loads((tmp_path / "policy_result.json").read_text())
+    assert result["status"] == "error" and result["reason"] == "ConnectionError"
+    assert result["model_calls"] == 2 and result["moves"] == 0
+    assert state.motion.active_request_id is None and state.client.commands[-1][0] == "STOP"
+    assert not any(action == "finish" for action, _ in state.client.commands)
 
 
 @pytest.mark.parametrize("revision,epoch", [(1, 1), (0, 0)])
@@ -282,6 +481,7 @@ def test_version_rejection_preserves_guard_and_allows_corrected_proposal(revisio
     client = FakeClient()
     controller = IsaacMotionController(client, client.pose)
     tools = object.__new__(IsaacNavigationTools)
+    tools.movement_budget_remaining = None
     tools.motion = MotionSupervisor(controller)
     tools.session = SimpleNamespace(spec=SimpleNamespace(revision=1), snapshot=SemanticMapSnapshot(
         0., Pose3D((0., 0., 1.5)), frontiers=(FrontierSnapshot(
@@ -400,11 +600,11 @@ def test_add_reports_only_current_fusion_bindings(monkeypatch, tmp_path, target_
     json.dumps([report, empty], allow_nan=False)
 
 
-@pytest.mark.parametrize("panorama_views,observation_mode", [(0, None), (1, None), (2, None), (3, None), (1, "multi")])
+@pytest.mark.parametrize("panorama_views", [0, 2, 3, 4])
 def test_refresh_publishes_only_this_batch_and_depth_visible_final_frame(
-        tmp_path, capsys, panorama_views, observation_mode):
+        tmp_path, capsys, panorama_views):
     observation_map = _surface_map()
-    image_count = 1 if panorama_views == 1 else panorama_views + 1
+    image_count = max(1, panorama_views)
     packets = [_frame_packet(tmp_path, 40 + i * 7, np.ones((10, 10)))
                for i in range(image_count)]
     reports = []
@@ -426,18 +626,16 @@ def test_refresh_publishes_only_this_batch_and_depth_visible_final_frame(
     packets[-1]["pose"] = {"position": [0.5, 0.25, 1.5], "yaw": start_yaw}
     packets[-1]["frontiers"] = [{"uid": "fresh", "position": [1., 2., 1.5]}]
     controller = IsaacMotionController(client, client.pose)
-    refresh_observations(session, observation_map, controller, client, tmp_path, panorama_views,
-                         observation_mode=observation_mode)
+    refresh_observations(session, observation_map, controller, client, tmp_path, panorama_views)
     images = session.snapshot.metadata["observation_images"]
     assert len(images) == image_count
-    assert images[:-1] == ([report["observation_image"] for report in reports] if panorama_views >= 2 else [])
+    assert images[:-1] == ([report["observation_image"] for report in reports[:-1]] if panorama_views >= 2 else [])
     assert controller.pose is packets[-1]["pose"]
     assert session.snapshot.robot_pose == pose_value(packets[-1]["pose"])
     assert session.snapshot.frontiers == (FrontierSnapshot(**packets[-1]["frontiers"][0]),)
     assert session.snapshot.objects is observation_map.objects()
-    selected_mode = observation_mode or ("multi" if panorama_views >= 2 else "single")
-    assert session.snapshot.metadata["observation_mode"] == selected_mode
-    assert session.snapshot.metadata["effective_views"] == panorama_views
+    assert session.snapshot.metadata["observation_mode"] == "multi"
+    assert session.snapshot.metadata["effective_views"] == image_count
     assert session.snapshot.metadata["panorama_views"] == panorama_views
     assert images[-1] == {"id": str(packets[-1]["frame"]["frame_id"]),
         "image_ref": str(tmp_path / packets[-1]["frame"]["rgb_path"]),
@@ -450,15 +648,15 @@ def test_refresh_publishes_only_this_batch_and_depth_visible_final_frame(
     assert [call.args[0] for call in observation_map.points.call_args_list] == [
         obj.uid for obj in observation_map.objects()]
     expected_commands = []
-    if panorama_views != 1:
+    if panorama_views >= 2:
         for i in range(panorama_views):
-            expected_commands.extend([("look", {"yaw": start_yaw + 2 * np.pi * i / panorama_views}),
-                                      ("observe", {})])
-        expected_commands.append(("look", {"yaw": start_yaw}))
-    expected_commands.append(("observe", {}))
+            yaw = start_yaw if i == panorama_views - 1 else start_yaw + 2 * np.pi * (i + 1) / panorama_views
+            expected_commands.extend([("look", {"yaw": yaw}), ("observe", {})])
+    else:
+        expected_commands.extend([("look", {"yaw": start_yaw}), ("observe", {})])
     assert client.commands == expected_commands
     logged = [json.loads(line) for line in (tmp_path / "perception.jsonl").read_text().splitlines()] if panorama_views else []
-    assert logged == [{**report, "observation_mode": selected_mode, "effective_views": panorama_views}
+    assert logged == [{**report, "observation_mode": "multi", "effective_views": image_count}
                       for report in reports]
     assert [json.loads(line) for line in capsys.readouterr().out.splitlines()] == [
         {"event": "perception", **report} for report in logged]
@@ -473,7 +671,17 @@ def test_refresh_publishes_only_this_batch_and_depth_visible_final_frame(
     observation_map.add.assert_not_called()
 
 
-@pytest.mark.parametrize("panorama_views", [1, 2])
+@pytest.mark.parametrize("panorama_views", [1, -1, 2.0, 2.5, "4", None, True, False])
+def test_refresh_rejects_single_view_or_invalid_panorama_before_io(tmp_path, panorama_views):
+    """Only a panorama or the explicit internal zero-view reprojection is admissible."""
+    observation_map, client = Mock(), Mock()
+    with pytest.raises(ValueError, match="panorama_views"):
+        refresh_observations(None, observation_map, None, client, tmp_path, panorama_views)
+    assert not observation_map.mock_calls and not client.mock_calls
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("panorama_views", [2, 4])
 def test_refresh_forwards_replaced_terms_to_actual_observation_map(monkeypatch, tmp_path, panorama_views):
     """Exercise refresh -> add -> segment, retaining historical labels across term revisions."""
     from instruction_adapter.contracts import InstructionPlan, TargetQuery
@@ -498,7 +706,7 @@ def test_refresh_forwards_replaced_terms_to_actual_observation_map(monkeypatch, 
         InstructionPlan("Find a reading spot.", targets=[TargetQuery(
             "goal", "reading spot", detector_terms=["espresso machine", "table"])]))
     spec, ledger = session.spec, session.verification_ledger
-    images_per_refresh = 1 if panorama_views == 1 else panorama_views + 1
+    images_per_refresh = max(1, panorama_views)
     packets = [_frame_packet(tmp_path, i + 1, np.ones((10, 10))) for i in range(2 * images_per_refresh)]
     client = FrameClient(packets)
     controller = IsaacMotionController(client, client.pose)
@@ -527,8 +735,7 @@ def test_refresh_forwards_replaced_terms_to_actual_observation_map(monkeypatch, 
     assert first_snapshot.objects[0].uid == "historical"
     reports = [json.loads(line) for line in (tmp_path / "perception.jsonl").read_text().splitlines()]
     assert all(report["observation_image"]["observed_object_uids"] == [] for report in reports)
-    if panorama_views == 1:
-        assert client.commands == [("observe", {})] * 2
+    assert [action for action, _ in client.commands] == ["look", "observe"] * (2 * panorama_views)
     assert len((tmp_path / "scene_snapshots.jsonl").read_text().splitlines()) == 2
     geometry.assert_not_called()
 
@@ -614,8 +821,7 @@ def test_capture_evidence_publishes_depth_filtered_covisibility_and_raw_image(
 
 @pytest.mark.parametrize("frontier_count", [1, 2])
 @pytest.mark.parametrize("candidate_visible", [True, False], ids=["golden", "missing_projection"])
-def test_guided_frontier_uses_same_current_packet_after_verification(tmp_path, candidate_visible, frontier_count):
-    from backends.isaac.runtime import IsaacGuidedNavigation
+def test_agent_frontier_uses_same_current_packet_after_verification(tmp_path, candidate_visible, frontier_count):
     from harness.runtime import AgentRuntime
     from instruction.contracts import TaskSpec, TargetSpec
     from instruction_adapter.task_compat import runtime_plan
@@ -623,6 +829,7 @@ def test_guided_frontier_uses_same_current_packet_after_verification(tmp_path, c
     from verification.contracts import VerificationResult
 
     observation_map = _surface_map()
+    side_view = _frame_packet(tmp_path, 40, np.ones((10, 10)))
     refreshed = _frame_packet(tmp_path, 47, np.ones((10, 10)))
     current = _frame_packet(tmp_path, 73, np.full((10, 10), 1. if candidate_visible else 0.))
     refreshed["pose"] = {"position": [1., 0., 1.5], "yaw": 0.}
@@ -633,10 +840,11 @@ def test_guided_frontier_uses_same_current_packet_after_verification(tmp_path, c
             for i in range(1, frontier_count + 1)]
     raw_path = tmp_path / current["frame"]["rgb_path"]
     Image.new("RGB", (10, 10), (120, 80, 40)).save(raw_path)
-    observation_map.add = Mock(return_value={"frame_id": 47, "observation_image": {
-        "id": "47", "image_ref": str(tmp_path / refreshed["frame"]["rgb_path"]),
-        "observed_object_uids": ["candidate"], "object_boxes": {"candidate": [2, 3, 7, 7]}}})
-    client = FrameClient([refreshed, current])
+    observation_map.add = Mock(side_effect=[{"frame_id": packet["frame"]["frame_id"], "observation_image": {
+        "id": str(packet["frame"]["frame_id"]), "image_ref": str(tmp_path / packet["frame"]["rgb_path"]),
+        "observed_object_uids": ["candidate"], "object_boxes": {"candidate": [2, 3, 7, 7]}}}
+        for packet in (side_view, refreshed)])
+    client = FrameClient([side_view, refreshed, current])
     client.status = "reached"
     controller = IsaacMotionController(client, client.pose)
     motion = MotionSupervisor(controller)
@@ -651,29 +859,35 @@ def test_guided_frontier_uses_same_current_packet_after_verification(tmp_path, c
         task_revision=session.spec.revision, target_uid="candidate", view_sufficient_for_stop=False))
     tools.query_scene = Mock(return_value={"candidates": [], "reason": "no_untried_candidate_view"})
 
+    actions = iter([
+        _action("submit_motion", task_revision=1, control_epoch=0, request_id="candidate",
+                candidate_uid="candidate", viewpoint_uid="view"),
+        _action("verify_target", task_revision=1, candidate_uid="candidate", target_id="t1"),
+        _action("submit_motion", task_revision=1, control_epoch=0, request_id="frontier",
+                frontier_uid=f"current:{frontier_count}")])
+
     def parse(**kwargs):
-        choice = kwargs["response_format"](frontier_uid=f"current:{frontier_count}", reason="Continue searching")
+        choice = kwargs["response_format"](**next(actions))
         return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(parsed=choice))])
 
     parse_call = Mock(side_effect=parse)
     model = SimpleNamespace(beta=SimpleNamespace(chat=SimpleNamespace(
         completions=SimpleNamespace(parse=parse_call))))
     agent = AgentRuntime(tools, tmp_path / "tools.jsonl", client_model=(model, "offline-replay"))
-    guided = IsaacGuidedNavigation(tools, agent, tmp_path)
-    guided.submit(candidate={"candidate_uid": "candidate", "target_id": "t1", "role": "primary"},
-                  view=asdict(view))
+    agent.step()
     controller.advance(motion.active_goal_id)
     feedback = motion.poll_active()
     assert not feedback.tracking_active
-    refresh_observations(session, observation_map, controller, client, tmp_path, panorama_views=1)
-    assert [image["id"] for image in session.snapshot.metadata["observation_images"]] == ["47"]
-    guided.motion_finished(feedback)
+    refresh_observations(session, observation_map, controller, client, tmp_path, panorama_views=2)
+    assert [image["id"] for image in session.snapshot.metadata["observation_images"]] == ["40", "47"]
+    tools.evidence_provider.assert_not_called()
+    agent.step()
     assert not session.progress.completed
     tools.evidence_provider.assert_called_once_with("candidate")
     assert tools.verifier.final.verify.call_count == int(candidate_visible)
-    assert guided.select()
+    agent.step()
 
-    parse_call.assert_called_once()
+    assert parse_call.call_count == 3
     content = parse_call.call_args.kwargs["messages"][1]["content"]
     context = json.loads(content[0]["text"])
     observation = context["observation"]
@@ -681,9 +895,9 @@ def test_guided_frontier_uses_same_current_packet_after_verification(tmp_path, c
     assert evidence["observation_status"] == ("current" if candidate_visible else "need_observation")
     assert observation["robot_pose"] == pose_value(current["pose"]).as_dict()
     assert observation["frontiers"] == [asdict(FrontierSnapshot(**item)) for item in current["frontiers"]]
-    assert [item["frontier_uid"] for item in context["options"]] == [
+    assert [item["uid"] for item in observation["frontiers"]] == [
         f"current:{i}" for i in range(1, frontier_count + 1)]
-    assert context["baseline_recommendation"] == f"current:{frontier_count}"
+    assert "baseline_recommendation" not in context
     assert len(observation["observation_images"]) == 1
     image = observation["observation_images"][0]
     assert {key: image[key] for key in evidence["observation_images"][0]} == evidence["observation_images"][0]
@@ -697,131 +911,274 @@ def test_guided_frontier_uses_same_current_packet_after_verification(tmp_path, c
     assert rows[-1]["timestamp"] == observation["timestamp"] > rows[0]["timestamp"]
     assert rows[-1]["frontiers"] == observation["frontiers"]
     assert rows[-1]["metadata"]["observation_images"] == evidence["observation_images"]
-    observation_map.add.assert_called_once_with(refreshed, target_list=session.detector_terms)
+    assert [call.args[0] for call in observation_map.add.call_args_list] == [side_view, refreshed]
+    assert [call.kwargs for call in observation_map.add.call_args_list] == [
+        {"target_list": session.detector_terms}] * 2
     assert observation_map.points.call_count == 2 * len(observation_map.objects())
-    assert [action for action, _ in client.commands] == ["move", "observe", "look", "observe"]
-    assert agent.model_calls == 1 and controller.moves == 1
+    assert [action for action, _ in client.commands] == ["move", "look", "observe", "look", "observe", "look", "observe"]
+    assert agent.model_calls == 3 and controller.moves == 1
     goal = controller.goals[motion.active_goal_id]
     assert goal.mode == MotionGoalMode.GO_TO_FRONTIER
     assert list(goal.goal_pose.position) == current["frontiers"][-1]["position"]
 
 
 @pytest.mark.parametrize("outcome", ["installed", "unchanged", "invalid", "guard_refused"])
-def test_guided_interpretation_handoff_preserves_physical_history(tmp_path, outcome):
-    """Only an installed revision releases candidate attempts, never blocked paths."""
-    from backends.isaac.runtime import IsaacGuidedNavigation
-    from harness.tools import NavigationTools
-    from instruction.contracts import TaskSpec, TargetSpec
-    from instruction_adapter.task_compat import runtime_plan
-    from task.session import TaskSession
+def test_agent_interpretation_refresh_preserves_motion_history(monkeypatch, tmp_path, outcome):
+    from instruction.compiler import compile_parsed_instruction
+    from instruction_adapter.compiler import RUNTIME_CONSTRAINT_TYPES
+    from prompting.schemas import ParsedInstruction
 
     client = FakeClient()
-    controller = IsaacMotionController(client, client.pose)
-    controller.moves = 7
-    motion = MotionSupervisor(controller)
-    spec = TaskSpec("Find somewhere to sit.", (TargetSpec("goal", "chair"),))
-    view = ViewpointSnapshot("view", Pose3D((1., 0., 1.5)), visible_objects=("obj",))
-    frontiers = tuple(FrontierSnapshot(f"f:{i}", (float(i), 2., 1.5), score=float(i),
-        metadata={"frame_id": "map", "explored_density": 0.}) for i in (1, 2))
-    snapshot = SemanticMapSnapshot(12., pose_value(client.pose),
-        objects=(ObjectNodeSnapshot("obj", "sofa", (2., 0., 1.5)),),
-        viewpoints=(view,), frontiers=frontiers)
-    session = TaskSession(snapshot, runtime_plan(spec))
-    tools = NavigationTools(session, motion, None, None)
-    queried = []
+    client.status = "reached"
+    spec = compile_parsed_instruction("Find somewhere to sit.",
+        ParsedInstruction(targets=[{"name": "chair"}]), RUNTIME_CONSTRAINT_TYPES).task
 
-    def query():
-        active = session.progress.active_target()
-        queried.append((session.spec.revision, active.name))
-        return {"candidates": [{"candidate_uid": "obj", "target_id": active.id,
-                                "label": active.name, "role": "primary"}], "reason": "observed"}
+    def reinterpret(state, context):
+        assert state.controller.moves == 1 and state.motion.active_request_id is None
+        state.previous_snapshot = state.session.snapshot
+        state.previous_ledger = state.session.verification_ledger
+        if outcome == "guard_refused":
+            state.motion.hold()
+        targets = [] if outcome == "invalid" else [{"name": "sofa" if outcome == "installed" else "chair"}]
+        return _action("revise_interpretation", interpretation_update={
+            "interpretation": {"targets": targets}, "basis_ids": ["instruction"],
+            "reason": "Reconsider the user's requested sitting resource"})
 
-    tools.query_scene = query
-    runtime = SimpleNamespace(model_calls=2, max_model_calls=5)
-    no_choice = outcome == "invalid"
-
-    def choose(options, recommended, reason):
-        runtime.model_calls += 1
-        assert [option["frontier_uid"] for option in options] == ["f:1"]
-        assert recommended == "f:1" and motion.active_request_id is None
-        if outcome == "installed":
-            revised = replace(spec, revision=2, targets=(TargetSpec("goal", "sofa"),))
-            session.install_plan(runtime_plan(revised))
-            return None
-        return None if no_choice else recommended
-
-    guard_events = []
-
-    @contextmanager
-    def choice_guard():
-        guard_events.append("enter")
-        try:
-            if outcome == "guard_refused":
-                raise ValueError("choice refused")
-            yield
-        finally:
-            guard_events.append("exit")
-
-    runtime.choose_frontier = Mock(side_effect=choose)
-    runtime.choice_guard = Mock(side_effect=choice_guard)
-    guided = IsaacGuidedNavigation(tools, runtime, tmp_path)
-    original_submit = guided.submit
-
-    def submit(**kwargs):
-        if "frontier" in kwargs:
-            assert guard_events == ["enter"]
-        return original_submit(**kwargs)
-
-    guided.submit = Mock(side_effect=submit)
-    guided.sequence = 4
-    attempts = guided.attempted_views
-    attempts["obj"] = [view.pose.position]
-    blocked = guided.blocked_frontiers
-    blocked.append(frontiers[1].position)
+    actions = [_action("submit_motion", task_revision=1, control_epoch=0, request_id="past", frontier_uid="f:1"),
+               reinterpret, _action("observe")]
+    state = _replay_episode(monkeypatch, tmp_path, actions, client=client, spec=spec)
+    result = state.run(max_model_calls=4)
+    assert result["reason"] == "decision_budget_exhausted"
+    assert state.agent.model_calls == 4
     if outcome == "guard_refused":
-        with pytest.raises(ValueError, match="choice refused"):
-            guided.select()
-    else:
-        assert guided.select()
-    if outcome == "installed":
-        assert session.spec.revision == 2
-        assert guided.sequence == 4 and guided.pending is None
-        assert motion.active_request_id is None and controller.goals == {}
-        guided.submit.assert_not_called()
-        assert attempts == {} and guided.attempted_views is attempts
-        assert guided.select()
-        assert queried == [(1, "chair"), (2, "sofa")]
-        assert guided.pending["candidate"]["label"] == "sofa"
-        assert motion.active_intent.target_object_uid == "obj"
-        assert motion.active_intent.metadata["task_revision"] == 2
-    else:
-        assert session.spec == spec and queried == [(1, "chair")]
-        assert attempts == {"obj": [view.pose.position]} and guided.attempted_views is attempts
-        if outcome == "unchanged":
-            assert motion.active_intent.metadata == {"task_revision": 1, "frontier_uid": "f:1"}
-        else:
-            assert guided.pending is None and motion.active_request_id is None
-            assert controller.goals == {}
-            guided.submit.assert_not_called()
-    submitted = int(outcome in {"installed", "unchanged"})
-    assert guided.sequence == 4 + submitted and len(controller.goals) == submitted
-    if outcome in {"unchanged", "guard_refused"}:
-        runtime.choice_guard.assert_called_once_with()
-        assert guard_events == ["enter", "exit"]
-    else:
-        runtime.choice_guard.assert_not_called()
-        assert guard_events == []
-    assert guided.blocked_frontiers is blocked and blocked == [frontiers[1].position]
-    assert controller.moves == 7 and client.commands == []
-    assert controller.pose is client.pose and session.snapshot.robot_pose == snapshot.robot_pose
-    assert runtime.model_calls == 3 and runtime.max_model_calls == 5
-    runtime.choose_frontier.assert_called_once()
-    events = [json.loads(line) for line in (tmp_path / "decisions.jsonl").read_text().splitlines()]
-    assert sum(event["event"] == "submitted" for event in events) == submitted
-    assert sum(event["event"] == "interpretation_changed" for event in events) == int(outcome == "installed")
-    assert sum(event["event"] == "decision_reselect" for event in events) == int(no_choice)
-    if no_choice:
-        assert events[-1] == {"event": "decision_reselect", "moves": 7, "task_revision": 1}
+        rejected = state.agent.history[-2]["result"]
+        assert rejected["proposal_rejected"] and not rejected["accepted"]
+        assert "motion state or control epoch changed" in rejected["reason"]
+    changed = outcome == "installed"
+    assert result["initial_predicted_target"] == "chair"
+    assert result["predicted_target"] == ("sofa" if changed else "chair")
+    assert result["prediction_task_revision"] == (2 if changed else 1)
+    assert result["prediction_source"] == "final_active_interpretation"
+    assert state.session.spec.revision == (2 if changed else 1)
+    assert state.session.spec.raw_instruction == spec.raw_instruction
+    assert state.session.spec.targets[0].name == ("sofa" if changed else "chair")
+    assert len(state.refreshes) == 2 + int(changed)
+    assert state.session.snapshot.objects is state.previous_snapshot.objects
+    assert state.session.snapshot.robot_pose == pose_value(client.pose)
+    assert (state.session.verification_ledger is state.previous_ledger) == (not changed)
+    assert state.controller.moves == len(state.controller.goals) == 1
+    assert state.motion.active_request_id is None
+    assert state.controller.goals["motion:0"].metadata["task_revision"] == 1
+    assert sum(action == "move" for action, _ in client.commands) == 1
+    if changed:
+        assert state.refreshes[-1][-1] == ["sofa"]
+        assert state.contexts[-1]["observation"]["task"]["revision"] == 2
+        assert len(state.session.interpretation_history) == 1
+    state.tools.evidence_provider.assert_not_called()
+    assert not any(call.args[0] == "propose_finish" for call in state.tools.dispatch.call_args_list)
+
+
+@pytest.mark.parametrize("changed", [False, True])
+@pytest.mark.parametrize("action", ["observe", "query_scene"])
+def test_agent_search_revision_refreshes_once_only_for_actual_changes(monkeypatch, tmp_path, changed, action):
+    def revise(state, context):
+        concept = context["observation"]["search_context"]["concepts"][0]
+        state.original_spec = state.session.spec
+        state.original_ledger = state.session.verification_ledger
+        return _action("revise_search", search_updates=[{"concept_id": concept["id"],
+            "detector_terms": ["sofa"] if changed else concept["detector_terms"],
+            "basis_ids": ["instruction"], "reason": "Search for another sitting resource"}])
+
+    def after_revision(state, context):
+        state.tools.dispatch.assert_not_called()
+        receipt = context["recent_tools"][-1]
+        assert receipt["name"] == "revise_search"
+        assert receipt["result"]["search_changed"] is changed
+        assert receipt["result"]["search_revision_before"] == 0
+        assert receipt["result"]["search_revision"] == int(changed)
+        return _action(action)
+
+    state = _replay_episode(monkeypatch, tmp_path, [revise, after_revision, _action("observe")])
+    result = state.run(max_model_calls=4)
+    assert result["moves"] == 0 and result["model_calls"] == 4
+    assert len(state.refreshes) == 1 + int(changed)
+    assert state.session.search_revision == int(changed)
+    assert state.session.spec is state.original_spec and state.session.verification_ledger is state.original_ledger
+    assert state.refreshes[-1][-1] == (["sofa"] if changed else ["chair"])
+    assert state.contexts[-1]["observation"]["search_context"]["revision"] == int(changed)
+    assert [action for action, _ in state.client.commands] == ["observe", "finish", "observe"]
+
+
+@pytest.mark.parametrize("revision", ["search", "interpretation"])
+def test_explicit_revision_replay_corrects_then_queries_and_moves(monkeypatch, tmp_path, revision):
+    from instruction.contracts import TaskSpec, TargetSpec
+
+    client = FakeClient()
+    client.status = "reached"
+    interpretation = revision == "interpretation"
+    expected_task_revision = 2 if interpretation else 1
+    expected_search_revision = 0 if interpretation else 1
+
+    def revision_action(state, *, invalid=False):
+        if interpretation:
+            return _action("revise_interpretation", interpretation_update={
+                "interpretation": {"targets": [] if invalid else [{"name": "sofa"}]},
+                "basis_ids": ["instruction"], "reason": "Reconsider sitting resource"})
+        return _action("revise_search", search_updates=[{
+            "concept_id": state.session.spec.targets[0].id,
+            "detector_terms": [" " if invalid else "sofa"],
+            "basis_ids": ["instruction"], "reason": "Search for sitting resource"}])
+
+    def invalid(state, context):
+        state.original_spec = state.session.spec
+        state.original_ledger = state.session.verification_ledger
+        return revision_action(state, invalid=True)
+
+    def correct(state, context):
+        receipt = context["recent_tools"][-1]
+        assert receipt["name"] == f"revise_{revision}" and not receipt["result"]["accepted"]
+        assert state.session.spec is state.original_spec
+        assert state.session.verification_ledger is state.original_ledger
+        assert state.session.search_revision == 0 and len(state.refreshes) == 1
+        state.tools.dispatch.assert_not_called()
+        return revision_action(state)
+
+    def noop(state, context):
+        receipt = context["recent_tools"][-1]
+        assert receipt["result"]["accepted"]
+        assert receipt["result"]["interpretation_changed"] is interpretation
+        assert receipt["result"]["task_revision_before"] == 1
+        assert receipt["result"]["task_revision"] == expected_task_revision
+        assert receipt["result"]["search_revision"] == expected_search_revision
+        assert len(state.refreshes) == 2 and state.refreshes[-1][-1] == ["sofa"]
+        assert context["observation"]["task"]["revision"] == expected_task_revision
+        state.tools.dispatch.assert_not_called()
+        return revision_action(state)
+
+    def query(state, context):
+        receipt = context["recent_tools"][-1]
+        assert receipt["name"] == f"revise_{revision}" and receipt["result"]["accepted"]
+        assert not receipt["result"]["interpretation_changed"] and not receipt["result"]["search_changed"]
+        assert len(state.refreshes) == 2 and state.controller.moves == 0
+        state.tools.dispatch.assert_not_called()
+        state.tools.evidence_provider.assert_not_called()
+        return _action("query_viewpoints", candidate_uid="second")
+
+    def submit(state, context):
+        receipt = context["recent_tools"][-1]
+        assert receipt["name"] == "query_viewpoints" and len(receipt["result"]) == 2
+        return _action("submit_motion", task_revision=expected_task_revision,
+            control_epoch=context["observation"]["motion"]["control_epoch"], request_id="after-revision",
+            candidate_uid="second", viewpoint_uid=receipt["result"][1]["uid"])
+
+    def arrived(state, context):
+        assert context["recent_tools"][-1]["event"] == "motion_feedback"
+        assert state.controller.moves == 1 and state.motion.active_request_id is None
+        assert len(state.refreshes) == 3
+        state.tools.evidence_provider.assert_not_called()
+        return _action("observe")
+
+    actions = [invalid, correct, noop, query, submit, arrived]
+    state = _replay_episode(monkeypatch, tmp_path, actions, client=client,
+        spec=TaskSpec("Find somewhere to sit.", (TargetSpec("t1", "chair"),)))
+    result = state.run(max_model_calls=len(actions) + 1, max_moves=2)
+    assert result["reason"] == "decision_budget_exhausted" and result["moves"] == 1
+    assert result["model_calls"] == len(actions) + 1 and not result["task_complete"]
+    assert state.session.spec.raw_instruction == state.original_spec.raw_instruction
+    assert state.session.search_revision == expected_search_revision
+    assert state.session.spec.revision == expected_task_revision
+    assert state.motion.control_epoch == 0 and state.motion.active_request_id is None
+    assert state.tools.movement_budget_remaining == 1
+    assert [call.args[0] for call in state.tools.dispatch.call_args_list] == [
+        "query_viewpoints", "submit_motion", "observe"]
+    goal, = state.controller.goals.values()
+    assert goal.target_object_uid == "second" and goal.goal_pose.position == (2., 0., 1.5)
+    assert goal.metadata["task_revision"] == expected_task_revision
+    assert state.tools.view_generation == 1
+    assert goal.metadata["viewpoint_uid"] == "second:view:1:1"
+    assert sum(action == "move" for action, _ in client.commands) == 1
+    state.tools.evidence_provider.assert_not_called()
+    state.tools.query_scene.assert_not_called()
+
+
+def test_final_prediction_is_bound_to_revised_verified_target(monkeypatch, tmp_path):
+    from instruction.contracts import TaskSpec, TargetSpec
+
+    def revise(state, context):
+        return _action("revise_interpretation", interpretation_update={
+            "interpretation": {"targets": [{"name": "sofa"}]}, "basis_ids": ["instruction"],
+            "reason": "Use the original sitting requirement, not the initial category guess"})
+
+    def verify(state, context):
+        target = state.session.spec.targets[0]
+        return _action("verify_target", candidate_uid="second", target_id=target.id,
+                       task_revision=state.session.spec.revision)
+
+    state = _replay_episode(monkeypatch, tmp_path, [revise, verify, _action("propose_finish")],
+        spec=TaskSpec("Find somewhere to sit.", (TargetSpec("t1", "chair"),)))
+    result = state.run(max_model_calls=4)
+    assert result["reason"] == "verified_finish" and result["task_complete"]
+    assert result["initial_predicted_target"] == "chair" and result["predicted_target"] == "sofa"
+    assert result["prediction_task_revision"] == result["final_task"]["revision"] == 2
+    assert result["predicted_target_id"] == state.session.spec.targets[0].id
+    assert result["completion_review"]["verified_target_id"] == result["predicted_target_id"]
+    assert result["prediction_source"] == "current_full_instruction_verification"
+    assert result["moves"] == 0
+
+
+@pytest.mark.parametrize("precheck_satisfied", [False, True])
+@pytest.mark.parametrize("accepted", [False, True])
+def test_constraint_precheck_is_forwarded_to_fulltext_verifier(tmp_path, precheck_satisfied, accepted):
+    from backends.isaac.runtime import IsaacEvidenceVerifier
+    from instruction_adapter.constraints import ConstraintEvaluation
+    from verification.contracts import VerificationResult
+
+    obj = ObjectNodeSnapshot("candidate", "chair", (1., 0., 1.5))
+    evaluator = SimpleNamespace(evaluate_before_final_verifier=Mock())
+    session = SimpleNamespace(spec=SimpleNamespace(revision=2), constraint_evaluator=evaluator,
+        snapshot=SemanticMapSnapshot(0., Pose3D((0., 0., 1.5)), objects=(obj,)))
+    plan = SimpleNamespace(terminal_targets=[SimpleNamespace(id="t1")])
+    evidence = {"target_id": "t1", "observation_status": "current",
+                "geometry": {"distance_to_object": 1., "required_stop_distance": 2.,
+                             "projection_failed_in_final_view": False}}
+    # The real evaluator mutates and returns the same evidence object.
+    def precheck(**kwargs):
+        kwargs["evidence"]["relation_edges"] = [{"state": "unknown", "reason": "anchor not observed"}]
+        return ConstraintEvaluation(precheck_satisfied, failed_constraints=[] if precheck_satisfied else ["near desk"],
+                                    reason="compiled relation precheck", evidence=kwargs["evidence"])
+    evaluator.evaluate_before_final_verifier.side_effect = precheck
+    verifier = IsaacEvidenceVerifier(SimpleNamespace(session=session), "offline", tmp_path)
+    expected = VerificationResult(accepted, "accept" if accepted else "need_relation_check",
+        task_revision=2, target_uid="candidate", semantic_satisfied=accepted, view_sufficient_for_stop=accepted)
+    verifier.final.verify = Mock(return_value=expected)
+    result = verifier.verify(raw_instruction="Find somewhere to sit.", instruction_plan=plan,
+                             candidate=obj, evidence=evidence)
+    assert result is expected
+    evaluator.evaluate_before_final_verifier.assert_called_once()
+    verifier.final.verify.assert_called_once_with("Find somewhere to sit.", plan, obj, evidence)
+    checked = evidence["constraint_precheck"]
+    assert checked["satisfied"] is precheck_satisfied
+    assert checked["failed_constraints"] == ([] if precheck_satisfied else ["near desk"])
+    assert checked["reason"] == "compiled relation precheck"
+    assert checked["relation_edges"] == []
+    assert evidence["relation_edges"] == [{"state": "unknown", "reason": "anchor not observed"}]
+    assert "evidence" not in checked and "geometry" not in checked
+    json.dumps(evidence, allow_nan=False)
+
+
+def test_missing_fresh_projection_still_blocks_precheck_and_final(tmp_path):
+    from backends.isaac.runtime import IsaacEvidenceVerifier
+
+    evaluator = SimpleNamespace(evaluate_before_final_verifier=Mock())
+    tools = SimpleNamespace(session=SimpleNamespace(spec=SimpleNamespace(revision=3), constraint_evaluator=evaluator))
+    verifier = IsaacEvidenceVerifier(tools, "offline", tmp_path)
+    verifier.final.verify = Mock(side_effect=AssertionError("must retain physical projection gate"))
+    result = verifier.verify(raw_instruction="Find a chair.", instruction_plan=None,
+        candidate=SimpleNamespace(uid="candidate"), evidence={"observation_status": "need_observation"})
+    assert not result.accepted and result.decision == "need_better_view"
+    assert result.task_revision == 3 and result.target_uid == "candidate"
+    evaluator.evaluate_before_final_verifier.assert_not_called()
+    verifier.final.verify.assert_not_called()
 
 
 @pytest.mark.parametrize("failure", ["invalid", "compile_exception", "setup_exception"])
@@ -876,59 +1233,17 @@ def test_initial_admission_failures_retain_calls_without_observation_or_motion(m
     assert (tmp_path / "instruction_plan.json").exists() == (failure == "setup_exception")
 
 
-@pytest.mark.parametrize("initial_calls", [1, 2])
-def test_episode_startup_calls_share_guided_budget(monkeypatch, tmp_path, initial_calls):
-    from backends.isaac import runtime
-    from harness.runtime import AgentRuntime
-    from harness.tools import NavigationTools
-    from instruction.contracts import CompileResult, TargetSpec, TaskSpec
-    from task.session import TaskSession
-
-    public = {"selection_id": "SEL_TEST", "scene_id": "test", "style": "formal",
-              "instruction": "Find a chair.", "start_position": [0., 0., 1.5],
-              "start_rotation_quat_wxyz": [1., 0., 0., 0.]}
-    initial = SimpleNamespace(model_calls=initial_calls, compile=Mock(return_value=CompileResult(
-        "success", TaskSpec(public["instruction"], (TargetSpec("goal", "chair"),)))))
-    monkeypatch.setattr(runtime, "InitialInstructionCompiler", Mock(return_value=initial))
+@pytest.mark.parametrize("initial_calls", [1, 2, 3])
+def test_episode_startup_calls_share_agent_tool_budget(monkeypatch, tmp_path, initial_calls):
     client = FakeClient()
     client.status = "reached"
-    monkeypatch.setattr(runtime, "IsaacClient", lambda port: client)
-    monkeypatch.setattr(runtime, "IsaacObservationMap", Mock(return_value=object()))
-    monkeypatch.setattr(runtime, "refresh_observations", Mock())
-    frontiers = tuple(FrontierSnapshot(f"f:{i}", (float(i), 0., 1.5), score=float(i),
-        metadata={"frame_id": "map", "explored_density": 0.}) for i in (1, 2))
-
-    def task_session(snapshot, plan, **kwargs):
-        return TaskSession(replace(snapshot, frontiers=frontiers), plan, **kwargs)
-
-    def make_tools(session, motion, *args):
-        tools = NavigationTools(session, motion, None, None)
-        tools.query_scene = Mock(return_value={"candidates": [], "reason": "no_observed_candidate"})
-        return tools
-
-    def parse(**kwargs):
-        choice = kwargs["response_format"](frontier_uid="f:1", reason="Continue searching")
-        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(parsed=choice))])
-
-    parse_call = Mock(side_effect=parse)
-    model = SimpleNamespace(beta=SimpleNamespace(chat=SimpleNamespace(
-        completions=SimpleNamespace(parse=parse_call))))
-    agents = []
-
-    def make_agent(tools, trace_path, **kwargs):
-        agent = AgentRuntime(tools, trace_path, client_model=(model, "offline-replay"), **kwargs)
-        assert agent.model_calls == initial_calls
-        agents.append(agent)
-        return agent
-
-    monkeypatch.setattr(runtime, "TaskSession", task_session)
-    monkeypatch.setattr(runtime, "IsaacNavigationTools", make_tools)
-    monkeypatch.setattr(runtime, "AgentRuntime", make_agent)
-    monkeypatch.setenv("STRIVE_LVLM_TRACE_DIR", str(tmp_path / "model_requests"))
-    result = runtime.run_episode(public, tmp_path, max_model_calls=3, max_moves=3)
+    actions = [_action("submit_motion", task_revision=1, control_epoch=0,
+                       request_id=f"request:{i}", frontier_uid="f:1") for i in range(3 - initial_calls)]
+    state = _replay_episode(monkeypatch, tmp_path, actions, initial_calls=initial_calls, client=client)
+    result = state.run(max_model_calls=3, max_moves=3)
     assert result["status"] == "completed" and result["reason"] == "decision_budget_exhausted"
-    assert result["model_calls"] == agents[0].model_calls == 3
-    assert parse_call.call_count == result["moves"] == 3 - initial_calls
+    assert result["model_calls"] == state.agent.model_calls == 3
+    assert state.parse.call_count == result["moves"] == 3 - initial_calls
     assert sum(action == "move" for action, _ in client.commands) == 3 - initial_calls
     assert not result["task_complete"]
     assert client.commands[-2][0] == "finish"

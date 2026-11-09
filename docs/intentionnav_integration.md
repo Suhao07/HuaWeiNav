@@ -7,7 +7,7 @@
 - 准备完整 IntentionNav 官方任务与场景资产、官方评测源码、独立 Isaac Sim 安装。
 - 已验证渲染的版本是 Isaac `6.0.1-rc.7+release.42383.32955d8d.gl`，不是官方 Isaac4.5 的等价复现。
 - 渲染使用 Isaac 自身 `python.sh`；策略感知在 `strive-hm3d:local` 容器中运行，模型服务独立部署。不要将三套 Python/CUDA 依赖混装。
-- 当前启动器模式为 `strive_isaac_guided`，动作是 freemap 校验后的运动学相机位移，不是动态物理机器人，也不等价于 Habitat 默认 `baseline_guided`。
+- 当前公开策略为 `strive_isaac_full_instruction_agent`：Agent 决定扫描、目标、运动、验证和完成，后端提供多视角感知与导航能力；动作是 freemap 校验后的运动学相机位移，不是动态物理机器人。
 - 分配空闲渲染/感知 GPU 与端口，不覆盖运行中的服务，不通过改全机驱动修复单任务。
 
 在 STRIVE 根目录准备以下环境，路径替换为已准备资源：
@@ -88,29 +88,26 @@ start_rotation_quat_wxyz
 
 ### 观测模式
 
-`launch_intentionnav_episode.py` 与直接策略入口 `run_intentionnav.py` 均默认 `--observation-mode single`。每轮只做一次当前 RGB-D observe 和感知；不先转向、不恢复朝向后重复采集，当前图像也会投影地图里历史对象的可见部分。历史地图持续积累，目标定向取证仍保留。
+公开导航始终使用多视角，`launch_intentionnav_episode.py` 与直接策略入口 `run_intentionnav.py` 不再接受 `--observation-mode`。`--panorama-views N` 对应 `panorama_views`，默认4，且始终要求整数N≥2；N=1不是单视角兼容入口。
 
-多视角对照需显式指定 `--observation-mode multi --panorama-views 4`。静止决策观测按4方向感知后恢复原朝向，再发布一帧当前投影，所以是 **4次感知 / 5帧图像**，并非4帧；N可调整但 multi 要求N≥2。运动跟踪刷新和定向取证仍用单视角；single 模式忽略方向数量配置，以实际记录的帧数为准。
+多视角扫描执行各方向 RGB-D 感知，融合地图与稳定实例，回到起始朝向发布当前投影。帧数与感知次数按本次 `scene_snapshots.jsonl` / `perception.jsonl` 核对，不沿用旧版本“4次感知 / 5帧图像”的统计。运动跟踪的内部状态刷新、定向验证所需当前帧不构成独立单视角导航模式，历史参考图像也不算当前传感器视角。
 
 ```bash
 python scripts/launch_intentionnav_episode.py \
   --selection-id SEL_001 --style formal \
   --sim-gpu 0 --policy-gpu 1 --port 9466 --model-port 18182 \
   --max-moves 30 --max-model-calls 60 \
-  --observation-mode single \
-  --output outputs/intentionnav/view-single
-
-python scripts/launch_intentionnav_episode.py \
-  --selection-id SEL_001 --style formal \
-  --sim-gpu 0 --policy-gpu 1 --port 9466 --model-port 18182 \
-  --max-moves 30 --max-model-calls 60 \
-  --observation-mode multi --panorama-views 4 \
-  --output outputs/intentionnav/view-multi
+  --panorama-views 4 \
+  --output outputs/intentionnav/agent-multiview-new
 ```
 
-两条命令顺序运行，使用相同六字段公开输入、冻结源码/模型、freemap及预算，输出目录必须不同且未存在。模式是运行参数，不写入六字段任务文件，不改变官方评分绑定。启动和策略回执保存配置；`scene_snapshots.jsonl` / `perception.jsonl` 可核对实际图像与感知次数。比较 SR/SPL 同时列出视角/转向、移动、模型调用与耗时，不能将运动学相机结果解释为实体机器人安全或效率。
+**能力不等于决策所有权：**多视角地图/实例融合、freemap frontier 及 approach/recheck 视点是后端给 Agent 的证据与合法选项；Agent 选择 `scan_scene`、目标、运动、验证和 `propose_finish`。Habitat 的每批4方向、最多12朝向扫描及 room/coverage frontier 能力见 [HM3D 指南](hm3d_docker_benchmark_guide.md#观测模式与对照口径)，不把其参数或能力无条件等同于 Isaac。唯一运动所有者仍负责准入与执行，Agent 不能捏造坐标、回执或解除安全 HOLD。
 
-当前完成的是 CPU 协议与回归验证；2026-11-09本机缺少完整 Isaac 运行时与数据，未运行新的 IntentionNav 仿真。同期 Habitat 功能对照不能替代这里的 single/multi 导航效果验收，原历史结果不重标、不覆盖。
+Agent 工具 `observe` 只是缓存状态读取，不等于模拟器协议中的采帧命令，不会隐式扫描或验证。反馈保留任务版本、实例/谓词/对象对与观测依赖的作用域；未知证据不变成否定，局部拒绝不扩大为整类对象失败。完整原始指令始终是最终语义权威；结构化解释只是可修订执行辅助，最终完成须同时具备完整原指令的当前验证、数量/顺序进度和运动静止条件。
+
+方向数属于运行参数，不写入六字段任务文件，不改变官方评分绑定。比较运行时固定同一公开输入、源码/模型、freemap及预算，使用不同且未存在的输出目录，同时列出实际视角/转向、移动、模型调用与耗时，不能将运动学相机结果解释为实体机器人安全或效率。
+
+历史边界：2026-11-09记录的 CPU 协议与回归验证针对当时版本；当日本机缺少完整 Isaac 运行时与数据，未运行新的 IntentionNav 仿真。同期 Habitat single/multi 功能对照及原 IntentionNav 结果不重标、不覆盖，也不验证当前 Agent 多视角交付。本次文档更新不声明验证集 SR 或成功率恢复。
 
 ## 4. 运动与评分
 
