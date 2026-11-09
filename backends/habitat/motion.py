@@ -5,6 +5,10 @@ from motion.supervisor import MotionSupervisor
 from motion.contracts import MotionGoal, MotionGoalMode, NavigationIntent, NavigationStatus, NavigationStatusCode
 
 
+class EpisodeStepLimit(RuntimeError):
+    """A nested skill reached the caller's primitive-action budget before submission."""
+
+
 class HabitatMotionController:
     """Execute discrete simulator actions and retain their observations.
 
@@ -22,11 +26,13 @@ class HabitatMotionController:
         self.observations = {}
         self.statuses = {}
         self.evaluation_trace = None
+        self.action_count = 0
 
     def _step(self, action):
-        if self.evaluation_trace is not None:
-            return self.evaluation_trace.step(action)
-        return self.env.step(action)
+        observation = (self.evaluation_trace.step(action) if self.evaluation_trace is not None
+                       else self.env.step(action))
+        self.action_count += 1
+        return observation
 
     def send_goal(self, goal: MotionGoal) -> str:
         """Execute one backend primitive and return its completed request ID."""
@@ -108,6 +114,8 @@ class HabitatExecution:
     def __init__(self, env):
         self.controller = HabitatMotionController(env)
         self.motion = MotionSupervisor(self.controller)
+        self.max_steps = float("inf")
+        self._completed_requests = set()
 
     def step(self, action: int, *, request_id=None):
         """Execute the existing planner's action once and return its observation.
@@ -122,8 +130,13 @@ class HabitatExecution:
         action = int(action)
         mode = MotionGoalMode.STOP if action == 0 else MotionGoalMode.EXPLORE
         goal = MotionGoal(mode=mode, action=action)
-        goal_id = self.motion.submit(NavigationIntent(mode=mode), goal, request_id=request_id)
-        self.motion.poll_active()
+        with self.motion.submission_guard():
+            if request_id not in self._completed_requests and self.controller.action_count >= self.max_steps:
+                raise EpisodeStepLimit("episode_limit")
+            goal_id = self.motion.submit(NavigationIntent(mode=mode), goal, request_id=request_id)
+            self.motion.poll_active()
+            if request_id:
+                self._completed_requests.add(request_id)
         if request_id is None:
             return self.controller.observations.pop(goal_id)
         return self.controller.observations[goal_id]

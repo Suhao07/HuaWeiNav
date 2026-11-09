@@ -44,6 +44,30 @@ def test_habitat_actions_are_executed_once_and_receipts_are_primitive_scoped(wit
     assert trace.actions == ([1, 2, 0] if with_trace else [])
 
 
+@pytest.mark.parametrize('action', [0, 1, 2, 3])
+def test_primitive_budget_rejects_new_actions_but_keeps_idempotent_receipts(action):
+    from types import SimpleNamespace
+    from backends.habitat.motion import EpisodeStepLimit
+
+    env = Environment()
+    execution = HabitatExecution(env)
+    execution.controller.agent = SimpleNamespace(episode_steps=1)
+    execution.max_steps = 1
+    first = execution.step(action, request_id='last-action')
+    execution.controller.agent.episode_steps += 1
+    assert execution.controller.action_count == 1
+    assert execution.step(action, request_id='last-action') == first
+    with pytest.raises(ValueError, match='another goal'):
+        execution.step((action + 1) % 4, request_id='last-action')
+    for request_id in (None, '', 'new-action'):
+        with pytest.raises(EpisodeStepLimit, match='episode_limit'):
+            execution.step(action, request_id=request_id)
+    assert env.actions == [action]
+    assert execution.controller.action_count == 1
+    assert execution.motion.active_request_id is None
+    assert execution.motion.phase == 'terminated'
+
+
 def test_habitat_hold_preserves_simulation_state_until_resume():
     env = Environment()
     execution = HabitatExecution(env)
@@ -95,6 +119,7 @@ def test_waypoint_execution_pumps_existing_planner_and_polling_is_read_only(with
     execution.controller.advance()
     assert execution.motion.poll_active().status.succeeded()
     assert env.actions == [1, 2]
+    assert execution.controller.action_count == 2
     assert planner_points == [[11, 1, 22]] * 3
     assert agent.episode_steps == 2
     execution.step(0)
