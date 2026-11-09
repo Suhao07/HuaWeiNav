@@ -11,6 +11,9 @@ from prior_map.simulation import PriorMapSimulationRuntime
 
 
 class _FakeSim:
+    def get_agent_state(self):
+        return SimpleNamespace(position=np.zeros(3))
+
     def geodesic_distance(self, start, goal):
         return float(np.linalg.norm(np.asarray(start, dtype=float) - np.asarray(goal, dtype=float)))
 
