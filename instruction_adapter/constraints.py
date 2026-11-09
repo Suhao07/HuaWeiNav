@@ -104,13 +104,17 @@ def _pcd_bounds(obj: Any) -> tuple[list[float], list[float]]:
 
 
 def object_record_from_mapper_object(obj: Any, requested_concept: str, step: int | None = None,
-                                     *, demand: dict[str, Any] | None = None) -> dict[str, Any]:
+                                     *, demand: dict[str, Any] | None = None,
+                                     attributes: dict[str, Any] | None = None,
+                                     raw_instruction: str = "") -> dict[str, Any]:
     candidate = candidate_from_object(obj, step=step)
     min_bound, max_bound = _pcd_bounds(obj)
     return {
         "id": candidate.uid,
         "requested_concept": normalize_term(requested_concept),
         "demand": dict(demand or {}),
+        "attributes": dict(attributes or {}),
+        "raw_instruction": raw_instruction,
         "detector_label": normalize_term(candidate.detector_label),
         "center": list(candidate.centroid or []),
         "centroid": list(candidate.centroid or []),
@@ -313,10 +317,13 @@ class ConstraintEvaluator:
 
         anchor_concept = anchor_concept or ConceptQuery(
             f"reference:{constraint.object}", constraint.object, role="anchor")
-        subject_record = object_record_from_mapper_object(
-            candidate_obj, requested_concept=target.name, step=step, demand=target.demand)
-        anchors = []
         raw_instruction = str(getattr(plan, "raw_instruction", "") or getattr(mapper, "target", ""))
+        subject_record = object_record_from_mapper_object(
+            candidate_obj, requested_concept=target.name, step=step, demand=target.demand,
+            attributes=target.attributes, raw_instruction=raw_instruction)
+        anchor_target = next((item for item in plan.targets
+                              if item.id == anchor_concept.id or item.name == anchor_concept.name), None)
+        anchors = []
         mapper_objects = list(getattr(mapper, "objects", []) or [])
         concept_records = {}
         if anchor_concept is not None and hasattr(mapper, "concept_matcher"):
@@ -358,7 +365,9 @@ class ConstraintEvaluator:
         for anchor in anchors:
             anchor_record = object_record_from_mapper_object(
                 anchor, requested_concept=anchor_concept.name if anchor_concept else constraint.object,
-                step=step, demand=anchor_concept.demand if anchor_concept else None)
+                step=step, demand=anchor_concept.demand,
+                attributes=anchor_target.attributes if anchor_target else {},
+                raw_instruction=raw_instruction)
             pair_ledger = getattr(mapper, "relation_pair_ledger", None)
             co_views = self.spatial_graph.co_visible_views(subject_record["id"], anchor_record["id"])
             view_dicts = [view.as_dict() if hasattr(view, "as_dict") else dict(view) for view in co_views]

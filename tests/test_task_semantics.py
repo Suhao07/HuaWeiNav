@@ -14,6 +14,24 @@ from instruction_adapter.grounding import ground_plan
 from planning.mode_policy import is_anchor_first_relation_search
 
 
+def test_relation_subrequest_preserves_original_and_reference_attributes():
+    from instruction_adapter.constraints import object_record_from_mapper_object
+    from instruction_adapter.semantic_edges import DynamicSemanticEdgeVerifier
+    from scene.contracts import ObjectNodeSnapshot
+    raw = "Find the cushion near the shallow container of fresh snacks."
+    subject = object_record_from_mapper_object(
+        ObjectNodeSnapshot("c", "cushion", (0, 0, 0)), "cushion",
+        attributes={"size": "little"}, raw_instruction=raw)
+    anchor = object_record_from_mapper_object(
+        ObjectNodeSnapshot("a", "table", (1, 0, 0)), "container",
+        attributes={"shape": "shallow", "content": "fresh snacks"}, raw_instruction=raw)
+    prompt = DynamicSemanticEdgeVerifier._build_vlm_prompt(subject, "near", anchor)
+    assert subject["raw_instruction"] == anchor["raw_instruction"] == raw
+    assert anchor["attributes"] == {"shape": "shallow", "content": "fresh snacks"}
+    assert raw in prompt and "fresh snacks" in prompt and "final semantic authority" in prompt
+    assert anchor["detector_label"] == "table" and anchor["requested_concept"] == "container"
+
+
 def test_task_spec_is_deeply_immutable_and_export_is_detached():
     from dataclasses import FrozenInstanceError
     import pytest

@@ -88,6 +88,7 @@ class VLMRelationVerifier:
                     crop_block, crop_archive, crop_digest = image_input(str(crop_path), crop_path.parent)
                     region = {"role": role, "instance_id": obj["id"],
                               "requested_concept": obj["requested_concept"], "demand": obj.get("demand", {}),
+                              "attributes": obj.get("attributes", {}),
                               "source_frame_id": view["id"], "source_image_sha256": digest,
                               "bbox_xyxy_in_source": box, "rgb_path": crop_archive,
                               "image_sha256": crop_digest,
