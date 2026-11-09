@@ -12,11 +12,8 @@ from navigation.goal_approach_controller import recheck_pitches
 from planning.viewpoint_policy import build_check_again_viewpoints
 
 
-def select_check_again_viewpoint(agent: Any) -> None:
-    """Select the next check-again or view-control viewpoint for the agent."""
-
-    logger.info("Need to check again")
-    agent.need_check_again = True
+def build_viewpoint_options(agent: Any) -> tuple[list[dict[str, Any]], Any]:
+    """Generate reachable projection-scored views without selecting or consuming one."""
 
     pathfinder = agent.env.sim.pathfinder
     import habitat_sim
@@ -72,6 +69,13 @@ def select_check_again_viewpoint(agent: Any) -> None:
         # 已取得当前视角的判定后，补拍要求可执行位移：d_nav(x,v) > rho。
         # 到达容差内的提案会立即返回 reached，不能提供新的观察位置。
         proposals = [p for p in proposals if p["travel_distance"] > agent.planner._goal_radius]
+    return proposals, interpolated_path
+
+
+def select_check_again_viewpoint(agent: Any) -> None:
+    """Select the next check-again view for the internal guided controller."""
+    agent.need_check_again = True
+    proposals, interpolated_path = build_viewpoint_options(agent)
     best_candidate = _log_and_pick_best_proposal(proposals)
     current_candidate = candidate_from_object(
         agent.object_final,

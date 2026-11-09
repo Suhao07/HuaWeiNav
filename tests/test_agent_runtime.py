@@ -48,7 +48,10 @@ class Verifier:
         assert evidence["arrival_frame"] == "frame-1"
         assert "object:cup-1" in evidence["dependencies"]
         return VerificationResult(True, "accept", semantic_satisfied=True,
-                                  task_revision=1, target_uid=candidate.uid)
+                                  task_revision=1, target_uid=candidate.uid,
+                                  diagnostics={"original_instruction_review": {
+                                      "coverage_complete": True, "interpretation_consistent": True,
+                                      "task_satisfied": True}})
 
 
 def make_tools(monkeypatch):
@@ -79,6 +82,116 @@ def model_calls(calls):
 
     client = SimpleNamespace(beta=SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(parse=parse))))
     return (client, "replay-model"), requests
+
+
+@pytest.mark.parametrize("stage", ["initial", "arrival", "tool"])
+def test_habitat_nested_skill_budget_returns_normal_termination(monkeypatch, tmp_path, stage):
+    from unittest.mock import Mock
+    import backends.habitat.agent_runtime as habitat_runtime
+    import navigation.planner_loop as planner
+    from backends.habitat.motion import HabitatExecution
+
+    episode = SimpleNamespace(episode_id="0", scene_id="scene", start_position=[0, 0, 0],
+                              start_rotation=[0, 0, 0, 1])
+    sim = SimpleNamespace(sim_config=SimpleNamespace(agents=[SimpleNamespace(
+        action_space={1: SimpleNamespace(actuation=SimpleNamespace(amount=.25))})]))
+    env = SimpleNamespace(current_episode=episode, sim=sim, episode_over=False,
+                          step=Mock(return_value={}))
+    execution = HabitatExecution(env)
+    node = SimpleNamespace(idx=0)
+    agent = SimpleNamespace(env=env, save_dir=str(tmp_path), vlm="test", episode_steps=1,
+        current_node_idx=0, execution=execution, task=SimpleNamespace(
+            search_revision=0, progress=SimpleNamespace(completed=False)),
+        mapper=SimpleNamespace(nodes=[node], change_state=Mock()))
+    execution.controller.agent = agent
+    execution.controller.advance = Mock()
+    motion = SimpleNamespace(active_request_id="frontier" if stage == "arrival" else None)
+    def poll():
+        motion.active_request_id = None
+        return SimpleNamespace(tracking_active=False, status=NavigationStatus(NavigationStatusCode.REACHED),
+            intent=SimpleNamespace(metadata={"frontier_uid": "node:0"}, target_object_uid=None,
+                                   goal_pose=Pose3D((1, 0, 0))))
+    motion.poll_active = poll
+    tools = SimpleNamespace(motion=motion, refresh_scene=Mock(), exploration_options=Mock(),
+                            motion_finished=Mock())
+    runtime = SimpleNamespace(model_calls=0, record_event=Mock())
+    def nested_actions():
+        for _ in range(12):
+            execution.step(3)
+            agent.episode_steps += 1
+    def observe(current, *, node, episode_idx):
+        if stage == "initial" or node is not None:
+            nested_actions()
+        return planner.PlanningCycleResult(agent.episode_steps)
+    def decide():
+        assert stage == "tool"
+        assert tools.movement_budget_remaining == 2
+        runtime.model_calls += 1
+        nested_actions()
+    runtime.step = decide
+    monkeypatch.setattr(habitat_runtime, "HabitatNavigationTools", lambda current: tools)
+    monkeypatch.setattr(habitat_runtime, "AgentRuntime", lambda *args, **kwargs: runtime)
+    monkeypatch.setattr(planner, "run_observation_mapping_cycle", observe)
+
+    result = habitat_runtime.run_agent_episode(agent, episode_idx=0, max_steps=2, stop_on_success=False)
+
+    assert result["reason"] == "episode_limit" and not result["task_complete"]
+    assert result["steps"] == 3 and result["model_calls"] == int(stage == "tool")
+    assert execution.controller.action_count == env.step.call_count == 2
+    assert execution.motion.active_request_id is None and motion.active_request_id is None
+    assert tools.motion_finished.call_count == int(stage == "arrival")
+    assert json.loads((tmp_path / "episode-0/harness/termination.json").read_text()) == result
+    agent.mapper.change_state.assert_not_called()
+
+
+@pytest.mark.parametrize("supported", [False, True])
+def test_scan_schema_is_exposed_only_by_capable_backend(monkeypatch, tmp_path, supported):
+    from pydantic import ValidationError
+    tools = make_tools(monkeypatch)
+    if supported:
+        tools.names = (*tools.names, "scan_scene")
+        tools.scan_scene = lambda: {"scan_complete": True}
+    runtime = AgentRuntime(tools, tmp_path / "tools.jsonl", client_model=model_calls([])[0])
+    response = runtime._response_type("ToolCall", runtime._messages(runtime.system_prompt), base=ToolCall)
+    payload = {"action": {"name": "scan_scene", "arguments": {}, "reason": "unseen headings"}}
+    if supported:
+        assert response.model_validate(payload).action.name == "scan_scene"
+    else:
+        with pytest.raises(ValidationError):
+            response.model_validate(payload)
+
+
+def test_habitat_view_queries_do_not_consume_execution_attempts(monkeypatch):
+    import sys
+    import numpy as np
+    from unittest.mock import Mock
+    from backends.habitat.agent_runtime import HabitatNavigationTools
+    base = make_tools(monkeypatch)
+    obj = SimpleNamespace(rgb=np.zeros((4, 4, 3), dtype=np.uint8), bbox=[0, 0, 4, 4])
+    agent = SimpleNamespace(task=base.session, execution=SimpleNamespace(
+        motion=base.motion, controller=base.motion.controller), final_instruction_verifier=base.verifier,
+        mapper=SimpleNamespace(current_position=np.zeros(3)), planner=SimpleNamespace(_goal_radius=.2),
+        episode_steps=1, find_final_waypoint=Mock())
+    tools = HabitatNavigationTools(agent)
+    tools.objects = {"cup-1": obj}
+    proposals = [{"position": [1., 0., 0.], "score": .8, "stop_feasible": True, "travel_distance": 1.}]
+    monkeypatch.setitem(sys.modules, "navigation.view_verification_controller", SimpleNamespace(
+        build_viewpoint_options=lambda current: (proposals, [])))
+    monkeypatch.setitem(sys.modules, "navigation.action_controller", SimpleNamespace(
+        geodesic_distance_to_waypoint=lambda current, position: float(np.linalg.norm(position))))
+    first = tools.query_viewpoints("cup-1")
+    assert first == tools.query_viewpoints("cup-1")
+    assert not agent.view_control_state.proposals[0].attempted
+    tools.submit_motion(1, 0, "view-1", candidate_uid="cup-1", viewpoint_uid=first[0]["uid"])
+    assert not agent.view_control_state.proposals[0].attempted
+    base.motion.controller.status = NavigationStatusCode.BLOCKED
+    tools.motion_finished(base.motion.poll_active())
+    assert tools.query_viewpoints("cup-1") == []
+    assert "cup-1" in tools.deferred_candidates
+    key = (1, "cup-1", tools.candidate_evidence(obj))
+    assert tools.candidate_motion_goals[key][(1., 0., 0.)] == "blocked"
+    with pytest.raises(ValueError):
+        tools.submit_motion(1, 0, "stale-view", candidate_uid="cup-1", viewpoint_uid=first[0]["uid"])
 
 
 def test_tool_loop_moves_verifies_and_finishes_from_domain_state(monkeypatch, tmp_path):
@@ -125,7 +238,114 @@ def test_tool_loop_moves_verifies_and_finishes_from_domain_state(monkeypatch, tm
         runtime.step()
 
 
-def test_model_motion_with_stale_revision_is_recorded_and_propagated(monkeypatch, tmp_path):
+@pytest.mark.parametrize("missing", ["coverage_complete", "interpretation_consistent", "task_satisfied"])
+def test_structured_progress_never_replaces_original_instruction_review(monkeypatch, missing):
+    tools = make_tools(monkeypatch)
+    original_verify = tools.verifier.verify
+
+    def incomplete(**kwargs):
+        result = original_verify(**kwargs)
+        result.diagnostics["original_instruction_review"][missing] = False
+        return result
+
+    tools.verifier.verify = incomplete
+    tools.verify_target("cup-1", "cup", 1)
+    assert tools.session.progress.completed
+    assert not tools.propose_finish()["accepted"]
+    assert not tools.propose_finish()["original_instruction_satisfied"]
+
+
+@pytest.mark.parametrize("change", ["observation", "pose", "object", "revision", "motion"])
+def test_full_instruction_finish_receipt_expires_with_its_execution_context(monkeypatch, change):
+    tools = make_tools(monkeypatch)
+    tools.verify_target("cup-1", "cup", 1)
+    assert tools.propose_finish()["accepted"]
+    snapshot = tools.session.snapshot
+    if change == "observation":
+        tools.session.snapshot = replace(snapshot, timestamp=snapshot.timestamp + 1)
+    elif change == "pose":
+        tools.session.snapshot = replace(snapshot, robot_pose=Pose3D((1, 1, 0)))
+    elif change == "object":
+        tools.session.snapshot = replace(snapshot, objects=(replace(snapshot.objects[0], position=(9, 0, 0)),))
+    elif change == "revision":
+        tools.session.install_plan(runtime_plan(replace(tools.session.spec, revision=2)))
+    else:
+        tools.submit_motion(1, 0, "after-verification", candidate_uid="cup-1", viewpoint_uid="view-1")
+        tools.motion.controller.status = NavigationStatusCode.REACHED
+        tools.motion.poll_active()
+    assert not tools.propose_finish()["accepted"]
+
+
+@pytest.mark.parametrize("in_place", [False, True])
+def test_finish_receipt_expires_on_image_change_at_same_timestamp_and_pose(monkeypatch, in_place):
+    tools = make_tools(monkeypatch)
+    images = [{"id": "frame-1", "image_ref": "", "observed_object_uids": ["cup-1"],
+               "object_boxes": {"cup-1": [0, 0, 2, 2]}}]
+    tools.session.snapshot = replace(tools.session.snapshot, metadata={"observation_images": images})
+    tools.verify_target("cup-1", "cup", 1)
+    assert tools.propose_finish()["accepted"]
+    snapshot = tools.session.snapshot
+    progress = tools.session.progress.as_dict()
+    ledger = tools.session.verification_ledger.as_dict()
+    if in_place:
+        images[0]["object_boxes"]["cup-1"][0] = 1
+        assert tools.session.snapshot is snapshot
+        assert tools.session.snapshot.metadata["observation_images"] is images
+    else:
+        tools.session.snapshot = replace(snapshot, metadata={"observation_images": [
+            {**images[0], "id": "replacement-frame"}]})
+    assert tools.session.snapshot.timestamp == snapshot.timestamp
+    assert tools.session.snapshot.robot_pose == snapshot.robot_pose
+    assert tools.session.progress.as_dict() == progress and tools.session.progress.completed
+    assert tools.session.verification_ledger.as_dict() == ledger
+    assert tools.session.spec.revision == 1 and tools.motion.control_epoch == 0
+    assert tools.motion.controller.sent == []
+    result = tools.propose_finish()
+    assert result["accepted"] is False and result["original_instruction_satisfied"] is False
+    assert result["task_complete"] is True and result["verified_target_id"] is None
+
+
+def test_zero_movement_budget_still_allows_verification_and_finish(monkeypatch):
+    tools = make_tools(monkeypatch)
+    tools.movement_budget_remaining = 0
+    result = tools.submit_motion(1, 0, "over-budget", candidate_uid="cup-1", viewpoint_uid="view-1")
+    assert result == {"accepted": False, "reason": "movement_budget_exhausted"}
+    assert tools.motion.controller.sent == []
+    tools.verify_target("cup-1", "cup", 1)
+    assert tools.propose_finish()["accepted"]
+
+
+def test_every_turn_retains_authoritative_full_original_after_history_truncation(monkeypatch, tmp_path):
+    tools = make_tools(monkeypatch)
+    raw = "Find a red cup, not the blue one, near the small tray with fresh snacks."
+    tools.session.install_plan(runtime_plan(TaskSpec(raw, (TargetSpec("cup", "cup"),), revision=2)))
+    calls = [tool_call(name="observe", arguments={}, reason="Inspect original requirements") for _ in range(6)]
+    client_model, requests = model_calls(calls)
+    runtime = AgentRuntime(tools, tmp_path / "tools.jsonl", client_model=client_model)
+    for _ in calls:
+        runtime.step()
+    for request in requests:
+        observation = request_context(request)["observation"]
+        assert observation["raw_instruction"] == raw
+        assert observation["semantic_authority"] == "raw_instruction"
+        assert observation["structured_interpretation_role"] == "revisable_execution_aid"
+        assert "final semantic authority" in request["messages"][0]["content"]
+    assert len(runtime.history) == 4
+
+
+def _assert_proposal_rejected(runtime, outcome, match):
+    assert outcome["event"] == "returned"
+    assert outcome["result"]["accepted"] is False
+    assert outcome["result"]["proposal_rejected"] is True
+    assert re.search(match, outcome["result"]["reason"])
+    assert "error" not in outcome and "error_type" not in outcome
+    assert runtime.history[-1] == outcome
+    events = [json.loads(line) for line in runtime.trace_path.read_text().splitlines()]
+    assert events[-2]["event"] == "proposed"
+    assert events[-1] == json.loads(json.dumps(outcome))
+
+
+def test_model_motion_with_stale_revision_is_recorded_as_rejected(monkeypatch, tmp_path):
     tools = make_tools(monkeypatch)
     client_model, _ = model_calls([tool_call(name="submit_motion", arguments={
         "candidate_uid": "cup-1", "viewpoint_uid": "view-1", "task_revision": 2,
@@ -133,10 +353,157 @@ def test_model_motion_with_stale_revision_is_recorded_and_propagated(monkeypatch
     }, reason="stale")])
     trace = tmp_path / "events.jsonl"
     runtime = AgentRuntime(tools, trace, client_model=client_model)
-    with pytest.raises(ValueError, match="revision"):
-        runtime.step()
+    _assert_proposal_rejected(runtime, runtime.step(), "revision")
     assert tools.motion.controller.sent == []
-    assert json.loads(trace.read_text().splitlines()[-1])["event"] == "failed"
+    assert not tools.session.progress.completed
+    assert tools.session.spec.revision == 1 and tools.motion.control_epoch == 0
+
+
+@pytest.mark.parametrize("name,invalid,match", [
+    ("query_viewpoints", {"candidate_uid": "missing"}, "Unknown observed instance"),
+    ("submit_motion", {"candidate_uid": "missing"}, "Unknown observed instance"),
+    ("submit_motion", {"frontier_uid": "missing"}, "Unknown observed frontier"),
+    ("submit_motion", {"viewpoint_uid": "missing"}, "not associated"),
+    ("submit_motion", {"viewpoint_uid": "unrelated-view"}, "not associated"),
+    ("submit_motion", {"control_epoch": 0}, "control epoch"),
+    ("submit_motion", {"task_revision": 0}, "task revision"),
+    ("verify_target", {"candidate_uid": "missing"}, "Unknown observed instance"),
+    ("verify_target", {"target_id": "missing"}, "Unknown terminal target"),
+    ("verify_target", {"target_id": "anchor"}, "Unknown terminal target"),
+    ("verify_target", {"task_revision": 0}, "task revision"),
+])
+def test_invalid_proposal_allows_legal_reselection_without_backend_calls(
+        monkeypatch, tmp_path, name, invalid, match):
+    from scene.contracts import FrontierSnapshot
+
+    tools = make_tools(monkeypatch)
+    snapshot = replace(tools.session.snapshot,
+        viewpoints=tools.session.snapshot.viewpoints + (
+            ViewpointSnapshot("unrelated-view", Pose3D((9, 0, 0))),),
+        frontiers=(FrontierSnapshot("frontier-1", (3, 2, 1), metadata={"frame_id": "map"}),))
+    task = replace(tools.session.spec, targets=tools.session.spec.targets + (
+        TargetSpec("anchor", "table", role="anchor", terminal=False),))
+    tools.session = TaskSession(snapshot, runtime_plan(task))
+    if "control_epoch" in invalid:
+        tools.motion.hold()
+        tools.motion.resume()
+    epoch = tools.motion.control_epoch
+    valid = {"candidate_uid": "cup-1"}
+    if name == "verify_target":
+        valid.update(target_id="cup", task_revision=1)
+    elif name == "submit_motion":
+        valid.update(viewpoint_uid="view-1", task_revision=1, control_epoch=epoch, request_id="reselect")
+        if "frontier_uid" in invalid:
+            valid.pop("candidate_uid")
+            valid.pop("viewpoint_uid")
+            valid["frontier_uid"] = "frontier-1"
+    invalid_arguments = {**valid, **invalid}
+    method = getattr(tools, name)
+    invoked = []
+
+    def execute(**arguments):
+        invoked.append(arguments)
+        return method(**arguments)
+
+    monkeypatch.setattr(tools, name, execute)
+    client_model, requests = model_calls([
+        tool_call(name=name, arguments=invalid_arguments, reason="inadmissible proposal"),
+        tool_call(name=name, arguments=valid, reason="reselect using current observed IDs"),
+    ])
+    runtime = AgentRuntime(tools, tmp_path / "reselect.jsonl", max_model_calls=2, client_model=client_model)
+    progress = tools.session.progress.as_dict()
+    ledger = tools.session.verification_ledger.as_dict()
+    rejection = runtime.step()
+    _assert_proposal_rejected(runtime, rejection, match)
+    assert invoked == []
+    assert tools.motion.controller.sent == [] and tools.motion.active_request_id is None
+    assert tools.last_goal_id is None and tools.motion.control_epoch == epoch
+    assert tools.session.spec == task and tools.session.search_revision == 0
+    assert tools.session.progress.as_dict() == progress
+    assert tools.session.verification_ledger.as_dict() == ledger
+    assert tools.session.verification_ledger.history == []
+    assert not tools.propose_finish()["accepted"]
+
+    outcome = runtime.step()
+    assert outcome["event"] == "returned"
+    assert invoked == [valid]
+    assert request_context(requests[1])["recent_tools"] == [rejection]
+    assert tools.session.spec == task and tools.session.search_revision == 0
+    assert tools.motion.control_epoch == epoch and runtime.model_calls == len(requests) == 2
+    if name == "submit_motion":
+        assert outcome["result"]["goal_id"] == "goal-1"
+        assert len(tools.motion.controller.sent) == 1
+        goal, = tools.motion.controller.sent
+        assert goal.goal_pose.position == ((3, 2, 1) if "frontier_uid" in valid else (1, 0, 0))
+        assert tools.motion.active_request_id == "reselect"
+        assert tools.session.progress.as_dict() == progress
+        assert tools.session.verification_ledger.history == []
+        assert not tools.propose_finish()["accepted"]
+    elif name == "verify_target":
+        assert VerificationResult(**outcome["result"]).accepted
+        assert tools.session.progress.target_progress["cup"].accepted_candidate_uids == ["cup-1"]
+        assert len(tools.session.verification_ledger.history) == 1
+        assert tools.propose_finish()["accepted"]
+        assert tools.motion.controller.sent == []
+    else:
+        assert [view["uid"] for view in outcome["result"]] == ["view-1"]
+        assert tools.session.progress.as_dict() == progress
+        assert tools.session.verification_ledger.history == []
+        assert tools.motion.controller.sent == []
+        assert not tools.propose_finish()["accepted"]
+    events = [json.loads(line) for line in runtime.trace_path.read_text().splitlines()]
+    assert [event["event"] for event in events] == ["proposed", "returned", "proposed", "returned"]
+
+
+@pytest.mark.parametrize("failure", ["model", "send_goal", "evidence_provider", "verifier"])
+@pytest.mark.parametrize("error_type", [RuntimeError, ValueError])
+def test_execution_failures_propagate_original_exception_not_proposal_rejection(
+        monkeypatch, tmp_path, failure, error_type):
+    tools = make_tools(monkeypatch)
+    error = error_type(f"{failure} service failed")
+    invoked = []
+
+    def fail(*args, **kwargs):
+        invoked.append((args, kwargs))
+        raise error
+
+    if failure == "send_goal":
+        monkeypatch.setattr(tools.motion.controller, "send_goal", fail)
+        proposal = tool_call(name="submit_motion", arguments={
+            "candidate_uid": "cup-1", "viewpoint_uid": "view-1", "task_revision": 1,
+            "control_epoch": 0, "request_id": "backend-failure"}, reason="valid motion")
+    else:
+        proposal = tool_call(name="verify_target", arguments={
+            "candidate_uid": "cup-1", "target_id": "cup", "task_revision": 1}, reason="valid verification")
+        if failure == "evidence_provider":
+            monkeypatch.setattr(tools, "evidence_provider", fail)
+        elif failure == "verifier":
+            monkeypatch.setattr(tools.verifier, "verify", fail)
+    client_model, requests = model_calls([fail if failure == "model" else proposal])
+    runtime = AgentRuntime(tools, tmp_path / "failure.jsonl", client_model=client_model)
+    progress = tools.session.progress.as_dict()
+    with pytest.raises(error_type) as caught:
+        runtime.step()
+    assert caught.value is error
+    assert len(invoked) == len(requests) == runtime.model_calls == 1
+    assert tools.session.progress.as_dict() == progress
+    assert tools.session.verification_ledger.history == []
+    assert tools.session.spec.revision == 1 and tools.motion.control_epoch == 0
+    assert tools.motion.controller.sent == [] and not tools.propose_finish()["accepted"]
+    if failure == "send_goal":
+        assert tools.motion.phase == "unknown"
+        assert tools.motion.active_request_id == "backend-failure"
+    else:
+        assert tools.motion.active_request_id is None
+    if failure == "model":
+        assert runtime.history == [] and not runtime.trace_path.exists()
+    else:
+        outcome, = runtime.history
+        assert outcome["event"] == "failed" and "result" not in outcome
+        assert outcome["error_type"] == error_type.__name__ and outcome["error"] == str(error)
+        events = [json.loads(line) for line in runtime.trace_path.read_text().splitlines()]
+        assert [event["event"] for event in events] == ["proposed", "failed"]
+        assert events[-1] == outcome
 
 
 def test_scene_change_during_model_request_prevents_motion(monkeypatch, tmp_path):
@@ -155,9 +522,10 @@ def test_scene_change_during_model_request_prevents_motion(monkeypatch, tmp_path
 
     client = SimpleNamespace(beta=SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(parse=parse))))
     runtime = AgentRuntime(tools, tmp_path / "events.jsonl", client_model=(client, "replay"))
-    with pytest.raises(ValueError, match="dependencies changed"):
-        runtime.step()
+    _assert_proposal_rejected(runtime, runtime.step(), "dependencies changed")
     assert tools.motion.controller.sent == []
+    assert not tools.session.progress.completed
+    assert tools.session.spec.revision == 1 and tools.motion.control_epoch == 0
 
 
 def test_verification_scene_change_preserves_task_progress(monkeypatch):
@@ -176,6 +544,128 @@ def test_verification_scene_change_preserves_task_progress(monkeypatch):
         tools.verify_target("cup-1", "cup", 1)
     assert not tools.session.progress.completed
     assert tools.session.verification_ledger.history == []
+
+
+@pytest.mark.parametrize("mode", ["direct", "step"])
+def test_verification_freezes_stop_context_after_active_evidence_capture(monkeypatch, tmp_path, mode):
+    from copy import deepcopy
+
+    tools = make_tools(monkeypatch)
+    source = tools.session.snapshot
+    captured = replace(source, timestamp=source.timestamp + 1,
+        robot_pose=replace(source.robot_pose, orientation_xyzw=(0., 0., 1., 0.)),
+        metadata={"observation_images": [{"id": "turned-frame", "image_ref": "",
+            "observed_object_uids": ["cup-1"], "object_boxes": {"cup-1": [0, 0, 2, 2]}}]})
+    provide, verify = tools.evidence_provider, tools.verifier.verify
+    calls = []
+
+    def capture(uid):
+        calls.append("capture")
+        # Backend active perception may turn and publish a fresh frame before returning evidence.
+        tools.session.snapshot = captured
+        return {**provide(uid), "observation_images": deepcopy(captured.metadata["observation_images"])}
+
+    def verify_captured(**kwargs):
+        calls.append("verify")
+        assert tools.session.snapshot is captured
+        assert kwargs["evidence"]["observation_images"] == captured.metadata["observation_images"]
+        return verify(**kwargs)
+
+    monkeypatch.setattr(tools, "evidence_provider", capture)
+    monkeypatch.setattr(tools.verifier, "verify", verify_captured)
+    if mode == "direct":
+        result = tools.verify_target("cup-1", "cup", 1)
+    else:
+        client_model, _ = model_calls([tool_call(name="verify_target", arguments={
+            "candidate_uid": "cup-1", "target_id": "cup", "task_revision": 1}, reason="capture then verify")])
+        runtime = AgentRuntime(tools, tmp_path / "capture.jsonl", client_model=client_model)
+        outcome = runtime.step()
+        assert outcome["event"] == "returned"
+        result = outcome["result"]
+    assert VerificationResult(**result).accepted and calls == ["capture", "verify"]
+    assert tools.session.progress.target_progress["cup"].accepted_candidate_uids == ["cup-1"]
+    assert len(tools.session.verification_ledger.history) == 1
+    assert tools.propose_finish()["accepted"]
+    assert tools.session.spec.revision == 1 and tools.motion.control_epoch == 0
+    assert tools.motion.controller.sent == [] and tools.motion.active_request_id is None
+    tools.session.snapshot = source
+    assert not tools.propose_finish()["accepted"]  # Receipt belongs to the captured, not pre-turn, context.
+
+
+@pytest.mark.parametrize("mode", ["direct", "step"])
+@pytest.mark.parametrize("change", ["position", "orientation", "timestamp", "observation_replaced",
+                                     "observation_in_place", "progress", "pending_progress", "task"])
+def test_verification_context_change_during_inference_never_writes_proof(
+        monkeypatch, tmp_path, mode, change):
+    from copy import deepcopy
+
+    tools = make_tools(monkeypatch)
+    session = tools.session
+    images = [{"id": "frame-1", "image_ref": "", "observed_object_uids": ["cup-1"],
+               "object_boxes": {"cup-1": [0, 0, 2, 2]}}]
+    session.snapshot = replace(session.snapshot, metadata={"observation_images": images})
+    if change == "pending_progress":
+        from task.reducer import apply_verification
+        from verification.contracts import CandidateInstance
+        apply_verification(session.progress, session.spec.targets[0], CandidateInstance("cup-1", "cup"),
+            VerificationResult(False, "need_better_view", semantic_satisfied=True,
+                               task_revision=1, target_uid="cup-1"),
+            {"verified_relation_context": {"edge": {"anchor_uid": "table-old"}}})
+        assert not session.progress.completed and session.progress.mode == "better_view_for_verified_pair"
+    snapshot = session.snapshot
+    ledger = session.verification_ledger
+    before = deepcopy(ledger.as_dict())
+    verify = tools.verifier.verify
+    concurrent = []
+
+    def delayed_verify(**kwargs):
+        result = verify(**kwargs)
+        if change == "position":
+            session.snapshot = replace(snapshot, robot_pose=replace(snapshot.robot_pose, position=(1, 0, 0)))
+        elif change == "orientation":
+            session.snapshot = replace(snapshot, robot_pose=replace(
+                snapshot.robot_pose, orientation_xyzw=(0., 0., 1., 0.)))
+        elif change == "timestamp":
+            session.snapshot = replace(snapshot, timestamp=snapshot.timestamp + 1)
+        elif change == "observation_replaced":
+            session.snapshot = replace(snapshot, metadata={"observation_images": [
+                {**images[0], "id": "new-frame"}]})
+        elif change == "observation_in_place":
+            images[0]["object_boxes"]["cup-1"][0] = 1
+            assert session.snapshot is snapshot and session.snapshot.metadata["observation_images"] is images
+        elif change == "progress":
+            session.progress.target_progress["cup"].rejected_candidate_uids.append("other-cup")
+        elif change == "pending_progress":
+            session.progress.pending_verified_pair["edge"]["anchor_uid"] = "table-new"
+        else:
+            session.install_plan(runtime_plan(replace(session.spec, revision=2, exhaustive=True)))
+        concurrent.append((session.spec, deepcopy(session.progress.as_dict())))
+        return result
+
+    monkeypatch.setattr(tools.verifier, "verify", delayed_verify)
+    message = "task changed" if change == "task" else "stop context changed"
+    if mode == "direct":
+        with pytest.raises(ValueError, match=message):
+            tools.verify_target("cup-1", "cup", 1)
+    else:
+        client_model, _ = model_calls([tool_call(name="verify_target", arguments={
+            "candidate_uid": "cup-1", "target_id": "cup", "task_revision": 1}, reason="verify current evidence")])
+        runtime = AgentRuntime(tools, tmp_path / "verification-race.jsonl", client_model=client_model)
+        with pytest.raises(ValueError, match=message):
+            runtime.step()
+        outcome, = runtime.history
+        assert outcome["event"] == "failed" and outcome["error_type"] == "ValueError"
+        assert "result" not in outcome and message in outcome["error"]
+    task, progress = concurrent[0]
+    assert len(concurrent) == 1 and session.spec is task
+    assert session.spec.revision == (2 if change == "task" else 1)
+    assert session.progress.as_dict() == progress and not session.progress.completed
+    assert session.progress.target_progress["cup"].accepted_candidate_uids == []
+    assert ledger.history == [] and ledger.as_dict() == before
+    assert session.verification_ledger.history == []
+    assert tools._finish_verification is None and not tools.propose_finish()["accepted"]
+    assert tools.motion.controller.sent == [] and tools.motion.active_request_id is None
+    assert tools.motion.control_epoch == 0
 
 
 def test_frontier_motion_uses_exported_frame_and_keeps_receipt(monkeypatch):
@@ -320,6 +810,83 @@ def test_tool_schema_binds_names_to_exact_arguments():
     assert tool_call(name="query_scene", arguments={}, reason="query").action.arguments.dict() == {}
 
 
+def test_revision_schema_is_single_object_with_scoped_action_arguments(monkeypatch, tmp_path):
+    from pydantic import ValidationError
+
+    tools = make_tools(monkeypatch)
+    client_model, _ = model_calls([])
+    runtime = AgentRuntime(tools, tmp_path / "schema.jsonl", client_model=client_model)
+    response_type = runtime._response_type("ToolCall", runtime._messages(runtime.system_prompt), base=ToolCall)
+    for schema_type in (ToolCall, response_type):
+        schema = schema_type.schema()
+        assert schema["type"] == "object" and set(schema["properties"]) == {"action"}
+        assert schema["required"] == ["action"] and schema["additionalProperties"] is False
+        assert "anyOf" not in schema and "oneOf" not in schema
+        definitions = schema.get("$defs", schema.get("definitions"))
+        for definition in definitions.values():
+            if "properties" in definition:
+                assert definition["additionalProperties"] is False
+        variants = [definitions[ref["$ref"].split("/")[-1]]
+                    for ref in schema["properties"]["action"]["anyOf"]]
+        assert len(variants) == 10
+        for variant in variants:
+            assert set(variant["properties"]) == {"name", "arguments", "reason"}
+            assert variant["additionalProperties"] is False
+        for payload in (search_payload("step", ["mug"], concept_id="cup"), interpretation_payload("step")):
+            assert schema_type(**payload).action.name.startswith("revise_")
+            payload["action"]["arguments"]["extra"] = True
+            with pytest.raises(ValidationError):
+                schema_type(**payload)
+        with pytest.raises(ValidationError):
+            schema_type(action={"name": "revise_search", "arguments": {"search_updates": []}, "reason": "empty"})
+        with pytest.raises(ValidationError):
+            schema_type(action={"name": "revise_interpretation", "arguments": {
+                "interpretation_update": None}, "reason": "empty"})
+        for location in ("interpretation", "target", "demand", "constraint"):
+            payload = interpretation_payload("step")
+            parsed = payload["action"]["arguments"]["interpretation_update"]["interpretation"]
+            if location == "interpretation":
+                container = parsed
+            elif location == "target":
+                container = parsed["targets"][0]
+            elif location == "demand":
+                container = parsed["targets"][0]["demand"]
+            else:
+                parsed["constraints"] = [{"type": "attribute", "subject": "drying surface"}]
+                container = parsed["constraints"][0]
+            container["hidden_action"] = "submit_motion"
+            with pytest.raises(ValidationError):
+                schema_type(**payload)
+    for invalid in ("concept", "basis", "update_extra", "dual", "too_many"):
+        payload = search_payload("step", ["mug"], concept_id="cup")
+        arguments = payload["action"]["arguments"]
+        update = arguments["search_updates"][0]
+        if invalid == "concept":
+            update["concept_id"] = "not-in-context"
+        elif invalid == "basis":
+            update["basis_ids"] = ["frame:not-supplied"]
+        elif invalid == "update_extra":
+            update["aliases"] = ["mug"]
+        elif invalid == "dual":
+            arguments.update(interpretation_payload("step")["action"]["arguments"])
+        else:
+            arguments["search_updates"].append(dict(update))
+        with pytest.raises(ValidationError):
+            response_type(**payload)
+    for invalid in ("basis", "extra"):
+        payload = interpretation_payload("step")
+        update = payload["action"]["arguments"]["interpretation_update"]
+        if invalid == "basis":
+            update["basis_ids"] = ["instruction", "frame:not-supplied"]
+        else:
+            update["raw_instruction"] = "Change the original request"
+        with pytest.raises(ValidationError):
+            response_type(**payload)
+    assert "Accepted revisions persist; do not repeat them every turn" in runtime.system_prompt
+    assert "pair a revision only with observe" not in runtime.system_prompt
+    assert "revise_search" not in tools.names and "revise_interpretation" not in tools.names
+
+
 def test_observation_preserves_late_discovered_objects_and_frontiers(monkeypatch):
     from dataclasses import replace
     from scene.contracts import FrontierSnapshot
@@ -341,6 +908,7 @@ def test_arrival_refresh_preserves_object_recheck_until_instance_disappears(monk
     recheck = ViewpointSnapshot("recheck-1", Pose3D((1, 1, 0)), visible_objects=("cup-1",))
     tools.session.snapshot = replace(snapshot, viewpoints=snapshot.viewpoints + (recheck,))
     tools.agent = SimpleNamespace(task=tools.session, mapper=SimpleNamespace(nodes=[]), episode_steps=5, current_node_idx=0)
+    tools.deferred_candidates = set()
     monkeypatch.setattr(tools.session.constraint_evaluator, "register_mapper_objects", lambda **kwargs: None)
     arrived = replace(snapshot, robot_pose=Pose3D((1, 0, 0)), viewpoints=())
     monkeypatch.setattr(backend, "snapshot_from_mapper", lambda *args, **kwargs: (arrived, {"cup-1": object()}))
@@ -468,14 +1036,14 @@ def test_guided_requests_share_skills_and_real_scoped_task_evidence(monkeypatch,
 
 
 def search_payload(mode, terms, *, concept_id="resource", basis_ids=None):
-    payload = decision_payload(mode)
-    if isinstance(payload, ToolCall):
-        payload = payload.dict()
-    return {**payload, "search_updates": [{
+    arguments = {"search_updates": [{
         "concept_id": concept_id, "detector_terms": terms,
         "basis_ids": basis_ids or ["instruction"],
         "reason": "Inspect another possible realization without changing the requested function.",
     }]}
+    if mode == "step":
+        return {"action": {"name": "revise_search", "arguments": arguments, "reason": "Revise retrieval"}}
+    return {**decision_payload(mode), **arguments}
 
 
 @pytest.mark.parametrize("mode", ["frontier", "recovery", "step"])
@@ -500,8 +1068,23 @@ def test_search_revision_changes_candidate_retrieval_not_task_or_rejections(monk
     payloads = [search_payload(mode, [term]) for term in ("couch", "couch", "sofa")]
     client_model, requests = model_calls(payloads)
     runtime = AgentRuntime(tools, tmp_path / "revisions.jsonl", max_model_calls=3, client_model=client_model)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Changed and noop revisions must not dispatch hidden actions")
+
+    monkeypatch.setattr(tools, "dispatch", forbidden)
+    monkeypatch.setattr(tools, "evidence_provider", forbidden)
+    monkeypatch.setattr(tools.verifier, "verify", forbidden)
+    monkeypatch.setattr(tools.motion.controller, "poll_status", forbidden)
     for index, expected in enumerate(("another-couch", "another-couch", "sofa-1")):
-        decision_call(runtime, mode)
+        outcome = decision_call(runtime, mode)
+        if mode == "step":
+            assert outcome["name"] == "revise_search"
+            assert outcome["result"]["accepted"]
+            assert outcome["result"]["search_changed"] == (index != 1)
+            assert bool(outcome["result"]["search_updates"]) == (index != 1)
+            assert outcome["result"]["task_revision"] == 2
+            assert runtime._choice_context is None
         result = query_scene(session)
         assert [candidate.obj.uid for candidate in result.candidates] == [expected]
         assert all(candidate.record["verdict"] == "unknown" for candidate in result.candidates)
@@ -523,8 +1106,9 @@ def test_search_revision_changes_candidate_retrieval_not_task_or_rejections(monk
     assert len(requests) == runtime.model_calls == 3
 
 
+@pytest.mark.parametrize("mode", ["frontier", "step"])
 @pytest.mark.parametrize("invalid_second", [False, True])
-def test_search_revision_updates_shared_anchor_atomically(monkeypatch, tmp_path, invalid_second):
+def test_search_revision_updates_shared_anchor_atomically(monkeypatch, tmp_path, invalid_second, mode):
     from instruction.contracts import ConstraintSpec
     from perception.detector_adapter import ground_plan
     tools = make_tools(monkeypatch)
@@ -534,18 +1118,22 @@ def test_search_revision_updates_shared_anchor_atomically(monkeypatch, tmp_path,
     plan = ground_plan(runtime_plan(task), ["cup", "table"])
     tools.session.install_plan(plan)
     original = plan.as_dict()
-    payload = search_payload("frontier", ["mug"], concept_id="cup")
-    payload["search_updates"].extend(search_payload(
+    payload = search_payload(mode, ["mug"], concept_id="cup")
+    arguments = payload["action"]["arguments"] if mode == "step" else payload
+    arguments["search_updates"].extend(search_payload(
         "frontier", [" " if invalid_second else "desk"], concept_id="table")["search_updates"])
     client_model, _ = model_calls([payload])
     runtime = AgentRuntime(tools, tmp_path / "anchors.jsonl", client_model=client_model)
     if invalid_second:
-        with pytest.raises(ValueError, match="retrieval phrases"):
-            decision_call(runtime, "frontier")
+        if mode == "step":
+            _assert_proposal_rejected(runtime, runtime.step(), "retrieval phrases")
+        else:
+            with pytest.raises(ValueError, match="retrieval phrases"):
+                decision_call(runtime, mode)
         assert plan.as_dict() == original
         assert tools.session.search_revision == 0
     else:
-        decision_call(runtime, "frontier")
+        decision_call(runtime, mode)
         target, anchor = plan.targets
         assert target.detector_terms == target.concept.detector_terms == ["mug"]
         assert anchor.detector_terms == anchor.concept.detector_terms == ["desk"]
@@ -599,14 +1187,16 @@ def test_search_hypothesis_retains_cited_judgment_after_ledger_update(monkeypatc
 
 
 def test_search_revision_cannot_accompany_motion(monkeypatch, tmp_path):
+    from pydantic import ValidationError
+
     tools = make_tools(monkeypatch)
-    payload = search_payload("step", ["mug"], concept_id="cup")
-    payload["action"] = tool_call(name="submit_motion", arguments={
+    payload = tool_call(name="submit_motion", arguments={
         "candidate_uid": "cup-1", "viewpoint_uid": "view-1", "task_revision": 1,
-        "control_epoch": 0, "request_id": "mixed-update"}, reason="move").action.dict()
+        "control_epoch": 0, "request_id": "mixed-update"}, reason="move").dict()
+    payload["search_updates"] = search_payload("frontier", ["mug"], concept_id="cup")["search_updates"]
     client_model, _ = model_calls([payload])
     runtime = AgentRuntime(tools, tmp_path / "execution.jsonl", client_model=client_model)
-    with pytest.raises(ValueError, match="not an execution action"):
+    with pytest.raises(ValidationError):
         runtime.step()
     assert tools.session.search_revision == 0 and tools.session.detector_terms == []
     assert tools.motion.controller.sent == []
@@ -631,8 +1221,11 @@ def test_stale_search_revision_never_applies_or_moves(monkeypatch, tmp_path, mod
         return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(parsed=payload))])
     client = SimpleNamespace(beta=SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(parse=parse))))
     runtime = AgentRuntime(tools, tmp_path / "stale-search.jsonl", client_model=(client, "mock"))
-    with pytest.raises(ValueError, match="changed|stale"):
-        decision_call(runtime, mode)
+    if mode == "step":
+        _assert_proposal_rejected(runtime, decision_call(runtime, mode), "changed|stale")
+    else:
+        with pytest.raises(ValueError, match="changed|stale"):
+            decision_call(runtime, mode)
     assert tools.session.search_hypotheses == {}
     assert tools.session.detector_terms == original_terms
     assert tools.motion.controller.sent == []
@@ -826,7 +1419,7 @@ def test_first_guided_request_includes_bounded_baseline_execution(monkeypatch, t
     assert trace[1:5] == expected
 
 
-def test_guided_choices_and_tool_failures_share_bounded_history(monkeypatch, tmp_path):
+def test_guided_choices_and_tool_rejections_share_bounded_history(monkeypatch, tmp_path):
     tools = make_tools(monkeypatch)
     client_model, requests = model_calls([
         tool_call(name="submit_motion", arguments={"frontier_uid": "missing", "task_revision": 2,
@@ -835,12 +1428,12 @@ def test_guided_choices_and_tool_failures_share_bounded_history(monkeypatch, tmp
         decision_payload("recovery"), decision_payload("step"),
     ])
     runtime = AgentRuntime(tools, tmp_path / "history.jsonl", max_model_calls=6, client_model=client_model)
-    with pytest.raises(ValueError, match="revision"):
-        runtime.step()
+    rejection = runtime.step()
+    _assert_proposal_rejected(runtime, rejection, "revision")
     for mode in ["frontier", "recovery", "frontier", "recovery", "step"]:
         decision_call(runtime, mode)
-    assert request_context(requests[1])["recent_tools"][0]["event"] == "failed"
-    assert "revision" in request_context(requests[1])["recent_tools"][0]["error"]
+    assert request_context(requests[1])["recent_tools"][0] == rejection
+    assert "revision" in request_context(requests[1])["recent_tools"][0]["result"]["reason"]
     frontier_event = request_context(requests[2])["recent_tools"][-1]
     assert frontier_event["event"] == "frontier_choice" and frontier_event["selected_uid"] == "node:2"
     assert frontier_event["trigger"]["reason"] == "prolonged_target_search"
@@ -909,8 +1502,11 @@ def test_plain_decision_cannot_use_changed_context(monkeypatch, tmp_path, mode, 
     client_model, requests = model_calls([mutate])
     runtime = AgentRuntime(tools, tmp_path / "stale-plain.jsonl", client_model=client_model)
     error = RuntimeError if change in {"control_epoch", "motion_owner"} else ValueError
-    with pytest.raises(error, match="changed|stale"):
-        decision_call(runtime, mode)
+    if mode == "step":
+        _assert_proposal_rejected(runtime, decision_call(runtime, mode), "changed|stale")
+    else:
+        with pytest.raises(error, match="changed|stale"):
+            decision_call(runtime, mode)
     assert runtime._choice_context is None and len(requests) == 1
     assert len(tools.motion.controller.sent) == (2 if change == "motion_owner" else 0)
 
@@ -991,21 +1587,20 @@ def interpretation_payload(mode, *, parsed=None, basis_ids=None):
             "demand": {"activity": "dry", "manipulated_objects": ["wet cup"],
                        "required_resource": "drying surface",
                        "destination_hypotheses": ["table", "counter"]}}]}
-    payload = decision_payload(mode)
-    if isinstance(payload, ToolCall):
-        payload = payload.dict()
-    return {**payload, "interpretation_update": {
+    arguments = {"interpretation_update": {
         "interpretation": ParsedInstruction(**parsed).dict(),
         "basis_ids": ["instruction"] if basis_ids is None else basis_ids,
         "reason": "The cup is manipulated material; the requested destination is a drying resource.",
     }}
+    if mode == "step":
+        return {"action": {"name": "revise_interpretation", "arguments": arguments,
+                           "reason": "Correct interpretation"}}
+    return {**decision_payload(mode), **arguments}
 
 
-@pytest.mark.parametrize("mode,action", [
-    ("frontier", None), ("recovery", None), ("step", "observe"), ("step", "query_scene"),
-])
+@pytest.mark.parametrize("mode", ["frontier", "recovery", "step"])
 def test_interpretation_corrects_material_goal_and_archives_revision(
-        interpretation_tools, monkeypatch, tmp_path, mode, action):
+        interpretation_tools, monkeypatch, tmp_path, mode):
     from copy import deepcopy
     from task.reducer import apply_verification
     from verification.contracts import CandidateInstance
@@ -1034,8 +1629,6 @@ def test_interpretation_corrects_material_goal_and_archives_revision(
     monkeypatch.setattr(tools.verifier, "verify", forbidden)
     monkeypatch.setattr(tools.motion.controller, "poll_status", forbidden)
     payload = interpretation_payload(mode, basis_ids=["instruction", "verification:0"])
-    if action:
-        payload["action"] = tool_call(name=action, arguments={}, reason="correct interpretation").action.dict()
     client_model, requests = model_calls([payload])
     runtime = AgentRuntime(tools, tmp_path / "interpretation.jsonl", max_model_calls=1, client_model=client_model)
     execution = {"event": "candidate_deferred", "task_revision": 1, "step": 32,
@@ -1048,7 +1641,10 @@ def test_interpretation_corrects_material_goal_and_archives_revision(
     assert json.dumps(execution) in runtime.trace_path.read_text()
 
     if mode == "step":
-        assert outcome["result"] == {"interpretation_changed": True, "task_revision": 2}
+        assert outcome["name"] == "revise_interpretation"
+        assert outcome["result"] == {"accepted": True, "interpretation_changed": True,
+            "task_revision_before": 1, "task_revision": 2,
+            "search_revision_before": 1, "search_revision": 0, "search_changed": True}
     else:
         assert outcome is None  # The previously selected action is no longer applicable.
     assert len(requests) == runtime.model_calls == 1
@@ -1081,7 +1677,8 @@ def test_interpretation_corrects_material_goal_and_archives_revision(
     assert archived["basis_ids"] == ["instruction", "verification:0"]
     supplied_basis = request_context(requests[0])["observation"]["search_context"]["basis"]
     assert archived["basis"] == supplied_basis
-    assert archived["reason"] == payload["interpretation_update"]["reason"]
+    update = payload["action"]["arguments"] if mode == "step" else payload
+    assert archived["reason"] == update["interpretation_update"]["reason"]
     assert "review" not in archived
     assert set(archived["changes"]) == {"target_0", "constraint_0"}
     assert archived["changes"]["target_0"]["before"]["name"] == "cup"
@@ -1117,7 +1714,9 @@ def test_complete_interpretation_installs_with_one_decision_call(interpretation_
     runtime = AgentRuntime(tools, tmp_path / "single-decision.jsonl", max_model_calls=1,
                            client_model=client_model)
 
-    assert runtime.step()["result"] == {"interpretation_changed": True, "task_revision": 2}
+    assert runtime.step()["result"] == {"accepted": True, "interpretation_changed": True,
+        "task_revision_before": 1, "task_revision": 2,
+        "search_revision_before": 0, "search_revision": 0, "search_changed": False}
 
     assert len(requests) == runtime.model_calls == runtime.max_model_calls == 1
     assert requests[0]["trace_label"] == "navigation_agent"
@@ -1132,17 +1731,112 @@ def test_complete_interpretation_installs_with_one_decision_call(interpretation_
     assert len(requests) == 1
 
 
+@pytest.mark.parametrize("invalid", ["search_terms", "duplicate_concept", "missing_instruction", "empty_interpretation"])
+def test_invalid_revision_can_be_corrected_without_hidden_execution(
+        interpretation_tools, monkeypatch, tmp_path, invalid):
+    from unittest.mock import Mock
+
+    tools = interpretation_tools
+    session = tools.session
+    original, plan, ledger = session.spec, session.plan, session.verification_ledger
+    if invalid == "duplicate_concept":
+        session.install_plan(runtime_plan(replace(original, targets=original.targets + (
+            TargetSpec("anchor", "table", role="anchor", terminal=False),), revision=2)))
+        original, plan, ledger = session.spec, session.plan, session.verification_ledger
+    concept_id = original.targets[0].id
+    search = invalid in {"search_terms", "duplicate_concept"}
+    if search:
+        corrected = search_payload("step", ["mug"], concept_id=concept_id)
+        payload = search_payload("step", [" " if invalid == "search_terms" else "mug"], concept_id=concept_id)
+        if invalid == "duplicate_concept":
+            updates = payload["action"]["arguments"]["search_updates"]
+            updates.append(dict(updates[0]))
+    else:
+        ledger.put(original.raw_instruction, "cup-1", VerificationResult(
+            False, "need_better_view", task_revision=original.revision, reason="Unresolved resource"))
+        corrected = interpretation_payload("step")
+        payload = (interpretation_payload("step", basis_ids=["verification:0"]) if invalid == "missing_instruction"
+                   else interpretation_payload("step", parsed={"targets": []}))
+    progress, records = session.progress.as_dict(), ledger.as_dict()
+    client_model, requests = model_calls([payload, corrected])
+    runtime = AgentRuntime(tools, tmp_path / "corrected-revision.jsonl", client_model=client_model)
+    dispatch = Mock(side_effect=AssertionError("Revision cannot dispatch"))
+    monkeypatch.setattr(tools, "dispatch", dispatch)
+    rejected = runtime.step()
+    if invalid == "empty_interpretation":
+        assert not rejected["result"]["accepted"] and not rejected["result"]["interpretation_changed"]
+        assert rejected["result"]["interpretation_status"] == "invalid"
+    else:
+        match = {"search_terms": "retrieval phrases", "duplicate_concept": "duplicate concept",
+                 "missing_instruction": "cite the original instruction"}[invalid]
+        _assert_proposal_rejected(runtime, rejected, match)
+    assert session.spec is original and session.plan is plan
+    assert session.progress.as_dict() == progress and session.verification_ledger is ledger
+    assert ledger.as_dict() == records
+    assert session.search_revision == 0 and session.interpretation_history == []
+    assert tools.motion.controller.sent == [] and tools.motion.active_request_id is None
+    accepted = runtime.step()
+    assert accepted["result"]["accepted"]
+    assert accepted["result"]["search_changed"] is search
+    assert accepted["result"]["interpretation_changed"] is (not search)
+    assert session.spec.raw_instruction == original.raw_instruction
+    assert request_context(requests[1])["recent_tools"] == [rejected]
+    assert runtime.model_calls == len(requests) == 2 and runtime._choice_context is None
+    assert tools.motion.controller.sent == [] and tools.motion.active_request_id is None
+    assert not tools.propose_finish()["accepted"]
+    dispatch.assert_not_called()
+
+
+@pytest.mark.parametrize("failure", ["compiler", "grounding", "installation"])
+@pytest.mark.parametrize("error_type", [ValueError, RuntimeError, ConnectionError])
+def test_revision_service_errors_are_not_proposal_rejections(
+        interpretation_tools, monkeypatch, tmp_path, failure, error_type):
+    from unittest.mock import Mock
+
+    tools = interpretation_tools
+    error = error_type(f"{failure} failed")
+    fail = Mock(side_effect=error)
+    if failure == "compiler":
+        monkeypatch.setattr("instruction.compiler.compile_parsed_instruction", fail)
+    elif failure == "grounding":
+        monkeypatch.setattr("perception.detector_adapter.ground_plan", fail)
+    else:
+        monkeypatch.setattr(tools, "install_interpretation", fail)
+    client_model, _ = model_calls([interpretation_payload("step")])
+    runtime = AgentRuntime(tools, tmp_path / "revision-failure.jsonl", client_model=client_model)
+    original = tools.session.spec
+    with pytest.raises(error_type) as caught:
+        runtime.step()
+    assert caught.value is error and fail.call_count == 1
+    assert tools.session.spec is original and tools.session.interpretation_history == []
+    assert tools.session.search_revision == 0 and tools.motion.controller.sent == []
+    outcome, = runtime.history
+    assert outcome["name"] == "revise_interpretation" and outcome["event"] == "failed"
+    assert outcome["error_type"] == error_type.__name__ and "result" not in outcome
+
+
 @pytest.mark.parametrize("mode", ["frontier", "recovery", "step"])
-def test_noop_interpretation_keeps_task_revision(interpretation_tools, tmp_path, mode):
+def test_noop_interpretation_keeps_task_revision(interpretation_tools, monkeypatch, tmp_path, mode):
     tools = interpretation_tools
     original, plan, progress = tools.session.spec, tools.session.plan, tools.session.progress
     payload = interpretation_payload(mode, parsed={"targets": [{"name": "cup"}]})
     client_model, requests = model_calls([payload])
     runtime = AgentRuntime(tools, tmp_path / "noop.jsonl", max_model_calls=1, client_model=client_model)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("A noop revision must not dispatch or implicitly execute anything")
+
+    monkeypatch.setattr(tools, "dispatch", forbidden)
+    monkeypatch.setattr(tools, "evidence_provider", forbidden)
+    monkeypatch.setattr(tools.verifier, "verify", forbidden)
+    monkeypatch.setattr(tools.motion.controller, "poll_status", forbidden)
     result = decision_call(runtime, mode)
     if mode == "step":
-        assert result["result"]["task"] == original.as_dict()
-        assert "interpretation_changed" not in result["result"]
+        assert result["name"] == "revise_interpretation"
+        assert result["result"] == {"accepted": True, "interpretation_changed": False,
+            "task_revision_before": 1, "task_revision": 1,
+            "search_revision_before": 0, "search_revision": 0, "search_changed": False}
+        assert runtime._choice_context is None
     else:
         assert result == ("node:2" if mode == "frontier" else "approach:u")
     assert len(requests) == runtime.model_calls == 1
@@ -1151,9 +1845,10 @@ def test_noop_interpretation_keeps_task_revision(interpretation_tools, tmp_path,
     assert tools.motion.controller.sent == []
 
 
+@pytest.mark.parametrize("mode", ["frontier", "step"])
 @pytest.mark.parametrize("phase", ["active", "held", "cancel_pending"])
 @pytest.mark.parametrize("during_decision", [False, True])
-def test_interpretation_requires_idle_unheld_motion(interpretation_tools, tmp_path, phase, during_decision):
+def test_interpretation_requires_idle_unheld_motion(interpretation_tools, tmp_path, phase, during_decision, mode):
     tools = interpretation_tools
     original = tools.session.spec
 
@@ -1170,7 +1865,7 @@ def test_interpretation_requires_idle_unheld_motion(interpretation_tools, tmp_pa
     def decision(request):
         if during_decision:
             change_motion()
-        return interpretation_payload("frontier")
+        return interpretation_payload(mode)
 
     if not during_decision:
         change_motion()
@@ -1178,8 +1873,11 @@ def test_interpretation_requires_idle_unheld_motion(interpretation_tools, tmp_pa
     runtime = AgentRuntime(tools, tmp_path / "owned.jsonl", client_model=client_model)
     # 响应期间改变运动状态由上下文守卫拒绝；已有运动由 idle_guard 拒绝。
     message = "motion state or control epoch changed" if during_decision else "idle, unheld"
-    with pytest.raises(RuntimeError, match=message):
-        decision_call(runtime, "frontier")
+    if mode == "step":
+        _assert_proposal_rejected(runtime, runtime.step(), message)
+    else:
+        with pytest.raises(RuntimeError, match=message):
+            decision_call(runtime, mode)
     assert len(requests) == runtime.model_calls == 1
     assert runtime._choice_context is None
     assert tools.session.spec is original and tools.session.interpretation_history == []
@@ -1280,12 +1978,18 @@ def test_interpretation_compiler_and_source_gates_precede_installation(interpret
 def test_interpretation_and_search_revisions_are_mutually_exclusive(interpretation_tools, tmp_path, mode):
     tools = interpretation_tools
     payload = interpretation_payload(mode)
-    payload["search_updates"] = search_payload(
-        mode, ["mug"], concept_id=tools.session.spec.targets[0].id)["search_updates"]
+    arguments = payload["action"]["arguments"] if mode == "step" else payload
+    arguments["search_updates"] = search_payload(
+        "frontier", ["mug"], concept_id=tools.session.spec.targets[0].id)["search_updates"]
     client_model, requests = model_calls([payload])
     runtime = AgentRuntime(tools, tmp_path / "mixed-revisions.jsonl", client_model=client_model)
-    with pytest.raises(ValueError, match="mutually exclusive"):
-        decision_call(runtime, mode)
+    if mode == "step":
+        from pydantic import ValidationError
+        with pytest.raises(ValidationError):
+            decision_call(runtime, mode)
+    else:
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            decision_call(runtime, mode)
     assert len(requests) == runtime.model_calls == 1
     assert tools.session.spec.revision == 1 and tools.session.search_revision == 0
     assert tools.session.search_hypotheses == {} and tools.session.interpretation_history == []
@@ -1293,19 +1997,31 @@ def test_interpretation_and_search_revisions_are_mutually_exclusive(interpretati
 
 
 @pytest.mark.parametrize("name,arguments", [
+    ("observe", {}), ("query_scene", {}),
     ("query_viewpoints", {"candidate_uid": "cup-1"}),
     ("motion_status", {}), ("cancel_motion", {}), ("propose_finish", {}),
     ("verify_target", {"candidate_uid": "cup-1", "target_id": "cup", "task_revision": 1}),
     ("submit_motion", {"candidate_uid": "cup-1", "viewpoint_uid": "view-1", "task_revision": 1,
                        "control_epoch": 0, "request_id": "must-not-move"}),
 ])
-def test_interpretation_cannot_accompany_other_tools(interpretation_tools, tmp_path, name, arguments):
+@pytest.mark.parametrize("location", ["root", "action", "arguments"])
+@pytest.mark.parametrize("revision", ["search", "interpretation"])
+def test_revision_cannot_accompany_other_tools(
+        interpretation_tools, tmp_path, name, arguments, location, revision):
+    from pydantic import ValidationError
+
     tools = interpretation_tools
-    payload = interpretation_payload("step")
-    payload["action"] = tool_call(name=name, arguments=arguments, reason="mixed turn").action.dict()
+    update = (interpretation_payload("step") if revision == "interpretation" else
+              search_payload("step", ["mug"], concept_id=tools.session.spec.targets[0].id))
+    payload = tool_call(name=name, arguments=arguments, reason="mixed turn").dict()
+    container = (payload if location == "root" else payload["action"] if location == "action"
+                 else payload["action"]["arguments"])
+    container.update(update["action"]["arguments"])
+    with pytest.raises(ValidationError):
+        ToolCall(**payload)
     client_model, requests = model_calls([payload])
     runtime = AgentRuntime(tools, tmp_path / "mixed-action.jsonl", client_model=client_model)
-    with pytest.raises(ValueError, match="not an execution action"):
+    with pytest.raises(ValidationError):
         runtime.step()
     assert len(requests) == runtime.model_calls == 1
     assert tools.session.spec.revision == 1 and tools.session.interpretation_history == []
@@ -1352,6 +2068,7 @@ def habitat_evidence_tools(monkeypatch, tmp_path):
     controller = Controller()
     agent = SimpleNamespace(
         task=session, episode_samples=3, episode_steps=16, save_dir=str(tmp_path), current_node_idx=0,
+        env=SimpleNamespace(episode_over=False),
         mapper=SimpleNamespace(objects=objects, nodes=[], camera_intrinsic=np.eye(3),
                                current_position=np.array([1., 2., 3.]), current_rotation=np.eye(3)),
         execution=SimpleNamespace(controller=controller, motion=MotionSupervisor(controller), step=Mock()),
@@ -1460,6 +2177,18 @@ def test_capture_refreshes_current_snapshot_even_without_bbox(habitat_evidence_t
     assert not tools.propose_finish()["accepted"]
 
 
+def test_capture_budget_boundary_returns_unknown_without_model_or_more_motion(habitat_evidence_tools):
+    fixture = habitat_evidence_tools
+    tools, agent = fixture.tools, fixture.tools.agent
+    fixture.rotate.side_effect = lambda current: setattr(current.env, "episode_over", True) or False
+    result = tools.verify_target("cup-1", "cup", 1)
+    assert result["decision"] == "need_better_view"
+    assert not tools.propose_finish()["accepted"]
+    agent._project_object_bbox_on_current_view.assert_not_called()
+    agent.final_instruction_verifier.verify.assert_not_called()
+    fixture.tilt.assert_not_called()
+
+
 @pytest.mark.parametrize("accepted", [False, True])
 def test_verification_publishes_restored_frame_only_when_incomplete(habitat_evidence_tools, accepted):
     from backends.habitat.scene import current_observation
@@ -1468,7 +2197,9 @@ def test_verification_publishes_restored_frame_only_when_incomplete(habitat_evid
     verifier = agent.final_instruction_verifier.verify
     verifier.return_value = VerificationResult(
         accepted, "accept" if accepted else "need_better_view", semantic_satisfied=True,
-        view_sufficient_for_stop=accepted, task_revision=1, target_uid="cup-1")
+        view_sufficient_for_stop=accepted, task_revision=1, target_uid="cup-1",
+        diagnostics={"original_instruction_review": {"coverage_complete": True,
+            "interpretation_consistent": True, "task_satisfied": accepted}})
 
     result = tools.verify_target("cup-1", "cup", 1)
 

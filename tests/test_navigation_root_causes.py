@@ -171,52 +171,71 @@ def test_habitat_observation_forwards_live_terms_through_perceiver_to_grounding(
 
 
 @pytest.mark.parametrize('kind', ['background', 'candidate', 'empty'])
-def test_single_view_detection_preserves_original_frame_boxes_and_refinement(monkeypatch, kind):
+def test_multiview_partial_triplets_preserve_center_detections_and_refinement(monkeypatch, kind):
+    """Partial batches blank nonadjacent ends and fuse only center-panel detections."""
     import sys
     from functools import partial as bind
-    from navigation.panoramic_detection import DetectionSlice
-    from mapping_utils.preprocess import preprocess_depth
-    image = np.zeros((20, 30, 3), dtype=np.uint8)
-    depth = np.full((20, 30, 1), 2.)
-    depth[0] = 5.
-    boxes, masks = np.array([[1, 2, 9, 12]]), np.ones((1, 20, 30))
-    detection = (np.array(['chair']), boxes, masks, np.array([.9]))
-    empty = (np.array([]), np.empty((0, 4)), np.empty((0, 20, 30)), np.array([]))
+    from navigation.panoramic_detection import build_triplet, filter_center_panel, pose_triplet
+
+    images = [np.full((20, 30, 3), i + 1, dtype=np.uint8) for i in range(3)]
+    depths = [np.full((20, 30, 1), i + 2.) for i in range(3)]
+    positions, rotations = [np.full(3, i) for i in range(3)], [np.eye(3) for _ in images]
+    boxes = np.array([[1, 2, 9, 12], [31, 2, 39, 12], [61, 2, 69, 12]])
+    masks = np.ones((3, 20, 90))
+    detection = (np.array(['side-left', 'chair', 'side-right']), boxes, masks, np.array([.8, .9, .8]))
+    empty = (np.array([]), np.empty((0, 4)), np.empty((0, 20, 90)), np.array([]))
     obj = NS(uid='candidate', pcd=object())
-    evidence = NS(image=image, bbox_xyxy=boxes[0])
-    project = Mock(return_value=evidence)
-    refine = Mock(return_value={})
+    evidence = NS(image=images[1], bbox_xyxy=np.array([1, 2, 9, 12]))
+    project, refine = Mock(return_value=evidence), Mock(return_value={})
     monkeypatch.setitem(sys.modules, 'navigation.bbox_refinement', NS(refine_candidates=refine))
+    monkeypatch.setitem(sys.modules, 'cv_utils.stitch', NS(
+        combine_image=lambda left, center, right, intrinsic: np.concatenate((left, center, right), axis=1)))
     ns = methods('objnav_agent_with_process_obs.py', {'rotate_segmentation'}, {
-        'np': np, 'torch': object(), 'bind': bind, 'DetectionSlice': DetectionSlice,
-        'preprocess_depth': preprocess_depth,
-        'build_triplet': Mock(side_effect=AssertionError('single frame must not be stitched')),
-        'filter_center_panel': Mock(side_effect=AssertionError('single frame has no center panel')),
+        'torch': object(), 'bind': bind, 'build_triplet': Mock(wraps=build_triplet),
+        'pose_triplet': pose_triplet, 'filter_center_panel': filter_center_panel,
         'detection_step_dir': Mock(return_value='unused'), 'save_combined_view': Mock(),
         'save_detection_overlay': Mock(), 'save_candidate_object_pointclouds': Mock(),
         'save_real_object_pointcloud': Mock(), 'save_object_view': Mock(),
-        'merge_candidate_objects': lambda groups: [item for group in groups for item in group],
+        'merge_candidate_objects': Mock(return_value=[obj] if kind == 'candidate' else []),
         'gpu_cluster_filter': lambda cloud: cloud, 'project_object_view': project,
         'sort_target_objects_last': lambda objects, target: objects})
     historical = object()
-    mapper = NS(target='chair', objects=[historical], current_obj_indices=[],
-        get_object_entities=Mock(return_value=[obj]), get_object_entities_pano=Mock(),
+    mapper = NS(target='chair', camera_intrinsic=np.eye(3), objects=[historical], current_obj_indices=[],
+        get_object_entities=Mock(), get_object_entities_pano=Mock(return_value=[obj]),
         object_perceiver=NS(perceive=Mock(return_value=(
             detection if kind == 'background' else empty) + (detection if kind == 'candidate' else empty))),
-        associate_object_entities=Mock(side_effect=lambda old, new: (old + new, list(range(len(old), len(old)+len(new))))),
+        associate_object_entities=Mock(side_effect=lambda old, new: ([historical, obj], [1]) if new else (old, [])),
         update_object_pcd=Mock())
     agent = NS(mapper=mapper, task=NS(detector_terms=['chair']), save_dir='unused', episode_samples=1, episode_steps=3)
-    images, rotations = [image], [np.eye(3)]
-    ns['rotate_segmentation'](agent, images, [depth], [np.zeros(3)], rotations, single_view=True)
-    assert mapper.object_perceiver.perceive.call_args.args[0] is image
+    ns['rotate_segmentation'](agent, images, depths, positions, rotations, partial=True)
+    assert ns['build_triplet'].call_count == len(images)
+    assert mapper.object_perceiver.perceive.call_count == len(images)
+    for i, call in enumerate(ns['build_triplet'].call_args_list):
+        assert call.args[0] is images and call.args[1] is depths and call.args[2] == i
+        assert call.args[3] is mapper.camera_intrinsic and call.kwargs == {'circular': False}
+        rgb = mapper.object_perceiver.perceive.call_args_list[i].args[0]
+        neighbors = (i - 1 if i > 0 else None, i, i + 1 if i + 1 < len(images) else None)
+        for panel, source in enumerate(neighbors):
+            np.testing.assert_array_equal(rgb[:, panel * 30:(panel + 1) * 30],
+                                          np.zeros_like(images[i]) if source is None else images[source])
+        if kind != 'empty':
+            entity_call = mapper.get_object_entities_pano.call_args_list[i]
+            raw, entity_rgb, actual_positions, actual_rotations, classes, actual_boxes, actual_masks, scores = entity_call.args
+            assert entity_rgb is rgb and classes.tolist() == ['chair']
+            np.testing.assert_array_equal(actual_boxes, boxes[1:2])
+            np.testing.assert_array_equal(actual_masks, masks[1:2])
+            np.testing.assert_array_equal(scores, [.9])
+            for panel, source in enumerate(neighbors):
+                np.testing.assert_array_equal(raw[:, panel * 30:(panel + 1) * 30],
+                                              np.zeros_like(depths[i]) if source is None else depths[source])
+            indices = ((i - 1) % len(images), i, (i + 1) % len(images))
+            assert all(actual_positions[j] is positions[index] and actual_rotations[j] is rotations[index]
+                       and entity_call.kwargs['depth_list'][j] is depths[index] for j, index in enumerate(indices))
     assert mapper.objects[0] is historical
-    mapper.get_object_entities_pano.assert_not_called()
-    assert mapper.get_object_entities.call_count == int(kind != 'empty')
-    if kind != 'empty':
-        raw, filtered, rgb, classes, actual_boxes, actual_masks, scores = mapper.get_object_entities.call_args.args
-        assert raw is depth and rgb is image and actual_boxes is boxes and actual_masks is masks
-        assert np.all(raw[0] == 5.) and np.all(filtered[0] == 0.) and np.all(filtered[1:] == 2.)
-        assert mapper.objects[-1] is obj and mapper.current_obj_indices == [1]
+    mapper.get_object_entities.assert_not_called()
+    assert mapper.get_object_entities_pano.call_count == (len(images) if kind != 'empty' else 0)
+    assert mapper.current_obj_indices == ([1] if kind != 'empty' else [])
+    ns['merge_candidate_objects'].assert_called_once_with([[obj]] * len(images) if kind == 'candidate' else [])
     if kind == 'candidate':
         project.assert_called_once_with(agent, obj, images, rotations, ns['torch'], partial=True)
         refine.assert_called_once_with(agent, [(0, obj, evidence)])
@@ -225,15 +244,26 @@ def test_single_view_detection_preserves_original_frame_boxes_and_refinement(mon
         refine.assert_called_once_with(agent, [])
 
 
-@pytest.mark.parametrize('options,expected', [([], 'single'), (['--observation-mode', 'multi'], 'multi')])
-def test_habitat_cli_observation_mode_default_and_switch(monkeypatch, options, expected):
+@pytest.mark.parametrize('options', [[], ['--observation-mode', 'single'], ['--observation-mode', 'multi'],
+                                    ['--observation_mode', 'single'], ['--observation_mode', 'multi'],
+                                    ['--decision_owner', 'legacy'], ['--decision_owner', 'baseline_guided'],
+                                    ['--decision_owner', 'agent']])
+def test_habitat_cli_rejects_removed_navigation_flags(monkeypatch, capsys, options):
+    """The public CLI must not accept observation or decision-owner selectors."""
     import sys, argparse
     tree = ast.parse((ROOT/'objnav_benchmark_with_process_obs.py').read_text())
     fn = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == 'get_args')
     namespace = dict(argparse=argparse, available_benchmarks=lambda: [], DEFAULT_VLM='self_hosted')
     exec(compile(ast.Module(body=[fn], type_ignores=[]), 'get_args', 'exec'), namespace)
     monkeypatch.setattr(sys, 'argv', ['benchmark', *options])
-    assert namespace['get_args']().observation_mode == expected
+    if options:
+        with pytest.raises(SystemExit) as raised:
+            namespace['get_args']()
+        assert raised.value.code == 2
+        assert 'unrecognized arguments: ' + ' '.join(options) in capsys.readouterr().err
+    else:
+        args = namespace['get_args']()
+        assert not hasattr(args, 'observation_mode') and not hasattr(args, 'decision_owner')
 
 
 def test_single_frame_entities_keep_full_and_filtered_world_geometry():
@@ -678,23 +708,44 @@ def test_frontier_response_schema_limits_model_to_domain_options(tmp_path):
     assert runtime.model_calls == 1
 
 
-def test_object_viewpoints_are_shared_and_replaced_on_feedback(monkeypatch):
+def test_object_viewpoints_are_shared_and_regenerated_on_query(monkeypatch):
+    """Queries replace cached views with pure proposals without consuming an attempt."""
+    import sys
     import navigation.action_controller as actions
-    monkeypatch.setattr(actions, "geodesic_distance_to_waypoint", lambda *args: 2.)
     from backends.habitat.agent_runtime import HabitatNavigationTools
     from scene.contracts import SemanticMapSnapshot, Pose3D, ObjectNodeSnapshot
+
+    monkeypatch.setattr(actions, "geodesic_distance_to_waypoint", lambda *args: 2.)
+    proposals = [{"position": position, "score": score} for position, score in
+                 [((7, 8, 0), .9), ((9, 10, 0), .8)]]
+    build = Mock(return_value=(proposals, []))
+    monkeypatch.setitem(sys.modules, "navigation.view_verification_controller", NS(build_viewpoint_options=build))
     tools = HabitatNavigationTools.__new__(HabitatNavigationTools)
-    tools.agent = NS(episode_steps=10, planner=NS(_goal_radius=.25), approach_viewpoint=(1, 2, 0), check_again_postion=(3, 4, 0))
-    tools.session = NS(snapshot=SemanticMapSnapshot(10, Pose3D((0, 0, 0)),
+    tools.agent = NS(episode_steps=10, planner=NS(_goal_radius=.25), mapper=NS(current_position=np.zeros(3)),
+                     find_final_waypoint=Mock(), whether_to_check_again=Mock(),
+                     approach_viewpoint=(1, 2, 0), check_again_postion=(3, 4, 0))
+    tools.session = NS(spec=NS(revision=1), snapshot=SemanticMapSnapshot(10, Pose3D((0, 0, 0)),
         objects=(ObjectNodeSnapshot(uid="obj", label="chair"),)))
+    tools.objects = {"obj": NS(rgb=np.zeros((4, 4, 3), dtype=np.uint8), bbox=[0, 0, 2, 2])}
+    tools.candidate_view_states, tools.candidate_motion_goals = {}, {}
     views = tools.publish_object_viewpoints("obj")
     assert {v.metadata["purpose"] for v in views} == {"approach", "recheck"}
     assert next(v for v in views if v.metadata["recommended"]).pose.position == (3, 4, 0)
     tools.agent.check_again_postion = (5, 6, 0)
-    tools.publish_object_viewpoints("obj")
+    views = tools.publish_object_viewpoints("obj")
+    assert len(views) == 2
+    assert next(v for v in views if v.metadata["recommended"]).pose.position == (5, 6, 0)
     offered = tools.query_viewpoints("obj")
-    assert len(offered) == 2
-    assert next(v for v in offered if v["metadata"]["recommended"])["pose"]["position"] == (5, 6, 0)
+    assert [v["pose"]["position"] for v in offered] == [(7, 8, 0), (9, 10, 0)]
+    assert next(v for v in offered if v["metadata"]["recommended"])["pose"]["position"] == (7, 8, 0)
+    assert tools.query_viewpoints("obj") == offered
+    assert build.call_count == tools.agent.find_final_waypoint.call_count == 2
+    assert all(call.args == (tools.agent,) for call in build.call_args_list)
+    tools.agent.whether_to_check_again.assert_not_called()
+    state = tools.candidate_view_states[(1, "obj")]
+    assert state is tools.agent.view_control_state and state.last_selected_index is None
+    assert not state.attempts and not any(proposal.attempted for proposal in state.proposals)
+    assert not tools.candidate_motion_goals
     tools.agent.approach_viewpoint = None
     assert [v.metadata["purpose"] for v in tools.publish_object_viewpoints("obj")] == ["recheck"]
 
@@ -798,7 +849,9 @@ def test_viewpoint_query_removes_reached_and_unreachable_motion_goals(monkeypatc
                         lambda agent, pose: [0., 2., float("inf")][pose[0]])
     tools = HabitatNavigationTools.__new__(HabitatNavigationTools)
     tools.agent = NS(planner=NS(_goal_radius=.25))
-    tools.session = NS(snapshot=SemanticMapSnapshot(30, Pose3D((0, 0, 0)), viewpoints=views))
+    tools.session = NS(spec=NS(revision=1), snapshot=SemanticMapSnapshot(30, Pose3D((0, 0, 0)), viewpoints=views))
+    tools.objects = {"obj": NS(rgb=np.zeros((4, 4, 3), dtype=np.uint8), bbox=[0, 0, 2, 2])}
+    tools.candidate_motion_goals = {}
     assert [v["uid"] for v in tools._moving_viewpoints("obj", [asdict(v) for v in views])] == ["1"]
     assert [v.uid for v in tools.session.snapshot.viewpoints] == ["1"]
 
@@ -1323,11 +1376,13 @@ def test_habitat_adoption_revokes_verified_success_before_finish(habitat_interpr
     forbidden = Mock(side_effect=AssertionError("adoption must not capture or move"))
     monkeypatch.setitem(sys.modules, "navigation.goal_approach_controller", NS(tilt_camera=forbidden))
     tools.refresh_scene = forbidden
-    tools.evidence_provider = Mock(return_value={})
-    tools.verifier = Mock()
+    evidence = {}
+    tools.evidence_provider = Mock(return_value=evidence)
+    tools.verifier = Mock(evidence=evidence)
     tools.verifier.verify.return_value = VerificationResult(
         True, "accept", semantic_satisfied=True, view_sufficient_for_stop=True,
-        task_revision=1, target_uid="obj")
+        task_revision=1, target_uid="obj", diagnostics={"original_instruction_review": {
+            "coverage_complete": True, "interpretation_consistent": True, "task_satisfied": True}})
     agent.instruction_success = agent.final_stop_success = False
     assert tools.verify_target("obj", "goal", 1)["decision"] == "accept"
     assert session.progress.completed and agent.instruction_success and agent.final_stop_success

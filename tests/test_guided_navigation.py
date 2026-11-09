@@ -113,33 +113,38 @@ def test_directed_verification_reuses_feedback_without_panorama(monkeypatch):
 
 @pytest.mark.parametrize('owner', ['baseline_guided', 'agent'])
 @pytest.mark.parametrize('empty_at', ['initial', 'arrival'])
-def test_unavailable_single_geometry_terminates_without_retry_or_success(monkeypatch, tmp_path, owner, empty_at):
+@pytest.mark.parametrize('stop_on_success', [False, True])
+def test_unavailable_geometry_terminates_without_retry_or_success(monkeypatch, tmp_path, owner, empty_at, stop_on_success):
     import json
     import navigation.planner_loop as planner
     import backends.habitat.agent_runtime as agent_runtime
     import backends.habitat.guided_runtime as guided_runtime
     from motion.contracts import NavigationStatus, NavigationStatusCode
+    from scene.contracts import Pose3D
     node = NS(idx=1)
     episode = NS(episode_id='0', scene_id='scene', start_position=[0, 0, 0], start_rotation=[0, 0, 0, 1])
-    agent = NS(save_dir=str(tmp_path), episode_steps=1, observation_mode='single', vlm='test',
-               env=NS(episode_over=False, current_episode=episode),
+    sim = NS(sim_config=NS(agents=[NS(action_space={1: NS(actuation=NS(amount=.25))})]))
+    agent = NS(save_dir=str(tmp_path), episode_steps=1, vlm='test',
+               env=NS(episode_over=False, current_episode=episode, sim=sim),
                task=NS(progress=NS(completed=False)), current_node_idx=0,
                mapper=NS(nodes=[NS(idx=0), node], traj=[], change_state=Mock()),
-               execution=NS(controller=NS(advance=Mock()), step=Mock()), update_trajectory=Mock())
+               execution=NS(controller=NS(advance=Mock(), action_count=0), step=Mock()), update_trajectory=Mock())
     motion = NS(active_request_id='goal' if empty_at == 'arrival' else None)
     feedback = NS(tracking_active=False, status=NavigationStatus(NavigationStatusCode.REACHED),
                   intent=NS(metadata={'task_revision': 1, 'node_index': 1, 'frontier_uid': 'node:1'},
-                            target_object_uid=None, goal_pose=NS(position=(1, 0, 0))))
+                            target_object_uid=None, goal_pose=Pose3D((1, 0, 0))))
     def poll():
         motion.active_request_id = None
         return feedback
     motion.poll_active = poll
-    tools = NS(motion=motion, refresh_scene=Mock())
-    runtime = NS(model_calls=0, step=Mock(side_effect=AssertionError('No model decision without geometry')))
+    tools = NS(motion=motion, refresh_scene=Mock(), exploration_options=Mock(), motion_finished=Mock())
+    runtime = NS(model_calls=0, record_event=Mock(),
+                 step=Mock(side_effect=AssertionError('No model decision without geometry')))
     def construct(current, directory, max_calls):
         directory.mkdir(parents=True, exist_ok=True)
         return NS(directory=directory, tools=tools, runtime=runtime, record=Mock(), motion_finished=Mock(),
-                  observation_updated=Mock(), select=Mock(side_effect=AssertionError('No geometry')))
+                  observation_updated=Mock(),
+                  select=Mock(side_effect=AssertionError('No geometry')))
     monkeypatch.setattr(guided_runtime, 'GuidedNavigation', construct)
     monkeypatch.setattr(agent_runtime, 'HabitatNavigationTools', lambda current: tools)
     monkeypatch.setattr(agent_runtime, 'AgentRuntime', lambda *args, **kwargs: runtime)
@@ -149,12 +154,22 @@ def test_unavailable_single_geometry_terminates_without_retry_or_success(monkeyp
     monkeypatch.setattr(guided_runtime, 'run_observation_mapping_cycle', observe)
     monkeypatch.setattr(planner, 'run_observation_mapping_cycle', observe)
     runner = guided_runtime.run_guided_episode if owner == 'baseline_guided' else agent_runtime.run_agent_episode
-    runner(agent, episode_idx=0, max_steps=500)
-    result = json.loads((tmp_path / 'episode-0/harness/termination.json').read_text())
+    directory = tmp_path / ('episode-0/harness' if stop_on_success else 'subtask-1/harness')
+    result = runner(agent, episode_idx=0, max_steps=500, stop_on_success=stop_on_success,
+                    output_dir=None if stop_on_success else directory)
+    assert json.loads((directory / 'termination.json').read_text()) == result
+    if not stop_on_success:
+        assert not (tmp_path / 'episode-0/harness').exists()
     assert result['reason'] == 'observation_geometry_unavailable'
-    assert result['observation_mode'] == 'single' and not result['task_complete']
+    assert not result['task_complete']
     assert result['steps'] == 1 and result['model_calls'] == 0
     assert observe.call_count == (2 if empty_at == 'arrival' else 1)
+    if owner == 'agent':
+        assert agent.adaptive_observation and not agent.scan_complete
+        assert agent.semantic_scan_headings == agent.semantic_label_evidence == {}
+        assert agent.mapper.coverage_guided_exploration and agent.mapper.frontier_distance_tie_m == .25
+        assert tools.exploration_options.call_count == int(empty_at == 'arrival')
+        assert tools.motion_finished.call_count == runtime.record_event.call_count == int(empty_at == 'arrival')
     agent.mapper.change_state.assert_not_called()
     agent.execution.step.assert_not_called()
     agent.update_trajectory.assert_not_called()
@@ -162,15 +177,14 @@ def test_unavailable_single_geometry_terminates_without_retry_or_success(monkeyp
 
 
 @pytest.mark.parametrize("stop_on_success", [True, False])
-@pytest.mark.parametrize("observation_mode", ["single", "multi"])
 @pytest.mark.parametrize("kind", ["frontier", "object", "blocked"])
-def test_terminal_event_dispatches_observation_or_verification_once(monkeypatch, tmp_path, kind, stop_on_success, observation_mode):
+def test_terminal_event_dispatches_observation_or_verification_once(monkeypatch, tmp_path, kind, stop_on_success):
     from pathlib import Path
     from motion.contracts import NavigationStatus, NavigationStatusCode
     import backends.habitat.guided_runtime as runtime
     events = []
-    agent = NS(save_dir=str(tmp_path), episode_steps=1, observation_mode=observation_mode,
-               scan_complete=observation_mode == 'multi', env=NS(episode_over=False),
+    agent = NS(save_dir=str(tmp_path), episode_steps=1,
+               scan_complete=True, env=NS(episode_over=False),
                task=NS(progress=NS(completed=False)),
                mapper=NS(nodes=[NS(idx=0)], traj=[], change_state=lambda n: events.append("visited")))
     def step(action):
@@ -226,9 +240,8 @@ def test_terminal_event_dispatches_observation_or_verification_once(monkeypatch,
 
 
 @pytest.mark.parametrize('review_due', [False, True])
-@pytest.mark.parametrize('geometry_available', [False, True])
-def test_single_anchor_arrival_observes_new_terminal_before_reselection(
-        monkeypatch, tmp_path, review_due, geometry_available):
+def test_anchor_arrival_resumes_multiview_collection_before_terminal_selection(
+        monkeypatch, tmp_path, review_due):
     import sys
     import numpy as np
     import backends.habitat.guided_runtime as runtime
@@ -243,7 +256,7 @@ def test_single_anchor_arrival_observes_new_terminal_before_reselection(
     objects = {obj.uid: obj for obj in (anchor, terminal)}
     facts = {'anchor_searched': False, 'terminal_visible': False}
     camera = np.array([[0, 0, -1], [-1, 0, 0], [0, 1, 0]], dtype=float)
-    agent = NS(save_dir=str(tmp_path), episode_steps=7, observation_mode='single',
+    agent = NS(save_dir=str(tmp_path), episode_steps=7,
                scan_complete=False, current_node_idx=0, env=NS(episode_over=False),
                task=NS(spec=NS(revision=1), progress=NS(completed=False)),
                selected_candidate=NS(role='anchor', target_id='reference'),
@@ -271,8 +284,8 @@ def test_single_anchor_arrival_observes_new_terminal_before_reselection(
 
     def observe(current, **kwargs):
         if facts['anchor_searched']:
-            facts['terminal_visible'] = geometry_available
-            return PlanningCycleResult(current.episode_steps, geometry_available=geometry_available)
+            facts['terminal_visible'] = True
+            current.scan_complete = True
         return PlanningCycleResult(current.episode_steps)
 
     def candidate(*args, **kwargs):
@@ -293,9 +306,10 @@ def test_single_anchor_arrival_observes_new_terminal_before_reselection(
         guided.motion_finished = Mock()
         guided.search_review_step, guided.search_review_interval = 0, 1 if review_due else 100
         guided.deferred_candidates, guided.candidate_view_states = set(), {}
+        guided.observation_updated = Mock()
         guided.view_attempted = lambda *args: False
         guided.submit = lambda position, candidate_uid, source: setattr(motion, 'active_request_id', candidate_uid)
-        guided.recover = Mock(side_effect=lambda *args: 'select' if facts['terminal_visible'] else 'search_exhausted')
+        guided.recover = Mock(return_value='select')
         return guided
 
     motion.poll_active = poll
@@ -307,10 +321,9 @@ def test_single_anchor_arrival_observes_new_terminal_before_reselection(
     monkeypatch.setattr(runtime, 'select_observed_candidate', candidate)
     monkeypatch.setattr(runtime, 'select_exploration_node', frontier)
     result = runtime.run_guided_episode(agent, episode_idx=0, max_steps=120, stop_on_success=False)
-    assert result['reason'] == ('verified_finish' if geometry_available else 'observation_geometry_unavailable')
-    assert result['task_complete'] is geometry_available
+    assert result['reason'] == 'verified_finish' and result['task_complete']
     assert result['steps'] == 7 and observation.call_count == 2
-    assert facts['anchor_searched'] and facts['terminal_visible'] is geometry_available
+    assert facts['anchor_searched'] and facts['terminal_visible'] and agent.scan_complete
     frontier.assert_not_called()
     agent.execution.step.assert_not_called()
     agent.update_trajectory.assert_not_called()
@@ -415,11 +428,12 @@ def test_recovery_selects_untried_approach_once_and_returns_to_driver(monkeypatc
     guided.runtime.step.assert_not_called()
 
 
-@pytest.mark.parametrize('mode', ['single', 'multi'])
-def test_single_view_proceeds_to_frontier_without_claiming_panorama(monkeypatch, mode):
+@pytest.mark.parametrize('scan_complete', [False, True])
+def test_multiview_coverage_precedes_frontier_selection(monkeypatch, scan_complete):
+    """Resume unfinished multi-view coverage before choosing an exploration node."""
     import backends.habitat.guided_runtime as runtime
     node = NS(idx=0, position=(1., 0., 0.))
-    agent = NS(observation_mode=mode, scan_complete=False, episode_steps=7, current_node_idx=0,
+    agent = NS(scan_complete=scan_complete, episode_steps=7, current_node_idx=0,
                mapper=NS(nodes=[node]))
     guided = GuidedNavigation.__new__(GuidedNavigation)
     guided.agent, guided.deferred_candidates = agent, set()
@@ -432,12 +446,14 @@ def test_single_view_proceeds_to_frontier_without_claiming_panorama(monkeypatch,
     monkeypatch.setattr(runtime, 'run_observation_mapping_cycle', scan)
     monkeypatch.setattr(runtime, 'select_exploration_node', frontier)
     assert guided.select(0)
-    assert not agent.scan_complete and agent.episode_steps == 7
-    assert scan.call_count == int(mode == 'multi')
-    assert frontier.call_count == int(mode == 'single')
-    if mode == 'single':
+    assert agent.scan_complete is scan_complete and agent.episode_steps == 7
+    assert scan.call_count == int(not scan_complete)
+    assert guided.observation_updated.call_count == int(not scan_complete)
+    assert frontier.call_count == int(scan_complete)
+    if scan_complete:
         guided.submit.assert_called_once_with(node.position, node=node, source='current_room')
     else:
+        scan.assert_called_once_with(agent, node=node, episode_idx=0)
         guided.submit.assert_not_called()
 
 
@@ -446,7 +462,7 @@ def test_candidate_discovery_does_not_postpone_search_review(monkeypatch):
     import backends.habitat.guided_runtime as module
     node = NS(idx=0, position=(5., 0., 0.))
     obj = NS(uid="candidate")
-    agent = NS(episode_steps=80, task=NS(spec=NS(revision=1)), observation_mode="multi", scan_complete=True,
+    agent = NS(episode_steps=80, task=NS(spec=NS(revision=1)), scan_complete=True,
                mapper=NS(current_position=np.zeros(3), nodes=[node],
                    prior_map_last_chosen_frontier={"candidates": [
                        {"node_idx": 0, "raw_distance_m": 5.}]}),
@@ -543,7 +559,8 @@ def test_prior_region_adds_its_branch_without_pruning_baseline_options(monkeypat
 def test_completed_anchor_review_excludes_anchor_views_and_reselects_when_empty(frontiers):
     node = NS(idx=2, position=(2., 0., 0.))
     guided = GuidedNavigation.__new__(GuidedNavigation)
-    guided.agent = NS(episode_steps=104, task=NS(spec=NS(revision=1)), mapper=NS(nodes=[None, None, node]))
+    guided.agent = NS(episode_steps=104, task=NS(spec=NS(revision=1)),
+                      mapper=NS(nodes=[None, None, node]))
     guided.tools = NS(refresh_scene=Mock(), query_viewpoints=Mock())
     guided.runtime = NS(model_calls=0, max_model_calls=5, choice_guard=nullcontext,
                         choose_recovery=Mock(return_value="frontier:2"))
@@ -652,7 +669,7 @@ def test_interpretation_handoff_reselects_without_stale_motion(monkeypatch, entr
                              metadata={"recommended": True})
     mapper = NS(nodes=[node], current_position=np.zeros(3), change_state=Mock(),
                 prior_map_last_chosen_frontier={"candidates": [{"node_idx": 0, "raw_distance_m": 5.}]})
-    agent = NS(task=session, mapper=mapper, episode_steps=125, travel_distance=8., observation_mode="multi", scan_complete=True,
+    agent = NS(task=session, mapper=mapper, episode_steps=125, travel_distance=8., scan_complete=True,
                planner=NS(_goal_radius=.25), find_final_waypoint=Mock(), whether_to_check_again=Mock())
     controller = NS(send_goal=Mock(return_value="goal"), moves=7, advance=Mock())
     motion = MotionSupervisor(controller)
@@ -781,3 +798,64 @@ def test_interpretation_handoff_reselects_without_stale_motion(monkeypatch, entr
     mapper.change_state.assert_not_called()
     controller.advance.assert_not_called()
     observe.assert_not_called()
+
+
+def test_adaptive_multiview_collector_preserves_batch_and_coverage_contract_source():
+    """Keep partial batches, pose-bound coverage and early candidate exit in source."""
+    import ast
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    tree = ast.parse((root / 'navigation/observation_pipeline.py').read_text())
+    functions = {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
+    assert 'collect_panoramic_observations' in functions
+    assert 'collect_single_observation' not in functions
+    collect = functions['collect_adaptive_observations']
+    source = ast.unparse(collect)
+    assert 'agent.task.spec.revision' in source
+    assert 'np.round(agent.mapper.current_position, 3)' in source
+    assert 'len(images) == 4' in source
+    assert 'candidate_seen or len(covered) == 12' in source
+    assert 'agent.scan_complete = len(covered) == 12' in source
+    batch = next(node for node in collect.body
+                 if isinstance(node, ast.FunctionDef) and node.name == 'process_batch')
+    assert ast.unparse(batch.body[0]) == (
+        'agent.rotate_segmentation(images, depths, positions, rotations, partial=True)')
+    assert ast.unparse(batch.body[1]) == 'covered.update(headings)'
+
+
+@pytest.mark.parametrize('adaptive', [True, False])
+def test_mapping_cycle_retains_adaptive_and_internal_panorama_paths(monkeypatch, adaptive):
+    """Map the collected views without exposing an observation-mode selector."""
+    import sys
+    from navigation.planner_loop import run_observation_mapping_cycle
+
+    collect = Mock()
+    monkeypatch.setitem(sys.modules, 'navigation.observation_pipeline',
+                        NS(collect_adaptive_observations=collect))
+    cloud, node = object(), NS(idx=2)
+    agent = NS(adaptive_observation=adaptive, current_node_idx=2, temporary_pcd=[cloud],
+               episode_steps=7, env=NS(episode_over=False), rotate_panoramic=Mock(),
+               mapper=NS(current_obj_indices=[3], update_obj=Mock()),
+               _merge_temporary_pointclouds=Mock(return_value=cloud),
+               _save_obs_pointcloud=Mock(), _log_mapper_state_before_after_get_nodes=Mock())
+    result = run_observation_mapping_cycle(agent, node=node, episode_idx=1)
+    assert result.step == 7 and result.geometry_available and not result.episode_over
+    assert collect.call_count == int(adaptive)
+    assert agent.rotate_panoramic.call_count == int(not adaptive)
+    assert agent.mapper.current_node_idx == 2 and agent.current_pcd is cloud
+    agent.mapper.update_obj.assert_called_once_with(2, [3])
+    agent._save_obs_pointcloud.assert_called_once_with(cloud, idx=1, step=7)
+
+
+def test_recovery_without_options_reports_search_exhausted():
+    """Internal guided recovery cannot request removed per-heading turns."""
+    guided = GuidedNavigation.__new__(GuidedNavigation)
+    guided.agent = NS()
+    guided.tools = NS(refresh_scene=Mock())
+    guided.exploration_options = lambda idx: (None, 'no_frontiers', [])
+    guided.runtime = NS(choose_recovery=Mock())
+    guided.submit = Mock()
+    assert guided.recover({'reason': 'motion_terminal_failure'}, 0) == 'search_exhausted'
+    guided.runtime.choose_recovery.assert_not_called()
+    guided.submit.assert_not_called()

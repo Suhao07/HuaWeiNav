@@ -20,7 +20,7 @@ bash docker/preflight.sh
 
 成功的 preflight 只验证依赖，不证明模型服务、指令理解或导航成功。
 
-## 2. 单例 smoke 与模式选择
+## 2. 单例 smoke 与 Agent 入口
 
 配置模型变量和私有密钥后：
 
@@ -28,13 +28,12 @@ bash docker/preflight.sh
 bash docker/run_hm3d_baseline.sh \
   --benchmark hm3d_objectnav \
   --eval_episodes 1 --start_episode 0 \
-  --decision_owner baseline_guided \
   --agent_max_model_calls 100 --max_steps 500 \
-  --vlm self_hosted --save_dir hm3d_single_smoke
+  --vlm self_hosted --save_dir hm3d_agent_smoke
 ```
 
-- `baseline_guided` 为默认：领域探索/接近策略与按需语义选择共用运动所有者。
-- `legacy` 为历史路径；`agent` 为自由工具决策对照。报告必须注明模式，不能把不同策略的结果解释为纯结构消融。
+- 最终公开入口仅使用 Agent：`run_agent_episode` 负责高层工具决策，增强 ObjNav 服务提供多视角感知、搜索/接近选项与执行能力。
+- 不再接受 `--decision_owner`、`--observation-mode` 或 `--observation_mode`；删除旧命令中的这些参数，而非改成 `agent`/`multi`。启动脚本名中的 `baseline` 不表示 guided 决策；内部 guided/legacy 实现仅供历史回归，没有生产入口。
 - 初始语言编译与 Agent 决策共享 `agent_max_model_calls`；感知与验证调用另列。
 - `--max_steps` 是环境步预算；达到预算、模型预算耗尽、工程错误和验证完成是不同终止原因。
 - `LLM_OFFLINE=1` / `STRIVE_LLM_FALLBACK=1` 不属于正式评测配置；不得用离线默认值绕过严格完成条件。
@@ -44,7 +43,7 @@ bash docker/run_hm3d_baseline.sh \
 ```bash
 bash docker/run_scene_object_nav.sh \
   --scene_id wcojb4TFT35 --object_category tv --episode_rank 0 \
-  --decision_owner baseline_guided --vlm self_hosted \
+  --vlm self_hosted \
   --save_dir hm3d_scene_smoke
 ```
 
@@ -52,19 +51,26 @@ bash docker/run_scene_object_nav.sh \
 
 ### 观测模式与对照口径
 
-`--observation-mode single` 为新默认值（主 Python 入口也接受 `--observation_mode`）。每轮只检测当前原始 RGB-D 帧，使用同一帧的位姿投影，保留地图、对象融合及历史证据，不执行用于凑齐输入视角的自动转向。检测与最终定向验证共用原有任务合同，不放宽 STOP 条件；信息不足仍可能由后续导航和定向复核补看，不承诺单帧覆盖整间房。
+当前交付仅保留增强多视角 ObjNav：Habitat 自适应扫描每批4方向、最多12个朝向，候选或覆盖条件满足时可提前结束；RGB-D 以对应位姿投影并融合地图、稳定实例和历史证据。它不是只增加发给 VLM 的图片张数，也不是旧自由 Agent 的固定12方向全景循环。
 
-单视角不会为了补齐无效深度而自动环视。临时建图缓存被房间选择或前序任务清空时，先用当前观测和传入节点的历史点云补齐，不把缓存清理误判为地图失效。当前回合若仍没有可用于建图的可通行几何（例如首帧深度全部无效），guided/agent 以 `observation_geometry_unavailable` 结束，legacy 返回规划失败；不伪造动作、访问状态或成功结果。A/B 统计应保留这些失败，而不是只比较能启动移动的回合。
+| 后端能力 | Agent 的决定 | 不能混淆的边界 |
+|---|---|---|
+| 自适应扫描与地图/实例融合 | 显式选择 `scan_scene` 补充证据 | `observe` 只读取缓存状态，不转向、拍摄或重新验证 |
+| 房间与 coverage frontier、可达性/路径信息 | 选择探索目标与运动 | 排序和推荐是选项，不是 guided 自动调度 |
+| approach/recheck 视点与定向取证 | 选择接近、复核或换候选 | 可接近、运动到达均不表示语义接受 |
+| 作用域反馈与最终验证 | 根据失败/未知继续搜索、验证或 `propose_finish` | 反馈按任务版本、实例、谓词/对象对及观测依赖绑定，不能把局部失败扩大为全类拒绝 |
 
-`--observation-mode multi` 保留历史采集路径：`baseline_guided` 每批4方向，看到候选可提前结束，最多覆盖12方向；显式 `agent` / `legacy` 是12方向全景。它不是“只把发给 VLM 的图像张数改多”：Habitat 上层 Agent 请求仍使用当前图像，地图已融合扫描证据。无任务 `collect_hm3d_patrol.py` 保留全景采集。
+Agent 是高层决策所有者，唯一运动所有者负责低层执行、版本准入和安全条件。完整原始指令仍是最终语义权威；结构化解释和搜索假设只是执行辅助，最终完成还需当前完整原指令验证、数量/顺序进度与运动静止，不能用局部候选接受替代。临时缓存清理不等于地图清空；无有效可通行几何时保留 `observation_geometry_unavailable` 等真实失败，不伪造访问、运动或成功。
 
-在上面的同一条命令中分别添加 `--observation-mode single` / `--observation-mode multi`，并指定不同 `save_dir`；完整可复制示例见 [交付 README](../README.md#3-单视角默认模式与多视角对照)。GOAT 连续导航与语言子集启动器也支持该开关，启动器参数放在 `--` 分隔符前。
+上面的命令已是多视角 Agent 入口，不需再加模式参数，见 [交付 README](../README.md#3-agent-决策与增强多视角能力)。GOAT 连续父 episode 使用 `run_agent_episode` 执行子任务，父 driver 独占 `SUBTASK_STOP` 与全局 STOP，保留连续位姿及地图记忆；语言派生单任务入口也不提供旧模式开关。无任务 `collect_hm3d_patrol.py` 仍保留全景采集，详见 [GOAT 协议边界](benchmark_providers.md#goat-连续父任务的决策与终止)。
 
-运行根目录 `run_manifest.json` 和 guided/agent 的 `harness/termination.json` 记录 `observation_mode`；单帧与 guided 自适应扫描的 `episode-*/observation_cycles.jsonl` 记录 `mode`、`views`、起止 step 和完成状态。`cycle_complete=true` 只代表这一批处理结束，`complete` 仍表示全景覆盖完成：单视角为 false，不能把节点已访问解释为360°已扫描。全景 legacy/agent 的帧数与动作从 RGB/轨迹产物核对。
+运行身份与配置从 `run_manifest.json`、`harness/episode_identity.json`、`harness/termination.json` 核对；自适应扫描的 `episode-*/observation_cycles.jsonl` 记录视角、起止 step 与完成状态。`cycle_complete=true` 只表示一批处理结束，不等于 `complete` 所表示的全景覆盖，节点已访问也不等于360°已扫描。帧数与转向成本须结合 RGB/轨迹和模型调用产物统计。
 
-A/B 使用相同冻结源码、完整任务身份（尤其起点与朝向）、模型/权重、预算、先验图与评分协议。除了 SR/SPL，分别核对实际转向/动作、处理帧数、感知/验证/Agent 调用和耗时；同样的环境步预算下，multi 扫描本身会消耗转向步。旧版本结果若没有模式字段，按其冻结源码认定，不能按新默认值补写成 single。CPU 测试只验证接口和状态机，性能与导航成功率需真实仿真对照，不能由单个 smoke 外推。
+跨版本比较固定完整任务身份（尤其起点与朝向）、模型/权重、预算、先验图与评分协议，分别冻结源码；不同决策策略不称为纯观测消融。除 SR/SPL 外，核对实际转向/动作、处理帧数、感知/验证/Agent 调用及耗时；扫描本身消耗转向步。旧结果按其冻结源码解释，不能补写成当前 Agent/multi，也不能重标历史 single 记录。本次文档更新不声明新导航验收、验证集 SR 或恢复旧成功率。
 
 #### 2026-11-09本机功能验证
+
+以下保留旧 single/multi 版本的历史实验描述、失败与回归统计，不是当前 Agent 多视角版本的验收，也不提供旧模式的生产启动方法。
 
 使用 RTX 3090、`strive-hm3d:local`、本机 Qwen2.5-VL-3B（BF16、32K上下文、vLLM 0.17.1），图像不外发。测试服务只将 `guided_json` 转为 vLLM 新版 `structured_outputs.json`，保留原 JSON schema，关闭离线与解析回退；该服务不是生产 Qwen3.5 服务。源码、权重、镜像标识及失败尝试保存在本机忽略目录 `logs/view_mode_smoke_20261109/`，以 `source_freeze_bounded80.json`、`execution_bounded80.json`、`acceptance_summary.json` 为80步配对依据，不提交运行图片或模型请求。
 
@@ -88,11 +94,11 @@ bash docker/run_scene_object_nav.sh \
   --scene_id wcojb4TFT35 --object_category tv \
   --enable_instruction_adapter \
   --custom_instruction "find the television in the scene" \
-  --decision_owner baseline_guided --vlm self_hosted \
+  --vlm self_hosted \
   --save_dir hm3d_instruction_smoke
 ```
 
-不开 adapter 的 ObjectNav 按数据集目标确定性编译。非 legacy 的自然语言入口使用有界初始解释，保存原文和编译诊断，不在失败后悄悄改成数据集类别。`rules` 是历史数据集兼容路径，不是通用自然语言规则解析器。任务义务、动态检索词和当前验证的职责见 [指令合同](instruction_adapter.md)。
+不开 adapter 的 ObjectNav 按数据集目标确定性编译。公开 Agent 自然语言入口使用有界初始解释，保存完整原文和编译诊断，不在失败后悄悄改成数据集类别；原文始终保留最终语义权威。`rules` 是历史数据集兼容路径，不是通用自然语言规则解析器。任务义务、动态检索词和当前验证的职责见 [指令合同](instruction_adapter.md)。
 
 ## 4. 固定清单与批量重跑
 
@@ -133,7 +139,7 @@ bash docker/run_hm3d_baseline.sh \
   --dataset_path /workspace/data/datasets/hm3d_simple_2000/tasks.json.gz \
   --episode_manifest /workspace/data/datasets/hm3d_simple_2000/manifest.json \
   --dataset_episodes 2000 --eval_episodes 2000 --start_episode 0 \
-  --decision_owner baseline_guided --agent_max_model_calls 100 \
+  --agent_max_model_calls 100 \
   --max_steps 500 --vlm self_hosted --save_dir hm3d_simple_2000_new
 ```
 

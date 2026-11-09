@@ -22,14 +22,10 @@ class PlanningCycleResult:
 
 
 def run_observation_mapping_cycle(agent: Any, *, node: Any, episode_idx: int | None) -> PlanningCycleResult:
-    """Run the selected observation mode, then update map nodes and objects."""
+    """Collect multi-view observations, then update map nodes and objects."""
 
     agent.mapper.current_node_idx = agent.current_node_idx
-    single_view = agent.observation_mode == "single" and not agent.patrol
-    if single_view:
-        from navigation.observation_pipeline import collect_single_observation
-        collect_single_observation(agent, node=node)
-    elif getattr(agent, "adaptive_observation", False):
+    if getattr(agent, "adaptive_observation", False):
         from navigation.observation_pipeline import collect_adaptive_observations
         collect_adaptive_observations(agent)
         if not agent.temporary_pcd:
@@ -38,10 +34,6 @@ def run_observation_mapping_cycle(agent: Any, *, node: Any, episode_idx: int | N
         agent.rotate_panoramic()
     if agent.env.episode_over:
         return PlanningCycleResult(step=agent.episode_steps, episode_over=True)
-
-    if single_view and (agent.mapper.traversable_pcd_all.is_empty()
-                        or agent.mapper.process_nav_pcd.is_empty()):
-        return PlanningCycleResult(step=agent.episode_steps, geometry_available=False)
 
     agent.current_pcd = agent._merge_temporary_pointclouds()
     step = agent.episode_steps

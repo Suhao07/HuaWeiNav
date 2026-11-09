@@ -103,16 +103,6 @@ def query_candidates(plan, progress, snapshot: SemanticMapSnapshot, evidence, *,
 
     pending = progress.pending_verified_pair
     pinned = pending.get("candidate_uid") if progress.mode == "better_view_for_verified_pair" else None
-    pinned_target = next((t for t in terminals if t.id == pending.get("target_id")), None)
-    pinned_obj = snapshot.object_by_uid(pinned) if pinned else None
-    if pinned_obj is not None and pinned_target is not None and not evidence.is_hard_rejected(raw, pinned_obj.uid):
-        row = records(pinned_target.concept_query()).get(pinned_obj.uid)
-        if row is not None and row.candidate_eligible:
-            result.candidates.append(CandidateMatch(pinned_obj, pinned_target.id, pinned_target.name,
-                                                   record=row.as_dict()))
-            result.reason = "Continue observation of the same pending verified instance"
-            return result
-
     for target in terminals:
         accepted = progress.target_progress[target.id].accepted_candidate_uids
         rows = records(target.concept_query())
@@ -138,7 +128,9 @@ def query_candidates(plan, progress, snapshot: SemanticMapSnapshot, evidence, *,
             prior_scores = {a.candidate.uid: a.prior_score for a in annotations}
             result.concept_debug.extend({"source": "prior_map_target_annotation", "candidate_uid": a.candidate.uid,
                                          **a.metadata.get("prior_map", {})} for a in annotations)
-        result.candidates.sort(key=lambda c: (prior_scores.get(c.obj.uid, 0), c.confidence), reverse=True)
+        result.candidates.sort(key=lambda c: (
+            c.obj.uid == pinned and c.target_id == pending.get("target_id"),
+            prior_scores.get(c.obj.uid, 0), c.confidence), reverse=True)
         result.reason = "Observed target candidates for instance and constraint verification"
         return result
 

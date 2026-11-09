@@ -13,6 +13,21 @@ from scene.contracts import ObjectNodeSnapshot, Pose3D, SemanticMapSnapshot
 from task.session import TaskSession
 
 
+def test_pending_pair_prefers_same_instance_without_hiding_alternatives(monkeypatch):
+    monkeypatch.setenv("LLM_OFFLINE", "1")
+    objects = (ObjectNodeSnapshot("cup-a", "cup", (1., 0., 0.), .1),
+               ObjectNodeSnapshot("cup-b", "cup", (2., 0., 0.), .9))
+    session = TaskSession(SemanticMapSnapshot(1, Pose3D((0., 0., 0.)), objects=objects),
+                          InstructionPlan("cup", targets=[TargetQuery("cup", "cup")], valid=True))
+    session.progress.mode = "better_view_for_verified_pair"
+    session.progress.pending_verified_pair = {"candidate_uid": "cup-a", "target_id": "cup"}
+    before = deepcopy(session.progress.as_dict())
+    result = query_scene(session)
+    assert [candidate.obj.uid for candidate in result.candidates] == ["cup-a", "cup-b"]
+    assert [candidate.obj.uid for candidate in result.candidates if candidate.obj.uid != "cup-a"] == ["cup-b"]
+    assert session.progress.as_dict() == before
+
+
 def test_query_preserves_native_snapshot_and_distinct_uids(monkeypatch):
     monkeypatch.setenv("LLM_OFFLINE", "1")
     objects = (ObjectNodeSnapshot("cup-a", "cup", (1., 0., 0.), 0.8),

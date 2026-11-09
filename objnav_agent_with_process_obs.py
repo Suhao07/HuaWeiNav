@@ -59,8 +59,7 @@ from navigation.observation_pipeline import (
     merge_temporary_pointclouds,
     save_observation_pointcloud,
 )
-from navigation.panoramic_detection import DetectionSlice, build_triplet, filter_center_panel, pose_triplet
-from mapping_utils.preprocess import preprocess_depth
+from navigation.panoramic_detection import build_triplet, filter_center_panel, pose_triplet
 from navigation.path_progress import action_after_replan
 from navigation.planner_loop import run_observation_mapping_cycle
 from navigation.view_verification_controller import select_check_again_viewpoint
@@ -76,11 +75,7 @@ class HM3D_Objnav_Agent:
                  relocate=False,
                  gpt_relocate=True,
                  vlm='cognav',
-                 observation_recorder=None,
-                 observation_mode="single"):
-        if observation_mode not in {"single", "multi"}:
-            raise ValueError("observation_mode must be single or multi")
-        self.observation_mode = observation_mode
+                 observation_recorder=None):
         self.env = env
         self.observation_recorder = observation_recorder
         self.mapper = mapper
@@ -242,26 +237,19 @@ class HM3D_Objnav_Agent:
         logger.info("object indices")
         logger.info(self.mapper.current_obj_indices)
 
-    def rotate_segmentation(self, images, depths, positions, rotations, *, partial=False, single_view=False):
-        """Detect current-frame or stitched-view objects and update shared object memory."""
+    def rotate_segmentation(self, images, depths, positions, rotations, *, partial=False):
+        """Detect stitched multi-view objects and update shared object memory."""
         _, w, _ = images[0].shape
         C_objs = []
         step_dir = detection_step_dir(self)
 
         for i in range(len(images)):
-            if single_view:
-                image = images[i]
-                depth_vis = np.clip(depths[i] / 5 * 255, 0, 255).astype(np.uint8)
-                filter_detections = DetectionSlice
-                get_entities = bind(self.mapper.get_object_entities, depths[i],
-                                    preprocess_depth(depths[i].copy(), 0.51, 4.99), image)
-            else:
-                triplet = build_triplet(images, depths, i, self.mapper.camera_intrinsic, circular=not partial)
-                image, depth_vis = triplet.image, triplet.depth_vis
-                current_pos, current_rot, depths_list = pose_triplet(positions, rotations, depths, triplet)
-                filter_detections = bind(filter_center_panel, image_width=w)
-                get_entities = bind(self.mapper.get_object_entities_pano, triplet.depth, image,
-                                    current_pos, current_rot, depth_list=depths_list)
+            triplet = build_triplet(images, depths, i, self.mapper.camera_intrinsic, circular=not partial)
+            image, depth_vis = triplet.image, triplet.depth_vis
+            current_pos, current_rot, depths_list = pose_triplet(positions, rotations, depths, triplet)
+            filter_detections = bind(filter_center_panel, image_width=w)
+            get_entities = bind(self.mapper.get_object_entities_pano, triplet.depth, image,
+                                current_pos, current_rot, depth_list=depths_list)
             B_classes, B_boxes, B_masks, B_confidences, \
                 C_classes, C_boxes, C_masks, C_confidences = \
                     self.mapper.object_perceiver.perceive(
@@ -304,7 +292,7 @@ class HM3D_Objnav_Agent:
         from navigation.bbox_refinement import refine_candidates
         candidates = []
         for i, obj in enumerate(real_C_objs):
-            evidence = project_object_view(self, obj, images, rotations, torch, partial=partial or single_view)
+            evidence = project_object_view(self, obj, images, rotations, torch, partial=partial)
             if evidence is None:
                 continue
             save_object_view(step_dir, i, evidence.image, evidence.bbox_xyxy)

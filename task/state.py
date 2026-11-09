@@ -1,5 +1,6 @@
 """Task-owned progress for an immutable instruction revision."""
 from __future__ import annotations
+from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from typing import Any
 from instruction.contracts import TaskSpec, TargetSpec
@@ -63,6 +64,6 @@ class TaskProgress:
             "active_target_index": self.active_target_index,
             "completed": self.completed,
             "mode": self.mode,
-            "pending_verified_pair": self.pending_verified_pair,
+            "pending_verified_pair": deepcopy(self.pending_verified_pair),
             "target_progress": {key: value.as_dict() for key, value in self.target_progress.items()},
         }

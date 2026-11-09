@@ -1,5 +1,7 @@
 # Instruction Understanding
 
+The complete original instruction has final semantic authority on every decision and final verification. Structured targets, constraints and search priors are revisable aids, never an exhaustive substitute for the original wording. Omitted clauses remain binding; do not redefine a requirement to fit a convenient observation.
+
 Read the original instruction before selecting a search target. Preserve the named destination and every explicit attribute, relation, prohibition, count and order. For a need, distinguish the intended activity, the material being acted on, and the resource that enables the activity; treat possible facilities as hypotheses, not additional requirements.
 
 Compare the current interpretation with the original wording, then inspect the supplied observation and verification feedback. Identify what is still unknown and choose an available search or observation action that can resolve it.

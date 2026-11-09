@@ -1,6 +1,6 @@
 # Active Observation
 
-After arrival, call `verify_target`. The backend supplies an observation that satisfies the arrival barrier.
+After object arrival, inspect the fresh observation and call `verify_target` when it can answer the task. The backend supplies an observation that satisfies the arrival barrier. `observe` only reads cached state. When `scan_scene` is available, choose it to process remaining multi-view headings at the current pose before abandoning an incompletely observed area.
 
 Use the verification result to choose the next query:
 

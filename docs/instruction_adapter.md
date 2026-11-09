@@ -13,7 +13,7 @@
   -> 完成检查与后端 STOP
 ```
 
-- [`TaskSpec`](../instruction/contracts.py) 是语义事实源：原始指令、目标、角色、数量、顺序、完成模式和约束不能被检测结果或导航方便性覆盖。
+- **完整原始指令是最终语义权威。** [`TaskSpec`](../instruction/contracts.py) 保存原文与同一 revision 内不可变的结构化执行解释；解释可经准入修订，但不能替代或缩减原始义务。目标、角色、数量、顺序、完成模式和约束不能被检测结果或导航方便性覆盖。
 - [`TaskSession`](../task/session.py) 持有当前任务 revision、[`TaskProgress`](../task/state.py)、搜索假设和证据服务；[`apply_verification`](../task/reducer.py) 是验证驱动进度的唯一写入口。新任务 revision 初始化自己的进度，不沿用旧解释的成功许可。
 - [`InstructionPlan`](../instruction_adapter/contracts.py) 由 [`runtime_plan`](../instruction_adapter/task_compat.py) 生成，是供查询、grounding、验证和 legacy spec 使用的可丢弃兼容投影，不是第二份语义事实源。其 `diagnostics.task_spec` 保存任务合同的序列化副本。
 - 场景快照保留原始观测；任务匹配不修改地图标签。检测类别、搜索先验、候选设施和几何可达性都不能自行成为任务完成事实。
@@ -32,7 +32,7 @@
 
 ### 初始调用和修正预算
 
-[`InitialInstructionCompiler`](../instruction/compiler.py) 用于 Habitat 非 legacy 决策入口的初始语言解析，以及 [Isaac 运行入口](../backends/isaac/runtime.py)：
+[`InitialInstructionCompiler`](../instruction/compiler.py) 用于公开 Habitat Agent 入口的初始语言解析，以及 [Isaac Agent 运行入口](../backends/isaac/runtime.py)；解析兼容配置不提供 legacy 决策入口：
 
 1. 首次解析；只有结构无效时，才允许最多一次完整结构修正。
 2. 每次真实请求发出前增加调用计数；修正同样消耗预算，预算不足不发请求。`ambiguous`、`unsupported` 等结果不是反复修正的理由。
@@ -106,7 +106,7 @@
 
 ### 接受与 STOP
 
-在安装任务的统一验证链中，当前结果须同时满足 `satisfied`、`decision=accept`、`semantic_satisfied`、`view_sufficient_for_stop`，并通过硬约束与当前证据准入，才交 reducer 接受实例。完成数量/顺序要求后，后端再按运动状态执行完成/STOP。
+在安装任务的统一验证链中，当前结果须同时满足 `satisfied`、`decision=accept`、`semantic_satisfied`、`view_sufficient_for_stop`，并通过硬约束与当前证据准入，才交 reducer 接受实例。局部实例接受与结构化数量/顺序完成都不足以单独 STOP：还需当前完整原指令复核，确认义务覆盖完整、解释与原文一致、任务确已满足；结果须匹配当前任务、进度、图像/对象及控制版本。Agent 决定调用验证和 `propose_finish`，领域服务执行门控，不把推荐视点或结构化解释当成最终语义权威。
 
 `hard_stop_constraints` 属于 planner/geometry：距离、当前目标投影以及提供时的实例表面对应关系。当前实现会将硬约束未满足的 accept 降为 `need_better_view`；即使记录了 planner infeasibility，也不能据此声称当前代码允许绕过硬条件停止。
 
@@ -114,7 +114,7 @@
 
 ## 6. View-control 与安全边界
 
-[`ViewControlState`](../instruction_adapter/view_control.py) 把 `need_better_view` 作为有预算的取证子任务：由 [视角控制器](../navigation/view_verification_controller.py) 调用 [视点策略](../planning/viewpoint_policy.py)，生成可见性、中心度、边界余量、面积和距离等通用视点 proposal，而非编写目标类别特例。
+[`ViewControlState`](../instruction_adapter/view_control.py) 把 `need_better_view` 作为有预算的取证子任务：[视角控制器](../navigation/view_verification_controller.py) 与 [视点策略](../planning/viewpoint_policy.py) 提供可见性、中心度、边界余量、面积和距离等通用视点 proposal，而非编写目标类别特例。公开 Agent 入口把 approach/recheck 与相关反馈作为可选能力，由 Agent 决定接近、复核、换候选或继续扫描，不由内部 guided 闭环自动接管决策。
 
 - 同一候选的 objective 文案变化不重置尝试历史；记录 baseline、尝试/观测质量、剩余可行 proposal、无改善轮次及预算。
 - `pinned_visual_evidence` 是早期身份参照，`latest`/`best` 是观察历史；它们都不是 STOP 许可。历史图像必须匹配当前候选和任务 revision，关系边也须满足当前对象对与证据依赖；不能因重分割产生新 UID 就无条件继承旧接受结果。
@@ -132,7 +132,7 @@
 | --- | --- |
 | 初始任务合同、兼容 plan/spec、episode metrics | [Habitat runner](../objnav_benchmark_with_process_obs.py)；其中 `task_spec.json` 是安装时合同，后续修订还须查看 revision trace |
 | 初始请求、结构修正、准入结果 | [`InitialInstructionCompiler`](../instruction/compiler.py)，`trace_path` 由运行入口传入 |
-| 工具提案、结果、修订与失败 | [`AgentRuntime`](../harness/runtime.py) 及 [guided driver](../backends/habitat/guided_runtime.py) |
+| 工具提案、结果、修订与作用域反馈 | [`AgentRuntime`](../harness/runtime.py) 及 [Habitat Agent driver](../backends/habitat/agent_runtime.py)；guided driver 仅属内部历史回归 |
 | 约束、对象对、概念匹配和进度快照 | [`ConstraintEvaluator.dump_state`](../instruction_adapter/constraints.py) |
 | 模型输入、原始响应、解析失败和调用计数 | [`lvlm_call_tracker.py`](../llm_utils/lvlm_call_tracker.py) |
 

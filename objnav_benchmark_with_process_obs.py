@@ -118,9 +118,6 @@ def get_args():
     parser.add_argument("--relocate", default=False, action="store_true")
     parser.add_argument("--no_gpt_relocate", default=False, action="store_true")
     parser.add_argument("--vlm", type=str, default=DEFAULT_VLM)
-    parser.add_argument("--decision_owner", choices=("legacy", "agent", "baseline_guided"), default="baseline_guided")
-    parser.add_argument("--observation-mode", "--observation_mode", choices=("single", "multi"), default="single",
-                        help="Current RGB-D frame (default) or the backend's panoramic scan")
     parser.add_argument("--agent_max_model_calls", type=int, default=100)
     parser.add_argument("--custom_instruction", type=str, default="")
     parser.add_argument("--enable_instruction_adapter", default=False, action="store_true")
@@ -142,7 +139,7 @@ def get_args():
     parser.add_argument("--prior_map_vlm_interval", type=int, default=10)
     parser.add_argument("--room_semantic_interval", type=int, default=10)
     parser.add_argument("--enable_room_semantics", default=False, action="store_true")
-    return parser.parse_known_args()[0]
+    return parser.parse_args()
 
 
 def _install_instruction_plan(
@@ -240,7 +237,7 @@ if __name__ == "__main__":
             {
                 "clean_save_dir": bool(args.clean_save_dir),
                 "run_id": run_id,
-                "observation_mode": args.observation_mode,
+                "decision_owner": "agent", "observation_mode": "multi",
                 "save_dir": args.save_dir,
                 "started_at_local": time.strftime("%Y-%m-%d %H:%M:%S"),
                 "prior_map": {
@@ -284,8 +281,7 @@ if __name__ == "__main__":
                                       do_seg=args.not_do_seg,
                                       relocate=args.relocate,
                                       gpt_relocate=not args.no_gpt_relocate,
-                                      vlm=args.vlm,
-                                      observation_mode=args.observation_mode)
+                                      vlm=args.vlm)
     habitat_agent.run_id = run_id
     # Provider-specific success distance must reach the agent as well as Habitat.
     # 否则 final-stop verifier 和靠近控制会沿用 HM3D 默认 1.0m，
@@ -369,8 +365,7 @@ if __name__ == "__main__":
             episode_info=episode_info,
             episode_dir=episode_dir,
             source=plan_source,
-            initial_model_budget=(args.agent_max_model_calls
-                                  if args.decision_owner != "legacy" else None),
+            initial_model_budget=args.agent_max_model_calls,
         )
 
         logger.info(f"Target: {habitat_mapper.target}")
@@ -380,22 +375,9 @@ if __name__ == "__main__":
 
         habitat_mapper.object_perceiver.sam.initialize(habitat_mapper.target)
 
-        if args.decision_owner == "baseline_guided":
-            from backends.habitat.guided_runtime import run_guided_episode
-            run_guided_episode(habitat_agent, episode_idx=i, max_steps=args.max_steps,
-                               max_model_calls=args.agent_max_model_calls)
-        elif args.decision_owner == "agent":
-            from backends.habitat.agent_runtime import run_agent_episode
-            run_agent_episode(habitat_agent, episode_idx=i, max_steps=args.max_steps,
-                              max_model_calls=args.agent_max_model_calls)
-        else:
-            if args.relocate:
-                habitat_agent.make_plan_mod_relocate(idx=i)
-            else:
-                habitat_agent.make_plan_mod_no_relocate(idx=i)
-            flag = True
-            while flag and not habitat_env.episode_over and habitat_agent.episode_steps < args.max_steps:
-                flag = habitat_agent.step_mod(idx=i)
+        from backends.habitat.agent_runtime import run_agent_episode
+        run_agent_episode(habitat_agent, episode_idx=i, max_steps=args.max_steps,
+                          max_model_calls=args.agent_max_model_calls)
 
         if prior_map_runtime is not None:
             prior_map_runtime.finish_episode(mapper=habitat_mapper,

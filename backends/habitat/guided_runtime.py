@@ -1,4 +1,4 @@
-"""Baseline navigation skills with event-scoped Agent recovery in Habitat."""
+"""Internal historical guided skills; delivered navigation uses agent_runtime."""
 from pathlib import Path
 import json
 import math
@@ -130,7 +130,7 @@ class GuidedNavigation:
                             source="baseline_viewpoint")
                 return True
             self.defer_candidate("available_views_already_attempted")
-        if agent.observation_mode == "multi" and not agent.scan_complete:
+        if not agent.scan_complete:
             run_observation_mapping_cycle(agent, node=agent.mapper.nodes[agent.current_node_idx], episode_idx=episode_idx)
             self.observation_updated()
             return True
@@ -416,19 +416,12 @@ def run_guided_episode(agent, *, episode_idx, max_steps, max_model_calls=100,
                     termination = "observation_geometry_unavailable"
                     break
                 guided.observation_updated()
-                if not agent.env.episode_over and (agent.observation_mode == "single" or agent.scan_complete):
+                if not agent.env.episode_over and agent.scan_complete:
                     agent.mapper.change_state(node)
                 state = "select"
             else:
                 agent.object_final = guided.tools.objects[feedback.intent.target_object_uid]
                 state = guided.verify(feedback.intent.goal_pose.position)
-                if agent.observation_mode == "single" and state in {"select", "recovery"} and not agent.env.episode_over:
-                    cycle = run_observation_mapping_cycle(
-                        agent, node=agent.mapper.nodes[agent.current_node_idx], episode_idx=episode_idx)
-                    if not cycle.geometry_available:
-                        termination = "observation_geometry_unavailable"
-                        break
-                    guided.observation_updated()
         elif state == "select":
             if not guided.select(episode_idx):
                 termination = "search_exhausted"
@@ -450,7 +443,6 @@ def run_guided_episode(agent, *, episode_idx, max_steps, max_model_calls=100,
         guided.tools.motion.poll_active()
     result = {
         "reason": termination, "decision_owner": "baseline_guided",
-        "observation_mode": agent.observation_mode,
         "model_calls": guided.runtime.model_calls, "steps": agent.episode_steps,
         "task_complete": agent.task.progress.completed,
     }
