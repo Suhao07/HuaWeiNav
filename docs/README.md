@@ -17,7 +17,7 @@
 ## 当前运行合同
 
 - [指令、检索与验证](instruction_adapter.md)：TaskSpec、初始解释、搜索修订、需求义务、三值关系与当前图像证据。
-- [Harness 与运动所有权](harness_refactor_design.md)：三种 Habitat 决策模式、八工具、五份 Skills、版本准入与预算。
+- [Harness 与运动所有权](harness_refactor_design.md)：Agent 唯一公开决策入口、增强多视角 ObjNav 能力、显式扫描与缓存观测、Skills、版本准入与预算。
 - [证据复用与并发边界](p3_p4_evidence_reuse_and_concurrency.md)：专题设计与实现边界，在线表现仍须独立验收。
 
 ## 核心技术方案

@@ -4,9 +4,9 @@ VLN 是面向 HM3D / Habitat、IntentionNav / Isaac 与实物机器人的语义�
 
 本文是交付的**从零部署统一入口**；数据、权重、镜像的原有部署步骤继续保留，新增模型服务、指令合同和评测流程在下文接入。命令默认在 STRIVE 仓库根目录执行，路径与 GPU 分配由部署者设置。
 
-- Habitat 默认使用 `baseline_guided`；`legacy` 和自由 `agent` 是显式对照模式。
-- 自然语言编译为不可变 `TaskSpec`；候选检索、任务验证、运动回执和外部评分各自保留职责。
-- IntentionNav 使用独立 Isaac 入口，不等同于 Habitat 默认模式或官方 Isaac 4.5 复现。
+- 最终公开导航交付为 **Agent 决策所有者 + 增强多视角 ObjNav 能力**；HM3D 与 GOAT 不提供 guided/legacy 生产入口，也不提供单视角导航模式。
+- 完整原始指令始终是最终语义权威；`TaskSpec` 是同一 revision 内不可变、可经准入修订的执行解释，候选检索、任务验证、运动回执和外部评分各自保留职责。
+- IntentionNav 使用独立 Isaac Agent 入口，始终多视角（默认4方向，至少2方向），不等同于官方 Isaac 4.5 复现。
 - 实物模式已实现，默认 bridge-off；调试参数见文末速查，实际行驶与到达另行验收。
 
 
@@ -392,7 +392,6 @@ bash docker/run_hm3d_baseline.sh \
   --benchmark hm3d_objectnav \
   --eval_episodes 1 \
   --start_episode 0 \
-  --decision_owner baseline_guided \
   --agent_max_model_calls 100 \
   --max_steps 500 \
   --save_dir hm3d_self_hosted_smoke \
@@ -403,36 +402,24 @@ bash docker/run_hm3d_baseline.sh \
 
 离线检查先运行 preflight 和回归测试。`LLM_OFFLINE` / `STRIVE_LLM_FALLBACK` 是显式兼容选项，不保证当前严格语义链路能完成导航；缺少验证证据不能自动接受目标，离线 smoke 也不能替代真实模型或导航验收。
 
-### 3. 单视角默认模式与多视角对照
+### 3. Agent 决策与增强多视角能力
 
-导航观测默认是 `--observation-mode single`：每轮直接处理当前一帧 RGB-D，不为收集输入固定原地环视，地图与历史对象记忆继续积累。导航转向、接近目标后的定向复核仍可获取新视角；这不是无深度、无地图的纯 RGB 方法，也不是禁止机器人转动。
+公开导航入口固定使用 Agent 决策和多视角，不再接受 `--decision_owner`、`--observation-mode` 或 `--observation_mode`；这不是把 single 的默认值改为 multi，而是移除单视角导航模式及 guided/legacy 生产选择。`docker/run_hm3d_baseline.sh` 保留原文件名，但启动的是 Agent 入口；内部 guided 实现可供历史回归，不作为部署选项。
 
-| 参数 | Habitat / GOAT 导航 | Isaac / IntentionNav 导航 |
+| 能力 | 提供的证据或合法选项 | 决策所有者 |
 |---|---|---|
-| `--observation-mode single`（默认） | 当前原始图像检测、单帧深度投影，不拼三联图 | 一次 observe / 感知，只发布一个当前传感器图像，不补拍同朝向重复帧 |
-| `--observation-mode multi` | `baseline_guided` 保留每批4方向、最多12方向的自适应扫描；`agent` / `legacy` 保留12方向全景 | 默认4方向感知，再恢复起始朝向发布当前帧；可用 `--panorama-views N` 调整（N≥2） |
+| Habitat 自适应多视角扫描 | 每批4方向、最多12个朝向；融合 RGB-D 地图、稳定实例及历史观测 | 初始及 frontier 到达时执行观测；Agent 选择 `scan_scene` 继续未覆盖方向，不由 guided 循环安排下一步 |
+| ObjNav 搜索与接近 | 房间/coverage frontier 选项、可达性与路径信息、目标 approach/recheck 视点 | Agent 选择候选、搜索区域、运动及复核；推荐不是自动提交 |
+| 反馈与完成 | 按任务/实例/谓词/对象对及观测依赖限定作用域的反馈，真实运动回执与当前验证证据 | Agent 选择验证与 `propose_finish`；领域服务负责准入、执行、安全及完成门控 |
+| Isaac 多视角融合 | `--panorama-views N`，默认4且N≥2；不是 Habitat 的12朝向扫描配置 | Isaac Agent 使用独立后端，公开输入与评分合同不变 |
 
-例如保持同一 Habitat 任务与预算，仅切换观测模式、分开输出目录：
+`observe` 只返回已缓存的任务、地图、图像元数据、反馈与运动状态，不拍摄、不触发扫描或重新验证；需要新证据时由 Agent 显式选择扫描或取证工具。完整原始指令始终是最终权威，结构化解释、检索假设、局部候选接受或到达回执均不能代替完整指令的最终验证。
 
-```bash
-bash docker/run_hm3d_baseline.sh \
-  --benchmark hm3d_objectnav --start_episode 0 --eval_episodes 1 \
-  --decision_owner baseline_guided --observation-mode single \
-  --agent_max_model_calls 100 --max_steps 500 \
-  --vlm self_hosted --save_dir hm3d_view_single
+HM3D 示例使用上节命令即可，无需添加模式参数。GOAT 连续父 episode 的各子任务使用 `run_agent_episode`，父 driver 保留 `SUBTASK_STOP`、同位姿切换、跨任务地图记忆及全局终止职责，Agent 不直接切换子任务。无任务巡采保留完整全景；本次仿真入口变更不改变实物 ROS 的部署与安全合同。
 
-bash docker/run_hm3d_baseline.sh \
-  --benchmark hm3d_objectnav --start_episode 0 --eval_episodes 1 \
-  --decision_owner baseline_guided --observation-mode multi \
-  --agent_max_model_calls 100 --max_steps 500 \
-  --vlm self_hosted --save_dir hm3d_view_multi
-```
+配置与产物说明见 [HM3D 多视角与评测口径](docs/hm3d_docker_benchmark_guide.md#观测模式与对照口径) 和 [IntentionNav 多视角观测](docs/intentionnav_integration.md#观测模式)。本节说明交付合同，不声明新版本已完成导航验收、取得验证集 SR，或恢复任何历史成功率。
 
-Habitat 主入口也接受 `--observation_mode`。`scripts/run_goat.py`、`scripts/launch_goat_episode.py` 使用同一连字符开关，GOAT 启动器参数放在 `--` 分隔符之前；历史参考图像不计作当前传感器视角。无任务巡采仍保持完整全景，实物 ROS 实时观测入口不受此仿真开关影响。
-
-恢复旧观测策略必须显式指定 `multi`，但不代表恢复旧代码所有行为。对照需固定源码、任务身份/起点/朝向、模型、预算和评分，统计成功率/SPL、动作（含转向）、感知帧数及模型调用/耗时，不只比较 Agent 请求的图片数。Habitat 高层决策仍主要使用当前图像，多视角信息经地图进入决策。配置与产物说明见 [HM3D 观测对照](docs/hm3d_docker_benchmark_guide.md#观测模式与对照口径) 和 [IntentionNav 观测模式](docs/intentionnav_integration.md#观测模式)。
-
-本功能已完成代码接线、667项定向回归（含真实 CPU Open3D）及2026-11-09本机 Habitat 小规模功能对照：single 的6轮单帧建图未额外消耗动作，能连续到达 frontier 并按预算结束。该80步同任务对照两组基准 success/SPL 均为0，multi 的内部验证通过也不等于基准成功；120步 single 另暴露模型非法修改固定目标而被拒绝的问题，失败记录保留。完整口径见上述 HM3D 观测对照，不能据此声称导航成功率、时延、Isaac或实机效果已验收。既有运行任务与冻结源码不会因本地默认值改变而自动切换。
+**历史证据（旧 single/multi 实现，非本次交付验收）：**当时已记录代码接线、667项定向回归（含真实 CPU Open3D）及2026-11-09本机 Habitat 小规模功能对照：single 的6轮单帧建图未额外消耗动作，能连续到达 frontier 并按预算结束。该80步同任务对照两组基准 success/SPL 均为0，multi 的内部验证通过也不等于基准成功；120步 single 另暴露模型非法修改固定目标而被拒绝的问题，失败记录保留。完整口径见上述 HM3D 观测对照，不能据此声称导航成功率、时延、Isaac或实机效果已验收。既有运行任务与冻结源码不会因本地默认值改变而自动切换。
 
 ### 指定场景和目标物
 
@@ -480,7 +467,7 @@ bash docker/run_scene_object_nav.sh \
   --custom_instruction "find the television in the scene"
 ```
 
-普通 ObjectNav 不需要开启 adapter；`--instruction_adapter_backend rules` 是旧的数据集目标兼容路径，不是任意自然语言的规则解析器，也不代表运行时不调用模型。当前非 legacy 指令入口使用有界初始编译，解析失败不得悄悄改成数据集目标。配置 self-hosted 后，将上述命令的 `--vlm ark` 改成 `--vlm self_hosted`。
+普通 ObjectNav 不需要开启 adapter；`--instruction_adapter_backend rules` 是旧的数据集目标兼容路径，不是任意自然语言的规则解析器，也不代表运行时不调用模型。当前公开 Agent 指令入口使用有界初始编译，解析失败不得悄悄改成数据集目标；解析兼容设置不授予 legacy 决策入口。配置 self-hosted 后，将上述命令的 `--vlm ark` 改成 `--vlm self_hosted`。
 
 批量数据选择、身份清单、重跑配对与日志诊断统一见 [HM3D 评测操作指南](docs/hm3d_docker_benchmark_guide.md)。每次使用新输出目录，不通过清空历史结果来混合新旧版本。
 
