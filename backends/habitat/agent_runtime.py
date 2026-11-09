@@ -209,11 +209,10 @@ def run_agent_episode(agent, *, episode_idx, max_steps, max_model_calls=100):
     }, indent=2))
     tools = HabitatNavigationTools(agent)
     runtime = AgentRuntime(tools, directory / "tools.jsonl", max_model_calls=max_model_calls, vlm=agent.vlm)
-    cycle = run_observation_mapping_cycle(agent, node=None, episode_idx=episode_idx)
-    if cycle.geometry_available:
-        tools.refresh_scene()
-    termination = "episode_limit" if cycle.geometry_available else "observation_geometry_unavailable"
-    while cycle.geometry_available and not agent.env.episode_over and agent.episode_steps < max_steps:
+    run_observation_mapping_cycle(agent, node=None, episode_idx=episode_idx)
+    tools.refresh_scene()
+    termination = "episode_limit"
+    while not agent.env.episode_over and agent.episode_steps < max_steps:
         if tools.motion.active_request_id is not None:
             agent.execution.controller.advance()
             feedback = tools.motion.poll_active()
@@ -224,12 +223,8 @@ def run_agent_episode(agent, *, episode_idx, max_steps, max_model_calls=100):
                     if frontier_uid:
                         node = agent.mapper.nodes[int(frontier_uid.split(":")[1])]
                         agent.current_node_idx = node.idx
-                    cycle = run_observation_mapping_cycle(agent, node=node, episode_idx=episode_idx)
-                    if not cycle.geometry_available:
-                        termination = "observation_geometry_unavailable"
-                        break
-                    if node is not None and not cycle.episode_over:
                         agent.mapper.change_state(node)
+                    run_observation_mapping_cycle(agent, node=node, episode_idx=episode_idx)
                 tools.refresh_scene()
             continue
         if runtime.model_calls >= max_model_calls:
@@ -248,6 +243,5 @@ def run_agent_episode(agent, *, episode_idx, max_steps, max_model_calls=100):
         tools.motion.poll_active()
     (directory / "termination.json").write_text(json.dumps({
         "reason": termination, "model_calls": runtime.model_calls,
-        "observation_mode": agent.observation_mode,
         "steps": agent.episode_steps, "task_complete": agent.task.progress.completed,
     }, indent=2))

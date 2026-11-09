@@ -24,7 +24,6 @@ def main(argv=None):
                         help='All primitive actions including one reserved terminal-event slot')
     parser.add_argument('--global-budget', type=int, default=5000, help='Includes all SUBTASK_STOP/global STOP events')
     parser.add_argument('--max-model-calls', type=int, default=100)
-    parser.add_argument('--observation-mode', choices=('single', 'multi'), default='single')
     parser.add_argument('--image-assets', type=Path,
                         help='JSON keyed by opaque image_ref: path, sha256, scene_id, image_parameters (position/rotation/hfov/image_dimensions)')
     args = parser.parse_args(argv)

@@ -52,9 +52,6 @@ def _slice_pcd_toward_center(
 ) -> Any:
     """Return the local 80-degree point-cloud sector facing a candidate center."""
 
-    if current_node_pcd.is_empty():
-        return current_node_pcd.clone()
-
     angle_center = np.arctan2(center[1] - mapper.current_position[1],
                               center[0] - mapper.current_position[0])
     angle_center = np.where(angle_center < 0, angle_center + 2 * np.pi, angle_center)

@@ -716,67 +716,6 @@ def test_batch_lock_prevents_concurrent_launch(navigation_batch):
     assert invoke()["completed"] == 1
 
 
-@pytest.mark.parametrize("args,mode,views", [
-    ([], "single", 4),
-    (["--observation-mode", "single", "--panorama-views", "7"], "single", 7),
-    (["--panorama-views", "0"], "single", 0),
-    (["--observation-mode", "multi"], "multi", 4),
-    (["--observation-mode", "multi", "--panorama-views", "2"], "multi", 2),
-    (["--observation-mode", "multi", "--panorama-views", "6"], "multi", 6),
-])
-def test_policy_cli_forwards_observation_mode_without_changing_public_input(dataset, monkeypatch, capsys, args, mode, views):
-    from types import SimpleNamespace
-    from unittest.mock import Mock
-    from scripts import run_intentionnav as runner
-
-    root = dataset[0]
-    public = json.loads(json.dumps(load_episode(root).policy_input()))
-    source = root / "public.json"
-    source.write_text(json.dumps(public), encoding="utf-8")
-    output = root / "policy output"
-    output.mkdir()
-    run = Mock(return_value={"status": "fixture-only"})
-    monkeypatch.setitem(sys.modules, "backends.isaac.runtime", SimpleNamespace(run_episode=run))
-    monkeypatch.setattr(sys, "path", list(sys.path))
-    monkeypatch.setattr(sys, "argv", ["run_intentionnav.py", "--public-episode", str(source),
-                                    "--output", str(output), *args])
-    runner.main()
-    run.assert_called_once_with(public, output, port=9466, vlm="self_hosted", device="cuda:0",
-                                max_model_calls=60, max_moves=30, panorama_views=views, observation_mode=mode)
-    assert len(run.call_args.args[0]) == 6
-    assert json.loads(source.read_text()) == public
-    assert json.loads(capsys.readouterr().out) == run.return_value
-
-
-@pytest.mark.parametrize("args,message", [
-    (["--observation-mode", "panorama"], "--observation-mode"),
-    (["--observation-mode", "multi", "--panorama-views", "0"], "--panorama-views"),
-    (["--observation-mode", "multi", "--panorama-views", "1"], "--panorama-views"),
-    (["--observation-mode", "multi", "--panorama-views", "-2"], "--panorama-views"),
-    (["--observation-mode", "multi", "--panorama-views", "2.5"], "--panorama-views"),
-    (["--max-moves", "0"], "budgets"),
-    (["--max-model-calls", "0"], "budgets"),
-])
-def test_policy_cli_validates_before_loading_or_running(monkeypatch, tmp_path, capsys, args, message):
-    from types import SimpleNamespace
-    from unittest.mock import Mock
-    from scripts import run_intentionnav as runner, serve_intentionnav as server
-
-    run = Mock(side_effect=AssertionError("must not run policy"))
-    load = Mock(side_effect=AssertionError("must not load episode"))
-    monkeypatch.setitem(sys.modules, "backends.isaac.runtime", SimpleNamespace(run_episode=run))
-    monkeypatch.setattr(server, "load_public_episode", load)
-    monkeypatch.setattr(sys, "argv", ["run_intentionnav.py", "--public-episode", str(tmp_path / "absent.json"),
-                                    "--output", str(tmp_path / "absent"), *args])
-    with pytest.raises(SystemExit) as error:
-        runner.main()
-    assert error.value.code == 2
-    assert message in capsys.readouterr().err
-    load.assert_not_called()
-    run.assert_not_called()
-    assert not list(tmp_path.iterdir())
-
-
 @pytest.fixture
 def launcher_case(dataset, fake_official, monkeypatch):
     """Run main with local protocol artifacts; no simulator, policy or scorer process."""
@@ -950,15 +889,8 @@ def launcher_case(dataset, fake_official, monkeypatch):
     return case
 
 
-def _assert_launcher_completed(case, expected_public, *, scored, observation_mode="single", panorama_views=4):
+def _assert_launcher_completed(case, expected_public, *, scored):
     result, execution, evaluation = case.run_result, case.execution, case.evaluation
-    settings = {"observation_mode": observation_mode, "panorama_views": panorama_views,
-                "effective_views": 1 if observation_mode == "single" else panorama_views}
-    for artifact in (result, execution, evaluation):
-        assert {key: artifact[key] for key in settings} == settings
-    policy_command = execution["policy_command"]
-    assert policy_command[policy_command.index("--observation-mode") + 1] == observation_mode
-    assert policy_command[policy_command.index("--panorama-views") + 1] == str(panorama_views)
     assert result["status"] == "completed"
     assert result["policy_exit_code"] == result["server_exit_code"] == 0
     assert result["server"] == case.ready
@@ -1035,47 +967,6 @@ def test_launcher_golden_protocol_preserves_dataset_selection(launcher_case, dat
     case.load.assert_called_once_with(root, expected["selection_id"], expected["style"])
     assert case.score.call_args.args[0]._evaluation_meta == (other_meta if explicit else meta)
     assert case.run_result["run_id"].startswith(f"strive-{expected['selection_id']}-guided-isaac6-")
-
-
-@pytest.mark.parametrize("args,mode,views", [
-    ([], "single", 4),
-    (["--observation-mode", "single", "--panorama-views", "7"], "single", 7),
-    (["--panorama-views", "0"], "single", 0),
-    (["--observation-mode", "multi"], "multi", 4),
-    (["--observation-mode", "multi", "--panorama-views", "2"], "multi", 2),
-    (["--observation-mode", "multi", "--panorama-views", "6"], "multi", 6),
-])
-@pytest.mark.parametrize("scored", [True, False])
-def test_launcher_forwards_observation_mode_and_records_effective_views(launcher_case, args, mode, views, scored):
-    case = launcher_case
-    public = dict(case.public)
-    if not scored:
-        public["instruction"] = "A different task."
-    case.invoke(*args, public=public)
-    _assert_launcher_completed(case, public, scored=scored, observation_mode=mode, panorama_views=views)
-
-
-@pytest.mark.parametrize("args,message", [
-    (["--observation-mode", "panorama"], "--observation-mode"),
-    (["--observation-mode", "multi", "--panorama-views", "0"], "--panorama-views"),
-    (["--observation-mode", "multi", "--panorama-views", "1"], "--panorama-views"),
-    (["--observation-mode", "multi", "--panorama-views", "-2"], "--panorama-views"),
-    (["--observation-mode", "multi", "--panorama-views", "2.5"], "--panorama-views"),
-    (["--max-moves", "0"], "budgets"),
-    (["--max-model-calls", "0"], "budgets"),
-])
-def test_launcher_invalid_observation_settings_fail_before_resources(launcher_case, capsys, args, message):
-    case = launcher_case
-    with pytest.raises(SystemExit) as error:
-        case.invoke(*args)
-    assert error.value.code == 2
-    assert message in capsys.readouterr().err
-    case.validate.assert_not_called()
-    case.load.assert_not_called()
-    case.score.assert_not_called()
-    for process in (case.processes.check_output, case.processes.Popen, case.processes.run):
-        process.assert_not_called()
-    assert not case.output.exists()
 
 
 @pytest.mark.parametrize("style", ["formal", "natural"])

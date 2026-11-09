@@ -436,68 +436,6 @@ def test_continuous_driver_success_failed_budget_and_same_pose_switch(monkeypatc
         agent.env.reset()
 
 
-def test_single_view_continuous_switch_rebuilds_local_geometry(monkeypatch, tmp_path):
-    import sys
-    from types import MethodType
-    from unittest.mock import Mock
-    import backends.habitat.goat_runtime as runtime
-    from navigation.planner_loop import run_observation_mapping_cycle
-    from test_navigation_efficiency import pointcloud_observation_functions
-    ns = pointcloud_observation_functions()
-    o3d = ns['o3d']
-    episode, events = parse(dataset()), []
-    agent, base, _ = continuous_agent(episode, events)
-    mapper = agent.mapper
-    device = o3d.core.Device('CPU:0')
-    mapper.pcd_device, mapper.pcd_resolution = device, .05
-    mapper.initial_position = np.zeros(3)
-    mapper.translation_func = mapper.rotation_func = lambda value: value.copy()
-    mapper.lower_img, mapper.upper_img = .51, 4.99
-    mapper.floor_height, mapper.ceiling_height = -1., 2.
-    mapper.camera_intrinsic = np.array([[8., 0, 7.5], [0, 8., 7.5], [0, 0, 1.]])
-    mapper.trajectory_position, mapper.traj_on_trav = [], []
-    mapper.env = SimpleNamespace(sim=SimpleNamespace(is_navigable=lambda point: True))
-    for field in ('scene_pcd', 'navigable_pcd', 'traversable_pcd_all', 'process_nav_pcd', 'process_obs_pcd'):
-        setattr(mapper, field, o3d.t.geometry.PointCloud(device))
-    mapper.get_closest_disances_and_points = MethodType(ns['get_closest_disances_and_points'], mapper)
-    rgb, depth = np.zeros((16, 16, 3), dtype=np.uint8), np.full((16, 16, 1), 1.2)
-    rotation = np.array([[1., 0, 0], [0, 0, -1.], [0, 1., 0]])
-    ns['update'](mapper, rgb, depth, np.zeros(3), rotation, 0, 19, True, agent.current_node_idx)
-    assert not mapper.traversable_pcd_all.is_empty()
-    assert mapper.process_nav_pcd.is_empty() and mapper.process_obs_pcd.is_empty()
-    agent.observation_mode, agent.patrol, agent.do_seg = 'single', False, False
-    agent.save_dir, agent.episode_samples, agent.rotation = str(tmp_path), 1, SimpleNamespace(w=1.)
-    agent.update_trajectory = Mock(side_effect=AssertionError('No synthetic trajectory update'))
-    agent._save_obs_pointcloud, mapper.update_obj = Mock(), Mock()
-    agent._merge_temporary_pointclouds = lambda: ns['merge_temporary_pointclouds'](agent)
-    (tmp_path / 'episode-0').mkdir()
-    monkeypatch.setitem(sys.modules, 'navigation.observation_pipeline', SimpleNamespace(
-        collect_single_observation=ns['collect_single_observation']))
-    revisions = []
-    def graph_update(*args):
-        assert not mapper.process_nav_pcd.is_empty() and not mapper.process_obs_pcd.is_empty()
-        revisions.append(agent.task.spec.revision)
-    agent._log_mapper_state_before_after_get_nodes = graph_update
-    def install(agent, public_goal, **kwargs):
-        agent.task = SimpleNamespace(spec=SimpleNamespace(revision=kwargs['revision']))
-    def guided(agent, **kwargs):
-        cycle = run_observation_mapping_cycle(agent, node=None, episode_idx=0)
-        assert cycle.geometry_available and cycle.step == 19
-        mapper.process_nav_pcd = o3d.t.geometry.PointCloud(device)
-        mapper.process_obs_pcd = o3d.t.geometry.PointCloud(device)
-        return {'reason': 'search_exhausted', 'task_complete': False}
-    monkeypatch.setattr(runtime, 'install_public_goal', install)
-    monkeypatch.setattr(runtime, '_guided_run', guided)
-    result = runtime.run_continuous_parent(agent, episode, parser=None, output=tmp_path, references={})
-    assert result['status'] == 'complete', result
-    assert revisions == list(range(1, len(episode.subtasks) + 1))
-    assert all(row['reason'] == 'search_exhausted' for row in result['subtasks'])
-    assert base.actions == [] and base.reset_count == 1
-    assert all(event['action'] == 'SUBTASK_STOP' for event in events)
-    assert mapper.update_iterations == 3 and agent.episode_steps == 19
-    agent.update_trajectory.assert_not_called()
-
-
 def test_global_budget_emits_actual_stop_without_visiting_remaining_goals(monkeypatch, tmp_path):
     import backends.habitat.goat_runtime as runtime
     episode, events = parse(dataset()), []

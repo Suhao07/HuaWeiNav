@@ -104,8 +104,7 @@ def test_language_launcher_binds_frozen_task_and_score(tmp_path, invalid, with_t
 
 
 @pytest.mark.parametrize('outcome', ['policy_error', 'success', 'scoring_error', 'nonfinite_json', 'overflow_json'])
-@pytest.mark.parametrize('observation_mode', [None, 'multi'])
-def test_language_launcher_resolves_symlinked_data_mount(tmp_path, monkeypatch, evaluation_env, outcome, observation_mode):
+def test_language_launcher_resolves_symlinked_data_mount(tmp_path, monkeypatch, evaluation_env, outcome):
     import csv
     import gzip
     import json
@@ -127,8 +126,7 @@ def test_language_launcher_resolves_symlinked_data_mount(tmp_path, monkeypatch, 
         json.dump({'episodes': [task]}, stream)
     output = tmp_path / 'run'
     monkeypatch.setattr(sys, 'argv', ['launcher', '--output', str(output), '--data-root', str(alias),
-        '--language-task-file', str(alias / 'tasks.json.gz'), '--language-task-index', '0'] + (
-            ['--observation-mode', observation_mode] if observation_mode else []))
+        '--language-task-file', str(alias / 'tasks.json.gz'), '--language-task-index', '0'])
     for name in ('STRIVE_ROOT', 'HF_HOME_HOST', 'SAM_CHECKPOINT', 'GROUNDING_DINO_CHECKPOINT'):
         monkeypatch.setenv(name, str(source))
     monkeypatch.setenv('VLN_LVLM_API_KEY', 'test-only')
@@ -187,10 +185,6 @@ def test_language_launcher_resolves_symlinked_data_mount(tmp_path, monkeypatch, 
         launcher.main()
     assert stopped.value.code == (1 if outcome == 'policy_error' else 0)
     assert len(policy_commands) == 1
-    command = policy_commands[0]
-    assert command[command.index('--observation-mode') + 1] == (observation_mode or 'single')
-    receipt = json.loads((output / 'execution.json').read_text())
-    assert receipt['observation_mode'] == (observation_mode or 'single')
     assert len(commands) == (1 if outcome == 'policy_error' else 2)
     if outcome != 'policy_error':
         assert commands[-1] == [

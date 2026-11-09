@@ -126,8 +126,6 @@ def test_live_detector_terms_preserve_target_presence_threshold_and_nms(
 @pytest.mark.parametrize("partial", [False, True])
 def test_habitat_observation_forwards_live_terms_through_perceiver_to_grounding(grounded_sam, partial):
     import torch
-    from functools import partial as bind
-    from navigation.panoramic_detection import filter_center_panel
 
     detector, _ = grounded_sam
     path = ROOT / "cv_utils/image_perceiver.py"
@@ -144,13 +142,10 @@ def test_habitat_observation_forwards_live_terms_through_perceiver_to_grounding(
 
     ns = methods("objnav_agent_with_process_obs.py", {"rotate_segmentation"}, {
         "detection_step_dir": Mock(return_value="unused"),
-        "build_triplet": Mock(return_value=NS(image=image, depth=None, depth_vis=None)),
-        "pose_triplet": Mock(return_value=([None], [None], [None])),
-        "bind": bind, "filter_center_panel": filter_center_panel,
+        "build_triplet": Mock(return_value=NS(image=image, depth_vis=None)),
         # End after the real perceive -> segment -> grounding chain, before artifact IO/fusion.
         "save_combined_view": Mock(side_effect=ObservationProcessed)})
     mapper = NS(object_perceiver=perceiver, target="chair", camera_intrinsic=np.eye(3),
-                get_object_entities_pano=Mock(),
                 perception_target_list=["stale anchor"], target_list=["stale target"],
                 objects=[NS(tag="historical label")])
     agent = NS(task=NS(detector_terms=[]), mapper=mapper, save_dir="unused",
@@ -168,167 +163,6 @@ def test_habitat_observation_forwards_live_terms_through_perceiver_to_grounding(
         assert mapper.objects[0].tag == "historical label"
         assert mapper.perception_target_list == ["stale anchor"]
         assert mapper.target_list == ["stale target"]
-
-
-@pytest.mark.parametrize('kind', ['background', 'candidate', 'empty'])
-def test_single_view_detection_preserves_original_frame_boxes_and_refinement(monkeypatch, kind):
-    import sys
-    from functools import partial as bind
-    from navigation.panoramic_detection import DetectionSlice
-    from mapping_utils.preprocess import preprocess_depth
-    image = np.zeros((20, 30, 3), dtype=np.uint8)
-    depth = np.full((20, 30, 1), 2.)
-    depth[0] = 5.
-    boxes, masks = np.array([[1, 2, 9, 12]]), np.ones((1, 20, 30))
-    detection = (np.array(['chair']), boxes, masks, np.array([.9]))
-    empty = (np.array([]), np.empty((0, 4)), np.empty((0, 20, 30)), np.array([]))
-    obj = NS(uid='candidate', pcd=object())
-    evidence = NS(image=image, bbox_xyxy=boxes[0])
-    project = Mock(return_value=evidence)
-    refine = Mock(return_value={})
-    monkeypatch.setitem(sys.modules, 'navigation.bbox_refinement', NS(refine_candidates=refine))
-    ns = methods('objnav_agent_with_process_obs.py', {'rotate_segmentation'}, {
-        'np': np, 'torch': object(), 'bind': bind, 'DetectionSlice': DetectionSlice,
-        'preprocess_depth': preprocess_depth,
-        'build_triplet': Mock(side_effect=AssertionError('single frame must not be stitched')),
-        'filter_center_panel': Mock(side_effect=AssertionError('single frame has no center panel')),
-        'detection_step_dir': Mock(return_value='unused'), 'save_combined_view': Mock(),
-        'save_detection_overlay': Mock(), 'save_candidate_object_pointclouds': Mock(),
-        'save_real_object_pointcloud': Mock(), 'save_object_view': Mock(),
-        'merge_candidate_objects': lambda groups: [item for group in groups for item in group],
-        'gpu_cluster_filter': lambda cloud: cloud, 'project_object_view': project,
-        'sort_target_objects_last': lambda objects, target: objects})
-    historical = object()
-    mapper = NS(target='chair', objects=[historical], current_obj_indices=[],
-        get_object_entities=Mock(return_value=[obj]), get_object_entities_pano=Mock(),
-        object_perceiver=NS(perceive=Mock(return_value=(
-            detection if kind == 'background' else empty) + (detection if kind == 'candidate' else empty))),
-        associate_object_entities=Mock(side_effect=lambda old, new: (old + new, list(range(len(old), len(old)+len(new))))),
-        update_object_pcd=Mock())
-    agent = NS(mapper=mapper, task=NS(detector_terms=['chair']), save_dir='unused', episode_samples=1, episode_steps=3)
-    images, rotations = [image], [np.eye(3)]
-    ns['rotate_segmentation'](agent, images, [depth], [np.zeros(3)], rotations, single_view=True)
-    assert mapper.object_perceiver.perceive.call_args.args[0] is image
-    assert mapper.objects[0] is historical
-    mapper.get_object_entities_pano.assert_not_called()
-    assert mapper.get_object_entities.call_count == int(kind != 'empty')
-    if kind != 'empty':
-        raw, filtered, rgb, classes, actual_boxes, actual_masks, scores = mapper.get_object_entities.call_args.args
-        assert raw is depth and rgb is image and actual_boxes is boxes and actual_masks is masks
-        assert np.all(raw[0] == 5.) and np.all(filtered[0] == 0.) and np.all(filtered[1:] == 2.)
-        assert mapper.objects[-1] is obj and mapper.current_obj_indices == [1]
-    if kind == 'candidate':
-        project.assert_called_once_with(agent, obj, images, rotations, ns['torch'], partial=True)
-        refine.assert_called_once_with(agent, [(0, obj, evidence)])
-    else:
-        project.assert_not_called()
-        refine.assert_called_once_with(agent, [])
-
-
-@pytest.mark.parametrize('options,expected', [([], 'single'), (['--observation-mode', 'multi'], 'multi')])
-def test_habitat_cli_observation_mode_default_and_switch(monkeypatch, options, expected):
-    import sys, argparse
-    tree = ast.parse((ROOT/'objnav_benchmark_with_process_obs.py').read_text())
-    fn = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == 'get_args')
-    namespace = dict(argparse=argparse, available_benchmarks=lambda: [], DEFAULT_VLM='self_hosted')
-    exec(compile(ast.Module(body=[fn], type_ignores=[]), 'get_args', 'exec'), namespace)
-    monkeypatch.setattr(sys, 'argv', ['benchmark', *options])
-    assert namespace['get_args']().observation_mode == expected
-
-
-def test_single_frame_entities_keep_full_and_filtered_world_geometry():
-    import torch
-    from mapping_utils.representation import ObjectNode
-    namespace = {'np': np}
-    tree = ast.parse((ROOT/'mapping_utils/geometry.py').read_text())
-    functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)
-                 and node.name in {'get_pointcloud_from_depth_mask', 'translate_to_world'}]
-    exec(compile(ast.Module(body=functions, type_ignores=[]), 'geometry', 'exec'), namespace)
-    def cloud(points, colors, device):
-        tensor = NS(shape=points.shape, cpu=lambda: NS(numpy=lambda: points))
-        result = NS(point=NS(positions=tensor))
-        result.voxel_down_sample = lambda resolution: result
-        return result
-    namespace.update(gpu_pointcloud_from_array=cloud, gpu_cluster_filter=lambda value: value,
-                     ObjectNode=ObjectNode, d3_40_colors_rgb=[[1, 2, 3]])
-    ns = methods('mapper_with_process_obs.py', {'get_object_entities'}, namespace)
-    mapper = NS(objects=[], exist_objects=[], camera_intrinsic=np.eye(3), current_position=np.array([2., 3., 4.]),
-                current_rotation=np.eye(3), pcd_device='CPU:0', pcd_resolution=.1)
-    raw = np.full((4, 5, 1), 2.)
-    filtered = raw.copy()
-    filtered[0] = 0
-    entities = ns['get_object_entities'](mapper, raw, filtered, None, ['chair'],
-                                        [torch.tensor([0, 0, 4, 3])], [torch.ones((4, 5))], [.9])
-    assert len(entities) == 1
-    obj = entities[0]
-    assert obj.tag == 'chair' and obj.pcd_all.point.positions.shape == (20, 3)
-    assert obj.pcd.point.positions.shape == (15, 3) and obj.num_list['chair'] == 15
-    assert np.allclose(obj.position, [6., 5., 2.])
-    assert np.allclose(obj.pcd_all.point.positions.cpu().numpy()[0], [2., 9., 2.])
-
-
-def test_single_frame_entities_keep_valid_projection_when_saturated_depth_dominates():
-    """Raw projection geometry must retain the smaller, valid-depth object component."""
-    o3d = pytest.importorskip('open3d')
-    from mapping_utils.preprocess import preprocess_depth
-    from mapping_utils.representation import ObjectNode
-
-    namespace = {'np': np, 'o3d': o3d, 'ObjectNode': ObjectNode,
-                 'd3_40_colors_rgb': [[1, 2, 3]]}
-    path = ROOT / 'mapping_utils/geometry.py'
-    names = {'get_pointcloud_from_depth_mask', 'translate_to_world',
-             'gpu_pointcloud_from_array', 'gpu_cluster_filter', 'project_to_camera'}
-    functions = [node for node in ast.parse(path.read_text()).body
-                 if isinstance(node, ast.FunctionDef) and node.name in names]
-    assert len(functions) == len(names)
-    exec(compile(ast.Module(body=functions, type_ignores=[]), str(path), 'exec'), namespace)
-    ns = methods('mapper_with_process_obs.py', {'get_object_entities'}, namespace)
-    mapper = NS(objects=[], exist_objects=[],
-                camera_intrinsic=np.array([[32., 0., 24.], [0., 32., 16.], [0., 0., 1.]]),
-                current_position=np.array([2., 3., 4.]),
-                current_rotation=np.array([[0., 0., 1.], [1., 0., 0.], [0., 1., 0.]]),
-                pcd_device=o3d.core.Device('CPU:0'), pcd_resolution=1 / 32)
-    raw = np.full((32, 48, 1), 5., dtype=np.float32)
-    raw[8:20, 6:18] = 2.
-    mask = np.zeros(raw.shape[:2], dtype=bool)
-    mask[4:28, 4:44] = True
-    filtered = preprocess_depth(raw.copy(), .51, 4.99)
-    valid = mask & (filtered > 0)
-    saturated = mask & (raw[:, :, 0] == 5.)
-    assert saturated.sum() > valid.sum() >= 10
-    assert np.all(filtered[saturated] == 0.)
-
-    entities = ns['get_object_entities'](
-        mapper, raw, filtered, np.zeros((32, 48, 3), dtype=np.uint8), ['chair'],
-        [np.array([4, 4, 44, 28])], [mask], [.9])
-    assert len(entities) == 1
-    obj = entities[0]
-    full_points = obj.pcd_all.point.positions.cpu().numpy()
-    valid_points = obj.pcd.point.positions.cpu().numpy()
-    full_depths = -((full_points - mapper.current_position) @ mapper.current_rotation)[:, 2]
-    valid_depths = -((valid_points - mapper.current_position) @ mapper.current_rotation)[:, 2]
-    assert set(np.unique(full_depths)) == {2., 5.}
-    assert len(full_points) == mask.sum()
-    assert np.count_nonzero(full_depths == 2.) == valid.sum()
-    assert np.count_nonzero(full_depths == 5.) == saturated.sum()
-    np.testing.assert_array_equal(valid_depths, np.full(valid.sum(), 2.))
-    assert obj.num_list['chair'] == valid.sum()
-    np.testing.assert_allclose(obj.position, valid_points.mean(axis=0))
-    expected_position = ns['translate_to_world'](
-        ns['get_pointcloud_from_depth_mask'](filtered, mask, mapper.camera_intrinsic),
-        mapper.current_position, mapper.current_rotation).mean(axis=0)
-    np.testing.assert_allclose(obj.position, expected_position)
-
-    # Binary-exact spacing and a smaller voxel preserve every source pixel.
-    def pixels(cloud):
-        x, y, _ = ns['project_to_camera'](
-            cloud, mapper.camera_intrinsic, mapper.current_position, mapper.current_rotation)
-        return set(zip(y.tolist(), x.tolist()))
-
-    valid_pixels = set(zip(*np.where(valid)))
-    assert valid_pixels <= pixels(obj.pcd_all)
-    assert pixels(obj.pcd_all) == set(zip(*np.where(mask)))
-    assert pixels(obj.pcd) == valid_pixels
 
 
 def test_real_detector_passes_bgr_to_ultralytics_without_double_swap():

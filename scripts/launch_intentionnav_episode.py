@@ -38,19 +38,8 @@ def main():
     parser.add_argument("--image", default="strive-hm3d:local")
     parser.add_argument("--max-moves", type=int, default=30)
     parser.add_argument("--max-model-calls", type=int, default=60)
-    parser.add_argument("--observation-mode", choices=("single", "multi"), default="single",
-                        help="single current view (default), or an explicit multi-view panorama")
-    parser.add_argument("--panorama-views", type=int, default=4,
-                        help="number of headings in multi mode (>= 2); ignored in single mode")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
-    if min(args.max_model_calls, args.max_moves) < 1:
-        parser.error("episode budgets must be positive")
-    if args.observation_mode == "multi" and args.panorama_views < 2:
-        parser.error("--observation-mode multi requires --panorama-views >= 2")
-    observation_settings = {"observation_mode": args.observation_mode,
-                            "panorama_views": args.panorama_views,
-                            "effective_views": 1 if args.observation_mode == "single" else args.panorama_views}
     if args.public_episode is not None and args.style is not None:
         parser.error("--style cannot override --public-episode")
     root = Path(os.environ["STRIVE_ROOT"])
@@ -117,7 +106,6 @@ def main():
     policy_started = False
     policy_finished = False
     result = {"run_id": run_id, "status": "starting", "policy": "strive_isaac_guided",
-              **observation_settings,
               "public_episode_sha256": public_hash, "evaluation_binding": binding,
               "mode_equivalence": "not_default_baseline_guided_or_official_isaac45",
               "motion_semantics": "freemap_checked_kinematic_camera_not_dynamic_robot"}
@@ -163,10 +151,8 @@ def main():
                        "python", "scripts/run_intentionnav.py", "--public-episode", str(public),
                        "--output", str(output), "--port", str(args.port),
                        "--max-model-calls", str(args.max_model_calls), "--max-moves", str(args.max_moves),
-                       "--observation-mode", args.observation_mode,
-                       "--panorama-views", str(args.panorama_views)]
+                       "--panorama-views", "4"]
             write_json(output / "execution.json", {"run_id": run_id, "image_id": image_id,
-                       **observation_settings,
                        "public_episode_sha256": public_hash, "evaluation_binding": binding,
                        "server_command": server_cmd, "policy_command": docker,
                        "policy_env": {k: v for k, v in settings.items() if "KEY" not in k},
@@ -205,7 +191,7 @@ def main():
             result["trajectory_sha256"] = trajectory_hash
             scene = data_root / "scenes" / public_input["scene_id"] / "start_result_navigation.usd"
             freemap = data_root / "metadata/metadata_train" / public_input["scene_id"] / "freemap.npy"
-            write_json(output / "evaluation.json", {**scored, **observation_settings,
+            write_json(output / "evaluation.json", {**scored,
                 "public_episode_sha256": public_hash, "evaluation_binding": binding,
                 "trajectory_sha256": trajectory_hash, "trajectory_steps": len(trajectory),
                 "scene_sha256": hashlib.sha256(scene.read_bytes()).hexdigest(),
