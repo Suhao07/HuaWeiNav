@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+from pydantic import ValidationError
+
 from deployment.lvlm_server.schema_smoke import (
     _check_final_guard,
     build_parser,
@@ -49,6 +52,12 @@ class _ScriptedStructuredClient:
             parsed = ParsedVerification(
                 satisfied=False,
                 decision="need_better_view",
+                original_instruction_review={
+                    "coverage_complete": True, "interpretation_consistent": True, "task_satisfied": False,
+                    "requirements": [{"quote": "Find a book on a shelf.", "scope": "candidate",
+                                      "verdict": "unknown", "reason": "No current candidate-bound image ID.",
+                                      "supporting_observation_ids": []}],
+                },
             )
         else:
             raise AssertionError(f"unexpected schema: {schema}")
@@ -113,3 +122,44 @@ def test_schema_smoke_exposes_optional_provider_endpoint_skips() -> None:
 
     assert args.skip_health is True
     assert args.skip_model_discovery is True
+
+
+@pytest.mark.parametrize("predicate_ids", [[], ["capability:1", "capability:2"]])
+def test_fulltext_review_is_required_typed_schema_with_conservative_defaults(predicate_ids):
+    from prompting.schemas import affordance_verification_response_model
+
+    model = affordance_verification_response_model(predicate_ids)
+    schema = model.model_json_schema()
+    assert "original_instruction_review" in schema["required"]
+    review = schema["$defs"]["OriginalInstructionReview"]
+    assert set(review["required"]) == {"coverage_complete", "interpretation_consistent", "task_satisfied", "requirements"}
+    assert review["additionalProperties"] is False
+    requirement = schema["$defs"]["OriginalInstructionRequirement"]
+    assert set(requirement["required"]) == {"quote", "scope", "verdict", "reason", "supporting_observation_ids"}
+    assert requirement["additionalProperties"] is False
+    assert requirement["properties"]["quote"]["minLength"] == 1
+    assert requirement["properties"]["reason"]["minLength"] == 1
+    assert requirement["properties"]["scope"]["enum"] == ["candidate", "task"]
+    assert requirement["properties"]["verdict"]["enum"] == ["true", "false", "unknown"]
+    assert ParsedVerification().original_instruction_review.model_dump() == {
+        "coverage_complete": False, "interpretation_consistent": False,
+        "task_satisfied": False, "requirements": []}
+    if predicate_ids:
+        assert "affordance_judgments" in schema["required"]
+        assert set(schema["$defs"]["AffordanceJudgments"]["required"]) == set(predicate_ids)
+        judgment = {"verdict": "unknown", "reason": "No observation.", "supporting_observation_ids": []}
+        for invalid in ({}, {predicate_ids[0]: judgment},
+                        {**{uid: judgment for uid in predicate_ids}, "invented": judgment}):
+            with pytest.raises(ValidationError):
+                model(affordance_judgments=invalid)
+
+
+@pytest.mark.parametrize("field,value", [("quote", ""), ("quote", 7), ("reason", ""),
+                                         ("scope", "history"), ("verdict", True),
+                                         ("verdict", "maybe"), ("supporting_observation_ids", [3])])
+def test_fulltext_review_rejects_invalid_typed_requirements(field, value):
+    requirement = {"quote": "book", "scope": "candidate", "verdict": "unknown",
+                   "reason": "No bound view.", "supporting_observation_ids": []}
+    requirement[field] = value
+    with pytest.raises(ValidationError):
+        ParsedVerification(original_instruction_review={"requirements": [requirement]})

@@ -11,6 +11,14 @@ from verification.contracts import CandidateInstance
 from verification.store import EvidenceStore
 
 
+def _instruction_review(quote, reason, observation_ids, *, verdict="true"):
+    """Build an explicit replay review; never infer success or support from a request."""
+    return {"coverage_complete": True, "interpretation_consistent": True,
+            "task_satisfied": verdict == "true", "requirements": [{
+                "quote": quote, "scope": "candidate", "verdict": verdict,
+                "reason": reason, "supporting_observation_ids": list(observation_ids)}]}
+
+
 def test_source_overwrite_preserves_archive_and_archive_loss_expires_evidence(tmp_path):
     source = tmp_path / "camera.png"
     source.write_bytes(b"first observed frame")
@@ -34,7 +42,9 @@ def test_verifier_records_exact_sent_images_and_expired_cache_is_ignored(tmp_pat
         requests.append(kwargs)
         from prompting.schemas import ParsedVerification
         parsed = ParsedVerification(decision="accept", satisfied=True, semantic_satisfied=True,
-                                 view_sufficient_for_stop=True, confidence=1.0)
+                                    view_sufficient_for_stop=True, confidence=1.0,
+                                    original_instruction_review=_instruction_review(
+                                        "find a chair", "The bound region shows a seat, backrest and legs.", ["current"]))
         return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(parsed=parsed))])
 
     client = SimpleNamespace(beta=SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(parse=parse))))
@@ -43,7 +53,8 @@ def test_verifier_records_exact_sent_images_and_expired_cache_is_ignored(tmp_pat
     monkeypatch.setattr(module, "get_client_and_model", lambda vlm: (client, "test-model"))
     result = module.FinalInstructionVerifier(evidence_dir=str(tmp_path / "blobs")).verify(
         "find a chair", {}, CandidateInstance("chair-1", "chair"),
-        {"current_rgb_with_bbox_path": str(image_path)},
+        {"current_rgb_with_bbox_path": str(image_path), "geometry": {"bbox_xyxy": [1, 2, 3, 4]},
+         "observation_identity": {"candidate_uid": "chair-1", "task_revision": 1, "observation_id": "current"}},
     )
     assert result.accepted
     assert result.target_uid == "chair-1"
@@ -55,6 +66,111 @@ def test_verifier_records_exact_sent_images_and_expired_cache_is_ignored(tmp_pat
     assert store.get("chair", "chair-1").status == "accepted"
     archived.write_bytes(b"changed archive")
     assert store.get("chair", "chair-1") is None
+
+
+def test_history_chain_never_rebinds_prior_or_other_role_images(tmp_path, monkeypatch):
+    import json
+    from copy import deepcopy
+    from hashlib import sha256
+    from PIL import Image
+    import instruction_adapter.verifier as module
+
+    raw = "Visit A, then B, then C."
+    requests = []
+    # Explicit offline replies: no request-driven injection of successful reviews.
+    replies = [{"decision": "accept", "satisfied": True, "semantic_satisfied": True,
+                "view_sufficient_for_stop": True, "original_instruction_review": _instruction_review(
+                    raw, "The bound candidate supports this scripted review.", [f"current:{uid}"])}
+               for uid in ("A", "B", "C", "C")]
+
+    def parse(**kwargs):
+        reply = replies[len(requests)]
+        requests.append(kwargs)
+        parsed = kwargs["response_format"](**reply)
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(parsed=parsed))])
+
+    client = SimpleNamespace(beta=SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(parse=parse))))
+    monkeypatch.setenv("STRIVE_FINAL_VERIFIER", "on")
+    monkeypatch.setenv("LLM_OFFLINE", "0")
+    monkeypatch.setenv("STRIVE_EVIDENCE_REUSE", "0")
+    monkeypatch.setattr(module, "get_client_and_model", lambda _: (client, "offline-history-replay"))
+    verifier = module.FinalInstructionVerifier(evidence_dir=str(tmp_path / "blobs"))
+    store = EvidenceStore(1)
+    records, archive_owners, observations = [], {}, {}
+    for index, uid in enumerate(("A", "B", "C")):
+        paths = {}
+        for number, kind in enumerate(("current", "crop", "earlier", "relation", "overlap", "reference")):
+            path = tmp_path / f"{uid}-{kind}.png"
+            Image.new("RGB", (8, 8), (index * 70, number * 30, 90)).save(path)
+            paths[kind] = str(path)
+        identity = {"candidate_uid": uid, "task_revision": 1, "observation_id": f"current:{uid}"}
+        evidence = {
+            "observation_identity": identity, "geometry": {"bbox_xyxy": [0, 0, 7, 7]},
+            "current_rgb_with_bbox_path": paths["current"], "object_crop_path": paths["crop"],
+            "object_crop_bbox_xyxy": [0, 0, 4, 4], "relation_evidence_paths": [paths["relation"]],
+            "view_control": {"pinned_visual_evidence": {
+                "observation_identity": {**identity, "observation_id": f"earlier:{uid}"},
+                "geometry": {"bbox_xyxy": [1, 1, 6, 6]},
+                "image_paths": {"current_rgb_with_bbox_path": paths["earlier"]}}},
+            "overlapping_instance_observations": [{"image_path": paths["overlap"],
+                "candidate_surface_fraction": .9, "bbox_xyxy": [2, 2, 5, 5]}],
+            "prior_verifications": list(records),
+        }
+        task = {"revision": 1, "targets": [{"id": "goal", "name": "object",
+                                           "attributes": {"goal_reference_image": paths["reference"]}}]}
+        before = deepcopy(evidence)
+        result = verifier.verify(raw, task, CandidateInstance(uid, "untrusted label"), evidence)
+        assert result.accepted and evidence == before
+        own = result.candidate_observations
+        observations[uid] = deepcopy(own)
+        assert len(own) == 3
+        assert {item["candidate_uid"] for item in own} == {uid}
+        assert [(item["observation_id"], item["bbox"], item["role"]) for item in own] == [
+            (f"current:{uid}", [0, 0, 7, 7], "current"),
+            (f"current:{uid}", [0, 0, 4, 4], "current"),
+            (f"earlier:{uid}", [1, 1, 6, 6], "earlier")]
+        for item in own:
+            archive_owners[item["archive_path"]] = uid
+            assert item["archive_path"] in result.evidence_ids
+        content = requests[-1]["messages"][1]["content"]
+        assert sum(item["type"] == "image_url" for item in content) == 6 + 3 * index
+        assert len(result.evidence_ids) == 6 + 3 * index  # Keep all request roles for proof/cache validity.
+        assert {key[6:] for key in result.dependencies if key.startswith("image:")} == set(result.evidence_ids)
+        history_labels = [json.loads(item["text"]) for item in content if item["type"] == "text"
+                          and json.loads(item["text"]).get("role") == "verified_history_candidate"]
+        assert len(history_labels) == 3 * index
+        for label in history_labels:
+            owner = label["candidate_uid"]
+            assert owner != uid
+            original = next(item for item in observations[owner]
+                            if item["observation_id"] == label["observation_identity"]["observation_id"]
+                            and item["bbox"] == label["bbox_xyxy_in_this_image"])
+            assert label["image_sha256"] == sha256(Path(original["archive_path"]).read_bytes()).hexdigest()
+            assert label["original_role"] == original["role"]
+        record = store.put(raw, uid, result)
+        assert record.candidate_observations == own
+        assert all(archive_owners[item["archive_path"]] == uid for item in record.candidate_observations)
+        records.append(record)
+
+    # B contains A dependencies, but only its own region bindings. Contamination by
+    # copied A bindings cannot give A pixels B's identity; duplicate A records do not grow inputs.
+    polluted_b = records[1].as_dict()
+    polluted_b["candidate_observations"].extend(deepcopy(records[0].candidate_observations))
+    evidence["prior_verifications"] = [records[0], polluted_b, records[0]]
+    repeated = verifier.verify(raw, task, CandidateInstance("C", "untrusted label"), evidence)
+    content = requests[-1]["messages"][1]["content"]
+    assert sum(item["type"] == "image_url" for item in content) == 12
+    assert repeated.evidence_ids == result.evidence_ids
+    assert repeated.candidate_observations == result.candidate_observations
+    assert repeated.diagnostics["sent_history_observation_ids"] == result.diagnostics["sent_history_observation_ids"]
+    assert len(repeated.diagnostics["excluded_history"]) == 3
+    labels = [json.loads(item["text"]) for item in content if item["type"] == "text"]
+    for label in labels:
+        if label.get("role") == "verified_history_candidate":
+            assert label["observation_identity"]["observation_id"].endswith(":" + label["candidate_uid"])
+    # Removing even a non-candidate dependency invalidates the complete accepted proof.
+    Path(result.diagnostics["image_sources"][paths["reference"]]).unlink()
+    assert store.get(raw, "C") is None
 
 
 def test_each_image_uses_its_own_observed_box_and_identity(tmp_path, monkeypatch):
@@ -96,6 +212,7 @@ def test_each_image_uses_its_own_observed_box_and_identity(tmp_path, monkeypatch
 
 def test_overlapping_instance_view_is_sent_without_its_map_label(tmp_path, monkeypatch):
     import json
+    from hashlib import sha256
     import instruction_adapter.verifier as module
     from prompting.schemas import ParsedVerification
     current, overlap = tmp_path / "current.jpg", tmp_path / "overlap.jpg"
@@ -112,14 +229,21 @@ def test_overlapping_instance_view_is_sent_without_its_map_label(tmp_path, monke
     monkeypatch.setattr(module, "get_client_and_model", lambda vlm: (client, "test"))
     result = module.FinalInstructionVerifier(evidence_dir=str(tmp_path / "blobs")).verify(
         "find sofa", {}, CandidateInstance("u", "sofa"),
-        {"current_rgb_with_bbox_path": str(current), "overlapping_instance_observations": [
-            {"image_path": str(overlap), "bbox_xyxy": [1, 2, 3, 4], "candidate_surface_fraction": .9}]})
+        {"current_rgb_with_bbox_path": str(current), "geometry": {"bbox_xyxy": [1, 2, 3, 4]},
+         "observation_identity": {"candidate_uid": "u", "task_revision": 1, "observation_id": "current"},
+         "overlapping_instance_observations": [
+             {"image_path": str(overlap), "bbox_xyxy": [1, 2, 3, 4], "candidate_surface_fraction": .9,
+              "detector_label": "untrusted map label"}]})
     content = requests[0]["messages"][1]["content"]
     texts = [json.loads(item["text"]) for item in content if item["type"] == "text"]
-    assert texts[-1] == {"role": "overlapping_instance_observation",
+    overlap_id = "overlap:1:u:" + sha256(overlap.read_bytes()).hexdigest()
+    assert texts[-1] == {"role": "overlapping_instance_observation", "observation_id": overlap_id,
                          "candidate_surface_fraction_on_this_instance": .9,
                          "bbox_xyxy_in_this_image": [1, 2, 3, 4]}
+    assert result.diagnostics["sent_relation_observation_ids"] == [overlap_id]
+    assert "untrusted map label" not in str(texts)
     assert content[-1]["type"] == "image_url" and len(result.evidence_ids) == 2
+    assert result.decision == "need_better_view"  # Missing review cannot establish a wrong instance.
 
 
 def test_exact_visual_cache_rechecks_current_physical_stop(tmp_path, monkeypatch):
@@ -128,26 +252,34 @@ def test_exact_visual_cache_rechecks_current_physical_stop(tmp_path, monkeypatch
     image = tmp_path/'current.jpg'
     image.write_bytes(b'current image')
     calls = []
+    review = _instruction_review("chair", "The bound region shows a seat, backrest and legs.", ["current"])
     def parse(**kwargs):
         calls.append(kwargs)
         return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(parsed=ParsedVerification(
-            decision='accept', satisfied=True, semantic_satisfied=True, view_sufficient_for_stop=True)))])
+            decision='accept', satisfied=True, semantic_satisfied=True, view_sufficient_for_stop=True,
+            original_instruction_review=review)))])
     client = SimpleNamespace(beta=SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(parse=parse))))
     monkeypatch.setattr(module, 'get_client_and_model', lambda _: (client,'test'))
     monkeypatch.setenv('LLM_OFFLINE','0')
     monkeypatch.setenv('STRIVE_FINAL_VERIFIER','on')
     monkeypatch.setenv('STRIVE_EVIDENCE_REUSE','1')
     verifier = module.FinalInstructionVerifier(evidence_dir=str(tmp_path/'blobs'))
-    evidence = {'current_rgb_with_bbox_path':str(image), 'hard_stop_constraints':{'satisfied':True}}
+    evidence = {'current_rgb_with_bbox_path': str(image), 'hard_stop_constraints': {'satisfied': True},
+                'geometry': {'bbox_xyxy': [1, 2, 3, 4]},
+                'observation_identity': {'candidate_uid': 'u', 'task_revision': 1, 'observation_id': 'current'}}
     candidate = CandidateInstance('u','chair')
     first = verifier.verify('chair',{},candidate,evidence)
     evidence['hard_stop_constraints'] = {'satisfied':False,'failed':[{'name':'distance'}]}
     second = verifier.verify('chair',{},candidate,evidence)
     assert first.accepted and not second.accepted
+    assert second.semantic_satisfied and second.decision == "need_better_view"
+    assert not second.diagnostics["original_instruction_review"]["validation_errors"]
+    assert not second.diagnostics["original_instruction_review"]["task_satisfied"]
     assert len(calls) == 1 and first.evidence_ids == second.evidence_ids
     image.write_bytes(b'new image')
     verifier.verify('chair',{},candidate,evidence)
     assert len(calls) == 2
+    review = _instruction_review("red chair", "The bound chair has a red seat and backrest.", ["current"])
     verifier.verify('red chair',{},candidate,evidence)
     assert len(calls) == 3
 
@@ -180,7 +312,8 @@ def test_goal_reference_is_sent_separately_and_recorded_as_image_dependency(tmp_
     identity = {"candidate_uid": "u", "task_revision": 1, "observation_id": "current"}
     result = module.FinalInstructionVerifier(evidence_dir=str(tmp_path / "blobs")).verify(
         "find the pictured chair", plan, CandidateInstance("u", "chair"),
-        {"target_id": "goal", "observation_identity": identity, "current_rgb_with_bbox_path": str(current)})
+        {"target_id": "goal", "observation_identity": identity, "current_rgb_with_bbox_path": str(current),
+         "geometry": {"bbox_xyxy": [0, 0, 2, 2]}})
     content = requests[0]["messages"][1]["content"]
     assert len(content) == 5
     assert json.loads(content[1]["text"])["role"] == "current_candidate_observation"
@@ -230,7 +363,8 @@ def test_goal_reference_content_and_revision_invalidate_visual_cache(tmp_path, m
     task = {"revision": 1, "targets": [{"id": "goal", "name": "chair", "attributes": attributes}]}
     plan = {"diagnostics": {"task_spec": task}}
     candidate = CandidateInstance("u", "chair")
-    evidence = {"current_rgb_with_bbox_path": str(current)}
+    evidence = {"current_rgb_with_bbox_path": str(current), "geometry": {"bbox_xyxy": [0, 0, 2, 2]},
+                "observation_identity": {"candidate_uid": "u", "task_revision": 1, "observation_id": "current"}}
     first = verifier.verify("find the pictured chair", plan, candidate, evidence)
     repeat = verifier.verify("find the pictured chair", plan, candidate, evidence)
     assert len(requests) == 1 and repeat.dependencies == first.dependencies
@@ -238,9 +372,23 @@ def test_goal_reference_content_and_revision_invalidate_visual_cache(tmp_path, m
     changed = verifier.verify("find the pictured chair", plan, candidate, evidence)
     assert len(requests) == 2 and changed.dependencies != first.dependencies
     task["revision"] = 2
+    evidence["observation_identity"]["task_revision"] = 2
     revised = verifier.verify("find the pictured chair", plan, candidate, evidence)
     assert len(requests) == 3 and revised.task_revision == 2
-    assert requests[1]["messages"] == requests[2]["messages"]
+    previous_content = requests[1]["messages"][1]["content"]
+    revised_content = requests[2]["messages"][1]["content"]
+    previous_payload, revised_payload = (json.loads(content[0]["text"])
+                                         for content in (previous_content, revised_content))
+    assert previous_payload.pop("task_revision") == 1
+    assert revised_payload.pop("task_revision") == 2
+    assert previous_payload == revised_payload
+    previous_binding, revised_binding = (json.loads(content[1]["text"])
+                                         for content in (previous_content, revised_content))
+    assert previous_binding["observation_identity"].pop("task_revision") == 1
+    assert revised_binding["observation_identity"].pop("task_revision") == 2
+    assert previous_binding == revised_binding
+    assert previous_content[2:] == revised_content[2:]  # Same pixels/reference, new explicit revision.
+    assert requests[1]["messages"][0] == requests[2]["messages"][0]
     attributes.pop("goal_reference_image")
     absent = verifier.verify("find the pictured chair", plan, candidate, evidence)
     assert len(requests) == 4
@@ -264,6 +412,13 @@ def test_affordance_schema_requires_exact_complete_predicate_judgments():
     parsed = model(affordance_judgments=complete)
     assert parsed.affordance_judgments.model_dump() == complete
     schema = model.model_json_schema()
+    assert "original_instruction_review" in schema["required"]
+    assert "original_instruction_review" in ParsedVerification.model_json_schema()["required"]
+    assert set(schema["$defs"]["OriginalInstructionReview"]["required"]) == {
+        "coverage_complete", "interpretation_consistent", "task_satisfied", "requirements"}
+    assert not parsed.original_instruction_review.coverage_complete
+    assert not parsed.original_instruction_review.interpretation_consistent
+    assert not parsed.original_instruction_review.task_satisfied
     nested = schema["$defs"]["AffordanceJudgments"]
     assert set(nested["required"]) == set(complete)
     assert nested["additionalProperties"] is False
@@ -303,7 +458,10 @@ def affordance_case(monkeypatch, tmp_path):
     reports = {uid: {"verdict": "true", "reason": "A broad exposed horizontal top supports the notebook.",
                      "supporting_observation_ids": ["camera:4"]} for uid in ("demand:goal", "design:goal")}
     response = {"decision": "accept", "satisfied": True, "semantic_satisfied": True,
-                "view_sufficient_for_stop": True, "affordance_judgments": reports}
+                "view_sufficient_for_stop": True, "affordance_judgments": reports,
+                "original_instruction_review": _instruction_review(
+                    "Find somewhere to work with my notebook", "The exposed horizontal top has space to support a notebook.",
+                    ["camera:4"])}
 
     def parse(**kwargs):
         parsed = kwargs["response_format"](**response)
@@ -325,10 +483,12 @@ def affordance_case(monkeypatch, tmp_path):
                            verify=lambda: verifier.verify("Find somewhere to work with my notebook", plan, candidate, evidence))
 
 
-def test_affordance_task_projection_preserves_demand_and_ids_without_search_priors(affordance_case):
+def test_affordance_task_projection_preserves_semantics_without_detector_grounding(affordance_case):
+    import json
     from copy import deepcopy
 
     case = affordance_case
+    case.task["targets"][0]["detector_terms"] = ["untrusted detector vocabulary"]
     case.task["targets"].append({"id": "other", "name": "other resource", "demand": {"activity": "other"}})
     other = {**case.task["constraints"][0], "id": "demand:other", "subject": "other"}
     soft = {**case.task["constraints"][0], "id": "optional", "hardness": "soft"}
@@ -339,12 +499,25 @@ def test_affordance_task_projection_preserves_demand_and_ids_without_search_prio
     projected = case.verifier._visual_task(case.plan, case.evidence)
     assert projected["active_target"]["demand"] == case.task["targets"][0]["demand"]
     assert [p["id"] for p in projected["visual_predicates"]] == ["demand:goal", "design:goal", "optional"]
-    assert "search_priors" not in str(projected) and "destination_hypotheses" not in str(projected)
+    assert projected["search_priors"] == case.task["search_priors"]  # Assistance, not instance proof.
+    assert projected["constraints"] == case.task["constraints"]
+    assert len(projected["targets"]) == 2
+    assert "detector_terms" not in str(projected) and "untrusted detector vocabulary" not in str(projected)
+    assert "destination_hypotheses" not in str(projected["active_target"])
+    assert "destination_hypotheses" not in str(projected["visual_predicates"])
     projected["active_target"]["demand"]["manipulated_objects"].append("changed")
     projected["visual_predicates"][0]["value"]["activity"] = "changed"
+    projected["search_priors"]["destination_hypotheses"].append("changed")
     assert case.plan == before
     assert case.verify().accepted
-    schema = case.parse.call_args.kwargs["response_format"].model_json_schema()
+    request = case.parse.call_args.kwargs
+    payload = json.loads(request["messages"][1]["content"][0]["text"])
+    assert payload["raw_instruction"] == "Find somewhere to work with my notebook"
+    assert payload["semantic_authority"] == "raw_instruction"
+    assert payload["candidate"] == {"uid": case.candidate.uid}
+    assert "untrusted detector vocabulary" not in str(payload)
+    assert "Search hypotheses and category typicality are never\ninstance proof" in request["messages"][0]["content"]
+    schema = request["response_format"].model_json_schema()
     assert set(schema["$defs"]["AffordanceJudgments"]["required"]) == {"demand:goal", "design:goal"}
 
 
@@ -365,6 +538,10 @@ def test_affordance_request_sends_current_candidate_bytes_and_records_judgments(
     sent_bytes = base64.b64decode(content[2]["image_url"]["url"].split(",", 1)[1])
     assert sent_bytes == case.current.read_bytes() == Path(result.evidence_ids[0]).read_bytes()
     assert result.diagnostics["affordance_judgments"] == case.reports
+    assert result.diagnostics["original_instruction_review"] == {
+        **case.response["original_instruction_review"], "validation_errors": [],
+        "lexical_coverage": {"covered_intervals": [[0, len("Find somewhere to work with my notebook")]],
+                             "uncovered_fragments": []}}
     assert result.diagnostics["sent_current_observation_ids"] == ["camera:4"]
     assert set(result.satisfied_constraints) == set(case.reports)
     assert (case.plan, case.evidence) == before
@@ -404,6 +581,8 @@ def test_affordance_direct_immutable_taskspec_retains_revision(affordance_case):
     case = affordance_case
     task = TaskSpec.from_dict({**case.task, "raw_instruction": "Find a work surface"})
     before = task.as_dict()
+    case.response["original_instruction_review"] = _instruction_review(
+        "Find a work surface", "The exposed horizontal top provides a usable work surface.", ["camera:4"])
     result = case.verifier.verify("Find a work surface", task, case.candidate, case.evidence)
     assert result.accepted and result.task_revision == 4
     assert task.as_dict() == before
@@ -421,12 +600,54 @@ def test_soft_affordance_keeps_original_response_schema(affordance_case):
     assert case.parse.call_args.kwargs["response_format"] is ParsedVerification
 
 
+@pytest.mark.parametrize("hard_affordance", [True, False])
+def test_missing_original_review_blocks_aggregate_accept(affordance_case, hard_affordance):
+    case = affordance_case
+    if not hard_affordance:
+        case.task["constraints"] = []
+        case.response.pop("affordance_judgments")
+    case.response.pop("original_instruction_review")
+    result = case.verify()
+    assert not result.accepted and not result.semantic_satisfied
+    assert result.decision == "need_better_view" and not result.view_sufficient_for_stop
+    assert result.diagnostics["sent_current_observation_ids"] == ["camera:4"]
+    review = result.diagnostics["original_instruction_review"]
+    assert review["validation_errors"] and not review["task_satisfied"]
+    assert not review["coverage_complete"] and not review["interpretation_consistent"]
+    case.parse.assert_called_once()
+
+
+@pytest.mark.parametrize("missing", ["identity", "bbox", "revision"])
+def test_nonaffordance_candidate_also_requires_current_image_binding(affordance_case, missing):
+    case = affordance_case
+    case.task["constraints"] = []
+    case.response.pop("affordance_judgments")
+    if missing == "identity":
+        case.evidence.pop("observation_identity")
+    elif missing == "bbox":
+        case.evidence["geometry"].pop("bbox_xyxy")
+    else:
+        case.evidence["observation_identity"]["task_revision"] = 3
+    result = case.verify()
+    assert not result.accepted and not result.semantic_satisfied
+    assert result.decision == "need_better_view" and not result.view_sufficient_for_stop
+    assert result.diagnostics["sent_current_observation_ids"] == []
+    assert result.diagnostics["sent_candidate_observation_ids"] == [] and result.evidence_ids == []
+    case.parse.assert_not_called()
+    assert result.diagnostics["source"] == "missing_candidate_image"
+    review = result.diagnostics["original_instruction_review"]
+    assert review["validation_errors"] and not review["task_satisfied"]
+    assert review["requirements"] == []
+
+
 @pytest.mark.parametrize("verdict,decision", [("false", "reject_candidate"), ("unknown", "need_better_view")])
 def test_affordance_single_nontrue_predicate_blocks_aggregate_accept(affordance_case, verdict, decision):
     case = affordance_case
     case.reports["design:goal"].update(verdict=verdict, reason="Required structure is absent or occluded.")
     result = case.verify()
     assert not result.accepted and not result.semantic_satisfied and result.decision == decision
+    assert not result.diagnostics["original_instruction_review"]["validation_errors"]
+    assert not result.diagnostics["original_instruction_review"]["task_satisfied"]
     assert result.diagnostics["affordance_judgments"]["design:goal"]["verdict"] == verdict
     assert "design:goal" not in result.satisfied_constraints
     assert ("design:goal" in result.failed_constraints) == (verdict == "false")
@@ -441,6 +662,8 @@ def test_affordance_unsent_or_unbound_support_is_unknown(affordance_case, suppor
     assert not result.accepted and not result.semantic_satisfied and result.decision == "need_better_view"
     judgment = result.diagnostics["affordance_judgments"]["demand:goal"]
     assert judgment["verdict"] == "unknown" and judgment["reported_verdict"] == verdict
+    assert not result.diagnostics["original_instruction_review"]["validation_errors"]
+    assert not result.diagnostics["original_instruction_review"]["task_satisfied"]
 
 
 @pytest.mark.parametrize("missing", ["path", "file", "identity", "candidate", "revision", "frame_id",
@@ -494,6 +717,10 @@ def test_affordance_history_support_requires_sent_matching_frame(affordance_case
     case.reports["demand:goal"]["supporting_observation_ids"] = ["earlier"]
     result = case.verify()
     assert result.accepted == bound
+    assert result.decision == ("accept" if bound else "need_better_view")
+    review = result.diagnostics["original_instruction_review"]
+    assert not review["validation_errors"]
+    assert review["requirements"][0]["supporting_observation_ids"] == ["camera:4"]
     assert ("earlier" in result.diagnostics["sent_candidate_observation_ids"]) == bound
     assert (str(earlier) in result.diagnostics["image_sources"]) == bound
 
@@ -529,6 +756,8 @@ def test_affordance_all_true_preserves_physical_gates_on_cache_hit(affordance_ca
     case.evidence["planner_infeasibility_proof"] = {"infeasible_by_geometry": True}
     result = case.verify()
     assert not result.accepted and result.semantic_satisfied and result.decision == "need_better_view"
+    assert not result.diagnostics["original_instruction_review"]["validation_errors"]
+    assert not result.diagnostics["original_instruction_review"]["task_satisfied"]
     assert result.failed_constraints and not result.hard_constraints["satisfied"]
     assert case.parse.call_count == 1
 

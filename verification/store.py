@@ -1,6 +1,7 @@
 """Evidence records and instance-level query indexes."""
 from __future__ import annotations
 import hashlib
+from copy import deepcopy
 from typing import Any
 from verification.contracts import VerificationRecord, VerificationResult
 from verification.images import image_dependencies_valid
@@ -74,6 +75,7 @@ class EvidenceStore:
             anchor_uid=result.anchor_uid,
             verdict=result.verdict if images_valid else "unknown",
             dependencies=dict(result.dependencies),
+            candidate_observations=deepcopy(result.candidate_observations),
         )
         # 记录保留原始版本及对象对；新 anchor 使用独立索引。
         self.history.append(record)

@@ -41,6 +41,8 @@ class VerificationRecord:
     anchor_uid: str = ""
     verdict: str = "unknown"
     dependencies: dict[str, str] = field(default_factory=dict)
+    # Only this candidate's current/earlier images actually sent, never other roles.
+    candidate_observations: list[dict[str, Any]] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -68,6 +70,8 @@ class VerificationResult:
     anchor_uid: str = ""
     evidence_ids: list[str] = field(default_factory=list)
     dependencies: dict[str, str] = field(default_factory=dict)
+    # Only this candidate's current/earlier images actually sent, never other roles.
+    candidate_observations: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def verdict(self) -> str:

@@ -163,15 +163,64 @@ be unknown. Proximity to a different visible object cannot establish this relati
 
 # LVLM最终决策（是否接受当前候选对象作为停靠目标）
 FINAL_VERIFIER_PROMPT = """
-You evaluate the visual predicates of an indoor navigation instruction.
-Use the original instruction, the active task predicates and the supplied images.
-Evaluate this candidate's identity and attributes for task.active_target and
-only task.visual_predicates. The existing constraint evaluator assigns these
-visual predicates, including explicitly delegated room/attribute checks.
-Task.domain_predicates retain their declared verifier and are evaluated by the
-domain services. Report no visual judgment for these domain predicates.
-Task progress, ordering and counts are maintained by the controller. Other
-terminal goals belong to their own checks.
+You verify an indoor navigation candidate against the FULL original instruction.
+semantic_authority is raw_instruction: its complete, literal wording is the final
+semantic authority. The structured task is revisable assistance, not an exhaustive
+list of obligations. Omissions in targets, attributes, constraints, demand or
+search_priors NEVER remove a requirement from the original instruction. Do not
+change any literal requirement's meaning to fit the observed candidate.
+Independently enumerate the obligations from raw_instruction before judging the
+candidate; do not merely repeat compiled predicates. Include identity, attributes,
+directed relations, reference-object attributes, negations and functional needs,
+even when the structured task omits them or treats them only as search hints.
+Task.active_target, visual_predicates and domain_predicates retain existing service
+assignments. Domain services judge their predicates; that assignment is NOT an
+exemption from reviewing their visual semantics against the original instruction.
+Physical distance, reachability and hard stop gates remain domain responsibilities.
+constraint_precheck contains explicit domain judgments under the structured task's
+assumptions, NOT authority to interpret raw_instruction. Review the full text even
+when this precheck fails. If a declared hard constraint conflicts with the original
+instruction, explicitly revise the task before verifying again; never silently
+ignore that constraint. A failed precheck forbids accept: request need_relation_check
+unless reliable candidate counterevidence requires reject_candidate. The independent
+physical hard stop gates still apply.
+
+Always return original_instruction_review with:
+- coverage_complete: whether the requirements cover the FULL original instruction.
+- interpretation_consistent: whether this review preserves the original meaning,
+  without weakening or substituting requirements to match the candidate. Correct
+  structured omissions using the original text; unresolved interpretation is false.
+- requirements: each has quote (an exact nonempty substring of raw_instruction),
+  scope (candidate or task), verdict (true, false or unknown), a nonempty reason,
+  and supporting_observation_ids from the actually supplied labeled images.
+  The quotes together must cover every clause of the full original text, including
+  all alphanumeric characters. Quote background clauses with their corresponding
+  obligations; background narrative is not an additional completion goal. Quotes
+  may overlap. The code audits only lexical omissions, not semantic truth: full
+  quote coverage does not establish a correct interpretation or a true verdict.
+  Candidate scope covers obligations this candidate must satisfy, including its
+  relationships and the properties of its reference objects. At least one
+  candidate row is required. Each true/false candidate row must cite a CURRENT
+  candidate-bound image; additional candidate/relation images may support it.
+  Task scope covers quantities, ordering, visits and other goals. Do not demand
+  that other destinations appear simultaneously in the current candidate image.
+  Unfinished or unestablished task obligations are unknown, not candidate failures.
+- task_satisfied: true only with complete coverage, consistent interpretation,
+  every requirement true and this candidate accepted. Even for a single target,
+  a task-scope unknown forbids task_satisfied=true.
+
+observation_support lists the allowed IDs. Never invent an ID, cite an unsent
+image, or use a goal reference as candidate evidence. Unknown may cite [] when
+no evidence exists. task_progress and prior_verifications are historical execution
+facts, NOT current visual truth. Only supplied verified_history_candidate images
+from accepted, true records bound to this original instruction and revision can
+support previous goals in task scope. Their IDs cannot replace current candidate
+support. Inspect the images rather than treating a prior verdict as visual proof.
+Incomplete coverage, inconsistent interpretation, invalid quotes or unsupported
+claims cannot authorize acceptance or prove a wrong instance: return unknown /
+need_better_view. A supported candidate false requires reject_candidate; a
+candidate unknown requires need_better_view. All candidate rows true may accept
+this candidate while task_satisfied remains false for unfinished task obligations.
 Each candidate observation
 has its own observation identity and bbox in that image's pixel coordinates.
 Identify the actual region enclosed by that bbox. Describe visible structure
@@ -184,8 +233,9 @@ relations directly from visible structure. For ambiguous background, support
 surfaces or depictions, identify the missing visual evidence. A partial view is
 sufficient when its visible structure distinguishes the required object.
 
-Task.active_target.demand is the immutable requested activity, manipulated_objects
-and required_resource. For every hard affordance in task.visual_predicates, judge
+Task.active_target.demand assists interpretation of the requested activity,
+manipulated_objects and required_resource; raw_instruction governs any discrepancy.
+For every hard affordance in task.visual_predicates, judge
 whether this actual candidate supports that demand, not whether its category is
 a typical destination. Search hypotheses and category typicality are never
 instance proof. Visible functional structure is sufficient for a design
@@ -211,13 +261,14 @@ request need_better_view or return uncertain. Only all true permits semantic
 acceptance. When this field is absent from the schema, do not add it.
 
 Return strict JSON:
-- satisfied: true only when all required visual predicates are established.
-- semantic_satisfied: true when visible structure establishes the requested
-  object's identity, attributes and explicit visual relations.
+- satisfied: candidate-level acceptance, true only when its full-text obligations
+  and required visual predicates are established; not whole-task completion.
+- semantic_satisfied: true when visible structure establishes all candidate-scope
+  obligations in the original instruction, not just the compiled predicates.
 - view_sufficient_for_stop: true when the current observation identifies the
-  candidate and supplies sufficient evidence for the visual predicates.
+  candidate and supplies sufficient evidence for those obligations.
 - decision:
-  - accept: all visual predicates are established by the images.
+  - accept: all candidate obligations and visual predicates are established.
   - reject_candidate: visible evidence identifies the wrong instance or attribute.
   - need_better_view: a specific missing visual observation can resolve ambiguity.
   - need_relation_check: a required relation needs additional observation.
@@ -232,11 +283,13 @@ Return strict JSON:
 - reason: describe the observed structure and explain the predicate judgment.
 
 Accept requires satisfied=true, semantic_satisfied=true and
-view_sufficient_for_stop=true. Once the visual predicates are established,
-return accept; better framing alone adds no task requirement. Each historical
-image is an observation: independently identify its visible object and check
-correspondence with the current candidate. The current view must identify the
-same actual instance. An overlapping_instance_observation shows another mapped
+view_sufficient_for_stop=true AND a valid, complete, consistent original-instruction
+review with all candidate requirements true. Once these are established, return
+accept; better framing alone adds no task requirement. For each
+earlier_candidate_observation, independently identify its visible object and
+check correspondence with the current candidate. The current view must identify
+the same actual instance. This correspondence rule does not turn a different
+verified_history_candidate into the current candidate; previous goals stay in task scope. An overlapping_instance_observation shows another mapped
 instance carrying the stated fraction of the candidate's 3D surface; it may be
 the same physical object seen from another viewpoint. Identify its object
 independently and weigh it as evidence of the candidate's identity.

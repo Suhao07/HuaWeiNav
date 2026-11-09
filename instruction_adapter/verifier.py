@@ -5,7 +5,7 @@ import json
 import os
 from copy import deepcopy
 from pathlib import Path
-from verification.images import image_input
+from verification.images import image_dependencies_valid, image_input
 from typing import Any
 
 import numpy as np
@@ -119,6 +119,80 @@ def _candidate_observation_id(identity, bbox, candidate_uid, revision):
     except (TypeError, ValueError):
         pass
     return None
+
+
+def _quote_coverage(raw_instruction, requirements):
+    """Audit exact quote interval union, not semantic truth (offsets are half-open)."""
+    intervals = []
+    for row in requirements:
+        quote = row["quote"]
+        if not quote.strip():
+            continue
+        start = raw_instruction.find(quote)
+        while start != -1:
+            intervals.append((start, start + len(quote)))
+            start = raw_instruction.find(quote, start + 1)
+    merged = []
+    for start, end in sorted(intervals):
+        if merged and start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    uncovered = []
+    cursor = 0
+    for start, end in [*merged, [len(raw_instruction), len(raw_instruction)]]:
+        fragment = raw_instruction[cursor:start]
+        if any(char.isalnum() for char in fragment):
+            uncovered.append({"start": cursor, "end": start, "text": fragment})
+        cursor = end
+    return {"covered_intervals": merged, "uncovered_fragments": uncovered}
+
+
+def _review_original_instruction(parsed, raw_instruction, current_ids, candidate_ids, relation_ids, history_ids):
+    """Validate lexical coverage and provenance, not language truth; errors stay unknown."""
+    review = parsed.original_instruction_review.model_dump()
+    errors = []
+    review["lexical_coverage"] = _quote_coverage(raw_instruction, review["requirements"])
+    if review["lexical_coverage"]["uncovered_fragments"]:
+        review["coverage_complete"] = False
+        errors.append("Uncovered raw_instruction fragments: " + json.dumps(
+            review["lexical_coverage"]["uncovered_fragments"], ensure_ascii=False))
+    if not review["coverage_complete"]:
+        errors.append("Original instruction coverage is incomplete.")
+    if not review["interpretation_consistent"]:
+        errors.append("Original instruction interpretation is inconsistent.")
+    candidate_rows = [row for row in review["requirements"] if row["scope"] == "candidate"]
+    if not candidate_rows:
+        errors.append("No candidate-scope requirements were reviewed.")
+    for row in review["requirements"]:
+        supporting = set(row["supporting_observation_ids"])
+        allowed = candidate_ids | relation_ids
+        if row["scope"] == "task":
+            allowed = allowed | history_ids
+        row_errors = []
+        if not row["quote"].strip() or row["quote"] not in raw_instruction:
+            row_errors.append("Quote is not a nonempty exact raw_instruction substring.")
+        if not row["reason"].strip():
+            row_errors.append("Missing requirement reason.")
+        if not supporting.issubset(allowed):
+            row_errors.append("Support ID was not sent for this scope and revision.")
+        if row["verdict"] != "unknown" and (
+                not supporting or (row["scope"] == "candidate" and not supporting.intersection(current_ids))):
+            row_errors.append("Claim lacks actually-sent current candidate or task image support.")
+        if row_errors:
+            row["reported_verdict"] = row["verdict"]
+            row["verdict"] = "unknown"
+            row["validation_errors"] = row_errors
+            errors.extend(row_errors)
+    if not current_ids:
+        errors.append("No current candidate-bound image was sent.")
+    verdict = "unknown" if errors else (
+        "false" if any(row["verdict"] == "false" for row in candidate_rows) else
+        "unknown" if any(row["verdict"] == "unknown" for row in candidate_rows) else "true")
+    review["task_satisfied"] = bool(review["task_satisfied"] and not errors
+                                    and all(row["verdict"] == "true" for row in review["requirements"]))
+    review["validation_errors"] = errors
+    return review, verdict
 
 
 def hard_stop_constraints_from_evidence(evidence: dict[str, Any] | None) -> dict[str, Any]:
@@ -266,12 +340,22 @@ class FinalInstructionVerifier:
 
     @staticmethod
     def _visual_task(plan, evidence):
-        """Project active user semantics while excluding grounding and execution."""
+        """Retain all semantic assistance, never detector grounding or candidate labels."""
         semantic = plan.get("diagnostics", {}).get("task_spec", plan)
-        targets = semantic.get("targets", [])
+        target_fields = ("id", "name", "role", "aliases", "attributes", "demand", "terminal", "min_count")
+        constraint_fields = ("id", "type", "subject", "relation", "object", "value", "hardness", "verifier", "source")
+        targets = [{key: target[key] for key in target_fields if key in target}
+                   for target in semantic.get("targets", [])]
+        constraints = [{key: condition[key] for key in constraint_fields if key in condition}
+                       for condition in semantic.get("constraints", [])]
+        assistance = {"targets": targets, "constraints": constraints,
+                      "ordered": semantic.get("ordered", False),
+                      "exhaustive": semantic.get("exhaustive", False),
+                      "completion_mode": semantic.get("completion_mode", "any_target_success"),
+                      "search_priors": semantic.get("search_priors", {})}
         terminal = [target for target in targets if target.get("terminal", True)]
         if not terminal:
-            return {}
+            return deepcopy(assistance)
         target_id = evidence.get("target_id")
         if target_id is None:
             if len(terminal) != 1:
@@ -296,13 +380,14 @@ class FinalInstructionVerifier:
                 visual.append(projected)
             else:
                 domain.append(projected)
-        anchors = {condition.get("object") for condition in visual}
+        references = {condition.get(key) for condition in constraints for key in ("subject", "object")}
         return deepcopy({
+            **assistance,
             "active_target": {key: active[key] for key in ("id", "name", "attributes", "demand") if key in active},
             "visual_predicates": visual,
             "domain_predicates": domain,
-            "referenced_targets": [{key: target[key] for key in ("id", "name", "attributes") if key in target}
-                                   for target in targets if target.get("id") in anchors or target.get("name") in anchors],
+            "referenced_targets": [target for target in targets if target["id"] != active["id"]
+                                   and (target.get("id") in references or target.get("name") in references)],
         })
 
     def verify(
@@ -326,30 +411,55 @@ class FinalInstructionVerifier:
         semantic = plan_dict.get("diagnostics", {}).get("task_spec", plan_dict)
         revision = semantic.get("revision", 1)
         evidence = dict(evidence or {})
+        precheck = deepcopy(evidence.get("constraint_precheck") or {})
         evidence.setdefault("hard_stop_constraints", hard_stop_constraints_from_evidence(evidence))
         # V(I, task) 与 G(pose, map) 独立求值；预测标签和接近距离不参与视觉判定。
         payload = {"raw_instruction": raw_instruction,
+                   "semantic_authority": "raw_instruction",
+                   "structured_task_policy": "Revisable assistance; omissions do not remove original requirements.",
+                   "task_revision": revision,
+                   "constraint_precheck": precheck,
+                   "constraint_precheck_policy": (
+                       "Domain judgments under structured task assumptions, not raw_instruction interpretation authority. "
+                       "Review the full original instruction; conflicts with declared hard constraints require explicit "
+                       "task revision before verifying again, never silently ignoring a constraint. "
+                       "A failed precheck forbids acceptance; physical hard stop gates remain independent."),
                    "task": self._visual_task(plan_dict or {}, evidence),
-                   "candidate": {"uid": candidate.uid}}
+                   "candidate": {"uid": candidate.uid},
+                   "history_policy": "Execution facts only, not current visual truth; inspect supplied history images.",
+                   "task_progress": deepcopy(evidence.get("task_progress", {})),
+                   "prior_verifications": []}
         affordance_ids = [predicate.get("id") for predicate in payload["task"].get("visual_predicates", [])
                           if predicate.get("type") == "affordance" and predicate.get("hardness", "hard") == "hard"]
         response_model = affordance_verification_response_model(affordance_ids)
         sent_current_ids: set[str] = set()
         sent_candidate_ids: set[str] = set()
+        sent_relation_ids: set[str] = set()
+        sent_history_ids: set[str] = set()
         content: list[dict[str, Any]] = [
             {"type": "text", "text": json.dumps(payload, ensure_ascii=False, indent=2)},
         ]
         seen_image_paths: set[str] = set()
         image_refs = {}
         image_dependencies = {}
+        candidate_observations = []
 
-        def load_image(path, missing_ok=False):
+        def load_image(path, missing_ok=False, expected_digest=None):
             if not path or (missing_ok and not Path(path).is_file()):
                 return None
             block, reference, digest = image_input(path, self.evidence_dir)
+            if expected_digest is not None and digest != expected_digest:
+                return None
             image_refs[path] = reference
             image_dependencies["image:" + reference] = digest
             return block
+
+        def bind_candidate(path, identity, bbox, role):
+            candidate_observations.append(deepcopy({
+                "archive_path": image_refs[path], "candidate_uid": identity["candidate_uid"],
+                "task_revision": identity["task_revision"], "observation_id": identity["observation_id"],
+                "bbox": bbox, "role": role,
+            }))
 
         for key in ("current_rgb_with_bbox_path", "object_crop_path", "centered_view_path"):
             path = str(evidence.get(key) or "")
@@ -359,14 +469,14 @@ class FinalInstructionVerifier:
                     else evidence.get("geometry", {}).get("bbox_xyxy"))
             observation_id = _candidate_observation_id(
                 evidence.get("observation_identity"), bbox, candidate.uid, revision)
-            if affordance_ids and observation_id is None:
+            if observation_id is None:
                 continue
-            block = load_image(path, missing_ok=bool(affordance_ids))
+            block = load_image(path, missing_ok=True)
             if block is not None:
                 seen_image_paths.add(path)
-                if observation_id is not None:
-                    sent_current_ids.add(observation_id)
-                    sent_candidate_ids.add(observation_id)
+                sent_current_ids.add(observation_id)
+                sent_candidate_ids.add(observation_id)
+                bind_candidate(path, evidence["observation_identity"], bbox, "current")
                 content.append({"type": "text", "text": json.dumps({
                     "role": "current_candidate_observation", "image_kind": key,
                     "observation_identity": evidence.get("observation_identity", {}),
@@ -377,10 +487,17 @@ class FinalInstructionVerifier:
             path = str(item)
             if path in seen_image_paths:
                 continue
-            block = load_image(path)
+            block = load_image(path, missing_ok=True)
             if block is not None:
                 seen_image_paths.add(path)
-                content.append({"type": "text", "text": "relation observation; identify visible entities from this image"})
+                digest = image_dependencies["image:" + image_refs[path]]
+                observation_id = f"relation:{revision}:{candidate.uid}:{digest}"
+                sent_relation_ids.add(observation_id)
+                content.append({"type": "text", "text": json.dumps({
+                    "role": "relation_observation", "observation_id": observation_id,
+                    "task_revision": revision,
+                    "instruction": "Identify visible entities; this does not replace current candidate binding.",
+                }, ensure_ascii=False)})
                 content.append(block)
         view_control = dict(evidence.get("view_control") or {})
         excluded_history = []
@@ -401,25 +518,89 @@ class FinalInstructionVerifier:
                 continue
             observation_id = _candidate_observation_id(
                 identity, visual_packet.get("geometry", {}).get("bbox_xyxy"), candidate.uid, revision)
-            if affordance_ids and observation_id is None:
+            if observation_id is None:
                 excluded_history.append({"image_path": image_path, "reason": "observation_binding_mismatch"})
                 continue
-            block = load_image(image_path, missing_ok=bool(affordance_ids))
+            block = load_image(image_path, missing_ok=True)
             if block is not None:
                 seen_image_paths.add(image_path)
-                if observation_id is not None:
-                    sent_candidate_ids.add(observation_id)
+                sent_candidate_ids.add(observation_id)
+                bind_candidate(image_path, identity, visual_packet["geometry"]["bbox_xyxy"], "earlier")
                 content.append({"type": "text", "text": json.dumps({
                     "role": "earlier_candidate_observation",
                     "observation_identity": identity,
                     "bbox_xyxy_in_this_image": visual_packet.get("geometry", {}).get("bbox_xyxy"),
                 }, ensure_ascii=False)})
                 content.append(block)
+        # Only accepted visual records from this instruction revision can support earlier goals.
+        records = evidence.get("prior_verifications", []) or []
+        if isinstance(records, dict):
+            records = records.values()
+        for record in records:
+            record = record.as_dict() if hasattr(record, "as_dict") else record
+            if not isinstance(record, dict):
+                continue
+            if (record.get("status") != "accepted" or record.get("verdict") != "true"
+                    or record.get("task_revision") != revision
+                    or record.get("instruction_hash") != instruction_hash(raw_instruction)
+                    or not record.get("candidate_uid")
+                    or not image_dependencies_valid(record.get("dependencies", {}))):
+                excluded_history.append({"candidate_uid": record.get("candidate_uid"),
+                                         "reason": "unverified_or_instruction_revision_mismatch"})
+                continue
+            historical = {key: record[key] for key in (
+                "candidate_uid", "instruction_hash", "task_revision", "status", "verdict",
+                "step", "predicate_id", "anchor_uid") if key in record}
+            historical["supporting_observation_ids"] = []
+            for binding in record.get("candidate_observations", []) or []:
+                if not isinstance(binding, dict):
+                    excluded_history.append({"candidate_uid": record["candidate_uid"],
+                                             "reason": "invalid_candidate_observation_binding"})
+                    continue
+                path = binding.get("archive_path")
+                digest = record.get("dependencies", {}).get("image:" + path) if isinstance(path, str) else None
+                if (binding.get("role") not in ("current", "earlier")
+                        or _candidate_observation_id(binding, binding.get("bbox"),
+                                                     record["candidate_uid"], revision) is None
+                        or not digest or path not in (record.get("evidence_paths") or [])):
+                    excluded_history.append({"candidate_uid": record["candidate_uid"],
+                                             "image_path": path, "reason": "invalid_candidate_observation_binding"})
+                    continue
+                block = load_image(path, missing_ok=True, expected_digest=digest)
+                if block is None:
+                    continue
+                identity = {key: binding[key] for key in ("candidate_uid", "task_revision", "observation_id")}
+                # The support ID binds both the pixels and their original region/identity.
+                binding_digest = hashlib.sha256(json.dumps(
+                    [identity, binding["bbox"], binding["role"]], sort_keys=True).encode("utf-8")).hexdigest()
+                observation_id = f"history:{revision}:{record['candidate_uid']}:{digest}:{binding_digest}"
+                if observation_id not in sent_history_ids:
+                    content.append({"type": "text", "text": json.dumps({
+                        "role": "verified_history_candidate", **historical,
+                        "observation_id": observation_id,
+                        "observation_identity": identity,
+                        "bbox_xyxy_in_this_image": binding["bbox"],
+                        "original_role": binding["role"],
+                        "image_sha256": digest,
+                        "instruction": "Previously verified candidate; task-scope history, not current visual truth.",
+                    }, ensure_ascii=False)})
+                    content.append(block)
+                    sent_history_ids.add(observation_id)
+                if observation_id not in historical["supporting_observation_ids"]:
+                    historical["supporting_observation_ids"].append(observation_id)
+            payload["prior_verifications"].append(historical)
+
         # 与候选共享表面的其它实例：同一物理物体可能被拆成多个实例，只给图像不给其标签。
         for item in evidence.get("overlapping_instance_observations", []) or []:
-            block = load_image(item["image_path"])
+            path = item["image_path"]
+            block = load_image(path, missing_ok=True)
+            if block is None:
+                continue
+            digest = image_dependencies["image:" + image_refs[path]]
+            observation_id = f"overlap:{revision}:{candidate.uid}:{digest}"
+            sent_relation_ids.add(observation_id)
             content.append({"type": "text", "text": json.dumps({
-                "role": "overlapping_instance_observation",
+                "role": "overlapping_instance_observation", "observation_id": observation_id,
                 "candidate_surface_fraction_on_this_instance": item["candidate_surface_fraction"],
                 "bbox_xyxy_in_this_image": item["bbox_xyxy"],
             }, ensure_ascii=False)})
@@ -439,17 +620,27 @@ class FinalInstructionVerifier:
             }, ensure_ascii=False)})
             content.append(block)
 
-        if affordance_ids and not sent_current_ids:
+        payload["observation_support"] = {
+            "current_candidate": sorted(sent_current_ids),
+            "candidate": sorted(sent_candidate_ids),
+            "relation": sorted(sent_relation_ids),
+            "verified_history": sorted(sent_history_ids),
+        }
+        content[0]["text"] = json.dumps(payload, ensure_ascii=False, indent=2)
+        if not sent_current_ids:
             image_refs.clear()
             image_dependencies.clear()
+            candidate_observations.clear()
             sent_candidate_ids.clear()
+            sent_relation_ids.clear()
+            sent_history_ids.clear()
             parsed = response_model(
                 decision="need_better_view", view_sufficient_for_stop=False,
-                reason="Hard affordances require a current candidate-bound image.",
-                affordance_judgments={uid: {
+                reason="Full-instruction verification requires a current candidate-bound image.",
+                **({"affordance_judgments": {uid: {
                     "verdict": "unknown", "reason": "No current candidate-bound image was sent.",
                     "supporting_observation_ids": [],
-                } for uid in affordance_ids})
+                } for uid in affordance_ids}} if affordance_ids else {}))
         else:
             # Provider errors propagate; only exact visual judgments are cached.
             client, model = get_client_and_model(self.vlm)
@@ -494,15 +685,26 @@ class FinalInstructionVerifier:
         semantic_satisfied = bool(getattr(parsed, "semantic_satisfied", False))
         view_sufficient = bool(getattr(parsed, "view_sufficient_for_stop", True))
         parsed_satisfied = bool(getattr(parsed, "satisfied", False))
+        review, review_verdict = _review_original_instruction(
+            parsed, raw_instruction, sent_current_ids, sent_candidate_ids, sent_relation_ids, sent_history_ids)
+        if review_verdict != "true":
+            semantic_satisfied = parsed_satisfied = False
+            decision = "reject_candidate" if review_verdict == "false" else "need_better_view"
+            if review_verdict == "unknown":
+                view_sufficient = False
         affordance_false = [uid for uid, judgment in affordance_judgments.items() if judgment["verdict"] == "false"]
         affordance_unknown = [uid for uid, judgment in affordance_judgments.items() if judgment["verdict"] == "unknown"]
         if affordance_false or affordance_unknown:
             semantic_satisfied = parsed_satisfied = False
-            if affordance_false:
+            if affordance_false or review_verdict == "false":
                 decision = "reject_candidate"
             else:
                 decision = "uncertain" if decision == "uncertain" else "need_better_view"
                 view_sufficient = False
+        if review["validation_errors"]:
+            # A malformed full-text review is not proof of a wrong instance.
+            decision = "need_better_view"
+            semantic_satisfied = parsed_satisfied = view_sufficient = False
         hard_constraints = dict(evidence.get("hard_stop_constraints") or hard_stop_constraints_from_evidence(evidence))
         planner_infeasible, planner_infeasible_reason = _planner_hard_constraint_infeasible(hard_constraints)
         if decision == "accept" and not (semantic_satisfied and view_sufficient):
@@ -510,6 +712,13 @@ class FinalInstructionVerifier:
         if decision == "accept" and not bool(hard_constraints.get("satisfied", True)):
             decision = "need_better_view"
             parsed_satisfied = False
+        precheck_failed = precheck.get("satisfied") is False
+        if precheck_failed:
+            parsed_satisfied = False
+            # Full review still runs; only reliable visual counterevidence rejects a candidate.
+            # No current binding retains the no-model / need_better_view contract.
+            if sent_current_ids and decision != "reject_candidate":
+                decision = "need_relation_check"
         view_guidance, view_guidance_goal = self._view_guidance(evidence)
         failed_constraints = list(getattr(parsed, "failed_constraints", []) or [])
         satisfied_constraints = list(getattr(parsed, "satisfied_constraints", []) or [])
@@ -517,7 +726,12 @@ class FinalInstructionVerifier:
             failed_constraints = [uid for uid in failed_constraints if uid not in affordance_ids] + affordance_false
             satisfied_constraints = [uid for uid in satisfied_constraints if uid not in affordance_ids] + [
                 uid for uid, judgment in affordance_judgments.items() if judgment["verdict"] == "true"]
-        if decision == "need_better_view" and not bool(hard_constraints.get("satisfied", True)):
+        if precheck_failed:
+            for item in precheck.get("failed_constraints", []) or []:
+                if item not in failed_constraints:
+                    failed_constraints.append(item)
+            satisfied_constraints = [item for item in satisfied_constraints if item not in failed_constraints]
+        if not bool(hard_constraints.get("satisfied", True)):
             for item in hard_constraints.get("failed", []) or []:
                 name = str(item.get("name") or "hard_stop_constraint")
                 if name not in failed_constraints:
@@ -525,6 +739,12 @@ class FinalInstructionVerifier:
         view_feedback = str(getattr(parsed, "view_feedback", "") or "")
         preferred_view_goal = str(getattr(parsed, "preferred_view_goal", "") or "")
         reason = str(getattr(parsed, "reason", "") or "")
+        if precheck_failed:
+            reason = "; ".join(filter(None, [reason, "Domain constraint precheck failed: " + str(
+                precheck.get("reason") or precheck.get("failed_constraints") or "unresolved declared constraints")]))
+        if review_verdict != "true":
+            reason = "; ".join(filter(None, [reason, "Original instruction review: " + review_verdict,
+                                            *review["validation_errors"]]))
         if affordance_false or affordance_unknown:
             reason = "; ".join(filter(None, [reason, "Hard affordances not established: " + ", ".join(
                 affordance_false + affordance_unknown)]))
@@ -566,10 +786,13 @@ class FinalInstructionVerifier:
             view_objective["hard_stop_constraints"] = hard_constraints
             if not view_feedback:
                 view_feedback = "Hard final-stop constraints are not yet satisfied; continue the view/approach objective."
+        accepted = parsed_satisfied and decision == "accept" and semantic_satisfied and view_sufficient
+        review["task_satisfied"] = bool(review["task_satisfied"] and accepted)
         return VerificationResult(
-            satisfied=parsed_satisfied and decision == "accept" and semantic_satisfied and view_sufficient,
+            satisfied=accepted,
             target_uid=candidate.uid,
             evidence_ids=sorted(set(image_refs.values())),
+            candidate_observations=candidate_observations,
             dependencies={**evidence.get("dependencies", {}), **image_dependencies,
                           "observation_identity": json.dumps(evidence.get("observation_identity"), sort_keys=True)},
             task_revision=revision,
@@ -589,12 +812,17 @@ class FinalInstructionVerifier:
             view_objective=view_objective,
             reason=reason,
             diagnostics={
-                "source": "missing_candidate_image" if affordance_ids and not sent_current_ids else "vlm",
+                "source": "missing_candidate_image" if not sent_current_ids else "vlm",
                 "image_sources": image_refs,
                 "excluded_history": excluded_history,
-                **({"affordance_judgments": affordance_judgments,
-                    "sent_current_observation_ids": sorted(sent_current_ids),
-                    "sent_candidate_observation_ids": sorted(sent_candidate_ids)} if affordance_ids else {}),
+                "original_instruction_review": review,
+                "constraint_precheck": precheck,
+                "parsed_satisfied": parsed_satisfied,
+                "sent_current_observation_ids": sorted(sent_current_ids),
+                "sent_candidate_observation_ids": sorted(sent_candidate_ids),
+                "sent_relation_observation_ids": sorted(sent_relation_ids),
+                "sent_history_observation_ids": sorted(sent_history_ids),
+                **({"affordance_judgments": affordance_judgments} if affordance_ids else {}),
                 "model_provider": self.vlm,
                 "view_guidance": {
                     "facts": view_guidance,

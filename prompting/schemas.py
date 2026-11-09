@@ -171,6 +171,40 @@ class ParsedViewObjective(BaseModel):
     reason: str = ""
 
 
+class OriginalInstructionRequirement(BaseModel):
+    """One literal instruction obligation and its image-grounded judgment."""
+
+    quote: str = Field(min_length=1, description="Exact, nonempty substring of raw_instruction.")
+    scope: Literal["candidate", "task"]
+    verdict: Literal["true", "false", "unknown"]
+    reason: str = Field(min_length=1)
+    supporting_observation_ids: list[str]
+
+    class Config:
+        extra = "forbid"
+
+
+class OriginalInstructionReview(BaseModel):
+    """Conservative full-text review; generation must explicitly supply every field."""
+
+    coverage_complete: bool = False
+    interpretation_consistent: bool = False
+    task_satisfied: bool = False
+    requirements: list[OriginalInstructionRequirement] = Field(default_factory=list)
+
+    class Config:
+        extra = "forbid"
+        json_schema_extra = {"required": [
+            "coverage_complete", "interpretation_consistent", "task_satisfied", "requirements"]}
+
+
+def _require_original_review(schema):
+    """Require review in generation while retaining conservative Python defaults."""
+    required = schema.setdefault("required", [])
+    if "original_instruction_review" not in required:
+        required.append("original_instruction_review")
+
+
 class ParsedVerification(BaseModel):
     """Visual judgment with closed, typed nested objects for strict generation."""
     satisfied: bool = False
@@ -184,6 +218,10 @@ class ParsedVerification(BaseModel):
     preferred_view_goal: str = ""
     view_objective: ParsedViewObjective = Field(default_factory=ParsedViewObjective)
     reason: str = ""
+    original_instruction_review: OriginalInstructionReview = Field(default_factory=OriginalInstructionReview)
+
+    class Config:
+        json_schema_extra = staticmethod(_require_original_review)
 
 
 class AffordanceJudgment(BaseModel):

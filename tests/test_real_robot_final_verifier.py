@@ -41,8 +41,15 @@ def test_robot_capture_reaches_visual_model_and_keeps_domain_stop_independent(tm
     def parse(**kwargs):
         requests.append(kwargs)
         from prompting.schemas import ParsedVerification
+        payload = json.loads(kwargs["messages"][1]["content"][0]["text"])
         verdict = ParsedVerification(decision="accept", satisfied=True, semantic_satisfied=True,
-                                  view_sufficient_for_stop=True, confidence=1.0)
+            view_sufficient_for_stop=True, confidence=1.0, original_instruction_review={
+                "coverage_complete": True, "interpretation_consistent": True, "task_satisfied": False,
+                "requirements": [{"quote": "a table", "scope": "candidate", "verdict": "true",
+                    "reason": "The bound region shows the table surface and supports.",
+                    "supporting_observation_ids": payload["observation_support"]["current_candidate"]},
+                    {"quote": "find a chair then a table", "scope": "task", "verdict": "unknown",
+                     "reason": "No previous chair visit evidence was provided.", "supporting_observation_ids": []}]})
         return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(parsed=verdict))])
     client = SimpleNamespace(beta=SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(parse=parse))))
     monkeypatch.setattr(module, "get_client_and_model", lambda _: (client, "stub"))
@@ -62,6 +69,7 @@ def test_robot_capture_reaches_visual_model_and_keeps_domain_stop_independent(tm
     assert "predicted-label" not in json.dumps(content)
     assert "distance_to_target" not in json.dumps(content)
     assert result["satisfied"] is False
+    assert result["semantic_satisfied"] is True
     assert result["hard_constraints"]["satisfied"] is False
 
 
@@ -110,9 +118,12 @@ def test_selection_reads_revision_from_task_owner():
     assert _selection_metadata(selection, CandidateInstance("object-2", "table"))["task_revision"] == 9
 
 
-def test_missing_image_file_keeps_original_io_error(tmp_path, monkeypatch):
+def test_missing_image_file_requires_observation_without_model_call(tmp_path, monkeypatch):
     monkeypatch.setenv("STRIVE_FINAL_VERIFIER", "on")
     monkeypatch.setenv("LLM_OFFLINE", "0")
+    monkeypatch.setattr("instruction_adapter.verifier.get_client_and_model",
+                        lambda _: pytest.fail("No model call without a current candidate image"))
     adapter = FinalInstructionVerifierAdapter(FinalInstructionVerifier(evidence_dir=str(tmp_path / "images")))
-    with pytest.raises(FileNotFoundError):
-        adapter.verify(_evidence(tmp_path / "missing.png"), _context())
+    result = adapter.verify(_evidence(tmp_path / "missing.png"), _context())
+    assert result["decision"] == "need_better_view" and not result["satisfied"]
+    assert result["diagnostics"]["source"] == "missing_candidate_image"
