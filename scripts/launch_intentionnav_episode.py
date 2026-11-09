@@ -59,7 +59,7 @@ def main():
     isaac_root = Path(os.environ["ISAACSIM_ROOT"])
     sys.path.insert(0, str(root))
     from benchmark.intentionnav import load_episode, score_trajectory
-    from scripts.serve_intentionnav import load_public_episode
+    from scripts.serve_intentionnav import gpu_identity, load_public_episode
 
     episode = None
     binding = {"status": "matched", "source": "official_dataset"}
@@ -106,8 +106,11 @@ def main():
     public_hash = hashlib.sha256(public.read_bytes()).hexdigest()
     write_json(output / "source_manifest.json", {str(p.relative_to(source)): hashlib.sha256(p.read_bytes()).hexdigest()
                for p in source.rglob("*") if p.is_file()})
-    server_env = dict(os.environ, PYTHONNOUSERSITE="1")
-    for name in ("PYTHONPATH", "PYTHONHOME", "LD_LIBRARY_PATH", "LD_PRELOAD", "CUDA_VISIBLE_DEVICES"):
+    simulator_gpu = gpu_identity(args.sim_gpu)
+    if args.sim_gpu == args.policy_gpu:
+        raise ValueError("Simulator and perception policy require separate GPUs")
+    server_env = dict(os.environ, PYTHONNOUSERSITE="1", CUDA_VISIBLE_DEVICES=simulator_gpu["uuid"])
+    for name in ("PYTHONPATH", "PYTHONHOME", "LD_LIBRARY_PATH", "LD_PRELOAD"):
         server_env.pop(name, None)
     server_cmd = [str(isaac_root / "python.sh"), str(source / "scripts/serve_intentionnav.py"),
                   "--public-episode", str(public), "--data-root", str(data_root), "--output", str(output),
@@ -117,7 +120,7 @@ def main():
     policy_started = False
     policy_finished = False
     result = {"run_id": run_id, "status": "starting", "policy": "strive_isaac_guided",
-              **observation_settings,
+              **observation_settings, "simulator_gpu": simulator_gpu,
               "public_episode_sha256": public_hash, "evaluation_binding": binding,
               "mode_equivalence": "not_default_baseline_guided_or_official_isaac45",
               "motion_semantics": "freemap_checked_kinematic_camera_not_dynamic_robot"}

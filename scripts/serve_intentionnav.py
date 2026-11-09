@@ -1,12 +1,15 @@
 """Serve one public IntentionNav episode through a main-thread loopback JSON bridge."""
 import argparse
+import ctypes
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
 import math
 import os
 from pathlib import Path
 import re
+import subprocess
 import sys
+import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -123,14 +126,55 @@ class CommandHandler(BaseHTTPRequestHandler):
                 self.server.shutdown_requested = True
 
 
-def serve(bridge, port, isaac_version):
-    """Publish readiness after binding loopback, then handle requests on this thread."""
+def gpu_identity(index):
+    row = subprocess.check_output([
+        "nvidia-smi", "-i", str(index), "--query-gpu=index,uuid,pci.bus_id",
+        "--format=csv,noheader,nounits"], text=True).strip()
+    ordinal, identity, pci_bus_id = (value.strip() for value in row.split(","))
+    if int(ordinal) != index or not re.fullmatch(r"GPU-[0-9a-fA-F-]{36}", identity):
+        raise RuntimeError("Unable to resolve requested simulator GPU")
+    return {"physical_index": index, "uuid": identity, "pci_bus_id": pci_bus_id}
+
+
+def validate_simulator_device(expected):
+    import carb
+
+    driver = ctypes.CDLL("libcuda.so.1")
+    count, device = ctypes.c_int(), ctypes.c_int()
+    identity = (ctypes.c_ubyte * 16)()
+    for function, arguments in ((driver.cuInit, (0,)),
+                                (driver.cuDeviceGetCount, (ctypes.byref(count),))):
+        code = function(*arguments)
+        if code != 0:
+            raise RuntimeError(f"Simulator CUDA initialization failed: {code}")
+    if count.value != 1:
+        raise RuntimeError(f"Simulator must see exactly one CUDA device, got {count.value}")
+    for function, arguments in ((driver.cuDeviceGet, (ctypes.byref(device), 0)),
+                                (driver.cuDeviceGetUuid, (ctypes.byref(identity), device))):
+        code = function(*arguments)
+        if code != 0:
+            raise RuntimeError(f"Simulator CUDA identity query failed: {code}")
+    actual = "GPU-" + str(uuid.UUID(bytes=bytes(identity)))
+    if actual.lower() != expected["uuid"].lower():
+        raise RuntimeError("Simulator CUDA device differs from the allocated GPU")
+    settings = carb.settings.get_settings()
+    physics, renderer = settings.get("/physics/cudaDevice"), settings.get("/renderer/activeGpu")
+    if physics != 0 or renderer != expected["physical_index"]:
+        raise RuntimeError("Simulator CUDA and Vulkan device settings disagree with allocation")
+    return {**expected, "cuda_device_count": count.value, "cuda_uuid": actual,
+            "physics_cuda_device": physics, "renderer_active_gpu": renderer}
+
+
+def serve(bridge, port, isaac_version, *, gpu=None):
+    """Publish readiness only after a complete RGB-D observation succeeds."""
     require_main_thread()
     with HTTPServer(("127.0.0.1", port), CommandHandler) as server:
         server.bridge = bridge
         server.shutdown_requested = False
+        initial = bridge.command({"action": "observe"})
         ready = {"port": server.server_address[1], "pid": os.getpid(),
-                 "isaac_version": isaac_version, "start_pose": bridge.env.get_pose()}
+                 "isaac_version": isaac_version, "start_pose": bridge.env.get_pose(),
+                 "initial_observation_frame_id": initial["frame"]["frame_id"], "gpu": gpu}
         with (bridge.output / "server_ready.json").open("x", encoding="utf-8") as stream:
             stream.write(json.dumps(ready, allow_nan=False) + "\n")
         while not server.shutdown_requested:
@@ -168,8 +212,10 @@ def main():
         parser.error("output must be an existing run directory")
     data_root = args.data_root.resolve(strict=True)
     official_root = Path(os.environ["INTENTIONNAV_ROOT"]).resolve(strict=True)
-    # Kit must never see the bridge's CLI flags; all official imports stay here.
-    sys.argv = [sys.argv[0]]
+    device = gpu_identity(args.gpu)
+    os.environ["CUDA_VISIBLE_DEVICES"] = device["uuid"]
+    # Vulkan keeps its physical index; CUDA has one UUID-isolated logical device.
+    sys.argv = [sys.argv[0], "--/physics/cudaDevice=0"]
     sys.path.insert(0, str(official_root / "eval" / "simulator"))
     from iss_env import IsaacSimEnv
     from walkable_map import WalkableMap
@@ -178,12 +224,13 @@ def main():
     wm = load_freemap(data_root, episode["scene_id"], WalkableMap)
     env = IsaacSimEnv(gpu=args.gpu)
     try:
+        gpu = validate_simulator_device(device)
         env.load_scene(episode["scene_id"], str(data_root / "scenes" / episode["scene_id"]
                                                / "start_result_navigation.usd"))
         env.place_agent(episode["start_position"], episode["start_rotation_quat_wxyz"])
         bridge = IsaacEnvironment(env, wm, output, capture_frame)
         import isaacsim
-        serve(bridge, args.port, isaac_version_file(isaacsim))
+        serve(bridge, args.port, isaac_version_file(isaacsim), gpu=gpu)
     finally:
         env.close()
 

@@ -1,10 +1,15 @@
 """Exercise geometry and the JSON boundary without importing Isaac or opening a server."""
+import builtins
+import ctypes
 import io
 import json
 import math
+import os
 from pathlib import Path
 import sys
 from types import SimpleNamespace
+from unittest.mock import Mock, call
+import uuid
 
 import numpy as np
 import pytest
@@ -528,10 +533,161 @@ def test_main_thread_guard_without_starting_a_thread(tmp_path, monkeypatch):
     assert not bridge.env.calls
 
 
-def test_ready_and_single_loop_with_fake_httpserver(tmp_path, monkeypatch):
-    """Test readiness and synchronous shutdown without binding or running an HTTP server."""
+@pytest.fixture
+def simulator_gpu():
+    """Use a nonzero physical GPU and a deterministic UUID without querying hardware."""
+    return {"physical_index": 7, "uuid": "GPU-00112233-4455-6677-8899-aabbccddeeff",
+            "pci_bus_id": "00000000:CA:00.0"}
+
+
+@pytest.mark.parametrize("index", [0, 7])
+def test_gpu_identity_binds_physical_index_without_shell(monkeypatch, index):
+    """Resolve the exact physical ordinal with argv, regardless of inherited CUDA masking."""
+    identity = "GPU-00112233-4455-6677-8899-aabbccddeeff"
+    query = Mock(return_value=f"  {index},  {identity}, 00000000:CA:00.0 \n")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "unrelated-parent-device")
+    monkeypatch.setattr(server, "subprocess", SimpleNamespace(check_output=query))
+    assert server.gpu_identity(index) == {
+        "physical_index": index, "uuid": identity, "pci_bus_id": "00000000:CA:00.0"}
+    query.assert_called_once_with([
+        "nvidia-smi", "-i", str(index), "--query-gpu=index,uuid,pci.bus_id",
+        "--format=csv,noheader,nounits"], text=True)
+    assert os.environ["CUDA_VISIBLE_DEVICES"] == "unrelated-parent-device"
+
+
+@pytest.mark.parametrize("row", [
+    "0, GPU-00112233-4455-6677-8899-aabbccddeeff, 00000000:CA:00.0",
+    "7, not-a-gpu-uuid, 00000000:CA:00.0",
+    "7, GPU-00112233-4455-6677-8899-aabbccddeefg, 00000000:CA:00.0",
+])
+def test_gpu_identity_rejects_wrong_ordinal_or_uuid(monkeypatch, row):
+    """Never accept another physical GPU or an unrecognized UUID as an allocation."""
+    query = Mock(return_value=row)
+    monkeypatch.setattr(server, "subprocess", SimpleNamespace(check_output=query))
+    with pytest.raises(RuntimeError, match="requested simulator GPU"):
+        server.gpu_identity(7)
+    query.assert_called_once()
+
+
+@pytest.fixture
+def cuda_driver(monkeypatch, simulator_gpu):
+    """Implement libcuda output pointers in CPU memory; never load a real CUDA library."""
+    state = SimpleNamespace(count=1, identity=simulator_gpu["uuid"], device=71,
+                            values={"/physics/cudaDevice": 0, "/renderer/activeGpu": 7})
+    driver = Mock()
+
+    def initialize(flags):
+        assert flags == 0
+        return 0
+
+    def get_count(pointer):
+        ctypes.cast(pointer, ctypes.POINTER(ctypes.c_int))[0] = state.count
+        return 0
+
+    def get_device(pointer, ordinal):
+        assert ordinal == 0
+        ctypes.cast(pointer, ctypes.POINTER(ctypes.c_int))[0] = state.device
+        return 0
+
+    def get_uuid(pointer, device):
+        assert device.value == state.device
+        raw = uuid.UUID(state.identity[4:]).bytes
+        ctypes.memmove(pointer, raw, len(raw))
+        return 0
+
+    driver.cuInit.side_effect = initialize
+    driver.cuDeviceGetCount.side_effect = get_count
+    driver.cuDeviceGet.side_effect = get_device
+    driver.cuDeviceGetUuid.side_effect = get_uuid
+    state.driver = driver
+    state.load = Mock(return_value=driver)
+    state.settings = Mock()
+    state.settings.get.side_effect = state.values.__getitem__
+    state.get_settings = Mock(return_value=state.settings)
+    monkeypatch.setattr(server.ctypes, "CDLL", state.load)
+    monkeypatch.setitem(sys.modules, "carb", SimpleNamespace(
+        settings=SimpleNamespace(get_settings=state.get_settings)))
+    return state
+
+
+@pytest.mark.parametrize("uppercase", [False, True])
+def test_validate_simulator_device_returns_verified_receipt(cuda_driver, simulator_gpu, uppercase):
+    """Bind CUDA logical zero and Vulkan physical seven to the same case-insensitive UUID."""
+    expected = dict(simulator_gpu)
+    if uppercase:
+        expected["uuid"] = expected["uuid"].upper()
+    before = dict(expected)
+    receipt = server.validate_simulator_device(expected)
+    assert receipt == {**expected, "cuda_device_count": 1, "cuda_uuid": simulator_gpu["uuid"],
+                       "physics_cuda_device": 0, "renderer_active_gpu": 7}
+    assert expected == before
+    cuda_driver.load.assert_called_once_with("libcuda.so.1")
+    assert [entry[0] for entry in cuda_driver.driver.mock_calls] == [
+        "cuInit", "cuDeviceGetCount", "cuDeviceGet", "cuDeviceGetUuid"]
+    cuda_driver.get_settings.assert_called_once_with()
+    assert cuda_driver.settings.get.call_args_list == [
+        call("/physics/cudaDevice"), call("/renderer/activeGpu")]
+
+
+@pytest.mark.parametrize("count", [0, 2, 8])
+def test_validate_simulator_device_requires_exactly_one_cuda_device(cuda_driver, simulator_gpu, count):
+    """Reject absent or multiple visible GPUs before querying a device or Carb settings."""
+    cuda_driver.count = count
+    with pytest.raises(RuntimeError, match=f"exactly one CUDA device, got {count}"):
+        server.validate_simulator_device(simulator_gpu)
+    assert [entry[0] for entry in cuda_driver.driver.mock_calls] == ["cuInit", "cuDeviceGetCount"]
+    cuda_driver.get_settings.assert_not_called()
+
+
+@pytest.mark.parametrize("function,stage", [
+    ("cuInit", "initialization"), ("cuDeviceGetCount", "initialization"),
+    ("cuDeviceGet", "identity query"), ("cuDeviceGetUuid", "identity query"),
+])
+def test_validate_simulator_device_rejects_cuda_errors(cuda_driver, simulator_gpu, function, stage):
+    """Stop at every failed driver call rather than interpreting uninitialized output memory."""
+    getattr(cuda_driver.driver, function).side_effect = lambda *args: 100
+    with pytest.raises(RuntimeError, match=f"CUDA {stage} failed: 100"):
+        server.validate_simulator_device(simulator_gpu)
+    order = ["cuInit", "cuDeviceGetCount", "cuDeviceGet", "cuDeviceGetUuid"]
+    assert [entry[0] for entry in cuda_driver.driver.mock_calls] == order[:order.index(function) + 1]
+    cuda_driver.get_settings.assert_not_called()
+
+
+def test_validate_simulator_device_rejects_uuid_mismatch(cuda_driver, simulator_gpu):
+    """Do not accept a single CUDA device when its identity belongs to another card."""
+    cuda_driver.identity = "GPU-ffeeddcc-bbaa-9988-7766-554433221100"
+    with pytest.raises(RuntimeError, match="CUDA device differs from the allocated GPU"):
+        server.validate_simulator_device(simulator_gpu)
+    cuda_driver.driver.cuDeviceGetUuid.assert_called_once()
+    cuda_driver.get_settings.assert_not_called()
+
+
+@pytest.mark.parametrize("physics,renderer", [(7, 7), (1, 7), (0, 0), (0, 5), (None, 7), (0, None)])
+def test_validate_simulator_device_rejects_wrong_settings(cuda_driver, simulator_gpu, physics, renderer):
+    """Reject physical CUDA ordinals and renderer remapping to another physical card."""
+    cuda_driver.values.update({"/physics/cudaDevice": physics, "/renderer/activeGpu": renderer})
+    with pytest.raises(RuntimeError, match="CUDA and Vulkan device settings disagree"):
+        server.validate_simulator_device(simulator_gpu)
+    cuda_driver.driver.cuDeviceGetUuid.assert_called_once()
+    assert cuda_driver.settings.get.call_args_list == [
+        call("/physics/cudaDevice"), call("/renderer/activeGpu")]
+
+
+@pytest.mark.parametrize("prior_observations", [0, 1])
+def test_ready_and_single_loop_with_fake_httpserver(tmp_path, monkeypatch, simulator_gpu, prior_observations):
+    """Publish a verified frame and GPU receipt only after bind and a complete observation."""
     bridge = bridge_at(tmp_path)
+    for _ in range(prior_observations):
+        bridge.command({"action": "observe"})
     events = []
+    gpu = {**simulator_gpu, "cuda_device_count": 1, "cuda_uuid": simulator_gpu["uuid"],
+           "physics_cuda_device": 0, "renderer_active_gpu": 7}
+
+    def capture(env, root, frame_id):
+        assert events == ["bind"]
+        assert not (tmp_path / "server_ready.json").exists()
+        events.append("observe")
+        return fake_capture(env, root, frame_id)
 
     class FakeHTTPServer:
         """Emulate only the context manager and synchronous request loop."""
@@ -553,34 +709,148 @@ def test_ready_and_single_loop_with_fake_httpserver(tmp_path, monkeypatch):
             assert ready["port"] == 9466 and ready["pid"] > 0
             assert ready["isaac_version"] == "test-VERSION"
             assert ready["start_pose"] == bridge.env.get_pose()
+            assert ready["gpu"] == gpu
+            assert ready["initial_observation_frame_id"] == prior_observations
+            assert ready["initial_observation_frame_id"] == records(bridge.capture_root / "frames.jsonl")[-1]["frame_id"]
+            assert records(tmp_path / "actions.jsonl")[-1]["event"] == "complete"
             assert self.bridge is bridge
             events.append("request")
             self.shutdown_requested = True
 
+    monkeypatch.setattr(bridge, "_capture", capture)
     monkeypatch.setattr(server, "HTTPServer", FakeHTTPServer)
-    server.serve(bridge, 9466, "test-VERSION")
-    assert events == ["bind", "request", "close"]
+    server.serve(bridge, 9466, "test-VERSION", gpu=gpu)
+    assert events == ["bind", "observe", "request", "close"]
+    assert len(records(bridge.capture_root / "frames.jsonl")) == prior_observations + 1
 
 
-@pytest.mark.parametrize("failure", [None, "load_scene", "place_agent", "serve"])
-def test_cli_only_public_inputs_strips_argv_and_always_closes(tmp_path, monkeypatch, failure):
-    """Exercise CLI orchestration using fake modules and no simulator or server process."""
+@pytest.mark.parametrize("failure", ["capture", "frontiers"])
+def test_ready_failure_preserves_observation_error_without_ready(tmp_path, monkeypatch, simulator_gpu, failure):
+    """Keep failed initial-observation evidence and close the bound socket without serving."""
+    events = []
+    error = RuntimeError("initial RGB-D observation failed")
+
+    def fail(*args, **kwargs):
+        assert events == ["bind"]
+        assert not (tmp_path / "server_ready.json").exists()
+        events.append("failure")
+        raise error
+
+    bridge = bridge_at(tmp_path, capture=fail if failure == "capture" else fake_capture)
+    if failure == "frontiers":
+        monkeypatch.setattr(bridge.env, "sample_frontier_waypoints", fail)
+    trajectory = (tmp_path / "trajectory.jsonl").read_bytes()
+
+    class FakeHTTPServer:
+        """Record context-manager cleanup and reject any request-loop entry."""
+
+        def __init__(self, address, handler):
+            assert address == ("127.0.0.1", 9466) and handler is server.CommandHandler
+            self.server_address = address
+            events.append("bind")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            assert exc_type is RuntimeError and exc is error
+            events.append("close")
+
+        def handle_request(self):
+            raise AssertionError("must not serve before a successful observation")
+
+    monkeypatch.setattr(server, "HTTPServer", FakeHTTPServer)
+    with pytest.raises(RuntimeError, match="initial RGB-D observation failed") as raised:
+        server.serve(bridge, 9466, "test-VERSION", gpu=simulator_gpu)
+    assert raised.value is error
+    assert events == ["bind", "failure", "close"]
+    assert not (tmp_path / "server_ready.json").exists()
+    assert records(tmp_path / "actions.jsonl") == [
+        {"command_id": 0, "event": "begin", "command": {"action": "observe"}},
+        {"command_id": 0, "event": "error", "error": str(error)}]
+    assert (tmp_path / "trajectory.jsonl").read_bytes() == trajectory
+    if failure == "frontiers":
+        assert records(bridge.capture_root / "frames.jsonl")[0]["frame_id"] == 0
+
+
+@pytest.mark.parametrize("options", [
+    ["--observation-mode", "single"],
+    ["--observation-mode", "multi"],
+    ["--observation-mode=multi"],
+    ["--panorama-views", "4"],
+])
+def test_server_cli_rejects_policy_observation_options_before_resources(tmp_path, monkeypatch, capsys, options):
+    """The simulator bridge accepts no navigation observation configuration."""
+    resources = ["load_public_episode", "gpu_identity", "IsaacEnvironment", "serve"]
+    factories = [Mock(side_effect=AssertionError("must not acquire resources")) for _ in resources]
+    for name, factory in zip(resources, factories):
+        monkeypatch.setattr(server, name, factory)
+    monkeypatch.setattr(sys, "argv", ["serve_intentionnav.py", "--public-episode", str(tmp_path / "absent.json"),
+        "--data-root", str(tmp_path), "--output", str(tmp_path / "absent"), *options])
+    with pytest.raises(SystemExit) as error:
+        server.main()
+    assert error.value.code == 2
+    assert "unrecognized arguments:" in capsys.readouterr().err
+    for factory in factories:
+        factory.assert_not_called()
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("failure", [None, "validate", "load_scene", "place_agent", "bridge", "version", "serve"])
+def test_cli_only_public_inputs_strips_argv_and_always_closes(tmp_path, monkeypatch, simulator_gpu, failure):
+    """Isolate CUDA before official imports while retaining the Vulkan ordinal and cleanup."""
     path = tmp_path / "public.json"
     path.write_text(json.dumps(public_episode()))
     output = tmp_path / "run"
     output.mkdir()
     env = FakeEnv()
-    seen = []
+    seen, imports, lifecycle = [], [], []
+    receipt = {**simulator_gpu, "cuda_device_count": 1, "cuda_uuid": simulator_gpu["uuid"],
+               "physics_cuda_device": 0, "renderer_active_gpu": 7}
+    error = RuntimeError("injected failure")
+
+    def assert_isolated():
+        assert sys.argv == ["serve_intentionnav.py", "--/physics/cudaDevice=0"]
+        assert os.environ["CUDA_VISIBLE_DEVICES"] == simulator_gpu["uuid"]
+
+    original_import = builtins.__import__
+
+    def isolated_import(name, *args, **kwargs):
+        if name in {"iss_env", "walkable_map", "backends.isaac.capture", "isaacsim"}:
+            assert_isolated()
+            imports.append(name)
+        return original_import(name, *args, **kwargs)
+
+    def identity(index):
+        assert index == 7
+        assert os.environ["CUDA_VISIBLE_DEVICES"] == "parent-device-marker"
+        assert sys.argv[-2:] == ["--gpu", "7"]
+        assert imports == [] and lifecycle == []
+        return dict(simulator_gpu)
 
     def factory(**kwargs):
-        assert sys.argv == ["serve_intentionnav.py"] and kwargs == {"gpu": 0}
+        assert_isolated()
+        assert kwargs == {"gpu": 7}
+        assert imports == ["iss_env", "walkable_map", "backends.isaac.capture"]
+        lifecycle.append("initialize")
         return env
 
-    def fail(*args):
-        raise RuntimeError("injected failure")
+    def fail(*args, **kwargs):
+        raise error
 
-    def serve(bridge, port, version):
+    def validate(expected):
+        assert expected == simulator_gpu
+        assert_isolated()
+        assert lifecycle == ["initialize"] and not env.closed
+        assert not hasattr(env, "scene")
+        lifecycle.append("validate")
+        if failure == "validate":
+            fail()
+        return receipt
+
+    def serve(bridge, port, version, *, gpu):
         assert port == 9466 and version == "test-VERSION"
+        assert gpu is receipt
         assert bridge.env.scene == ("scene", str(tmp_path / "scenes" / "scene" / "start_result_navigation.usd"))
         assert bridge.env.position == public_episode()["start_position"]
         assert bridge.env.start_quat == public_episode()["start_rotation_quat_wxyz"]
@@ -588,26 +858,41 @@ def test_cli_only_public_inputs_strips_argv_and_always_closes(tmp_path, monkeypa
         if failure == "serve":
             fail()
 
+    close = Mock(wraps=env.close)
+    resolve = Mock(side_effect=identity)
+    check = Mock(side_effect=validate)
     monkeypatch.setenv("INTENTIONNAV_ROOT", str(tmp_path))
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "parent-device-marker")
     monkeypatch.setattr(sys, "argv", ["serve_intentionnav.py", "--public-episode", str(path),
-                                     "--data-root", str(tmp_path), "--output", str(output), "--gpu", "0"])
+                                     "--data-root", str(tmp_path), "--output", str(output), "--gpu", "7"])
     monkeypatch.setattr(sys, "path", list(sys.path))
     monkeypatch.setitem(sys.modules, "iss_env", SimpleNamespace(IsaacSimEnv=factory))
     monkeypatch.setitem(sys.modules, "walkable_map", SimpleNamespace(WalkableMap=FakeMap))
     monkeypatch.setitem(sys.modules, "isaacsim", SimpleNamespace())
     monkeypatch.setitem(sys.modules, "backends.isaac.capture", SimpleNamespace(capture_frame=fake_capture))
+    monkeypatch.setattr(builtins, "__import__", isolated_import)
+    monkeypatch.setattr(server, "gpu_identity", resolve)
+    monkeypatch.setattr(server, "validate_simulator_device", check)
     monkeypatch.setattr(server, "load_freemap", lambda *args: FakeMap())
-    monkeypatch.setattr(server, "isaac_version_file", lambda module: "test-VERSION")
+    monkeypatch.setattr(server, "isaac_version_file", fail if failure == "version" else lambda module: "test-VERSION")
     monkeypatch.setattr(server, "serve", serve)
+    monkeypatch.setattr(env, "close", close)
     if failure in {"load_scene", "place_agent"}:
         monkeypatch.setattr(env, failure, fail)
+    if failure == "bridge":
+        monkeypatch.setattr(server, "IsaacEnvironment", fail)
     if failure:
-        with pytest.raises(RuntimeError, match="injected failure"):
+        with pytest.raises(RuntimeError, match="injected failure") as raised:
             server.main()
+        assert raised.value is error
     else:
         server.main()
         assert seen == ["serve"]
+    resolve.assert_called_once_with(7)
+    check.assert_called_once_with(simulator_gpu)
+    close.assert_called_once_with()
     assert env.closed
+    assert not (output / "server_ready.json").exists()
 
 
 def test_version_is_read_from_installed_version_file(tmp_path, monkeypatch):
