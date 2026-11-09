@@ -184,6 +184,7 @@ def plan_from_parsed_instruction(
             "source": ["llm"],
             "requires_runtime_relation": bool(parsed.requires_runtime_relation),
             "unresolved": list(parsed.unresolved),
+            "observation_requirements": list(parsed.observation_requirements),
             "invalid": invalid,
         },
     )

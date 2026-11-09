@@ -63,7 +63,7 @@ def compile_parsed_instruction(text, parsed, capabilities, *, revision=1) -> Com
 
 
 class InitialInstructionCompiler:
-    """在调用预算内解析指令，无效结构允许一次修正。"""
+    """在调用预算内解析指令，结构或准入诊断允许一次修正。"""
 
     def __init__(self, *, max_model_calls, trace_path, vlm="cognav", client_model=None):
         self.max_model_calls = max_model_calls
@@ -87,9 +87,12 @@ class InitialInstructionCompiler:
             prompt = INSTRUCTION_PARSE_PROMPT
             if stage == "initial_correction":
                 prompt += (
-                    "\nReturn one complete interpretation that resolves the reported structural errors. "
-                    "Preserve the original instruction's requirements and express genuine ambiguity "
-                    "in unresolved. Use the previous response and diagnostics to locate the error."
+                    "\nReturn one complete interpretation that resolves the reported structural errors "
+                    "or misclassified observation requirements. Preserve the original instruction's requirements "
+                    "and express genuine ambiguity in unresolved. Recheck each reported ambiguity against "
+                    "the original wording: missing scene evidence belongs in observation_requirements, "
+                    "not unresolved. Never clear genuine ambiguity just to admit a task. "
+                    "Use the previous response and diagnostics to locate the error."
                 )
             parsed, raw, errors = self._request(stage, request, prompt, ParsedInstruction)
             result = (compile_parsed_instruction(text, parsed, capabilities, revision=revision)
@@ -97,7 +100,8 @@ class InitialInstructionCompiler:
             current = parsed.model_dump() if parsed is not None else None
             self._record({"event": "compilation", "stage": stage, "interpretation": current,
                           "status": result.status, "diagnostics": result.diagnostics})
-            if result.status != "invalid" or stage == "initial_correction":
+            if (result.status not in {"invalid", "ambiguous"} or stage == "initial_correction"
+                    or (result.status == "ambiguous" and self.model_calls >= self.max_model_calls)):
                 return self._finish(result)
             request.update(previous_interpretation=current, previous_response=raw,
                            diagnostics=list(result.diagnostics), status=result.status)

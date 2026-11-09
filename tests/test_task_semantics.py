@@ -816,20 +816,80 @@ def test_initial_invalid_interpretation_recovers_once(tmp_path, initial, budget)
 
 
 @pytest.mark.parametrize("initial,status,diagnostics", [
-    ({"targets": [{"name": "chair"}], "unresolved": ["which chair?", "which room?"]},
-     "ambiguous", ("which chair?", "which room?")),
+    ({"targets": [{"name": "chair"}], "unresolved": ["missing antecedent of 'it'"]},
+     "ambiguous", ("missing antecedent of 'it'",)),
     ({"targets": [{"name": "chair"}], "constraints": [{
         "type": "avoid_room", "value": "bedroom", "hardness": "hard"}]},
      "unsupported", ("c0:avoid room",)),
 ])
 @pytest.mark.parametrize("budget", [1, 20])
 def test_initial_ambiguous_or_unsupported_returns_original_diagnostics(tmp_path, initial, status, diagnostics, budget):
-    compiler, requests = _initial_compiler_replay(tmp_path, [initial], budget=budget)
-    result = compiler.compile("Find a chair without entering the bedroom.", set())
+    expected_calls = 2 if status == "ambiguous" and budget > 1 else 1
+    compiler, requests = _initial_compiler_replay(tmp_path, [initial] * expected_calls, budget=budget)
+    raw = "Find it." if status == "ambiguous" else "Find a chair without entering the bedroom."
+    result = compiler.compile(raw, set())
     assert result.status == status and result.task is None
     assert result.diagnostics == diagnostics
-    assert compiler.model_calls == len(requests) == 1 and compiler.max_model_calls == budget
-    assert [request["trace_label"] for request in requests] == ["initial_parse"]
+    assert compiler.model_calls == len(requests) == expected_calls and compiler.max_model_calls == budget
+    assert [request["trace_label"] for request in requests] == ["initial_parse", "initial_correction"][:expected_calls]
+
+
+@pytest.mark.parametrize("unknowns", [
+    ["exact location of the target", "availability of the target"],
+    ["whether the target is visible", "whether the target has the requested properties"],
+])
+def test_scene_unknowns_do_not_block_instruction_or_establish_success(tmp_path, unknowns):
+    from instruction.parser import plan_from_parsed_instruction
+    from prompting.schemas import ParsedInstruction
+    from task.state import TaskProgress
+
+    raw = "Find two red cups on a table."
+    payload = {"targets": [{"name": "cup", "min_count": 2, "attributes": {"color": "red"}},
+                           {"name": "table", "terminal": False}],
+               "constraints": [{"type": "spatial", "subject": "cup", "relation": "on",
+                                "object": "table", "hardness": "hard"}],
+               "observation_requirements": unknowns}
+    parsed = ParsedInstruction.model_validate(payload)
+    plan = plan_from_parsed_instruction(raw, parsed)
+    assert plan.diagnostics["observation_requirements"] == unknowns
+    compiler, requests = _initial_compiler_replay(tmp_path, [payload])
+    result = compiler.compile(raw, {"spatial"})
+    assert result.status == "success" and result.task.raw_instruction == raw
+    assert result.task.targets[0].min_count == 2
+    assert result.task.targets[0].attributes == {"color": "red"}
+    assert result.task.constraints[0].hardness == "hard"
+    assert not TaskProgress(result.task).completed
+    assert compiler.model_calls == len(requests) == 1
+
+
+def test_misclassified_scene_unknowns_get_one_explicit_correction(tmp_path):
+    import json
+
+    raw = "Find a glass vase for my flowers."
+    unknowns = ["exact location of glass vase", "availability of glass vase"]
+    target = {"name": "vase", "attributes": {"material": "glass"}}
+    initial = {"targets": [target], "unresolved": unknowns}
+    corrected = {"targets": [target], "unresolved": [], "observation_requirements": unknowns}
+    compiler, requests = _initial_compiler_replay(tmp_path, [initial, corrected])
+    result = compiler.compile(raw, set())
+    assert result.status == "success" and result.task.raw_instruction == raw
+    assert result.task.targets[0].attributes == {"material": "glass"}
+    assert compiler.model_calls == len(requests) == 2
+    correction = json.loads(requests[1]["messages"][1]["content"])
+    assert correction["status"] == "ambiguous" and correction["diagnostics"] == unknowns
+    assert correction["previous_interpretation"]["unresolved"] == unknowns
+    assert correction["original_instruction"] == raw
+    assert "observation_requirements" in requests[1]["messages"][0]["content"]
+
+
+def test_ambiguity_correction_provider_error_is_not_admitted(tmp_path):
+    error = ConnectionError("model unavailable")
+    compiler, requests = _initial_compiler_replay(tmp_path,
+        [{"unresolved": ["missing antecedent of 'it'"]}, error])
+    with pytest.raises(ConnectionError) as caught:
+        compiler.compile("Find it.", set())
+    assert caught.value is error
+    assert compiler.model_calls == len(requests) == 2
 
 
 @pytest.mark.parametrize("budget,expected_calls,stage", [

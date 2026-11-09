@@ -43,8 +43,14 @@ not become independent identities. Preserve explicit constraints as hard, and
 explicit hints as soft. Use room, spatial, sequence, count, area, attribute,
 co_occurrence or affordance as appropriate; use avoid_room for forbidden rooms.
 Set min_count and ordered from explicit counts/sequences; set exhaustive only
-when the user requests exhausting the target set. Record genuinely unresolved
-meaning in unresolved, not missing scene evidence.
+when the user requests exhausting the target set. Separate interpretation from
+observation: unresolved contains only genuine ambiguity in the user's meaning
+that requires clarification. Unknown location, existence, availability, visibility
+or satisfaction of an object's requested properties are observation_requirements,
+not reasons to reject an otherwise interpretable navigation request. A target
+need not already be found or known to exist before navigation can begin. Preserve
+its requested properties and relations as obligations to verify, not facts already
+established. Do not invent a missing referent or discard contradictory instructions.
 
 Representation examples, not facts about the current instruction:
 - "Find the metal trolley with wheels and a carton underneath": trolley is the

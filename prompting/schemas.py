@@ -88,7 +88,10 @@ class ParsedInstruction(BaseModel):
     support_objects: list[str] = Field(default_factory=list)
     affordances: list[str] = Field(default_factory=list)
     requires_runtime_relation: bool = False
-    unresolved: list[str] = Field(default_factory=list)
+    observation_requirements: list[str] = Field(default_factory=list,
+        description="Unknown scene facts to discover during navigation, such as object location, existence, visibility or whether it satisfies a requested property. These do not block instruction interpretation.")
+    unresolved: list[str] = Field(default_factory=list,
+        description="Only ambiguities in the user's intended meaning that require clarification, such as a pronoun without an antecedent or contradictory requirements. Never include missing scene evidence; use observation_requirements for that.")
     ordered: bool = False
     exhaustive: bool = False
 
