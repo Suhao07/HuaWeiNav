@@ -10,6 +10,7 @@ from loguru import logger
 from instruction_adapter.verifier import candidate_from_object
 from navigation.goal_approach_controller import recheck_pitches
 from planning.viewpoint_policy import build_check_again_viewpoints
+from navigation_core.view_geometry import _proposal_rank, rank_view_proposals
 
 
 def select_check_again_viewpoint(agent: Any) -> None:
@@ -66,8 +67,8 @@ def select_check_again_viewpoint(agent: Any) -> None:
         proposal["travel_distance"] = geodesic_distance_to_waypoint(agent, proposal["position"])
     proposals = [p for p in proposals if np.isfinite(p["travel_distance"])]
     # 接近视点取停止半径内投影质量最高者；没有可见且可停的视点时不提供接近选项。
-    feasible = [p for p in proposals if p["stop_feasible"]]
-    agent.approach_viewpoint = max(feasible, key=lambda p: p["score"])["position"] if feasible else None
+    feasible = rank_view_proposals(proposals, approach=True)
+    agent.approach_viewpoint = feasible[0]["position"] if feasible else None
     if agent.view_control_state.active:
         # 已取得当前视角的判定后，补拍要求可执行位移：d_nav(x,v) > rho。
         # 到达容差内的提案会立即返回 reached，不能提供新的观察位置。
@@ -98,13 +99,6 @@ def select_check_again_viewpoint(agent: Any) -> None:
     else:
         logger.info("Can't find a good point to check, use the current position")
         agent.check_again_postion = agent.mapper.current_position
-
-
-def _proposal_rank(candidate):
-    """Rank feasible terminal views by travel cost, intermediate views by quality."""
-    if candidate.get("stop_feasible", False):
-        return (1, -candidate["travel_distance"], candidate["score"])
-    return (0, candidate["score"], -candidate.get("travel_distance", 0.0))
 
 
 def _log_and_pick_best_proposal(proposals: list[dict[str, Any]]) -> dict[str, Any] | None:
