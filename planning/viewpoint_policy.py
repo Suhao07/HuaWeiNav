@@ -51,22 +51,22 @@ def score_object_view(
     """
     positions = object_node.pcd.point.positions.cpu().numpy()
     bbox = object_node.bbox
-    camera_points = np.asarray(project_to_camera(object_node.pcd, camera_intrinsic, position, rotation))
-    if camera_points.ndim < 2 or camera_points.shape[1] == 0:
+    x, y, _, point_indices = project_to_camera(
+        object_node.pcd, camera_intrinsic, position, rotation, return_indices=True)
+    if len(point_indices) == 0:
         return None
-    pixels = np.asarray(camera_points[:2].T, dtype=np.int32)
+    pixels = np.column_stack((x, y))
     in_frame = (
         (pixels[:, 0] >= 0)
         & (pixels[:, 0] < image_width)
         & (pixels[:, 1] >= 0)
         & (pixels[:, 1] < image_height)
     )
-    # project_to_camera 只返回光轴前方的点：-R[:,2]^T (p - v) > 0，用同一判据恢复点序号。
-    front = (positions - position) @ rotation[:, 2] < 0
+    # Recomputing the front mask can disagree at the camera plane due to roundoff.
     quality = score_projection(
         camera_points=pixels[in_frame],
-        all_point_count=int(camera_points.shape[1]),
-        object_positions=positions[front][in_frame],
+        all_point_count=len(point_indices),
+        object_positions=positions[point_indices[in_frame]],
         viewpoint_position=position,
         original_bbox_area=float((bbox[2] - bbox[0]) * (bbox[3] - bbox[1])),
         original_bbox_length=float(bbox[2] - bbox[0]),

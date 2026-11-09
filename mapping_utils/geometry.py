@@ -72,7 +72,7 @@ def translate_to_world(pointcloud, position, rotation):
     return world_points[:, 0:3]
 
 
-def project_to_camera(pcd, intrinsic, position, rotation):
+def project_to_camera(pcd, intrinsic, position, rotation, *, return_indices=False):
     extrinsic = np.eye(4)
     extrinsic[0:3, 0:3] = rotation
     extrinsic[0:3, 3] = position
@@ -94,6 +94,8 @@ def project_to_camera(pcd, intrinsic, position, rotation):
                 intrinsic[0][2]).astype(np.int32)
     filter_z = (-camera_points[:, 1] * intrinsic[1][1] / depth_values - intrinsic[1][2] +
                 intrinsic[1][2] * 2 - 1).astype(np.int32)
+    if return_indices:
+        return filter_x, filter_z, depth_values, np.flatnonzero(flag)
     return filter_x, filter_z, depth_values
 
 

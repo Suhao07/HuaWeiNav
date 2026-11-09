@@ -61,7 +61,8 @@ class CaptureFusionTest(unittest.TestCase):
         from planning.viewpoint_policy import build_check_again_viewpoints
         # 8 个实例点都在光轴前方，其中 6 个落入 320x240 画面。
         projected = np.array([[80, 240, 80, 240, 80, 240, 400, 400],
-                              [60, 180, 180, 60, 60, 180, 120, 120], [1] * 8])
+                              [60, 180, 180, 60, 60, 180, 120, 120], [1] * 8,
+                              np.arange(8)])
         with patch('planning.viewpoint_policy.project_to_camera', return_value=projected):
             proposals, _ = build_check_again_viewpoints(object_node=_entity(),
                 camera_intrinsic=np.eye(3), mapper_initial_position=np.zeros(3),
