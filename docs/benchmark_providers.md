@@ -171,6 +171,14 @@ Habitat Env -> 只决定 benchmark metrics
 
 [IntentionNav](intentionnav_integration.md) 使用独立 Isaac 启动器，不通过 Habitat provider 冒充环境等价；六字段公开输入必须匹配官方任务才可评分。当前 [交付验收](acceptance_4500.md) 是简单2,000 + IntentionNav需求2,000，困难500为子集；GOAT / LangMap 保留研究入口但不额外计入。
 
+### GOAT 连续父任务的决策与终止
+
+公开 HM3D 与 GOAT 导航仅使用 Agent 决策 + 增强多视角 ObjNav，不接受 `--decision_owner` 或 `--observation-mode`（含旧下划线别名）。`scripts/run_goat.py` 的连续父 episode 对每个子任务调用 `run_agent_episode`；`scripts/launch_goat_episode.py` 的语言派生任务入口也不暴露 guided/legacy 或单视角导航选择。
+
+Agent 选择 `scan_scene`、候选、运动、验证与完成；自适应4方向批次（最多12个 Habitat 朝向）、地图/实例融合、room/coverage frontier 与 approach/recheck 都是提供给 Agent 的能力，不是自动推进任务的第二个策略。`observe` 只读缓存。完整原始指令仍是最终语义权威，局部接受不等于完整任务完成。
+
+连续父任务的 **`SUBTASK_STOP` 由 driver 独占**：子任务 Agent 返回完成/终止回执，不直接切换子任务或发父级全局 STOP。driver 按连续协议执行 `SUBTASK_STOP`、保持切换前后同一位姿和跨任务地图记忆，并核算全局预算及最终 STOP；预算耗尽或验证失败不能伪造子任务成功。这不改变下面语言派生单任务的独立评分合同，也不构成新的导航验收结论。
+
 ## 运动证据与独立评分
 
 GOAT 语言派生任务在实际运行时通过 [HabitatEvaluationTrace](../benchmark/habitat_evaluation.py) 冻结：

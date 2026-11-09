@@ -3,6 +3,9 @@ import pytest
 from benchmark.goat_language import language_tasks, freeze_subset
 
 
+_OBSOLETE_POLICY_FLAGS = ('--observation-mode', '--observation_mode', '--decision_owner', '--decision-owner')
+
+
 def test_language_subset_preserves_targets_and_removes_repeated_subtasks():
     goal=dict(object_id='chair_1',object_category='chair',position=[1,0,0],
               view_points=[],lang_desc='the red chair next to the table')
@@ -43,6 +46,7 @@ def test_language_launcher_binds_frozen_task_and_score(tmp_path, invalid, with_t
     argv, identity, instruction = language_inputs(source, 0, tmp_path, tmp_path, 500, 60)
     assert argv[argv.index('--benchmark') + 1] == 'goat_language'
     assert argv[argv.index('--eval_episodes') + 1] == '1'
+    assert not set(_OBSOLETE_POLICY_FLAGS).intersection(token.split('=', 1)[0] for token in argv)
     assert instruction == row['info']['instruction']
     assert json.loads((tmp_path / 'runtime_episodes.json').read_text()) == {'runtime_episodes': [identity]}
     folder = tmp_path / 'navigation/task'
@@ -52,7 +56,8 @@ def test_language_launcher_binds_frozen_task_and_score(tmp_path, invalid, with_t
     if invalid == 'identity':
         actual['episode_id'] = 'wrong'
     (episode / 'episode_identity.json').write_text(json.dumps(actual))
-    (episode / 'harness/termination.json').write_text(json.dumps({'reason': 'episode_limit'}))
+    (episode / 'harness/termination.json').write_text(json.dumps({
+        'reason': 'episode_limit', 'observation_mode': 'multi', 'decision_owner': 'agent'}))
     if with_trace:
         for key, value in identity.items():
             setattr(evaluation_env.current_episode, key, value)
@@ -60,6 +65,7 @@ def test_language_launcher_binds_frozen_task_and_score(tmp_path, invalid, with_t
         evaluation_env.moves = [[2, 1, 0]]
         trace.step(0)
     metrics = dict(Episode='0', object_goal=instruction, benchmark='goat_language',
+                   observation_mode='multi', decision_owner='agent',
                    benchmark_success_distance='0.25', success='0', spl='0', distance_to_goal='2', End='1')
     if invalid == 'instruction':
         metrics['object_goal'] = 'the blue chair'
@@ -89,6 +95,8 @@ def test_language_launcher_binds_frozen_task_and_score(tmp_path, invalid, with_t
         else:
             assert score['aggregate_ready'] and score['metrics'] == {'SR': 0, 'SPL': 0, 'distance_to_goal': 2}
         assert score['raw_metrics'] == metrics
+        assert score['termination'] == {
+            'reason': 'episode_limit', 'observation_mode': 'multi', 'decision_owner': 'agent'}
         json.dumps(score, allow_nan=False)
         assert score['protocol'] == 'goat_language_single_parent_start_v1'
         if with_trace:
@@ -104,8 +112,7 @@ def test_language_launcher_binds_frozen_task_and_score(tmp_path, invalid, with_t
 
 
 @pytest.mark.parametrize('outcome', ['policy_error', 'success', 'scoring_error', 'nonfinite_json', 'overflow_json'])
-@pytest.mark.parametrize('observation_mode', [None, 'multi'])
-def test_language_launcher_resolves_symlinked_data_mount(tmp_path, monkeypatch, evaluation_env, outcome, observation_mode):
+def test_language_launcher_resolves_symlinked_data_mount(tmp_path, monkeypatch, evaluation_env, outcome):
     import csv
     import gzip
     import json
@@ -127,8 +134,7 @@ def test_language_launcher_resolves_symlinked_data_mount(tmp_path, monkeypatch, 
         json.dump({'episodes': [task]}, stream)
     output = tmp_path / 'run'
     monkeypatch.setattr(sys, 'argv', ['launcher', '--output', str(output), '--data-root', str(alias),
-        '--language-task-file', str(alias / 'tasks.json.gz'), '--language-task-index', '0'] + (
-            ['--observation-mode', observation_mode] if observation_mode else []))
+        '--language-task-file', str(alias / 'tasks.json.gz'), '--language-task-index', '0'])
     for name in ('STRIVE_ROOT', 'HF_HOME_HOST', 'SAM_CHECKPOINT', 'GROUNDING_DINO_CHECKPOINT'):
         monkeypatch.setenv(name, str(source))
     monkeypatch.setenv('VLN_LVLM_API_KEY', 'test-only')
@@ -147,8 +153,10 @@ def test_language_launcher_resolves_symlinked_data_mount(tmp_path, monkeypatch, 
         identity['scene_id'] = str(data / 'scene_datasets' / task['scene_id'])
         (episode / 'harness').mkdir(parents=True)
         (episode / 'episode_identity.json').write_text(json.dumps(identity))
-        (episode / 'harness/termination.json').write_text(json.dumps({'reason': 'episode_limit'}))
+        (episode / 'harness/termination.json').write_text(json.dumps({
+            'reason': 'episode_limit', 'observation_mode': 'multi', 'decision_owner': 'agent'}))
         metrics = dict(Episode='0', object_goal='the red chair', benchmark='goat_language',
+                       observation_mode='multi', decision_owner='agent',
                        benchmark_success_distance='.25', success='1', spl='nan', distance_to_goal='0', End='1')
         with (episode.parent / 'metrics.csv').open('w') as stream:
             writer = csv.DictWriter(stream, fieldnames=list(metrics))
@@ -188,9 +196,10 @@ def test_language_launcher_resolves_symlinked_data_mount(tmp_path, monkeypatch, 
     assert stopped.value.code == (1 if outcome == 'policy_error' else 0)
     assert len(policy_commands) == 1
     command = policy_commands[0]
-    assert command[command.index('--observation-mode') + 1] == (observation_mode or 'single')
+    assert not set(_OBSOLETE_POLICY_FLAGS).intersection(token.split('=', 1)[0] for token in command)
     receipt = json.loads((output / 'execution.json').read_text())
-    assert receipt['observation_mode'] == (observation_mode or 'single')
+    assert receipt['observation_mode'] == 'multi'
+    assert receipt['decision_owner'] == 'agent'
     assert len(commands) == (1 if outcome == 'policy_error' else 2)
     if outcome != 'policy_error':
         assert commands[-1] == [
@@ -216,6 +225,90 @@ def test_language_launcher_resolves_symlinked_data_mount(tmp_path, monkeypatch, 
     argv = execution['command']
     assert argv[argv.index('--dataset_path') + 1] == str(data / 'tasks.json.gz')
     assert execution['language_task']['identity']['scene_id'] == str(data / 'scene_datasets/scene/a.glb')
+
+
+@pytest.mark.parametrize('option', [None, *_OBSOLETE_POLICY_FLAGS])
+def test_continuous_goat_cli_has_no_policy_mode_switches(tmp_path, monkeypatch, option):
+    """Use the agent-only API and reject removed CLI switches before navigation."""
+    import sys
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    from scripts import run_goat as runner
+
+    run = Mock(return_value={'status': 'complete'})
+    monkeypatch.setitem(sys.modules, 'backends.habitat.goat_runtime', SimpleNamespace(run_goat=run))
+    args = ['--source-shard', str(tmp_path / 'tasks.json.gz'), '--parent-index', '0',
+            '--split', 'val', '--data-root', str(tmp_path), '--scenes-root', str(tmp_path),
+            '--official-config', str(tmp_path / 'config.yaml'), '--output', str(tmp_path / 'run'),
+            '--vlm', 'self_hosted']
+    if option is not None:
+        value = 'single' if 'observation' in option else 'agent'
+        with pytest.raises(SystemExit) as stopped:
+            runner.main([*args, option, value])
+        assert stopped.value.code == 2
+        run.assert_not_called()
+        return
+    assert runner.main(args) == 0
+    run.assert_called_once()
+    assert not hasattr(run.call_args.args[0], 'observation_mode')
+    assert not hasattr(run.call_args.args[0], 'decision_owner')
+
+
+@pytest.mark.parametrize('filename', [
+    'objnav_benchmark_with_process_obs.py', 'scripts/run_goat.py', 'scripts/launch_goat_episode.py'])
+def test_navigation_clis_do_not_declare_obsolete_policy_flags(filename):
+    """Inspect CLI declarations without importing the application or simulator."""
+    import ast
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[1] / filename
+    tree = ast.parse(path.read_text())
+    options = {argument.value for node in ast.walk(tree)
+               if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+               and node.func.attr == 'add_argument'
+               for argument in node.args if isinstance(argument, ast.Constant)
+               and isinstance(argument.value, str)}
+    assert options  # Do not silently pass if the parser disappears or moves.
+    assert not set(_OBSOLETE_POLICY_FLAGS).intersection(options)
+
+
+@pytest.mark.parametrize('filename', [
+    'objnav_agent_with_process_obs.py', 'backends/habitat/agent_runtime.py',
+    'backends/habitat/goat_runtime.py'])
+def test_habitat_navigation_apis_do_not_expose_observation_mode(filename):
+    """Constructor/run signatures must not retain the removed observation input."""
+    import ast
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[1] / filename
+    tree = ast.parse(path.read_text())
+    assert not any(isinstance(node, ast.arg) and node.arg == 'observation_mode'
+                   for node in ast.walk(tree))
+    policy_calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id in {'HM3D_Objnav_Agent', 'run_agent_episode', '_agent_run'}]
+    assert all(keyword.arg != 'observation_mode' for node in policy_calls for keyword in node.keywords)
+
+
+@pytest.mark.parametrize('filename', [
+    'scripts/launch_goat_episode.py', 'backends/habitat/goat_runtime.py',
+    'backends/habitat/agent_runtime.py'])
+def test_navigation_artifact_policy_metadata_is_constant(filename):
+    """Retain explicit artifact provenance without accepting user-selected modes."""
+    import ast
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[1] / filename
+    tree = ast.parse(path.read_text())
+    entries = [(key.value, value) for node in ast.walk(tree) if isinstance(node, ast.Dict)
+               for key, value in zip(node.keys, node.values) if isinstance(key, ast.Constant)]
+    entries += [(keyword.arg, keyword.value) for node in ast.walk(tree)
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == 'dict'
+                for keyword in node.keywords]
+    for field, expected in [('observation_mode', 'multi'), ('decision_owner', 'agent')]:
+        values = [value for key, value in entries if key == field]
+        assert values, f'{filename} must record {field}'
+        assert all(isinstance(value, ast.Constant) and value.value == expected for value in values)
 
 
 @pytest.fixture

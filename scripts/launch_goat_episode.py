@@ -34,7 +34,7 @@ def language_inputs(task_file, index, data_root, output, max_steps, max_model_ca
             '--benchmark_split', 'val_unseen', '--dataset_path', str(task_file),
             '--dataset_episodes', str(len(episodes)), '--episode_manifest', str(manifest),
             '--start_episode', str(index), '--eval_episodes', str(index + 1),
-            '--max_steps', str(max_steps), '--decision_owner', 'baseline_guided',
+            '--max_steps', str(max_steps),
             '--agent_max_model_calls', str(max_model_calls), '--vlm', 'self_hosted',
             '--save_dir', 'task']
     return argv, identities[index], selected['info']['instruction']
@@ -88,12 +88,9 @@ def main():
     parser.add_argument("--language-task-index", type=int)
     parser.add_argument("--max-steps-per-task", type=int, default=500)
     parser.add_argument("--max-model-calls", type=int, default=60)
-    parser.add_argument("--observation-mode", choices=("single", "multi"), default="single")
     parser.add_argument("policy_args", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     language = args.language_task_file is not None
-    if any(value == '--observation-mode' or value.startswith('--observation-mode=') for value in args.policy_args):
-        parser.error('--observation-mode must be supplied before the policy argument separator')
     if language != (args.language_task_index is not None) or (language and args.policy_args):
         parser.error('Language mode requires both task file and index, without continuous policy arguments')
     image_id = subprocess.check_output(
@@ -130,7 +127,6 @@ def main():
         settings['HM3D_DATA_PATH'] = str(data)
         settings['MP3D_DATA_PATH'] = str(data)
         (output / 'navigation').mkdir()
-    policy += ['--observation-mode', args.observation_mode]
     command = ["docker", "run", "--rm", "--name", run_id, "--gpus", f"device={args.gpu}",
                "--network", "host", "--shm-size=12g", "--entrypoint", "/bin/bash"]
     for name in settings:
@@ -146,7 +142,7 @@ def main():
         command += ['-v', f'{output}/navigation:/workspace/STRIVE/logs']
     command += ["-w", "/workspace/STRIVE", image_id, "-lc", 'exec "$@"', "bash", "python", *policy]
     receipt = {
-        "run_id": run_id, "command": command, "observation_mode": args.observation_mode,
+        "run_id": run_id, "command": command, "observation_mode": "multi", "decision_owner": "agent",
         "environment": {k: v for k, v in settings.items() if "KEY" not in k},
         "source_sha256": {str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest()
                           for p in root.rglob("*.py") if "__pycache__" not in p.parts},

@@ -395,11 +395,12 @@ def test_continuous_driver_success_failed_budget_and_same_pose_switch(monkeypatc
         assert agent.mapper.nodes is nodes and agent.position_trajectory is trajectory
         assert agent.object_final is None and not agent.found_goal
         agent.task = SimpleNamespace(spec=SimpleNamespace(revision=kwargs['revision']))
-    def guided(agent, **kwargs):
+    def agent_run(agent, **kwargs):
         assert kwargs['stop_on_success'] is False
         revision = agent.task.spec.revision
-        # Repeated guided IDs must not return stale execution receipts across tasks.
-        agent.execution.step(1, request_id='guided-1')
+        assert kwargs['output_dir'] == tmp_path / f'subtask-{revision - 1:03d}' / 'harness'
+        # Repeated agent IDs must not return stale execution receipts across tasks.
+        agent.execution.step(1, request_id='agent-1')
         agent.object_final, agent.found_goal = object(), True
         if revision == 2:
             # An unguarded nested skill is cut off at the public env.step boundary.
@@ -407,7 +408,7 @@ def test_continuous_driver_success_failed_budget_and_same_pose_switch(monkeypatc
                 agent.execution.step(2)
         return {'reason': 'verified_finish', 'task_complete': True}
     monkeypatch.setattr(runtime, 'install_public_goal', install)
-    monkeypatch.setattr(runtime, '_guided_run', guided)
+    monkeypatch.setattr(runtime, '_agent_run', agent_run)
     result = runtime.run_continuous_parent(agent, episode, parser=None, output=tmp_path, references={})
     assert result['status'] == 'complete', result
     assert result['parent_reset_count'] == base.reset_count == 1
@@ -420,6 +421,8 @@ def test_continuous_driver_success_failed_budget_and_same_pose_switch(monkeypatc
     assert result['metrics']['subtask_success'] == [1., 0., 1., 1.]
     assert not result['metrics']['task_success']
     assert result['subtasks'][1]['reason'] == 'subtask_budget'
+    assert result['subtasks'][0]['termination'] == {'reason': 'verified_finish', 'task_complete': True}
+    assert result['subtasks'][1]['termination'] == {'reason': 'subtask_budget', 'task_complete': False}
     for old, new in zip(result['subtasks'], result['subtasks'][1:]):
         assert old['end_pose'] == new['start_pose']
     stops = [e for e in events if e['action'] == 'SUBTASK_STOP']
@@ -436,66 +439,95 @@ def test_continuous_driver_success_failed_budget_and_same_pose_switch(monkeypatc
         agent.env.reset()
 
 
-def test_single_view_continuous_switch_rebuilds_local_geometry(monkeypatch, tmp_path):
+def test_agent_run_forwards_subtask_controls_and_returns_termination(monkeypatch, tmp_path):
+    """The GOAT adapter preserves Agent termination and driver-owned stops."""
     import sys
-    from types import MethodType
+    from unittest.mock import Mock
+    import backends.habitat.goat_runtime as runtime
+
+    termination = {'reason': 'verified_finish', 'task_complete': True,
+                   'observation_mode': 'multi', 'decision_owner': 'agent'}
+    run = Mock(return_value=termination)
+    monkeypatch.setitem(sys.modules, 'backends.habitat.agent_runtime',
+                        SimpleNamespace(run_agent_episode=run))
+    agent = object()
+    kwargs = dict(episode_idx=17, max_steps=float('inf'), max_model_calls=7,
+                  stop_on_success=False, output_dir=tmp_path / 'harness')
+    assert runtime._agent_run(agent, **kwargs) is termination
+    run.assert_called_once_with(agent, **kwargs)
+
+
+def test_adaptive_multiview_continuous_switch_scopes_coverage_to_revision(monkeypatch, tmp_path):
+    """Each subtask observes fresh headings without resetting the parent map."""
+    import sys
     from unittest.mock import Mock
     import backends.habitat.goat_runtime as runtime
     from navigation.planner_loop import run_observation_mapping_cycle
-    from test_navigation_efficiency import pointcloud_observation_functions
-    ns = pointcloud_observation_functions()
-    o3d = ns['o3d']
-    episode, events = parse(dataset()), []
-    agent, base, _ = continuous_agent(episode, events)
+    from test_navigation_efficiency import adaptive_observation_functions
+
+    ns = adaptive_observation_functions()
+    episode, events, batches = parse(dataset()), [], []
+    agent, base, _ = continuous_agent(episode, events, segment_budget=5)
     mapper = agent.mapper
-    device = o3d.core.Device('CPU:0')
-    mapper.pcd_device, mapper.pcd_resolution = device, .05
-    mapper.initial_position = np.zeros(3)
-    mapper.translation_func = mapper.rotation_func = lambda value: value.copy()
-    mapper.lower_img, mapper.upper_img = .51, 4.99
-    mapper.floor_height, mapper.ceiling_height = -1., 2.
-    mapper.camera_intrinsic = np.array([[8., 0, 7.5], [0, 8., 7.5], [0, 0, 1.]])
-    mapper.trajectory_position, mapper.traj_on_trav = [], []
-    mapper.env = SimpleNamespace(sim=SimpleNamespace(is_navigable=lambda point: True))
-    for field in ('scene_pcd', 'navigable_pcd', 'traversable_pcd_all', 'process_nav_pcd', 'process_obs_pcd'):
-        setattr(mapper, field, o3d.t.geometry.PointCloud(device))
-    mapper.get_closest_disances_and_points = MethodType(ns['get_closest_disances_and_points'], mapper)
-    rgb, depth = np.zeros((16, 16, 3), dtype=np.uint8), np.full((16, 16, 1), 1.2)
-    rotation = np.array([[1., 0, 0], [0, 0, -1.], [0, 1., 0]])
-    ns['update'](mapper, rgb, depth, np.zeros(3), rotation, 0, 19, True, agent.current_node_idx)
-    assert not mapper.traversable_pcd_all.is_empty()
-    assert mapper.process_nav_pcd.is_empty() and mapper.process_obs_pcd.is_empty()
-    agent.observation_mode, agent.patrol, agent.do_seg = 'single', False, False
-    agent.save_dir, agent.episode_samples, agent.rotation = str(tmp_path), 1, SimpleNamespace(w=1.)
-    agent.update_trajectory = Mock(side_effect=AssertionError('No synthetic trajectory update'))
-    agent._save_obs_pointcloud, mapper.update_obj = Mock(), Mock()
-    agent._merge_temporary_pointclouds = lambda: ns['merge_temporary_pointclouds'](agent)
+    mapper.pcd_device, mapper.pcd_resolution = 'test', .05
+    mapper.current_navigable_pcd = mapper.current_pcd = ns['cloud']
+    mapper.objects = [SimpleNamespace(tag='chair')]
+    mapper._is_target_tag = lambda tag: tag == 'chair'
+    mapper.update_obj = Mock()
+    agent.adaptive_observation, agent.patrol = True, False
+    agent.semantic_scan_headings = {}
+    agent.save_dir, agent.episode_samples = str(tmp_path), 1
+    agent._save_obs_pointcloud = Mock()
+    agent._merge_temporary_pointclouds = Mock(return_value=ns['cloud'])
+    agent._log_mapper_state_before_after_get_nodes = Mock()
+
+    def update():
+        step = len(base.actions)
+        angle = step * np.pi / 6
+        mapper.current_rotation = np.array([[0, 0, -np.cos(angle)],
+                                            [0, 0, -np.sin(angle)], [0, 1, 0]])
+        agent.rotation = SimpleNamespace(w=np.cos(angle / 2))
+        agent.rgb_trajectory, agent.temporary_depths = [step], [step + 100]
+        agent.episode_steps = 19 + step
+
+    def detect(images, depths, positions, rotations, *, partial):
+        assert partial and depths == [image + 100 for image in images]
+        assert len(images) == len(positions) == len(rotations) == 4
+        batches.append(list(images))
+        mapper.current_obj_indices = [0]
+
+    agent.update_trajectory, agent.rotate_segmentation = update, detect
+    update()
     (tmp_path / 'episode-0').mkdir()
     monkeypatch.setitem(sys.modules, 'navigation.observation_pipeline', SimpleNamespace(
-        collect_single_observation=ns['collect_single_observation']))
-    revisions = []
-    def graph_update(*args):
-        assert not mapper.process_nav_pcd.is_empty() and not mapper.process_obs_pcd.is_empty()
-        revisions.append(agent.task.spec.revision)
-    agent._log_mapper_state_before_after_get_nodes = graph_update
+        collect_adaptive_observations=ns['collect_adaptive_observations']))
+
     def install(agent, public_goal, **kwargs):
         agent.task = SimpleNamespace(spec=SimpleNamespace(revision=kwargs['revision']))
-    def guided(agent, **kwargs):
+    def agent_run(agent, **kwargs):
+        assert kwargs['stop_on_success'] is False
         cycle = run_observation_mapping_cycle(agent, node=None, episode_idx=0)
-        assert cycle.geometry_available and cycle.step == 19
-        mapper.process_nav_pcd = o3d.t.geometry.PointCloud(device)
-        mapper.process_obs_pcd = o3d.t.geometry.PointCloud(device)
+        assert cycle.geometry_available and cycle.step == 19 + 3 * agent.task.spec.revision
         return {'reason': 'search_exhausted', 'task_complete': False}
     monkeypatch.setattr(runtime, 'install_public_goal', install)
-    monkeypatch.setattr(runtime, '_guided_run', guided)
+    monkeypatch.setattr(runtime, '_agent_run', agent_run)
     result = runtime.run_continuous_parent(agent, episode, parser=None, output=tmp_path, references={})
     assert result['status'] == 'complete', result
-    assert revisions == list(range(1, len(episode.subtasks) + 1))
+    assert batches == [[0, 1, 2, 3], [3, 4, 5, 6], [6, 7, 8, 9], [9, 10, 11, 12]]
+    assert agent.semantic_scan_headings == {
+        (revision, *mapper.current_position): {heading % 12 for heading in batch}
+        for revision, batch in enumerate(batches, 1)
+    }
     assert all(row['reason'] == 'search_exhausted' for row in result['subtasks'])
-    assert base.actions == [] and base.reset_count == 1
-    assert all(event['action'] == 'SUBTASK_STOP' for event in events)
-    assert mapper.update_iterations == 3 and agent.episode_steps == 19
-    agent.update_trajectory.assert_not_called()
+    for old, new in zip(result['subtasks'], result['subtasks'][1:]):
+        assert old['end_pose'] == new['start_pose']
+    assert base.actions == [3] * 12 and base.reset_count == result['parent_reset_count'] == 1
+    stops = [event for event in events if event['action'] == 'SUBTASK_STOP']
+    assert len(stops) == 4 and all(event['before'] == event['after'] for event in stops)
+    assert result['actual_action_count'] == 16
+    assert agent.mapper is mapper and mapper.update_iterations == 2
+    assert agent._log_mapper_state_before_after_get_nodes.call_count == 4
+    assert mapper.update_obj.call_count == 4
 
 
 def test_global_budget_emits_actual_stop_without_visiting_remaining_goals(monkeypatch, tmp_path):
@@ -506,7 +538,7 @@ def test_global_budget_emits_actual_stop_without_visiting_remaining_goals(monkey
     def nested_scan(agent, **kwargs):
         for _ in range(12):
             agent.execution.step(2)
-    monkeypatch.setattr(runtime, '_guided_run', nested_scan)
+    monkeypatch.setattr(runtime, '_agent_run', nested_scan)
     result = runtime.run_continuous_parent(agent, episode, parser=None, output=tmp_path, references={})
     assert result['status'] == 'complete'
     assert [e['action'] for e in events] == ['TURN_LEFT', 'TURN_LEFT', 'STOP']
@@ -668,7 +700,7 @@ def test_driver_undefined_spl_keeps_stop_and_reports_unavailable_score(tmp_path,
     agent, base, _ = continuous_agent(episode, events)
     base.sim.geodesic_distance = lambda *args: distance
     monkeypatch.setattr(runtime, 'install_public_goal', lambda *a, **kw: None)
-    monkeypatch.setattr(runtime, '_guided_run', lambda *a, **kw: {'reason': 'search_exhausted'})
+    monkeypatch.setattr(runtime, '_agent_run', lambda *a, **kw: {'reason': 'search_exhausted'})
     result = runtime.run_continuous_parent(agent, episode, parser=None, output=tmp_path, references={})
     value = runtime._write_json(tmp_path / 'result.json', result)
     assert events[0]['action'] == value['subtasks'][0]['stop'] == 'SUBTASK_STOP'

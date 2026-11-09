@@ -228,7 +228,7 @@ def clear_subtask_state(agent):
 
     agent.execution.motion.cancel()
     agent.execution.motion.poll_active()
-    # Scope guided-N request IDs to this segment without resetting the environment.
+    # Request IDs are segment-scoped even though the environment is continuous.
     agent.execution = HabitatExecution(agent.env)
     agent.view_control_state.reset()
     agent.final_instruction_verifier.evidence_store.reset()
@@ -249,9 +249,9 @@ def clear_subtask_state(agent):
     agent.path_node_idx = []
 
 
-def _guided_run(*args, **kwargs):
-    from backends.habitat.guided_runtime import run_guided_episode
-    return run_guided_episode(*args, **kwargs)
+def _agent_run(*args, **kwargs):
+    from backends.habitat.agent_runtime import run_agent_episode
+    return run_agent_episode(*args, **kwargs)
 
 
 def run_continuous_parent(agent, episode, *, parser, output, references, max_model_calls=100):
@@ -285,7 +285,7 @@ def run_continuous_parent(agent, episode, *, parser, output, references, max_mod
                     map_updates_before=updates, map_updates_after=agent.mapper.update_iterations,
                     node_count=len(agent.mapper.nodes), pose_after_install=env.pose())
                 try:
-                    termination = _guided_run(
+                    termination = _agent_run(
                         agent, episode_idx=episode.source_episode_index, max_steps=math.inf,
                         max_model_calls=max_model_calls, stop_on_success=False,
                         output_dir=directory / 'harness')
@@ -340,7 +340,7 @@ def run_goat(args):
     if any(output.iterdir()):
         raise ValueError('Use an empty output directory for one GOAT parent')
     result = dict(status='unavailable', metrics=None, source_sha256=None, public_goals=[],
-                  observation_mode=args.observation_mode)
+                  observation_mode='multi', decision_owner='agent')
     env = None
     try:
         source = (args.data_root / args.source_shard).resolve(strict=True)
@@ -407,8 +407,7 @@ def run_goat(args):
                                  **resources['mapper_height_bounds'],
                                  save_dir=str(output), categories=categories, no_gpt_seg=True,
                                  env=env, vlm=args.vlm)
-        agent = HM3D_Objnav_Agent(env, mapper, save_dir=str(output), vlm=args.vlm,
-                                  observation_mode=args.observation_mode)
+        agent = HM3D_Objnav_Agent(env, mapper, save_dir=str(output), vlm=args.vlm)
         parser = StriveInstructionParser(backend='llm', strict_available_classes=False, vlm=args.vlm)
         result.update(run_continuous_parent(agent, episode, parser=parser, output=output,
                                            references=references, max_model_calls=args.max_model_calls))
