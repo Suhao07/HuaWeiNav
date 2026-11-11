@@ -115,7 +115,7 @@ def plan_from_parsed_instruction(
         name = normalize_term(item.name)
         if not name:
             continue
-        target_id = _target_id(name, idx)
+        target_id = item.id or _target_id(name, idx)
         demand = item.demand.model_dump(exclude={"destination_hypotheses"}) if item.demand else {}
         if item.demand:
             destination_hypotheses[target_id] = dedupe_terms(item.demand.destination_hypotheses)
@@ -149,10 +149,11 @@ def plan_from_parsed_instruction(
 
     constraints = [
         Constraint(
+            id=item.id,
             type=normalize_term(item.type),
-            subject=normalize_term(item.subject),
+            subject=item.subject,
             relation=normalize_term(item.relation),
-            object=normalize_term(item.object),
+            object=item.object,
             value=item.value,
             hardness=normalize_term(item.hardness) or "soft",
             verifier=normalize_term(item.verifier) or "planner",

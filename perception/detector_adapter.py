@@ -10,6 +10,9 @@ from prompting.registry import CONCEPT_GROUNDING
 from prompting.schemas import HAS_PYDANTIC, GroundingResult
 from prompting.templates import CONCEPT_GROUNDING_PROMPT
 
+from instruction.contracts import TARGET_OBJECT_CONSTRAINT_TYPES, resolve_target_reference
+from instruction.compiler import task_from_parsed_plan
+from instruction_adapter.task_compat import runtime_plan
 from instruction_adapter.contracts import ConceptQuery, Constraint, InstructionPlan, TargetQuery
 from instruction_adapter.ontology import dedupe_terms, filter_terms_to_available, normalize_term
 
@@ -109,6 +112,8 @@ def ground_target(
         negative_terms=dedupe_terms(negative_terms),
         terminal=target.terminal,
         demand=dict(target.demand),
+        attributes=dict(target.attributes),
+        constraints=list(base_concept.constraints),
         source=target.source or "grounding",
     )
     return replace(
@@ -119,46 +124,18 @@ def ground_target(
     )
 
 
-def _target_by_name_or_id(plan: InstructionPlan, value: str) -> TargetQuery | None:
-    key = normalize_term(value)
-    if not key:
-        return None
-    for target in plan.targets:
-        if key == normalize_term(target.id) or key in {normalize_term(x) for x in target.match_terms}:
-            return target
-    return None
+def _target_by_name_or_id(plan: InstructionPlan, value: str, *, predicate_id, field) -> TargetQuery | None:
+    if not value:
+        return None  # Only admitted global predicates may have an empty subject.
+    target_id = resolve_target_reference(plan.targets, value, predicate_id=predicate_id, field=field)
+    return next(target for target in plan.targets if target.id == target_id)
 
 
-def _constraint_concept_id(name: str, index: int) -> str:
-    base = normalize_term(name).replace(" ", "_") or "anchor"
-    return f"c{index}_{base}"
-
-
-def _concept_from_constraint(plan: InstructionPlan, constraint: Constraint, index: int, available_classes,
-                             vlm: str, allow_model_calls: bool = True) -> ConceptQuery | None:
-    object_name = normalize_term(constraint.object)
-    if not object_name and isinstance(constraint.value, str):
-        object_name = normalize_term(constraint.value)
-    if not object_name:
-        return None
-    existing = _target_by_name_or_id(plan, object_name)
-    if existing is not None:
-        return existing.concept_query()
-    concept = constraint.object_concept or ConceptQuery(
-        id=_constraint_concept_id(object_name, index),
-        name=object_name,
-        role="anchor",
-        detector_terms=[object_name],
-        aliases=[object_name],
-        terminal=False,
-        source=constraint.source or "constraint",
-    )
-    grounded = (_llm_ground_terms(concept, available_classes, vlm)
-                if available_classes and allow_model_calls else GroundingResult())
-    detector_terms = filter_terms_to_available(grounded.detector_terms, available_classes or [])
-    if not detector_terms:
-        detector_terms = _exact_or_compact_matches([object_name], available_classes or []) or [object_name]
-    return replace(concept, detector_terms=dedupe_terms(detector_terms))
+def _concept_from_constraint(plan: InstructionPlan, constraint: Constraint, predicate_id) -> ConceptQuery | None:
+    if normalize_term(constraint.type) not in TARGET_OBJECT_CONSTRAINT_TYPES:
+        return None  # Room/property values are literals, not new anchor concepts.
+    target = _target_by_name_or_id(plan, constraint.object, predicate_id=predicate_id, field="object")
+    return target.concept_query() if target is not None else None
 
 
 def ground_plan(
@@ -170,6 +147,8 @@ def ground_plan(
     *,
     allow_model_calls: bool = True,
 ) -> InstructionPlan:
+    """Ground admitted targets without inferring new task entities or bindings."""
+    runtime_plan(task_from_parsed_plan(plan), plan=plan)
     grounded_targets = [
         ground_target(
             target,
@@ -181,15 +160,17 @@ def ground_plan(
         )
         for target in plan.targets
     ]
-    if allow_model_calls and use_legacy_similarity_fallback and len(grounded_targets) == 1:
-        target = grounded_targets[0]
-        if target.terminal and len(target.detector_terms) <= 1 and not _llm_offline():
+    terminal_indices = [index for index, target in enumerate(grounded_targets) if target.terminal]
+    if allow_model_calls and use_legacy_similarity_fallback and len(terminal_indices) == 1:
+        index = terminal_indices[0]
+        target = grounded_targets[index]
+        if len(target.detector_terms) <= 1 and not _llm_offline():
             from cv_utils.gpt_utils import ask_gpt_similar_objects
 
             similar = ask_gpt_similar_objects(list(available_classes or []), target.name, vlm)
             detector_terms = dedupe_terms(target.detector_terms + similar)
             # 检索扩展不提供身份证据；先同步概念，再绑定约束引用。
-            grounded_targets[0] = replace(
+            grounded_targets[index] = replace(
                 target,
                 detector_terms=detector_terms,
                 concept=replace(target.concept_query(), detector_terms=detector_terms),
@@ -202,9 +183,10 @@ def ground_plan(
 
     grounded_constraints = []
     for idx, constraint in enumerate(plan.constraints):
-        obj_concept = _concept_from_constraint(plan, constraint, idx, available_classes or [], vlm,
-                                               allow_model_calls=allow_model_calls)
-        subject_target = _target_by_name_or_id(plan, constraint.subject)
+        predicate_id = plan.diagnostics["task_spec"]["constraints"][idx]["id"]
+        obj_concept = _concept_from_constraint(plan, constraint, predicate_id)
+        subject_target = _target_by_name_or_id(plan, constraint.subject,
+                                             predicate_id=predicate_id, field="subject")
         grounded_constraints.append(
             replace(
                 constraint,

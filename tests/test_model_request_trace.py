@@ -55,7 +55,7 @@ def test_invalid_json_is_saved_before_validation_and_retried_once(tmp_path, monk
     messages = [{"role": "user", "content": "same frozen observation"}]
     if recover:
         result = adapter.parse(model="test", messages=messages, response_format=ParsedVerification)
-        assert result.choices[0].message.parsed.decision == "uncertain"
+        assert result.choices[0].message.parsed.observed_category == ""
     else:
         with pytest.raises(ValidationError):
             adapter.parse(model="test", messages=messages, response_format=ParsedVerification)
@@ -123,7 +123,7 @@ def test_truncated_output_shares_single_regeneration_budget(tmp_path, monkeypatc
     messages = [{'role': 'user', 'content': 'frozen image evidence'}]
     if recover:
         assert adapter.parse(model='test', messages=messages,
-                             response_format=ParsedVerification).decision == 'uncertain'
+                             response_format=ParsedVerification).observed_category == ''
     else:
         with pytest.raises(LengthFinishReasonError) as caught:
             adapter.parse(model='test', messages=messages, response_format=ParsedVerification)
@@ -149,7 +149,7 @@ def test_doubao_text_keeps_strict_local_validation(tmp_path, monkeypatch, recove
     kwargs = dict(model='doubao-seed-2-0-pro-260215', messages=[{'role':'user','content':'same evidence'}],
                   response_format=ParsedVerification)
     if recover:
-        assert adapter.parse(**kwargs).choices[0].message.parsed.decision == 'uncertain'
+        assert adapter.parse(**kwargs).choices[0].message.parsed.observed_category == ''
     else:
         with pytest.raises(ValidationError):
             adapter.parse(**kwargs)
@@ -285,6 +285,6 @@ def test_tracing_per_call_retry_budget_is_not_forwarded(tmp_path, monkeypatch):
 
     adapter = _TracingParsedCompletions(SimpleNamespace(with_raw_response=SimpleNamespace(parse=request)))
     result = adapter.parse(model='test', messages=[], response_format=ParsedVerification, parse_retries=2)
-    assert result.decision == 'uncertain'
+    assert result.observed_category == ''
     assert len(calls) == 3
     assert all('parse_retries' not in call for call in calls)

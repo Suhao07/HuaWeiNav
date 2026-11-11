@@ -28,6 +28,24 @@ def test_query_preserves_native_snapshot_and_distinct_uids(monkeypatch):
     assert not hasattr(selection.result.obj, "tag")
 
 
+@pytest.mark.parametrize("metadata,eligible", [({}, True), ({"label_probabilities": {}}, False),
+    ({"label_probabilities": {"cup": 1.}}, True)])
+@pytest.mark.parametrize("pinned", [False, True])
+def test_empty_category_posterior_cannot_become_an_exact_candidate(monkeypatch, metadata, eligible, pinned):
+    monkeypatch.setenv("LLM_OFFLINE", "1")
+    obj = ObjectNodeSnapshot("observed", "cup", (1., 0., 0.), 0., metadata=metadata)
+    snapshot = SemanticMapSnapshot(1, Pose3D((0., 0., 0.)), objects=(obj,))
+    plan = InstructionPlan("cup", targets=[TargetQuery("cup", "cup")], valid=True)
+    session = TaskSession(snapshot, plan)
+    if pinned:
+        session.progress.mode = "better_view_for_verified_pair"
+        session.progress.pending_verified_pair = {"candidate_uid": obj.uid, "target_id": "cup"}
+    result = query_scene(session)
+    assert bool(result.candidates) is eligible
+    assert session.snapshot.object_by_uid(obj.uid) is obj
+    assert not session.progress.completed
+
+
 def test_habitat_export_and_native_input_select_same_object(monkeypatch):
     monkeypatch.setenv("LLM_OFFLINE", "1")
     mapper = SimpleNamespace(current_position=[0, 0, 0], objects=[
@@ -65,9 +83,58 @@ def test_candidate_rejects_invalid_box_and_preserves_valid_xyxy():
     assert candidate_from_object(obj).bbox_2d == [1., 2., 3., 4.]
 
 
+@pytest.mark.parametrize("candidate_end", ["subject", "object"])
+def test_relation_lookup_keeps_direction_and_anchor_attributes(monkeypatch, candidate_end):
+    import json
+    from instruction_adapter.verifier import FinalInstructionVerifier
+    from instruction_adapter.constraints import ConstraintEvaluator
+    from planning.mode_policy import is_anchor_first_relation_search
+    from scene.query import anchor_concepts
+    from unittest.mock import Mock
+    from instruction_adapter.semantic_edges import SemanticEdge
+
+    monkeypatch.setenv("LLM_OFFLINE", "1")
+    subject, reference = (("goal", "anchor") if candidate_end == "subject" else ("anchor", "goal"))
+    plan = InstructionPlan("Find the seat with a red carton beneath it", targets=[
+        TargetQuery("goal", "seat"),
+        TargetQuery("anchor", "carton", terminal=False, role="anchor", attributes={"color": "red"})],
+        constraints=[Constraint("spatial", subject=subject, object=reference, relation="under",
+                               value={"source_text": "beneath it", "requirement": "beneath the bound instance"},
+                               hardness="hard", verifier="vlm"),
+                     Constraint("state", subject="anchor", value="open", hardness="hard", verifier="vlm")])
+    objects = (ObjectNodeSnapshot("seat-1", "seat", (0., 0., 0.)),
+               ObjectNodeSnapshot("carton-1", "carton", (.5, 0., 0.)))
+    service = SimpleNamespace(verify=Mock(side_effect=lambda **kw: SemanticEdge(
+        subject_id=kw["subject"]["id"], relation=kw["relation"], object_id=kw["object_"]["id"], verified=True)))
+    session = TaskSession(SemanticMapSnapshot(1, Pose3D((0., 0., 0.)), objects=objects), plan,
+                          constraint_evaluator=ConstraintEvaluator(relation_service=service))
+    target = session.plan.targets[0]
+    assert is_anchor_first_relation_search(plan)
+    assert [c.id for c in anchor_concepts(plan, target)] == ["anchor"]
+    projection = FinalInstructionVerifier._visual_task(plan.as_dict(), {"target_id": "goal"})
+    assert projection["domain_predicates"][0]["subject"] == subject
+    assert projection["referenced_targets"] == [{"id": "anchor", "name": "carton", "attributes": {"color": "red"}}]
+    result = session.constraint_evaluator.evaluate_before_final_verifier(mapper=session, plan=plan,
+        target=target, candidate=candidate_from_object(objects[0]), candidate_obj=objects[0], evidence={})
+    assert result.satisfied
+    request = service.verify.call_args.kwargs
+    expected = ("seat-1", "carton-1") if candidate_end == "subject" else ("carton-1", "seat-1")
+    assert (request["subject"]["id"], request["object_"]["id"]) == expected
+    assert request["relation"] == "under"
+    assert request["predicate"] == {**session.spec.as_dict()["constraints"][0],
+                                    "subject_concept": None, "object_concept": None}
+    assert request["predicate"]["value"] == {
+        "source_text": "beneath it", "requirement": "beneath the bound instance"}
+    anchor = request["object_"] if candidate_end == "subject" else request["subject"]
+    assert anchor["attributes"] == {"color": "red"}
+    assert [(c["id"], c["subject"], c["value"]) for c in anchor["constraints"]] == [("c1", "anchor", "open")]
+    assert json.loads(json.dumps(plan.as_dict()))["concept_queries"][1]["attributes"] == {"color": "red"}
+
+
 def _relation_plan():
     return InstructionPlan("mug on work desk", targets=[
-        TargetQuery("goal", "mug", detector_terms=["container"])], constraints=[
+        TargetQuery("goal", "mug", detector_terms=["container"]),
+        TargetQuery("desk", "work desk", role="anchor", terminal=False, detector_terms=["table"])], constraints=[
         Constraint("spatial", subject="mug", relation="on", object="work desk",
                    hardness="hard", object_concept=ConceptQuery(
                        "desk", "work desk", role="anchor", detector_terms=["table"]))], valid=True)
@@ -100,6 +167,30 @@ def test_target_can_approach_without_unsearched_anchor_but_does_not_complete(mon
                                                 concept=plan.constraints[0].object_concept,
                                                 objects=[anchor])[0]
         assert row.matches_concept is True and not row.terminal_eligible
+
+
+@pytest.mark.parametrize("pin_target", [False, True])
+def test_deferred_terminal_allows_anchor_search_without_semantic_rejection(monkeypatch, pin_target):
+    monkeypatch.setenv("LLM_OFFLINE", "1")
+    target = ObjectNodeSnapshot("target", "mug", (1., 0., 0.), 0.9)
+    anchor = ObjectNodeSnapshot("anchor", "table", (2., 0., 0.), 0.8)
+    session = TaskSession(SemanticMapSnapshot(1, Pose3D((0., 0., 0.)), objects=(target, anchor)), _relation_plan())
+    if pin_target:
+        session.progress.mode = "better_view_for_verified_pair"
+        session.progress.pending_verified_pair = {"candidate_uid": target.uid, "target_id": "goal"}
+    before = deepcopy(session.snapshot), deepcopy(session.progress.as_dict())
+    assert query_scene(session).selected.obj is target
+    result = query_scene(session, deferred_uids={target.uid})
+    assert result.selected.obj is anchor and result.selected.role == "anchor"
+    assert result.skipped_objs == [{"uid": target.uid, "target_id": "goal",
+                                   "skip_reason": "waiting_for_relevant_evidence"}]
+    assert not query_scene(session, deferred_uids={target.uid, anchor.uid}).candidates
+    session.anchor_search_ledger.mark(raw_instruction=session.plan.raw_instruction,
+        concept_id="desk", anchor_uid=anchor.uid, status="searched_no_terminal_found")
+    assert not query_scene(session, deferred_uids={target.uid}).candidates
+    assert query_scene(session).selected.obj is target
+    assert (session.snapshot, session.progress.as_dict()) == before
+    assert not session.verification_ledger.records
 
 
 def test_broad_target_is_unknown_candidate_without_relabeling_unrelated_objects(monkeypatch):
@@ -381,3 +472,187 @@ def test_explicit_objectnav_remains_exact_identity_not_a_destination_hypothesis(
     assert session.destination_hypotheses == []
     assert not session.progress.completed
     assert (session.spec.as_dict(), session.plan.as_dict(), session.progress.as_dict()) == before
+
+
+def _evaluate_relation_precheck(session, evidence=None):
+    obj = session.objects[0]
+    return session.constraint_evaluator.evaluate_before_final_verifier(
+        mapper=session, plan=session.plan, target=session.plan.targets[0],
+        candidate=candidate_from_object(obj), candidate_obj=obj, evidence=evidence or {})
+
+
+@pytest.mark.parametrize("candidate_end", ["subject", "object"])
+@pytest.mark.parametrize("status", ["missing_anchor", "rejected_relation", "insufficient_evidence", "verified"])
+def test_relation_precheck_outcomes_preserve_direction_and_verdict(monkeypatch, tmp_path, candidate_end, status):
+    from unittest.mock import Mock
+    from PIL import Image
+    from instruction_adapter.constraints import ConstraintEvaluator
+    from instruction_adapter.relation_verifier import DynamicRelationService
+    from instruction_adapter.verifier import instruction_hash
+    from task.reducer import apply_verification
+
+    monkeypatch.setenv("LLM_OFFLINE", "1")
+    plan = _relation_plan()
+    if candidate_end == "object":
+        plan.constraints[0].subject, plan.constraints[0].object = "work desk", "mug"
+    target = ObjectNodeSnapshot("mug-1", "mug", (0., 0., 0.))
+    anchor = ObjectNodeSnapshot("desk-1", "work desk", (0., 0., 0.))
+    objects = (target,) if status == "missing_anchor" else (target, anchor)
+    service = DynamicRelationService()
+    service.vlm_callback = Mock(return_value={
+        "verified": status == "verified", "confidence": 0.83, "reason": "Scripted pair judgment."})
+    service.verify = Mock(wraps=service.verify)
+    session = TaskSession(SemanticMapSnapshot(1, Pose3D((0., 0., 0.)), objects=objects), plan,
+                          constraint_evaluator=ConstraintEvaluator(relation_service=service))
+    session.constraint_evaluator.register_mapper_objects(mapper=session)
+    evidence = {}
+    view_ids = []
+    if status in ("rejected_relation", "verified"):
+        frame = tmp_path / "shared.png"
+        Image.new("RGB", (40, 40), "white").save(frame)
+        view_ids = ["shared-view"]
+        evidence = {"observation_images": [{
+            "id": view_ids[0], "rgb_path": str(frame), "observed_object_uids": [target.uid, anchor.uid],
+            "object_boxes": {target.uid: [0, 0, 20, 20], anchor.uid: [20, 20, 40, 40]},
+        }]}
+    evaluation = _evaluate_relation_precheck(session, evidence)
+    subject, reference = ("goal", "desk") if candidate_end == "subject" else ("desk", "goal")
+    anchor_uid = "" if status == "missing_anchor" else anchor.uid
+    assert evaluation.relation_outcomes == [{
+        "predicate_id": "c0", "subject_id": subject, "object_id": reference,
+        "candidate_uid": target.uid, "anchor_concept_id": "desk", "anchor_uid": anchor_uid,
+        "relation": "on", "status": status, "evidence_view_ids": view_ids,
+        "reason": ("Anchor object has not been observed yet." if status == "missing_anchor" else
+                   "No shared instance-bound observation is available." if status == "insufficient_evidence" else
+                   "Scripted pair judgment."),
+    }]
+    decision = ("pass" if status == "verified" else
+                "reject_relation" if status == "rejected_relation" else "need_relation_check")
+    result = evaluation.to_verification_result(session.spec.revision, target.uid)
+    assert result.decision == evaluation.decision == decision
+    assert result.confidence == evaluation.confidence
+    assert result.satisfied == evaluation.satisfied == (status == "verified")
+    assert result.satisfied_constraints == evaluation.satisfied_constraints
+    assert result.failed_constraints == evaluation.failed_constraints
+    assert result.reason == evaluation.reason
+    assert result.diagnostics == {"constraint_eval": evaluation.as_dict()}
+    assert result.view_objective == {"relation_outcomes": evaluation.relation_outcomes}
+    assert (result.task_revision, result.target_uid) == (session.spec.revision, target.uid)
+    from scene.dependencies import object_dependencies
+    assert result.dependencies == object_dependencies(session.snapshot, target.uid, anchor_uid)
+    assert result.predicate_id == ("final_stop" if status == "verified" else "c0")
+    assert result.anchor_uid == ("" if status == "verified" else anchor_uid)
+    assert not result.accepted
+    assert result.verdict == ("false" if status == "rejected_relation" else "unknown")
+    assert service.vlm_callback.call_count == (1 if view_ids else 0)
+    if status == "missing_anchor":
+        service.verify.assert_not_called()
+    else:
+        service.verify.assert_called_once()
+        request = service.verify.call_args.kwargs
+        pair = (target.uid, anchor.uid) if candidate_end == "subject" else (anchor.uid, target.uid)
+        assert (request["subject"]["id"], request["object_"]["id"]) == pair
+        record = session.relation_pair_ledger.get(instruction_hash(plan.raw_instruction), pair[0], "on", pair[1])
+        assert record.status == {"verified": "accepted_relation", "rejected_relation": "rejected_relation",
+                                 "insufficient_evidence": "unknown"}[status]
+    if status == "rejected_relation":
+        record = session.verification_ledger.put(plan.raw_instruction, target.uid, result)
+        assert record.verdict == "false" and record.status == "rejected_soft"
+        assert (record.predicate_id, record.anchor_uid) == ("c0", anchor.uid)
+        assert not session.verification_ledger.is_hard_rejected(plan.raw_instruction, target.uid)
+        assert not apply_verification(session.progress, session.spec.targets[0], candidate_from_object(target), result, evidence)
+        assert not session.progress.target_progress["goal"].rejected_candidate_uids
+        assert query_scene(session).selected.obj is target
+
+
+def test_relation_precheck_keeps_all_predicates_and_conflicting_false(monkeypatch):
+    from unittest.mock import Mock
+    from instruction_adapter.constraints import ConstraintEvaluator
+    from instruction_adapter.semantic_edges import SemanticEdge
+
+    monkeypatch.setenv("LLM_OFFLINE", "1")
+    statuses = ["rejected_relation", "missing_anchor", "insufficient_evidence", "verified"]
+    labels = ["desk", "shelf", "tray", "lamp"]
+    target = ObjectNodeSnapshot("mug-1", "mug", (0., 0., 0.))
+    anchors = [ObjectNodeSnapshot(f"anchor-{i}", label, (0., 0., 0.)) for i, label in enumerate(labels)]
+    plan = InstructionPlan("mug near the desk, shelf, tray and lamp", targets=[TargetQuery("goal", "mug"), *[
+        TargetQuery(f"ref-{i}", label, role="anchor", terminal=False) for i, label in enumerate(labels)]],
+        constraints=[Constraint("spatial", subject="goal", object=f"ref-{i}", relation="near", hardness="hard")
+                     for i in range(len(labels))], valid=True)
+    service = SimpleNamespace(verify=Mock(side_effect=lambda **kw: SemanticEdge(
+        subject_id=kw["subject"]["id"], relation=kw["relation"], object_id=kw["object_"]["id"],
+        verified=kw["object_"]["id"] == "anchor-3", need_better_view=kw["object_"]["id"] == "anchor-2",
+        confidence=0.8, evidence_view_ids=[f"view-{kw['object_']['id']}"], reason="Scripted pair judgment.")))
+    session = TaskSession(SemanticMapSnapshot(1, Pose3D((0., 0., 0.)),
+                          objects=(target, anchors[0], anchors[2], anchors[3])), plan,
+                          constraint_evaluator=ConstraintEvaluator(relation_service=service))
+    evaluation = _evaluate_relation_precheck(session)
+    outcomes = evaluation.relation_outcomes
+    assert [row["status"] for row in outcomes] == statuses
+    assert [row["predicate_id"] for row in outcomes] == [f"c{i}" for i in range(4)]
+    assert [row["object_id"] for row in outcomes] == [f"ref-{i}" for i in range(4)]
+    assert [row["anchor_concept_id"] for row in outcomes] == [f"ref-{i}" for i in range(4)]
+    assert [row["anchor_uid"] for row in outcomes] == ["anchor-0", "", "anchor-2", "anchor-3"]
+    assert all(row["subject_id"] == "goal" and row["candidate_uid"] == target.uid for row in outcomes)
+    assert [row["evidence_view_ids"] for row in outcomes] == [["view-anchor-0"], [], ["view-anchor-2"], ["view-anchor-3"]]
+    assert len(evaluation.failed_constraints) == 3 and len(evaluation.satisfied_constraints) == 1
+    result = evaluation.to_verification_result(session.spec.revision, target.uid)
+    assert result.decision == evaluation.decision == "reject_relation"
+    assert result.verdict == "false" and result.confidence == 0.8
+    assert (result.predicate_id, result.anchor_uid) == ("final_stop", "")
+    assert result.view_objective == {"relation_outcomes": outcomes}
+    assert result.diagnostics["constraint_eval"]["relation_outcomes"] == outcomes
+    assert service.verify.call_count == 3
+
+
+@pytest.mark.parametrize("second_status", ["verified", "insufficient_evidence", "rejected_relation"])
+def test_relation_precheck_keeps_alternative_pairs_without_candidate_rejection(monkeypatch, second_status):
+    from unittest.mock import Mock
+    from instruction_adapter.constraints import ConstraintEvaluator
+    from instruction_adapter.semantic_edges import SemanticEdge
+    from task.reducer import apply_verification
+
+    monkeypatch.setenv("LLM_OFFLINE", "1")
+    objects = (ObjectNodeSnapshot("mug-1", "mug", (0., 0., 0.)), *[
+        ObjectNodeSnapshot(uid, "work desk", (0., 0., 0.)) for uid in ("desk-1", "desk-2")])
+    service = SimpleNamespace(verify=Mock(side_effect=lambda **kw: SemanticEdge(
+        subject_id=kw["subject"]["id"], relation=kw["relation"], object_id=kw["object_"]["id"],
+        verified=kw["object_"]["id"] == "desk-2" and second_status == "verified",
+        need_better_view=kw["object_"]["id"] == "desk-2" and second_status == "insufficient_evidence")))
+    session = TaskSession(SemanticMapSnapshot(1, Pose3D((0., 0., 0.)), objects=objects), _relation_plan(),
+                          constraint_evaluator=ConstraintEvaluator(relation_service=service))
+    evaluation = _evaluate_relation_precheck(session)
+    assert [row["status"] for row in evaluation.relation_outcomes] == ["rejected_relation", second_status]
+    assert [row["anchor_uid"] for row in evaluation.relation_outcomes] == ["desk-1", "desk-2"]
+    assert [row["predicate_id"] for row in evaluation.relation_outcomes] == ["c0", "c0"]
+    result = evaluation.to_verification_result(session.spec.revision, objects[0].uid)
+    assert result.decision == {"verified": "pass", "insufficient_evidence": "need_relation_check",
+                               "rejected_relation": "reject_relation"}[second_status]
+    assert (result.predicate_id, result.anchor_uid) == ("final_stop", "")
+    assert result.view_objective["relation_outcomes"] == evaluation.relation_outcomes
+    session.verification_ledger.put(session.plan.raw_instruction, objects[0].uid, result)
+    assert not session.verification_ledger.is_hard_rejected(session.plan.raw_instruction, objects[0].uid)
+    assert not apply_verification(session.progress, session.spec.targets[0], candidate_from_object(objects[0]), result, {})
+    assert not session.progress.target_progress["goal"].rejected_candidate_uids
+    assert query_scene(session).selected.obj is objects[0]
+    assert service.verify.call_count == 2
+
+
+def test_relation_precheck_without_evaluated_pairs_remains_unknown(monkeypatch):
+    from unittest.mock import Mock
+    from instruction_adapter.constraints import ConstraintEvaluator
+
+    monkeypatch.setenv("LLM_OFFLINE", "1")
+    objects = (ObjectNodeSnapshot("mug-1", "mug", (0., 0., 0.)),
+               ObjectNodeSnapshot("desk-1", "work desk", (0., 0., 0.)))
+    service = SimpleNamespace(verify=Mock(side_effect=AssertionError("Identity-rejected pair must not invoke VLM")))
+    session = TaskSession(SemanticMapSnapshot(1, Pose3D((0., 0., 0.)), objects=objects), _relation_plan(),
+                          constraint_evaluator=ConstraintEvaluator(relation_service=service))
+    session.constraint_evaluator.record_identity(session.plan.raw_instruction, session.plan.targets[0].concept_query(),
+        {"instance_id": objects[0].uid, "verdict": "false", "source_crop_sha256": [], "reason": "Not a mug."}, 0.9)
+    evaluation = _evaluate_relation_precheck(session)
+    assert evaluation.decision == "need_relation_check" and evaluation.relation_edges == []
+    assert evaluation.relation_outcomes[0]["status"] == "insufficient_evidence"
+    assert evaluation.relation_outcomes[0]["anchor_uid"] == ""
+    assert evaluation.to_verification_result(session.spec.revision, objects[0].uid).verdict == "unknown"
+    service.verify.assert_not_called()

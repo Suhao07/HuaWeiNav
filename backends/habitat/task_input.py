@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from instruction.contracts import RELATION_CONSTRAINT_TYPES
 from instruction_adapter.contracts import Constraint, ExecutionPolicy, InstructionPlan, SearchPriors, TargetQuery
 from instruction_adapter.ontology import dedupe_terms, normalize_term
 
@@ -62,8 +63,8 @@ def _constraints_from_complex(value: Any) -> list[Constraint]:
         if not isinstance(item, dict):
             continue
         relation = normalize_term(item.get("relation") or item.get("predicate") or item.get("type"))
-        subject = normalize_term(item.get("subject") or item.get("target") or item.get("source"))
-        obj = normalize_term(item.get("object") or item.get("anchor") or item.get("reference"))
+        subject = str(item.get("subject") or item.get("target") or item.get("source") or "")
+        obj = str(item.get("object") or item.get("anchor") or item.get("reference") or "")
         if relation and (subject or obj):
             constraints.append(
                 Constraint(
@@ -87,7 +88,7 @@ def _constraints_from_complex(value: Any) -> list[Constraint]:
     for item in _as_list(attribute_items):
         if not isinstance(item, dict):
             continue
-        subject = normalize_term(item.get("subject") or item.get("target") or item.get("object"))
+        subject = str(item.get("subject") or item.get("target") or item.get("object") or "")
         attrs = item.get("attributes", item.get("value", {}))
         if subject or attrs:
             constraints.append(
@@ -105,7 +106,7 @@ def _constraints_from_complex(value: Any) -> list[Constraint]:
     room_items = value.get("rooms") or value.get("room_constraints") or []
     for item in _as_list(room_items):
         if isinstance(item, dict):
-            subject = normalize_term(item.get("subject") or item.get("target") or item.get("object"))
+            subject = str(item.get("subject") or item.get("target") or item.get("object") or "")
             room = normalize_term(item.get("room") or item.get("value") or item.get("name"))
         else:
             subject = ""
@@ -265,6 +266,20 @@ def plan_from_episode_info(
 
     constraints.extend(_constraints_from_complex(info.get("complex_constraints", {})))
     constraints.extend(_constraints_from_complex(contract.get("complex_constraints", {})))
+
+    # Metadata relation fields explicitly declare their reference entities, unlike
+    # a language interpretation with a missing TargetSpec. Materialize them here,
+    # before strict semantic admission; never infer targets from detector hints.
+    for constraint in constraints:
+        if constraint.type not in RELATION_CONSTRAINT_TYPES or not normalize_term(constraint.object):
+            continue
+        if any(constraint.object == target.id or normalize_term(constraint.object) in {
+                normalize_term(name) for name in (target.name, *target.aliases)} for target in targets):
+            continue
+        name = normalize_term(constraint.object)
+        targets.append(TargetQuery(id=_target_id(name, len(targets)), name=name,
+                                   role="anchor", terminal=False, aliases=[name],
+                                   detector_terms=[name], source=constraint.source))
 
     terminal_targets = [target for target in targets if target.terminal]
     if len(terminal_targets) > 1 and execution.ordered:

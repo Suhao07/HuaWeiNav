@@ -199,12 +199,20 @@ class AgentRuntime:
             "copy basis_ids from search_context.basis and cite only supplied evidence. "
             "interpretation_update proposes a complete corrected instruction structure, with a reason "
             "and basis_ids including instruction. Preserve every explicit requirement; do not alter "
-            "the request to fit scene convenience. Submit only one revision type, or [] and null. "
+            "the request to fit scene convenience. Preserve target and constraint IDs for the same "
+            "entities and requirements; bind relation endpoints to those IDs. "
+            "Submit only one revision type, or [] and null. "
             "In tool mode pair a revision only with observe or query_scene. A changed interpretation "
             "is compiled and installed in this decision turn; read its result and reselect before executing. "
             "An invalid interpretation retains the current task and is not an instance rejection.\n\n"
             + self.skill_content
         )
+        if tools.session.interpretation_locked:
+            self.decision_context += (
+                "\n\nFrozen task override: the task contract is fixed. Disregard interpretation "
+                "revision instructions above; interpretation_update must be null. "
+                "Only retrieval revision through search_updates is allowed."
+            )
         contracts = "\n".join(
             f"{name}{inspect.signature(getattr(tools, name))}: {getattr(tools, name).__doc__}"
             for name in tools.names
@@ -352,10 +360,13 @@ class AgentRuntime:
         update_type = create_model("ScopedSearchUpdate", __base__=SearchUpdate,
             concept_id=(Literal[tuple(item["id"] for item in context["concepts"])], ...),
             basis_ids=(list[Literal[tuple(context["basis"])]], Field(min_length=1)))
-        interpretation_type = create_model("ScopedInterpretationUpdate", __base__=InterpretationUpdate,
-            basis_ids=(list[Literal[tuple(context["basis"])]], Field(min_length=1)))
+        interpretation_field = (type(None), None)
+        if not self.tools.session.interpretation_locked:
+            interpretation_type = create_model("ScopedInterpretationUpdate", __base__=InterpretationUpdate,
+                basis_ids=(list[Literal[tuple(context["basis"])]], Field(min_length=1)))
+            interpretation_field = (Union[interpretation_type, None], None)
         return create_model(name, __base__=base, **fields,
-            interpretation_update=(Union[interpretation_type, None], None),
+            interpretation_update=interpretation_field,
             search_updates=(list[update_type], Field(default_factory=list,
                                                     max_length=len(context["concepts"]))))
 
@@ -400,6 +411,8 @@ class AgentRuntime:
         return None, updates
 
     def _apply_interpretation(self, update, source_snapshot, messages):
+        if self.tools.session.interpretation_locked:
+            raise ValueError("Task interpretation is locked; only search revisions are allowed")
         from instruction.compiler import compile_parsed_instruction
         from instruction.contracts import interpretation_changes
         from instruction_adapter.compiler import RUNTIME_CONSTRAINT_TYPES

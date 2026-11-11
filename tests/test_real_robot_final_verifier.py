@@ -1,4 +1,4 @@
-"""Robot evidence reaches the shared visual protocol with capture-owned identity."""
+"""Scripted robot evidence contracts with capture-owned identity, not real VLM ability."""
 import base64
 import json
 from types import SimpleNamespace
@@ -17,7 +17,7 @@ def _context():
         "target_id": "table",
         "candidate_instance": CandidateInstance("object-2", "predicted-label", bbox_2d=[90, 90, 99, 99]),
         "instruction_plan": {"diagnostics": {"task_spec": {
-            "revision": 7,
+            "raw_instruction": "find a chair then a table", "revision": 7, "constraints": [],
             "targets": [{"id": "chair", "name": "chair"}, {"id": "table", "name": "table"}],
         }}},
         "verifier_evidence": {"geometry": {"distance_to_target": 2.0, "bbox_xyxy": [90, 90, 99, 99]},
@@ -31,7 +31,10 @@ def _evidence(path):
                         bbox_xyxy=(1, 2, 3, 4), target_object_uid="object-2")
 
 
-def test_robot_capture_reaches_visual_model_and_keeps_domain_stop_independent(tmp_path, monkeypatch):
+@pytest.mark.parametrize("visible_context", [
+    [], ["A stove and sink stand beside the table on continuous flooring, with no intervening doorway."],
+])
+def test_robot_capture_reaches_visual_model_and_keeps_domain_stop_independent(tmp_path, monkeypatch, visible_context):
     import instruction_adapter.verifier as module
     image = tmp_path / "capture.png"
     # A valid one-pixel PNG: exact encoded capture bytes are preserved by image_input.
@@ -40,9 +43,23 @@ def test_robot_capture_reaches_visual_model_and_keeps_domain_stop_independent(tm
     requests = []
     def parse(**kwargs):
         requests.append(kwargs)
-        from prompting.schemas import ParsedVerification
-        verdict = ParsedVerification(decision="accept", satisfied=True, semantic_satisfied=True,
-                                  view_sufficient_for_stop=True, confidence=1.0)
+        content = kwargs["messages"][1]["content"]
+        assert kwargs["parse_retries"] == 0
+        if kwargs["trace_label"] == "instance_observer":
+            current_id = json.loads(content[0]["text"])["observation_identity"]["observation_id"]
+            verdict = kwargs["response_format"](observations={current_id: {
+                "observed_category": "table", "visible_parts": ["flat top", "legs"],
+                "support_and_attachment": "Legs on the floor.", "visible_surface_content": "",
+                "visible_context": visible_context, "uncertainties": []}})
+        else:
+            assert kwargs["trace_label"] == "final_instruction_verifier"
+            assert all(item["type"] == "text" for item in content)
+            bound = json.loads(content[1]["text"])["bound_observations"]
+            current_id = next(uid for uid, record in bound.items() if record["current"])
+            verdict = kwargs["response_format"](observed_category="invented desk", observed_structure="Invented drawers.",
+                confidence=1.0, predicate_judgments={"candidate_identity": {
+                    "verdict": "true", "reason": "This bound region shows a table.",
+                    "supporting_observation_ids": [current_id]}})
         return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(parsed=verdict))])
     client = SimpleNamespace(beta=SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(parse=parse))))
     monkeypatch.setattr(module, "get_client_and_model", lambda _: (client, "stub"))
@@ -50,17 +67,37 @@ def test_robot_capture_reaches_visual_model_and_keeps_domain_stop_independent(tm
     monkeypatch.setenv("LLM_OFFLINE", "0")
     adapter = FinalInstructionVerifierAdapter(FinalInstructionVerifier(evidence_dir=str(tmp_path / "images")))
     result = adapter.verify(_evidence(image), _context())
-    content = requests[0]["messages"][1]["content"]
-    task = json.loads(content[0]["text"])
+    assert [request["trace_label"] for request in requests] == [
+        "instance_observer", "final_instruction_verifier"]
+    observer, final = requests
+    content = observer["messages"][1]["content"]
+    task = json.loads(final["messages"][1]["content"][0]["text"])
     assert task["task"]["active_target"]["id"] == "table"
-    binding = json.loads(content[1]["text"])
+    assert task["raw_instruction"] == _context()["raw_instruction"]
+    assert "find a chair then a table" not in json.dumps(observer["messages"])
+    binding = json.loads(content[0]["text"])
     assert binding["bbox_xyxy_in_this_image"] == [1, 2, 3, 4]
     assert binding["observation_identity"]["candidate_uid"] == "object-2"
     assert binding["observation_identity"]["task_revision"] == 7
     assert binding["observation_identity"]["pose"]["stamp"] == 12.5
-    assert base64.b64decode(content[2]["image_url"]["url"].split(",", 1)[1]) == data
+    assert base64.b64decode(content[1]["image_url"]["url"].split(",", 1)[1]) == data
     assert "predicted-label" not in json.dumps(content)
     assert "distance_to_target" not in json.dumps(content)
+    final_content = final["messages"][1]["content"]
+    assert all(item["type"] == "text" for item in final_content)
+    bound = json.loads(final_content[1]["text"])["bound_observations"]
+    record = bound[binding["observation_identity"]["observation_id"]]
+    assert record["observation_identity"] == binding["observation_identity"]
+    assert record["images"][0]["bbox_xyxy"] == [1, 2, 3, 4]
+    assert record["images"][0]["image_sha256"] == binding["image_sha256"]
+    assert record["facts"] == {
+        "observed_category": "table", "visible_parts": ["flat top", "legs"],
+        "support_and_attachment": "Legs on the floor.", "visible_surface_content": "",
+        "visible_context": visible_context, "uncertainties": []}
+    assert record["current"] is True
+    assert result["diagnostics"]["bound_observations"] == bound
+    assert result["observed_category"] == "table"
+    assert result["diagnostics"]["observed_structure"] == "flat top, legs; Legs on the floor."
     assert result["satisfied"] is False
     assert result["hard_constraints"]["satisfied"] is False
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from instruction.contracts import RELATION_CONSTRAINT_TYPES, resolve_target_reference
 from instruction_adapter.ontology import normalize_term
 from scene.contracts import ObjectNodeSnapshot, SemanticMapSnapshot
 
@@ -54,14 +55,17 @@ def anchor_concepts(plan, target=None):
     values = []
     if target is None:
         values.extend(t.concept_query() for t in plan.anchor_targets)
-    terms = set() if target is None else {normalize_term(x) for x in [target.id, *target.match_terms]}
     for constraint in plan.constraints:
-        if target is not None:
-            if normalize_term(constraint.type) not in {"spatial", "relation", "object relation", "co occurrence"}:
-                continue
-            if constraint.subject and normalize_term(constraint.subject) not in terms:
-                continue
-        concept = constraint.object_concept
+        if normalize_term(constraint.type) not in RELATION_CONSTRAINT_TYPES:
+            continue
+        subject = resolve_target_reference(plan.targets, constraint.subject, predicate_id="anchor query", field="subject")
+        reference = resolve_target_reference(plan.targets, constraint.object, predicate_id="anchor query", field="object")
+        if target is None or subject == target.id:
+            concept = constraint.object_concept
+        elif reference == target.id:
+            concept = constraint.subject_concept
+        else:
+            continue
         if concept is not None and not concept.terminal:
             values.append(concept)
     return list({c.id: c for c in values}.values())
@@ -69,7 +73,7 @@ def anchor_concepts(plan, target=None):
 
 def query_candidates(plan, progress, snapshot: SemanticMapSnapshot, evidence, *,
                      matcher, anchor_ledger, step=None, prior_adapter=None,
-                     prior_result=None) -> CandidateSet:
+                     prior_result=None, deferred_uids=()) -> CandidateSet:
     """Query fixed observations without changing map labels or task progress.
 
     Args:
@@ -85,7 +89,8 @@ def query_candidates(plan, progress, snapshot: SemanticMapSnapshot, evidence, *,
     """
     result = CandidateSet()
     raw = plan.raw_instruction
-    objects = tuple(snapshot.objects)
+    objects = tuple(obj for obj in snapshot.objects
+                    if obj.metadata.get("label_probabilities") != {})
     terminals = ([t for t in plan.terminal_targets if t.id == progress.active_target().id]
                  if progress.task.ordered else plan.terminal_targets)
     terminals = [t for t in terminals if t is not None]
@@ -105,7 +110,8 @@ def query_candidates(plan, progress, snapshot: SemanticMapSnapshot, evidence, *,
     pinned = pending.get("candidate_uid") if progress.mode == "better_view_for_verified_pair" else None
     pinned_target = next((t for t in terminals if t.id == pending.get("target_id")), None)
     pinned_obj = snapshot.object_by_uid(pinned) if pinned else None
-    if pinned_obj is not None and pinned_target is not None and not evidence.is_hard_rejected(raw, pinned_obj.uid):
+    if (pinned_obj is not None and pinned_target is not None and pinned_obj.uid not in deferred_uids
+            and not evidence.is_hard_rejected(raw, pinned_obj.uid)):
         row = records(pinned_target.concept_query()).get(pinned_obj.uid)
         if row is not None and row.candidate_eligible:
             result.candidates.append(CandidateMatch(pinned_obj, pinned_target.id, pinned_target.name,
@@ -126,6 +132,8 @@ def query_candidates(plan, progress, snapshot: SemanticMapSnapshot, evidence, *,
                 reason = "already_counted_instance"
             elif evidence.is_hard_rejected(raw, obj.uid):
                 reason = "rejected_instance"
+            elif obj.uid in deferred_uids:
+                reason = "waiting_for_relevant_evidence"
             if reason:
                 result.skipped_objs.append({"uid": obj.uid, "target_id": target.id, "skip_reason": reason})
                 continue
@@ -146,7 +154,8 @@ def query_candidates(plan, progress, snapshot: SemanticMapSnapshot, evidence, *,
         rows = records(concept)
         for obj in objects:
             row = rows.get(obj.uid)
-            if row is not None and row.candidate_eligible and not anchor_ledger.is_blocked(raw, concept.id, obj.uid):
+            if (row is not None and row.candidate_eligible and obj.uid not in deferred_uids
+                    and not anchor_ledger.is_blocked(raw, concept.id, obj.uid)):
                 result.candidates.append(CandidateMatch(obj, concept.id, concept.name, "anchor", row.confidence, row.as_dict()))
     result.candidates.sort(key=lambda c: c.confidence, reverse=True)
     result.reason = "Search from a relation anchor" if result.candidates else "No eligible observed candidate"

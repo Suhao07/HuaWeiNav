@@ -166,9 +166,12 @@ def test_constraint_anchor_grounding_preserves_original_semantics(monkeypatch, p
     monkeypatch.setattr(detector_adapter, "_llm_ground_terms", proposal)
     original = ConceptQuery("desk", "work desk", role="anchor", aliases=["writing desk"],
                             description="The desk used for writing.", negative_terms=["dining table"])
-    plan = InstructionPlan("mug on work desk", targets=[TargetQuery("mug", "mug")],
-                           constraints=[Constraint("spatial", subject="mug", object="work desk",
-                                                   object_concept=original if preexisting else None)])
+    plan = InstructionPlan("mug on work desk", targets=[TargetQuery("mug", "mug"),
+        TargetQuery("desk", "work desk", role="anchor", terminal=False,
+                    aliases=original.aliases if preexisting else ["work desk"],
+                    concept=original if preexisting else None)],
+        constraints=[Constraint("spatial", subject="mug", object="work desk",
+                                object_concept=original if preexisting else None)])
     detector_adapter.ground_plan(plan, available, use_legacy_similarity_fallback=False)
     if available:
         proposal.assert_called_once()
@@ -177,7 +180,8 @@ def test_constraint_anchor_grounding_preserves_original_semantics(monkeypatch, p
     anchor = plan.constraints[0].object_concept
     assert anchor.role == "anchor" and not anchor.terminal
     assert anchor.name == "work desk"
-    assert anchor.detector_terms == (["table"] if available else ["work desk"])
+    assert anchor.detector_terms == (["table"] if available else
+                                     ["work desk", "writing desk"] if preexisting else ["work desk"])
     assert anchor.aliases == (original.aliases if preexisting else ["work desk"])
     assert anchor.description == (original.description if preexisting else "")
     assert anchor.negative_terms == (original.negative_terms if preexisting else [])
@@ -191,9 +195,12 @@ def test_constraint_reference_does_not_bind_target_by_broad_detector_label(monke
     plan = InstructionPlan("workbench near table", targets=[
         TargetQuery("goal", "workbench", detector_terms=["table"])], constraints=[
         Constraint("spatial", subject="workbench", object="table")])
+    with pytest.raises(ValueError, match="c0.*object.*unbound"):
+        detector_adapter.ground_plan(plan, ["table"])
+    plan.targets.append(TargetQuery("anchor", "table", role="anchor", terminal=False))
     detector_adapter.ground_plan(plan, ["table"])
-    assert plan.constraints[0].object_concept.id != "goal"
-    assert plan.constraints[0].object_concept.name == "table"
+    assert plan.constraints[0].object == "anchor"
+    assert plan.constraints[0].object_concept.id == "anchor"
     assert plan.constraints[0].subject_concept is plan.targets[0].concept
 
 
@@ -203,7 +210,8 @@ def test_similarity_extension_updates_all_concept_views_without_alias_pollution(
         ask_gpt_similar_objects=lambda *args: ["container"]))
     monkeypatch.setattr(detector_adapter, "_llm_ground_terms", lambda *args:
                         GroundingResult(detector_terms=["table"]))
-    plan = InstructionPlan("mug on table", targets=[TargetQuery("mug", "mug")],
+    plan = InstructionPlan("mug on table", targets=[TargetQuery("mug", "mug"),
+        TargetQuery("reference", "table", role="anchor", terminal=False)],
                            constraints=[Constraint("spatial", subject="mug", object="table")])
     detector_adapter.ground_plan(plan, ["mug", "container", "table"])
     target = plan.targets[0]
@@ -238,25 +246,31 @@ def test_empty_vocabulary_runtime_grounding_never_requests_model(monkeypatch, an
     # 关闭离线保护，确保空词表本身阻止模型调用。
     monkeypatch.setenv("LLM_OFFLINE", "0")
     result = compile_parsed_instruction(
-        "Find two clean writing surfaces near the work desk and lamp.",
+        "Find every clean writing surface near the work desk and near the lamp "
+        "for writing in my notebook; visit at least two in order.",
         ParsedInstruction.model_validate({
             "targets": [
-                {"name": "writing surface", "aliases": ["work surface"], "min_count": 2,
+                {"id": "surface", "name": "writing surface", "aliases": ["work surface"], "min_count": 2,
                  "attributes": {"state": "clean"}, "demand": {
                      "activity": "write", "manipulated_objects": ["notebook"],
                      "required_resource": "usable surface", "destination_hypotheses": ["table"]}},
-                {"name": "lamp", "aliases": ["desk light"], "role": "anchor", "terminal": False},
+                {"id": "lamp", "name": "lamp", "aliases": ["desk light"], "role": "anchor", "terminal": False},
+                {"id": "desk", "name": "work desk", "aliases": ["work desk"], "role": "anchor", "terminal": False},
             ],
             "constraints": [
-                {"type": "relation", "subject": "writing surface", "relation": "near",
+                {"id": "near-desk", "type": "relation", "subject": "writing surface", "relation": "near",
                  anchor_field: "work desk", "hardness": "hard"},
-                {"type": "relation", "subject": "writing surface", "relation": "near",
+                {"id": "near-lamp", "type": "relation", "subject": "writing surface", "relation": "near",
                  "object": "desk light", "hardness": "hard"},
             ],
             "ordered": True, "exhaustive": True,
         }),
         {"relation", "affordance"}, revision=4,
     )
+    if anchor_field == "value":
+        assert result.status == "invalid" and "object: missing" in result.diagnostics[0]
+        forbidden.assert_not_called()
+        return
     assert result.status == "success", result.diagnostics
     task = result.task
     before = task.as_dict()
@@ -265,8 +279,10 @@ def test_empty_vocabulary_runtime_grounding_never_requests_model(monkeypatch, an
     )
     forbidden.assert_not_called()
     assert plan.valid and plan.raw_instruction == task.raw_instruction
+    assert plan.diagnostics["task_spec"] == before
+    assert [constraint.id for constraint in plan.constraints] == ["near-desk", "near-lamp", "demand:surface"]
     assert plan.execution.ordered and plan.execution.exhaustive
-    target, explicit_anchor = plan.targets
+    target, explicit_anchor, desk = plan.targets
     assert target.min_count == 2 and target.attributes == {"state": "clean"}
     assert target.demand == before["targets"][0]["demand"]
     assert target.detector_terms == ["writing surface", "work surface", "table"]

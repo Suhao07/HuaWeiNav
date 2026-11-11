@@ -52,7 +52,7 @@ class Verifier:
                                   task_revision=1, target_uid=candidate.uid)
 
 
-def make_tools(monkeypatch):
+def make_tools(monkeypatch, *, interpretation_locked=False):
     monkeypatch.setenv("LLM_OFFLINE", "1")
     task = TaskSpec("find cup", (TargetSpec("cup", "cup"),))
     snapshot = SemanticMapSnapshot(
@@ -60,7 +60,7 @@ def make_tools(monkeypatch):
         objects=(ObjectNodeSnapshot("cup-1", "cup", (2, 0, 0), visible_viewpoints=("view-1",)),),
         viewpoints=(ViewpointSnapshot("view-1", Pose3D((1, 0, 0))),),
     )
-    session = TaskSession(snapshot, runtime_plan(task))
+    session = TaskSession(snapshot, runtime_plan(task), interpretation_locked=interpretation_locked)
     owner = MotionSupervisor(Controller())
     return NavigationTools(session, owner, Verifier(), lambda uid: {"arrival_frame": "frame-1"})
 
@@ -99,6 +99,8 @@ def test_tool_loop_moves_verifies_and_finishes_from_domain_state(monkeypatch, tm
     client_model, requests = model_calls([tool_call(name=n, arguments=a, reason="replay") for n, a in specs])
     trace = tmp_path / "events.jsonl"
     runtime = AgentRuntime(tools, trace, max_model_calls=len(specs), client_model=client_model)
+    assert tools.session.interpretation_locked is False
+    assert "Frozen task override" not in runtime.system_prompt
     from prompting import templates
     # Check model-facing instructions; task inputs may remain multilingual.
     prompt_texts = [runtime.system_prompt, json.dumps(ToolCall.schema(), ensure_ascii=False)]
@@ -384,7 +386,7 @@ def test_skill_loading_uses_utf8_after_native_locale_change(tmp_path):
     try:
         locale.setlocale(locale.LC_CTYPE, 'C')
         runtime = AgentRuntime(SimpleNamespace(names=(), session=SimpleNamespace(
-            plan=SimpleNamespace(diagnostics={}))), tmp_path/'trace.jsonl',
+            plan=SimpleNamespace(diagnostics={}), interpretation_locked=False)), tmp_path/'trace.jsonl',
                                client_model=(object(), 'mock'))
         assert 'Return one ToolCall' in runtime.system_prompt
         assert len(runtime.system_prompt) > 500
@@ -667,7 +669,9 @@ def search_payload(mode, terms, *, concept_id="resource", basis_ids=None):
 
 
 @pytest.mark.parametrize("mode", ["frontier", "recovery", "step"])
-def test_search_revision_changes_candidate_retrieval_not_task_or_rejections(monkeypatch, tmp_path, mode):
+@pytest.mark.parametrize("interpretation_locked", [False, True])
+def test_search_revision_changes_candidate_retrieval_not_task_or_rejections(
+        monkeypatch, tmp_path, mode, interpretation_locked):
     from harness.tools import query_scene
     tools = make_tools(monkeypatch)
     task = TaskSpec("I need a soft place to sit", (TargetSpec(
@@ -676,6 +680,7 @@ def test_search_revision_changes_candidate_retrieval_not_task_or_rejections(monk
         }),), revision=2)
     tools.session.install_plan(runtime_plan(task))
     session = tools.session
+    session.interpretation_locked = interpretation_locked
     session.snapshot = replace(session.snapshot, objects=tuple(
         ObjectNodeSnapshot(uid, label, (2, 0, 0)) for uid, label in (
             ("bad-couch", "couch"), ("another-couch", "couch"), ("sofa-1", "sofa"))))
@@ -744,9 +749,10 @@ def test_search_revision_updates_shared_anchor_atomically(monkeypatch, tmp_path,
     assert tools.session.spec == task and tools.motion.controller.sent == []
 
 
-def test_same_task_plan_replacement_preserves_search_and_evidence(monkeypatch, tmp_path):
+@pytest.mark.parametrize("interpretation_locked", [False, True])
+def test_same_task_plan_replacement_preserves_search_and_evidence(monkeypatch, tmp_path, interpretation_locked):
     from perception.detector_adapter import ground_plan
-    tools = make_tools(monkeypatch)
+    tools = make_tools(monkeypatch, interpretation_locked=interpretation_locked)
     session = tools.session
     progress, ledger = session.progress, session.verification_ledger
     record = ledger.put(session.spec.raw_instruction, "cup-1", VerificationResult(
@@ -1172,15 +1178,12 @@ def test_guided_submission_rechecks_and_consumes_choice(monkeypatch, tmp_path, m
 def interpretation_tools(monkeypatch):
     import instruction.compiler as compiler
     import perception.detector_adapter as detector
-    from instruction_adapter.compiler import RUNTIME_CONSTRAINT_TYPES
-    from prompting.schemas import ParsedInstruction
 
     tools = make_tools(monkeypatch)
-    compiled = compiler.compile_parsed_instruction(
-        "I need a flat surface to dry my wet cup.",
-        ParsedInstruction(targets=[{"name": "cup"}]), RUNTIME_CONSTRAINT_TYPES)
-    assert compiled.task is not None
-    tools.session = TaskSession(tools.session.snapshot, runtime_plan(compiled.task))
+    # Start with an incorrect material goal so revision changes the task semantics.
+    historical = TaskSpec("I need a flat surface to dry my wet cup.",
+                          (TargetSpec("t0_cup", "cup", aliases=("cup",)),))
+    tools.session = TaskSession(tools.session.snapshot, runtime_plan(historical))
 
     def forbidden(*args, **kwargs):
         pytest.fail("Interpretation correction must not make hidden parsing or grounding calls")
@@ -1202,7 +1205,8 @@ def interpretation_tools(monkeypatch):
 def interpretation_payload(mode, *, parsed=None, basis_ids=None):
     from prompting.schemas import ParsedInstruction
     if parsed is None:
-        parsed = {"targets": [{"name": "drying surface", "attributes": {"shape": "flat"},
+        parsed = {"targets": [{"id": "drying-resource", "name": "drying surface",
+            "attributes": {"shape": "flat"},
             "demand": {"activity": "dry", "manipulated_objects": ["wet cup"],
                        "required_resource": "drying surface",
                        "destination_hypotheses": ["table", "counter"]}}]}
@@ -1214,6 +1218,119 @@ def interpretation_payload(mode, *, parsed=None, basis_ids=None):
         "basis_ids": ["instruction"] if basis_ids is None else basis_ids,
         "reason": "The cup is manipulated material; the requested destination is a drying resource.",
     }}
+
+
+@pytest.mark.parametrize("mode", ["frontier", "recovery", "step"])
+def test_locked_decision_schema_is_null_only_and_keeps_scoped_search(monkeypatch, tmp_path, mode):
+    from pydantic import ValidationError
+
+    tools = make_tools(monkeypatch, interpretation_locked=True)
+    original = tools.session.spec
+    before = deepcopy(tools.session.progress.as_dict())
+
+    def decision(request):
+        response_type = request["response_format"]
+        schema = response_type.schema()
+        field = response_type.__fields__["interpretation_update"]
+        assert field.annotation is type(None) and field.default is None
+        assert schema["properties"]["interpretation_update"]["type"] == "null"
+        assert "anyOf" not in schema["properties"]["interpretation_update"]
+        assert "ParsedInstruction" not in json.dumps(schema)
+        assert "InterpretationUpdate" not in json.dumps(schema)
+        assert "ScopedSearchUpdate" in json.dumps(schema)
+        assert schema["properties"]["search_updates"]["maxItems"] == 1
+        payload = search_payload(mode, ["mug"], concept_id="cup")
+        payload.pop("interpretation_update", None)
+        assert response_type(**payload).interpretation_update is None
+        assert response_type(**{**payload, "interpretation_update": None}).interpretation_update is None
+        with pytest.raises(ValidationError):
+            response_type(**interpretation_payload(mode))
+        for invalid in ({"concept_id": "invented"}, {"basis_ids": ["frame:missing"]}):
+            with pytest.raises(ValidationError):
+                response_type(**{**payload, "search_updates": [{**payload["search_updates"][0], **invalid}]})
+        return payload
+
+    client_model, requests = model_calls([decision])
+    runtime = AgentRuntime(tools, tmp_path / "locked-schema.jsonl", client_model=client_model)
+    decision_call(runtime, mode)
+    for prompt in (runtime.decision_context, runtime.system_prompt, requests[0]["messages"][0]["content"]):
+        assert "Frozen task override" in prompt
+        assert "interpretation_update must be null" in prompt
+        assert "Only retrieval revision through search_updates is allowed" in prompt
+    assert tools.session.spec is original and tools.session.progress.as_dict() == before
+    assert tools.session.search_revision == 1 and tools.session.detector_terms == ["mug"]
+    assert tools.session.interpretation_history == [] and tools.motion.controller.sent == []
+
+
+@pytest.mark.parametrize("mode,action", [
+    ("frontier", None), ("recovery", None), ("step", "observe"), ("step", "query_scene"),
+    ("step", "submit_motion"),
+])
+def test_locked_interpretation_injection_never_compiles_grounds_installs_or_dispatches(
+        interpretation_tools, monkeypatch, tmp_path, mode, action):
+    from harness.runtime import InterpretationUpdate
+
+    tools = interpretation_tools
+    session = tools.session
+    session.interpretation_locked = True
+    target_id = session.spec.targets[0].id
+    tools.verify_target("cup-1", target_id, 1)
+    session.revise_search([{"concept_id": target_id, "detector_terms": ["mug"],
+                           "reason": "Existing retrieval", "basis_ids": ["instruction"]}],
+                          task_revision=1, search_revision=0, snapshot=session.snapshot)
+    session.interpretation_history.append({"task_revision": 1, "reason": "Audited contract"})
+    session.destination_hypotheses.append({"candidate_uid": "cup-1", "task_revision": 1})
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Locked interpretation must not compile, ground, install, dispatch, or capture evidence")
+
+    monkeypatch.setattr("instruction.compiler.compile_parsed_instruction", forbidden)
+    monkeypatch.setattr("perception.detector_adapter.ground_plan", forbidden)
+    monkeypatch.setattr(tools, "install_interpretation", forbidden)
+    monkeypatch.setattr(session, "install_plan", forbidden)
+    monkeypatch.setattr(tools, "dispatch", forbidden)
+    monkeypatch.setattr(tools, "evidence_provider", forbidden)
+    monkeypatch.setattr(tools.verifier, "verify", forbidden)
+    monkeypatch.setattr(tools.motion.controller, "poll_status", forbidden)
+    references = dict(vars(session))
+
+    def state():
+        return deepcopy((session.spec.as_dict(), session.plan.as_dict(), session.progress.as_dict(),
+                         session.verification_ledger.as_dict(), session.search_revision,
+                         session.search_hypotheses, session.interpretation_history,
+                         session.destination_hypotheses, vars(session.anchor_search_ledger),
+                         vars(session.relation_pair_ledger), session.constraint_evaluator.identity_records))
+
+    before = state()
+    payload = interpretation_payload(mode)
+    if action:
+        arguments = ({"candidate_uid": "cup-1", "viewpoint_uid": "view-1", "task_revision": 1,
+                      "control_epoch": 0, "request_id": "injected-motion"} if action == "submit_motion" else {})
+        payload["action"] = tool_call(name=action, arguments=arguments, reason="injected update").action.dict()
+    update = InterpretationUpdate(**payload.pop("interpretation_update"))
+
+    def inject(request):
+        # Bypass schema validation as an untrusted adapter or preconstructed response could.
+        return request["response_format"](**payload).copy(update={"interpretation_update": update})
+
+    client_model, requests = model_calls([inject])
+    runtime = AgentRuntime(tools, tmp_path / "locked-injection.jsonl", client_model=client_model)
+    previous = {"event": "candidate_deferred", "candidate_uid": "cup-1", "task_revision": 1}
+    runtime.record_event(previous)
+    message = "not an execution action" if action == "submit_motion" else "interpretation is locked"
+    with pytest.raises(ValueError, match=message):
+        decision_call(runtime, mode)
+    # The common guard also rejects direct calls before inspecting an injected update.
+    with pytest.raises(ValueError, match="interpretation is locked"):
+        runtime._apply_interpretation(object(), None, None)
+    assert len(requests) == runtime.model_calls == 1
+    assert state() == before
+    assert all(getattr(session, name) is value for name, value in references.items())
+    assert previous in runtime.history and runtime._choice_context is None
+    assert tools.motion.control_epoch == 0 and tools.motion.active_request_id is None
+    assert tools.motion.controller.sent == []
+    events = [json.loads(line) for line in runtime.trace_path.read_text().splitlines()]
+    assert not any(event["event"] == "interpretation_adopted" for event in events)
 
 
 @pytest.mark.parametrize("mode,action", [
@@ -1271,7 +1388,12 @@ def test_interpretation_corrects_material_goal_and_archives_revision(
     assert requests[0]["model"] == "replay-model"
 
     assert session.spec.revision == 2 and session.spec.raw_instruction == old_task.raw_instruction
+    assert session.plan.raw_instruction == old_task.raw_instruction
+    assert session.plan.diagnostics["task_spec"] == session.spec.as_dict()
+    with pytest.raises(TypeError):
+        session.spec.targets[0].attributes["shape"] = "replacement"
     target, = session.spec.targets
+    assert target.id == "drying-resource"
     assert target.name == "drying surface" and dict(target.attributes) == {"shape": "flat"}
     demand = session.spec.as_dict()["targets"][0]["demand"]
     assert demand == {"activity": "dry", "manipulated_objects": ["wet cup"],
@@ -1349,9 +1471,18 @@ def test_complete_interpretation_installs_with_one_decision_call(interpretation_
 
 @pytest.mark.parametrize("mode", ["frontier", "recovery", "step"])
 def test_noop_interpretation_keeps_task_revision(interpretation_tools, tmp_path, mode):
+    from instruction.compiler import compile_parsed_instruction
+    from instruction_adapter.compiler import RUNTIME_CONSTRAINT_TYPES
+    from prompting.schemas import ParsedInstruction
+
     tools = interpretation_tools
+    payload = interpretation_payload(mode)
+    # A no-op repeats the installed semantics, not the earlier material-goal interpretation.
+    compiled = compile_parsed_instruction(tools.session.spec.raw_instruction,
+        ParsedInstruction(**payload["interpretation_update"]["interpretation"]), RUNTIME_CONSTRAINT_TYPES)
+    assert compiled.status == "success", compiled.diagnostics
+    tools.session = TaskSession(tools.session.snapshot, runtime_plan(compiled.task))
     original, plan, progress = tools.session.spec, tools.session.plan, tools.session.progress
-    payload = interpretation_payload(mode, parsed={"targets": [{"name": "cup"}]})
     client_model, requests = model_calls([payload])
     runtime = AgentRuntime(tools, tmp_path / "noop.jsonl", max_model_calls=1, client_model=client_model)
     result = decision_call(runtime, mode)
@@ -1485,10 +1616,94 @@ def test_interpretation_compiler_and_source_gates_precede_installation(interpret
         assert decision_call(runtime, "frontier") is None
         feedback = runtime.history[-1]["interpretation_result"]
         assert feedback["interpretation_changed"] is False and feedback["reason"]
-        assert feedback["interpretation_status"] in {"invalid", "unsupported", "ambiguous"}
+        assert feedback["interpretation_status"] == {
+            "unsupported": "unsupported", "unresolved": "ambiguous", "empty": "invalid"}[invalid]
+        if invalid == "unsupported":
+            assert "teleport" in feedback["reason"]
+        elif invalid == "unresolved":
+            assert "The intended resource is ambiguous" in feedback["reason"]
     assert len(requests) == runtime.model_calls == 1
     assert tools.session.spec is original and tools.session.plan is plan
     assert tools.session.interpretation_history == [] and tools.motion.controller.sent == []
+
+
+@pytest.mark.parametrize("mode", ["frontier", "recovery", "step"])
+@pytest.mark.parametrize("binding", ["missing", "wrong"])
+def test_invalid_predicate_binding_retains_task_progress_and_evidence(
+        interpretation_tools, monkeypatch, tmp_path, mode, binding):
+    from instruction.compiler import compile_parsed_instruction
+    from instruction_adapter.compiler import RUNTIME_CONSTRAINT_TYPES
+    from prompting.schemas import ParsedInstruction
+
+    tools = interpretation_tools
+    payload = interpretation_payload(mode, basis_ids=["instruction", "verification:0"])
+    parsed = payload["interpretation_update"]["interpretation"]
+    compiled = compile_parsed_instruction(tools.session.spec.raw_instruction,
+        ParsedInstruction(**parsed), RUNTIME_CONSTRAINT_TYPES)
+    assert compiled.status == "success", compiled.diagnostics
+    tools.session = TaskSession(tools.session.snapshot, runtime_plan(compiled.task))
+    session = tools.session
+    target_id = session.spec.targets[0].id
+    monkeypatch.setattr(tools.verifier, "verify", lambda **kwargs: VerificationResult(
+        False, "reject_candidate", task_revision=1, target_uid="cup-1",
+        reason="The cup is manipulated material, not a flat drying surface."))
+    tools.verify_target("cup-1", target_id, 1)
+    assert session.progress.target_progress[target_id].rejected_candidate_uids == ["cup-1"]
+    assert session.verification_ledger.history
+    session.revise_search([{"concept_id": target_id, "detector_terms": ["counter"],
+                            "reason": "Search a different drying resource"}],
+                          task_revision=1, search_revision=0, snapshot=session.snapshot)
+    original, plan, progress = session.spec, session.plan, session.progress
+    ledger, snapshot = session.verification_ledger, session.snapshot
+    progress_before, evidence_before = deepcopy(progress.as_dict()), deepcopy(ledger.as_dict())
+    search_before = deepcopy(session.search_hypotheses)
+
+    # An explicit flatness predicate must bind to a declared target, not a predicate ID.
+    parsed["constraints"] = [{
+        "id": "flatness", "type": "attribute",
+        "subject": "" if binding == "missing" else "demand:drying-resource",
+        "value": {"shape": "flat"}, "hardness": "hard", "verifier": "vlm",
+    }]
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Invalid predicate binding must not ground, install, dispatch, or collect new evidence")
+
+    monkeypatch.setattr("perception.detector_adapter.ground_plan", forbidden)
+    monkeypatch.setattr(tools, "install_interpretation", forbidden)
+    monkeypatch.setattr(tools, "dispatch", forbidden)
+    monkeypatch.setattr(tools, "evidence_provider", forbidden)
+    monkeypatch.setattr(tools.verifier, "verify", forbidden)
+    client_model, requests = model_calls([payload])
+    runtime = AgentRuntime(tools, tmp_path / "invalid-predicate-binding.jsonl",
+                           max_model_calls=3, client_model=client_model)
+    previous_event = {"event": "candidate_deferred", "candidate_uid": "cup-1", "task_revision": 1}
+    runtime.record_event(previous_event)
+    result = decision_call(runtime, mode)
+    if mode == "step":
+        feedback = result["result"]
+    else:
+        assert result is None
+        feedback = runtime.history[-1]["interpretation_result"]
+    assert feedback["interpretation_changed"] is False
+    assert feedback["task_revision"] == 1 and feedback["interpretation_status"] == "invalid"
+    assert "Constraint 'flatness' subject:" in feedback["reason"]
+    assert ("missing target reference" if binding == "missing" else
+            "unbound target reference 'demand:drying-resource'") in feedback["reason"]
+    assert len(requests) == runtime.model_calls == 1 < runtime.max_model_calls
+    assert requests[0]["parse_retries"] == 0  # Rejection does not start a repair loop.
+    assert session.spec is original and session.plan is plan and session.progress is progress
+    assert dict(original.targets[0].attributes) == {"shape": "flat"}
+    assert session.verification_ledger is ledger and session.snapshot is snapshot
+    assert progress.as_dict() == progress_before and ledger.as_dict() == evidence_before
+    assert session.search_revision == 1 and session.search_hypotheses == search_before
+    assert session.interpretation_history == [] and previous_event in runtime.history
+    assert not tools.propose_finish()["accepted"]
+    assert tools.motion.active_request_id is None and tools.motion.controller.sent == []
+    with pytest.raises(ValueError, match="No current guided choice"):
+        with runtime.choice_guard():
+            pytest.fail("Rejected interpretation must not leave an executable choice")
+    events = [json.loads(line) for line in runtime.trace_path.read_text().splitlines()]
+    assert not any(event["event"] in {"interpretation_adopted", "interpretation_review"} for event in events)
 
 
 @pytest.mark.parametrize("mode", ["frontier", "recovery", "step"])

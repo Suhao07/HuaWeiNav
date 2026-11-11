@@ -53,6 +53,69 @@ def _fake_client(responses: list[str]):
     return client, completions
 
 
+@pytest.mark.parametrize("guided", ["0", "1"])
+@pytest.mark.parametrize("verdict", ["true", "false", "unknown"])
+def test_scripted_two_stage_verifier_uses_production_adapter_and_traces(tmp_path, monkeypatch, guided, verdict):
+    import base64
+    import json
+    from hashlib import sha256
+    import instruction_adapter.verifier as module
+    from prompting.schemas import visual_verification_response_model
+    from verification.contracts import CandidateInstance
+
+    image = tmp_path / "frame.png"
+    image.write_bytes(b"scripted-image-bytes-not-a-real-vlm-test")
+    facts = {"observed_category": "chair", "visible_parts": ["seat", "backrest", "legs"],
+             "support_and_attachment": "Legs on floor.", "visible_surface_content": "",
+             "visible_context": ["A sink and stove are across the doorway."],
+             "uncertainties": ["The candidate's room is not established."]}
+    observation = {"observations": {"now": facts}}
+    final = visual_verification_response_model(["candidate_identity"])(
+        observed_category="invented category", observed_structure="Invented structure",
+        predicate_judgments={"candidate_identity": {"verdict": verdict,
+            "reason": "Scripted response, not a model capability judgment.",
+            "supporting_observation_ids": ["now"]}}).model_dump()
+    fake, completions = _fake_client([json.dumps(observation), json.dumps(final)])
+    client = SelfHostedOpenAICompatibleClient(base_url="http://local/v1", client=fake, parse_retries=4)
+    monkeypatch.setattr(module, "get_client_and_model", lambda provider: (client, "scripted-local"))
+    monkeypatch.setenv("LLM_OFFLINE", "0")
+    monkeypatch.setenv("STRIVE_FINAL_VERIFIER", "on")
+    monkeypatch.setenv("STRIVE_EVIDENCE_REUSE", "0")
+    monkeypatch.setenv("VLN_LVLM_GUIDED_JSON", guided)
+    monkeypatch.setenv("STRIVE_LVLM_TRACE_DIR", str(tmp_path / "requests"))
+    result = module.FinalInstructionVerifier(vlm="self_hosted", evidence_dir=str(tmp_path / "images")).verify(
+        "Find a backless seat.", {"targets": [{"id": "goal", "name": "backless seat"}]},
+        CandidateInstance("candidate-1", "untrusted detector label"), {
+            "current_rgb_with_bbox_path": str(image), "geometry": {"bbox_xyxy": [0, 0, 4, 4]},
+            "observation_identity": {"candidate_uid": "candidate-1", "task_revision": 1, "observation_id": "now"},
+            "hard_stop_constraints": {"satisfied": True}})
+    assert len(completions.requests) == 2
+    observer_request, final_request = completions.requests
+    assert "backless seat" not in json.dumps(observer_request)
+    assert "untrusted detector label" not in json.dumps(completions.requests)
+    assert base64.b64decode(observer_request["messages"][1]["content"][1]["image_url"]["url"].split(",", 1)[1]) == image.read_bytes()
+    assert all(item["type"] == "text" for item in final_request["messages"][1]["content"])
+    bound = json.loads(final_request["messages"][1]["content"][1]["text"])["bound_observations"]["now"]
+    assert bound["facts"] == facts
+    assert bound["images"][0]["image_sha256"] == sha256(image.read_bytes()).hexdigest()
+    assert result.accepted is (verdict == "true")
+    assert result.observed_category == "chair"
+    assert result.decision == {"true": "accept", "false": "reject_candidate", "unknown": "uncertain"}[verdict]
+    requests = {item["request_id"]: item for path in (tmp_path / "requests").glob("request_*.json")
+                for item in [json.loads(path.read_text())]}
+    responses = [json.loads(path.read_text()) for path in sorted((tmp_path / "requests").glob("[0-9]*.json"))]
+    assert [item["kind"] for item in responses] == ["instance_observer", "final_instruction_verifier"]
+    for response, sent, expected in zip(responses, completions.requests, (observation, final)):
+        saved = requests[response["metadata"]["request_id"]]
+        assert saved["messages"] == sent["messages"]
+        assert json.loads(response["raw_response"]) == expected
+        assert response["metadata"]["attempt"] == 1
+        assert "parse_retries" not in sent
+    if guided == "1":
+        schema = observer_request["extra_body"]["guided_json"]
+        assert "visible_context" in schema["$defs"]["ObservedInstanceFacts"]["required"]
+
+
 def test_schema_injection_preserves_multimodal_content() -> None:
     messages = [
         {"role": "system", "content": "verify target"},

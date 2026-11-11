@@ -55,6 +55,7 @@ class ParsedDemand(BaseModel):
 
 
 class ParsedTarget(BaseModel):
+    id: str = Field(default="", description="Opaque entity ID. Preserve it when revising the same entity; use it in constraint references.")
     demand: ParsedDemand | None = Field(default=None,
         description="For an implicit destination, infer the activity and needed resource before naming its target. Null for explicit objects and reference anchors.")
     name: str = Field(default="",
@@ -69,6 +70,7 @@ class ParsedTarget(BaseModel):
 
 
 class ParsedConstraint(BaseModel):
+    id: str = Field(default="", description="Opaque predicate ID. Preserve it when revising the same requirement.")
     type: str = ""
     subject: str = ""
     relation: str = ""
@@ -168,24 +170,54 @@ class ParsedViewObjective(BaseModel):
     reason: str = ""
 
 
+class ObservedInstanceFacts(BaseModel):
+    observed_category: str = Field(max_length=80)
+    visible_parts: list[str] = Field(max_length=16)
+    support_and_attachment: str
+    visible_surface_content: str
+    visible_context: list[str] = Field(max_length=16)
+    uncertainties: list[str] = Field(max_length=16)
+
+    class Config:
+        extra = "forbid"
+
+
+class ReferenceImageComparison(BaseModel):
+    verdict: Literal["same", "different", "unknown"]
+    reason: str = Field(min_length=1, max_length=240)
+    supporting_observation_ids: list[str]
+
+    class Config:
+        extra = "forbid"
+
+
+def instance_observation_response_model(observation_ids, *, compare_reference=False):
+    from pydantic import create_model
+    observations = create_model(
+        "BoundInstanceFacts", __config__={"extra": "forbid"},
+        **{uid: (ObservedInstanceFacts, ...) for uid in sorted(observation_ids)})
+    fields = {"observations": (observations, ...)}
+    if compare_reference:
+        fields["reference_comparison"] = (ReferenceImageComparison, ...)
+    return create_model("InstanceObservation", __config__={"extra": "forbid"}, **fields)
+
+
 class ParsedVerification(BaseModel):
-    """Visual judgment with closed, typed nested objects for strict generation."""
-    satisfied: bool = False
-    semantic_satisfied: bool = False
-    view_sufficient_for_stop: bool = True
-    decision: str = "uncertain"
-    confidence: float = 0.0
-    satisfied_constraints: list[str] = Field(default_factory=list)
-    failed_constraints: list[str] = Field(default_factory=list)
+    """Observed instance description; the controller derives decisions from evidence."""
+    observed_category: str = Field(default="", max_length=80)
+    observed_structure: str = Field(default="", max_length=240)
+    confidence: float = Field(default=0.0, ge=0, le=1)
     view_feedback: str = ""
     preferred_view_goal: str = ""
     view_objective: ParsedViewObjective = Field(default_factory=ParsedViewObjective)
     reason: str = ""
 
+    class Config:
+        extra = "forbid"
 
-class AffordanceJudgment(BaseModel):
-    """Instance-level visual evidence for one hard affordance predicate."""
 
+class VisualPredicateJudgment(BaseModel):
+    """Candidate-bound evidence for an identity, property or functional requirement."""
     verdict: Literal["true", "false", "unknown"]
     reason: str = Field(min_length=1, max_length=240)
     supporting_observation_ids: list[str]
@@ -194,19 +226,17 @@ class AffordanceJudgment(BaseModel):
         extra = "forbid"
 
 
-def affordance_verification_response_model(predicate_ids):
-    """Require exactly one judgment per active hard affordance ID, if any."""
-    if not predicate_ids:
-        return ParsedVerification
-    if any(not isinstance(uid, str) or not uid for uid in predicate_ids) or len(set(predicate_ids)) != len(predicate_ids):
-        raise ValueError("Hard affordance predicates require unique nonempty IDs")
+def visual_verification_response_model(predicate_ids):
+    """Require one evidence judgment for every active visual obligation."""
+    if not predicate_ids or any(not isinstance(uid, str) or not uid for uid in predicate_ids) or len(set(predicate_ids)) != len(predicate_ids):
+        raise ValueError("Visual predicates require unique nonempty IDs")
     from pydantic import create_model
     judgments = create_model(
-        "AffordanceJudgments", __config__={"extra": "forbid"},
-        **{uid: (AffordanceJudgment, ...) for uid in predicate_ids})
+        "VisualPredicateJudgments", __config__={"extra": "forbid"},
+        **{uid: (VisualPredicateJudgment, ...) for uid in predicate_ids})
     return create_model(
-        "AffordanceVerification", __base__=ParsedVerification,
-        affordance_judgments=(judgments, ...))
+        "VisualVerification", __base__=ParsedVerification,
+        predicate_judgments=(judgments, ...))
 
 
 class ParsedRoomSemantic(BaseModel):

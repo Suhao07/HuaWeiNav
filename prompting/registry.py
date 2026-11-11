@@ -18,13 +18,14 @@ class PromptSpec:
     version: str = PROMPT_TEMPLATE_VERSION
 
 
-INSTRUCTION_PARSE = PromptSpec("instruction.parse.v1", "instruction_parser", "ParsedInstruction")
+INSTRUCTION_PARSE = PromptSpec("instruction.parse.v2", "instruction_parser", "ParsedInstruction")
 CONCEPT_GROUNDING = PromptSpec("concept.grounding.v1", "concept_grounding", "GroundingResult")
 EXECUTION_STRATEGY = PromptSpec("execution.strategy.v1", "execution_strategy", "ExecutionStrategyResult")
 CONCEPT_MATCH_SINGLE = PromptSpec("concept.match.single.v1", "concept_match_single", "ParsedConceptMatch")
 CONCEPT_MATCH_BATCH = PromptSpec("concept.match.batch.v2", "concept_match_batch", "CandidateConceptJudgments")
 RELATION_VERIFY = PromptSpec("relation.verify.v1", "relation_verifier", "ParsedRelationResult")
-FINAL_VERIFY = PromptSpec("final.verify.v2", "final_instruction_verifier", "ParsedVerification")
+INSTANCE_OBSERVE = PromptSpec("instance.observe.v1", "instance_observer", "InstanceObservation")
+FINAL_VERIFY = PromptSpec("final.verify.v4", "final_instruction_verifier", "VisualVerification")
 BBOX_OBJECT_LABEL = PromptSpec("bbox.object_label.v1", "bbox_object_in_box", "BBoxObjectLabelResponse")
 TAG_REFINE = PromptSpec("tag.refine.v1", "refine_tag_with_target", "TagRefineResponse")
 TAG_REFINE_OBJECT_LIST = PromptSpec(

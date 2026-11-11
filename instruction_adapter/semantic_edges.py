@@ -44,6 +44,8 @@ class SemanticEdge:
     need_better_view: bool = False
     evidence_key: str = ""
     identity_judgments: dict[str, dict[str, Any]] = field(default_factory=dict)
+    evidence_ids: list[str] = field(default_factory=list)
+    dependencies: dict[str, str] = field(default_factory=dict)
 
     @property
     def verdict(self) -> str:
@@ -162,8 +164,6 @@ def normalize_relation(value: str) -> str:
         return "near"
     if text in ("in", "within"):
         return "inside"
-    if text in ("on top of", "above"):
-        return "on"
     return text
 
 
@@ -227,6 +227,7 @@ class DynamicSemanticEdgeVerifier:
         subject: dict[str, Any],
         relation: str,
         object_: dict[str, Any],
+        predicate: dict[str, Any] | None = None,
         evidence_views: list[dict[str, Any]] | None = None,
         vlm_callback: RelationCallback | None = None,
     ) -> SemanticEdge:
@@ -240,11 +241,14 @@ class DynamicSemanticEdgeVerifier:
             image_hashes.append(hashlib.sha256(Path(path).read_bytes()).hexdigest()
                                 if path and Path(path).is_file() else None)
         evidence_key = hashlib.sha256(json.dumps(
-            [subject, relation, object_, evidence, image_hashes, vlm_callback is not None],
+            [subject, relation, object_, predicate, evidence, image_hashes, vlm_callback is not None],
             sort_keys=True, default=str,
         ).encode("utf-8")).hexdigest()
         cached = self.cache.get(query)
-        if cached is not None and cached.evidence_key == evidence_key:
+        from verification.images import image_dependencies_valid
+
+        if (cached is not None and cached.evidence_key == evidence_key
+                and image_dependencies_valid(cached.dependencies)):
             return cached
 
         allow_visual_override = any(bool(view.get("allow_vlm_despite_geometry")) for view in evidence)
@@ -267,7 +271,7 @@ class DynamicSemanticEdgeVerifier:
                 need_better_view=True, reason="Visual relation verification is unavailable.",
             )
         else:
-            prompt = self._build_vlm_prompt(subject, relation, object_)
+            prompt = self._build_vlm_prompt(subject, relation, object_, predicate)
             result = vlm_callback(relation, subject, object_, evidence, prompt)
             edge = self._coerce_vlm_result(query, evidence, result)
         edge.evidence_key = evidence_key
@@ -301,7 +305,8 @@ class DynamicSemanticEdgeVerifier:
             if subject_max and object_min:
                 return subject_max[self.vertical_axis] <= object_min[self.vertical_axis] + 0.2 and xy_overlap
             return vertical_delta < 0 and horizontal_dist <= self.max_near_distance
-        if relation == "on":
+        # 顶部支撑才适用垂向接触模型；泛指 on 的墙面附着交给视觉判断。
+        if relation == "on top of":
             if subject_min and object_max:
                 vertical_gap = subject_min[self.vertical_axis] - object_max[self.vertical_axis]
                 return -0.15 <= vertical_gap <= 0.35 and xy_overlap
@@ -313,21 +318,26 @@ class DynamicSemanticEdgeVerifier:
         return True
 
     @staticmethod
-    def _build_vlm_prompt(subject: dict[str, Any], relation: str, object_: dict[str, Any]) -> str:
+    def _build_vlm_prompt(subject: dict[str, Any], relation: str, object_: dict[str, Any],
+                          predicate: dict[str, Any] | None) -> str:
         return (
             "Verify this exact directed relation between the two bound instances. "
             "Requested concepts are requirements, not established identities; detector labels "
             "are fallible observations. Do not substitute another visible object or relation. "
-            "Use only each frame's object_boxes for its instance regions.\n"
+            "Use only each frame's object_boxes for its instance regions. "
+            "Judge the relation together with all qualifiers in the required predicate.\n"
+            f"Required predicate: {json.dumps(predicate, ensure_ascii=False)}\n"
             f"Subject instance: {subject['id']}\n"
             f"Required subject concept: {subject['requested_concept']}\n"
             f"Subject detector label: {subject['detector_label']}\n"
             f"Subject demand: {json.dumps(subject.get('demand', {}), ensure_ascii=False)}\n"
+            f"Subject attributes: {json.dumps(subject.get('attributes', {}), ensure_ascii=False)}\n"
             f"Required relation: {relation}\n"
             f"Reference instance: {object_['id']}\n"
             f"Required reference concept: {object_['requested_concept']}\n"
             f"Reference detector label: {object_['detector_label']}\n"
-            f"Reference demand: {json.dumps(object_.get('demand', {}), ensure_ascii=False)}"
+            f"Reference demand: {json.dumps(object_.get('demand', {}), ensure_ascii=False)}\n"
+            f"Reference attributes: {json.dumps(object_.get('attributes', {}), ensure_ascii=False)}"
         )
 
     @staticmethod
@@ -360,4 +370,6 @@ class DynamicSemanticEdgeVerifier:
             reason=reason,
             need_better_view=need_better_view,
             identity_judgments=result.get("identity_judgments", {}) if isinstance(result, dict) else {},
+            evidence_ids=list(result.get("evidence_ids", [])) if isinstance(result, dict) else [],
+            dependencies=dict(result.get("dependencies", {})) if isinstance(result, dict) else {},
         )

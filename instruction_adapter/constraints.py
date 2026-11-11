@@ -17,7 +17,9 @@ from .verifier import CandidateInstance, VerificationResult, candidate_from_obje
 from llm_utils.lvlm_call_tracker import counts as lvlm_counts
 
 
-from instruction.contracts import RELATION_CONSTRAINT_TYPES
+from instruction.contracts import (
+    GLOBAL_SUBJECT_CONSTRAINT_TYPES, RELATION_CONSTRAINT_TYPES, resolve_target_reference,
+)
 
 
 @dataclass
@@ -30,36 +32,57 @@ class ConstraintEvaluation:
     relation_edges: list[SemanticEdge] = field(default_factory=list)
     evidence: dict[str, Any] = field(default_factory=dict)
     reason: str = ""
+    relation_outcomes: list[dict[str, Any]] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
         data = asdict(self)
         data["relation_edges"] = [edge.as_dict() for edge in self.relation_edges]
         return data
 
+    def to_verification_result(self, task_revision: int | None, target_uid: str) -> VerificationResult:
+        """Preserve precheck decisions and pair scope without accepting a final stop."""
+        data = self.as_dict()
+        result = VerificationResult(
+            satisfied=self.satisfied,
+            decision=self.decision,
+            confidence=self.confidence,
+            satisfied_constraints=list(self.satisfied_constraints),
+            failed_constraints=list(self.failed_constraints),
+            reason=self.reason,
+            diagnostics={"constraint_eval": data},
+            view_objective={"relation_outcomes": data["relation_outcomes"]},
+            task_revision=task_revision,
+            target_uid=target_uid,
+            dependencies={**self.evidence.get("dependencies", {}),
+                          **{key: value for edge in self.relation_edges
+                             for key, value in edge.dependencies.items()}},
+            evidence_ids=sorted({item for edge in self.relation_edges for item in edge.evidence_ids}),
+        )
+        if self.decision != "pass" and len(self.relation_outcomes) == 1:
+            result.predicate_id = self.relation_outcomes[0]["predicate_id"]
+            result.anchor_uid = self.relation_outcomes[0]["anchor_uid"]
+        return result
 
-def _target_names(target: TargetQuery) -> set[str]:
-    return {normalize_term(item) for item in target.match_terms if normalize_term(item)}
 
-
-def _constraint_subject_matches(constraint: Constraint, target: TargetQuery, candidate: CandidateInstance) -> bool:
-    subject = normalize_term(constraint.subject)
-    if not subject:
+def _constraint_subject_matches(constraint: Constraint, target: TargetQuery, plan: InstructionPlan,
+                                predicate_id: str) -> bool:
+    subject = resolve_target_reference(
+        plan.targets, constraint.subject, predicate_id=predicate_id, field="subject",
+        allow_empty=normalize_term(constraint.type) in GLOBAL_SUBJECT_CONSTRAINT_TYPES,
+    )
+    if not subject or subject == target.id:
         return True
-    if subject == normalize_term(target.id) or subject in _target_names(target):
-        return True
-    return subject in {
-        normalize_term(candidate.detector_label),
-        normalize_term(candidate.canonical_label),
-    }
+    return normalize_term(constraint.type) in RELATION_CONSTRAINT_TYPES and resolve_target_reference(
+        plan.targets, constraint.object, predicate_id=predicate_id, field="object") == target.id
 
 
-def _constraint_object_terms(constraint: Constraint) -> set[str]:
+def _constraint_object_terms(constraint: Constraint, concept=None) -> set[str]:
+    concept = concept or getattr(constraint, "object_concept", None)
+    if concept is not None:
+        return {normalize_term(item) for item in concept.match_terms if normalize_term(item)}
     terms = []
     if constraint.object:
         terms.append(constraint.object)
-    concept = getattr(constraint, "object_concept", None)
-    if concept is not None:
-        terms.extend(getattr(concept, "match_terms", []))
     value = constraint.value
     if isinstance(value, str):
         terms.append(value)
@@ -104,13 +127,17 @@ def _pcd_bounds(obj: Any) -> tuple[list[float], list[float]]:
 
 
 def object_record_from_mapper_object(obj: Any, requested_concept: str, step: int | None = None,
-                                     *, demand: dict[str, Any] | None = None) -> dict[str, Any]:
+                                     *, demand: dict[str, Any] | None = None,
+                                     attributes: dict[str, Any] | None = None,
+                                     constraints: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     candidate = candidate_from_object(obj, step=step)
     min_bound, max_bound = _pcd_bounds(obj)
     return {
         "id": candidate.uid,
         "requested_concept": normalize_term(requested_concept),
         "demand": dict(demand or {}),
+        "attributes": dict(attributes or {}),
+        "constraints": list(constraints or []),
         "detector_label": normalize_term(candidate.detector_label),
         "center": list(candidate.centroid or []),
         "centroid": list(candidate.centroid or []),
@@ -146,7 +173,9 @@ class ConstraintEvaluator:
     @staticmethod
     def _identity_key(raw_instruction, concept, object_uid):
         return (instruction_hash(raw_instruction), concept.id, normalize_term(concept.name),
-                json.dumps(concept.demand, sort_keys=True), object_uid)
+                json.dumps(concept.demand, sort_keys=True),
+                json.dumps(concept.attributes, sort_keys=True),
+                json.dumps(concept.constraints, sort_keys=True), object_uid)
 
     def record_identity(self, raw_instruction, concept, judgment, confidence):
         uid = judgment["instance_id"]
@@ -231,22 +260,31 @@ class ConstraintEvaluator:
     ) -> ConstraintEvaluation:
         """Evaluate hard runtime constraints before final stop acceptance."""
 
+        from scene.dependencies import object_dependencies
+        from instruction.compiler import task_from_parsed_plan
+
+        source_snapshot = getattr(mapper, "snapshot", None)
         relation_edges: list[SemanticEdge] = []
+        relation_outcomes: list[dict[str, Any]] = []
         failed: list[str] = []
         satisfied: list[str] = []
         decisions = []
         for view in evidence.get("observation_images", []):
             self._register_view(view)
 
-        for constraint in plan.constraints:
+        declared = task_from_parsed_plan(plan).as_dict()["constraints"]
+        for item in declared:
+            constraint = Constraint(**item)
+            predicate_id = constraint.id
             ctype = normalize_term(constraint.type)
-            if not _constraint_subject_matches(constraint, target, candidate):
+            if not _constraint_subject_matches(constraint, target, plan, predicate_id):
                 continue
             if ctype in RELATION_CONSTRAINT_TYPES:
                 relation_eval = self._evaluate_relation_constraint(
                     mapper=mapper,
                     plan=plan,
                     constraint=constraint,
+                    predicate_id=predicate_id,
                     target=target,
                     candidate=candidate,
                     candidate_obj=candidate_obj,
@@ -254,6 +292,7 @@ class ConstraintEvaluator:
                     step=step,
                 )
                 relation_edges.extend(relation_eval.relation_edges)
+                relation_outcomes.extend(relation_eval.relation_outcomes)
                 decisions.append(relation_eval.decision)
                 failed.extend(relation_eval.failed_constraints)
                 satisfied.extend(relation_eval.satisfied_constraints)
@@ -266,6 +305,11 @@ class ConstraintEvaluator:
                 evidence.setdefault("declared_attribute_constraints", []).append(constraint.as_dict())
                 satisfied.append("attribute constraint queued for final verifier")
 
+        evidence["relation_outcomes"] = relation_outcomes
+        if source_snapshot is not None:
+            evidence["dependencies"] = {**evidence.get("dependencies", {}),
+                **object_dependencies(source_snapshot, candidate.uid,
+                                      *(row["anchor_uid"] for row in relation_outcomes))}
         if failed:
             return ConstraintEvaluation(
                 satisfied=False,
@@ -274,6 +318,7 @@ class ConstraintEvaluator:
                 failed_constraints=failed,
                 satisfied_constraints=satisfied,
                 relation_edges=relation_edges,
+                relation_outcomes=relation_outcomes,
                 evidence=evidence,
                 reason="One or more hard runtime constraints failed.",
             )
@@ -284,6 +329,7 @@ class ConstraintEvaluator:
             failed_constraints=[],
             satisfied_constraints=satisfied,
             relation_edges=relation_edges,
+            relation_outcomes=relation_outcomes,
             evidence=evidence,
             reason="Runtime constraints passed or were deferred to final verifier.",
         )
@@ -294,6 +340,7 @@ class ConstraintEvaluator:
         mapper: Any,
         plan: InstructionPlan,
         constraint: Constraint,
+        predicate_id: str = "relation",
         target: TargetQuery,
         candidate: CandidateInstance,
         candidate_obj: Any,
@@ -301,20 +348,34 @@ class ConstraintEvaluator:
         step: int | None = None,
     ) -> ConstraintEvaluation:
         relation = normalize_relation(constraint.relation or str(constraint.value or ""))
-        anchor_terms = _constraint_object_terms(constraint)
-        anchor_concept = getattr(constraint, "object_concept", None)
+        subject_id = resolve_target_reference(plan.targets, constraint.subject,
+                                              predicate_id=predicate_id, field="subject")
+        object_id = resolve_target_reference(plan.targets, constraint.object,
+                                             predicate_id=predicate_id, field="object")
+        candidate_is_subject = subject_id == target.id
+        anchor_id = object_id if candidate_is_subject else subject_id
+        anchor_concept = next(item.concept_query() for item in plan.targets if item.id == anchor_id)
+        anchor_terms = _constraint_object_terms(constraint, anchor_concept)
+        outcome_context = {
+            "predicate_id": predicate_id, "subject_id": subject_id, "object_id": object_id,
+            "candidate_uid": candidate.uid, "anchor_concept_id": anchor_id, "anchor_uid": "",
+            "relation": relation, "evidence_view_ids": [],
+        }
         if not relation or (not anchor_terms and anchor_concept is None):
             return ConstraintEvaluation(
                 satisfied=False,
                 decision="need_relation_check",
                 failed_constraints=[f"incomplete relation constraint: {constraint.as_dict()}"],
+                relation_outcomes=[{
+                    **outcome_context, "status": "insufficient_evidence",
+                    "reason": "Relation constraint lacks relation or anchor object.",
+                }],
                 reason="Relation constraint lacks relation or anchor object.",
             )
 
-        anchor_concept = anchor_concept or ConceptQuery(
-            f"reference:{constraint.object}", constraint.object, role="anchor")
-        subject_record = object_record_from_mapper_object(
-            candidate_obj, requested_concept=target.name, step=step, demand=target.demand)
+        candidate_record = object_record_from_mapper_object(
+            candidate_obj, requested_concept=target.name, step=step, demand=target.demand,
+            attributes=target.attributes, constraints=target.concept_query().constraints)
         anchors = []
         raw_instruction = str(getattr(plan, "raw_instruction", "") or getattr(mapper, "target", ""))
         mapper_objects = list(getattr(mapper, "objects", []) or [])
@@ -349,21 +410,33 @@ class ConstraintEvaluator:
                 satisfied=False,
                 decision="need_relation_check",
                 failed_constraints=[f"missing anchor object for relation {relation}: {sorted(anchor_terms)}"],
+                relation_outcomes=[{
+                    **outcome_context, "status": "missing_anchor",
+                    "reason": "Anchor object has not been observed yet.",
+                }],
                 reason="Anchor object has not been observed yet.",
             )
 
+        relation_outcomes = []
         edges = []
         evidence_paths = []
         inst_hash = instruction_hash(raw_instruction)
         for anchor in anchors:
-            anchor_record = object_record_from_mapper_object(
-                anchor, requested_concept=anchor_concept.name if anchor_concept else constraint.object,
-                step=step, demand=anchor_concept.demand if anchor_concept else None)
+            other_record = object_record_from_mapper_object(
+                anchor, requested_concept=anchor_concept.name, step=step,
+                demand=anchor_concept.demand, attributes=anchor_concept.attributes,
+                constraints=anchor_concept.constraints)
+            if candidate_is_subject:
+                subject_record, anchor_record = candidate_record, other_record
+                subject_concept, reference_concept = target.concept_query(), anchor_concept
+            else:
+                subject_record, anchor_record = other_record, candidate_record
+                subject_concept, reference_concept = anchor_concept, target.concept_query()
             pair_ledger = getattr(mapper, "relation_pair_ledger", None)
             co_views = self.spatial_graph.co_visible_views(subject_record["id"], anchor_record["id"])
             view_dicts = [view.as_dict() if hasattr(view, "as_dict") else dict(view) for view in co_views]
-            identities = [("subject", target.concept_query(), subject_record),
-                          ("reference", anchor_concept, anchor_record)]
+            identities = [("subject", subject_concept, subject_record),
+                          ("reference", reference_concept, anchor_record)]
             judgments = [self.identity_match(
                 raw_instruction=raw_instruction, concept=concept, object_uid=record["id"],
                 observed_label=record["detector_label"], evidence_views=view_dicts)
@@ -374,6 +447,8 @@ class ConstraintEvaluator:
                 subject=subject_record,
                 relation=relation,
                 object_=anchor_record,
+                predicate={**constraint.as_dict(), "id": predicate_id,
+                           "subject": subject_id, "object": object_id},
                 evidence_views=view_dicts,
                 use_vlm=True,
             )
@@ -381,6 +456,12 @@ class ConstraintEvaluator:
                 if role in edge.identity_judgments:
                     self.record_identity(raw_instruction, concept, edge.identity_judgments[role], edge.confidence)
             edges.append(edge)
+            relation_outcomes.append({
+                **outcome_context, "anchor_uid": other_record["id"],
+                "status": "verified" if edge.verified else (
+                    "insufficient_evidence" if edge.need_better_view else "rejected_relation"),
+                "evidence_view_ids": list(edge.evidence_view_ids), "reason": edge.reason,
+            })
             evidence_paths.extend([view.get("rgb_path", "") for view in view_dicts if view.get("rgb_path")])
             if edge.verified:
                 if pair_ledger is not None:
@@ -397,18 +478,20 @@ class ConstraintEvaluator:
                     )
                 evidence.setdefault("relation_edges", []).append(edge.as_dict())
                 evidence["verified_relation_context"] = {
-                    "edge": edge.as_dict(),
+                    "predicate_id": predicate_id, "edge": edge.as_dict(),
                     "subject_record": subject_record,
                     "anchor_record": anchor_record,
-                    "source": "vlm",
+                    "observation_images": view_dicts, "source": "vlm",
                 }
+                evidence.setdefault("verified_relation_contexts", []).append(evidence["verified_relation_context"])
                 evidence.setdefault("relation_evidence_paths", []).extend(evidence_paths)
                 return ConstraintEvaluation(
                     satisfied=True,
                     decision="pass",
                     confidence=edge.confidence,
-                    satisfied_constraints=[f"{candidate.uid} {relation} {anchor_record['id']}"],
+                    satisfied_constraints=[f"{subject_record['id']} {relation} {anchor_record['id']}"],
                     relation_edges=edges,
+                    relation_outcomes=relation_outcomes,
                     evidence=evidence,
                     reason=edge.reason,
                 )
@@ -433,6 +516,10 @@ class ConstraintEvaluator:
             confidence=max([edge.confidence for edge in edges] or [0.0]),
             failed_constraints=[f"relation not verified: {candidate.uid} {relation} {sorted(anchor_terms)}"],
             relation_edges=edges,
+            relation_outcomes=relation_outcomes or [{
+                **outcome_context, "status": "insufficient_evidence",
+                "reason": "No candidate anchor pair could be evaluated.",
+            }],
             evidence=evidence,
             reason="No candidate anchor pair satisfied the required relation.",
         )

@@ -82,12 +82,66 @@ def test_compiler_rejects_unsupported_hard_condition(monkeypatch):
     assert result.task is None
 
 
+@pytest.mark.parametrize("subject,reference", [("resource_ID", "desk_ID"), ("work surface", "work desk"),
+                                                  ("surface", "writing desk")])
+def test_stable_bindings_survive_session_roundtrip(subject, reference):
+    from instruction.contracts import ConstraintSpec, TargetSpec, TaskSpec
+    from instruction_adapter.task_compat import runtime_plan
+    from scene.contracts import Pose3D, SemanticMapSnapshot
+    from task.session import TaskSession
+
+    task = TaskSpec("Find a surface by the work desk", targets=(
+        TargetSpec("resource_ID", "work surface", aliases=("surface",), attributes={"state": "clean"}),
+        TargetSpec("desk_ID", "work desk", terminal=False, aliases=("writing desk",))),
+        constraints=(ConstraintSpec("relation_ID", "spatial", subject, "near", reference),))
+    assert (task.constraints[0].subject, task.constraints[0].object) == ("resource_ID", "desk_ID")
+    plan = runtime_plan(task)
+    session = TaskSession(SemanticMapSnapshot(0, Pose3D((0., 0., 0.))), plan)
+    assert TaskSpec.from_dict(task.as_dict()) == session.spec == task_from_parsed_plan(plan)
+    assert session.plan is plan
+    assert plan.constraints[0].subject_concept.id == "resource_ID"
+    assert plan.constraints[0].object_concept.id == "desk_ID"
+    assert plan.targets[0].concept_query().attributes == {"state": "clean"}
+
+
+@pytest.mark.parametrize("field,reference,diagnostic", [
+    ("subject", "", "missing"), ("object", "", "missing"),
+    ("subject", "table", "unbound"), ("object", "unseen desk", "unbound"),
+    ("subject", "shared alias", "ambiguous"), ("object", "shared alias", "ambiguous"),
+])
+def test_task_binding_exposes_missing_unbound_and_ambiguous_references(field, reference, diagnostic):
+    from instruction.contracts import ConstraintSpec, TargetSpec, TaskSpec
+
+    fields = {"subject": "a", "object": "b", field: reference}
+    with pytest.raises(ValueError, match=f"constraint-ID.*{field}.*{diagnostic}"):
+        TaskSpec("Find a workbench near a desk", targets=(
+            TargetSpec("a", "workbench", aliases=("shared alias",)),
+            TargetSpec("b", "desk", terminal=False, aliases=("shared alias",))),
+            constraints=(ConstraintSpec("constraint-ID", "spatial", relation="near", **fields),))
+
+
+def test_unbound_initial_reference_is_corrected_once_without_weakening(tmp_path):
+    raw = "Find a steady backless seat at the vanity."
+    initial = {"targets": [{"name": "seat", "attributes": {"back": "backless", "support": "steady"}}],
+               "constraints": [{"type": "spatial", "subject": "seat", "relation": "near",
+                                "object": "vanity", "hardness": "hard"}]}
+    corrected = {**initial, "targets": [*initial["targets"], {"name": "vanity", "terminal": False}]}
+    compiler, requests = _initial_compiler_replay(tmp_path, [initial, corrected])
+    result = compiler.compile(raw, {"spatial"})
+    assert result.status == "success" and compiler.model_calls == len(requests) == 2
+    assert result.task.raw_instruction == raw
+    assert result.task.targets[0].attributes == initial["targets"][0]["attributes"]
+    assert result.task.constraints[0].object == result.task.targets[1].id
+
+
 def test_grounding_preserves_order_and_count_with_anchor(monkeypatch):
     monkeypatch.setenv("LLM_OFFLINE", "1")
     plan = InstructionPlan(
         raw_instruction="Find two cups on the table, then a chair",
+        eval_mode="all_targets_success",
         targets=[TargetQuery(id="cups", name="cup", min_count=2),
-                 TargetQuery(id="chair", name="chair")],
+                 TargetQuery(id="chair", name="chair"),
+                 TargetQuery(id="table", name="table", role="anchor", terminal=False)],
         constraints=[Constraint(type="relation", subject="cup", relation="on",
                                 object="table", hardness="hard")],
         execution=ExecutionPolicy(mode="all_targets_success", ordered=True, exhaustive=True),
@@ -154,12 +208,14 @@ def _structured_parser_provider(monkeypatch, payload):
 
 @pytest.fixture(params=[
     pytest.param(
-        ("I need somewhere soft and unoccupied to lie down, preferably in the bedroom.",
+        ("I need somewhere soft and unoccupied to lie down; it must be soft and unoccupied, "
+         "preferably in the bedroom.",
          "resting surface", "lie down", ["body"], "soft body-supporting surface",
          {"softness": "soft", "state": "unoccupied"}, ["bed", "sofa"], "bedroom"),
         id="soft-unoccupied-resting-surface"),
     pytest.param(
-        ("I want to lay out plates and food on a clean surface, preferably in the kitchen.",
+        ("I want to lay out plates and food on a clean surface; it must be clean, "
+         "preferably in the kitchen.",
          "dining surface", "lay out plates and food", ["plates", "food"], "flat support surface",
          {"state": "clean"}, ["dining table", "kitchen counter"], "kitchen"),
         id="clean-surface-for-plates-and-food"),
@@ -224,7 +280,7 @@ def test_structured_demand_survives_real_parse_compile_and_is_deeply_immutable(s
     # be replaced by the generated hard resource predicate.
     explicit = task.as_dict()["constraints"][:-1]
     assert explicit == [
-        {"id": f"c{i}", "type": c.type, "subject": c.subject, "relation": c.relation,
+        {"id": f"c{i}", "type": c.type, "subject": target.id, "relation": c.relation,
          "object": c.object, "value": c.value, "hardness": c.hardness,
          "verifier": c.verifier, "source": "llm"}
         for i, c in enumerate(plan.constraints)
@@ -356,7 +412,8 @@ def test_explicit_object_instruction_does_not_acquire_a_demand(monkeypatch):
     from instruction.compiler import compile_instruction
     from instruction_adapter.task_compat import runtime_plan
 
-    raw = "Find the red chair."
+    # Both representations of color remain exercised, each with its own wording.
+    raw = "Find the red chair; it must be red."
     requests = _structured_parser_provider(monkeypatch, {
         "targets": [{"name": "chair", "attributes": {"color": "red"}}],
         "constraints": [{"type": "attribute", "subject": "chair", "value": {"color": "red"},
@@ -381,7 +438,8 @@ def test_parsed_projection_and_revision_preserve_immutable_semantics(monkeypatch
     from instruction import compiler, parser
     from prompting.schemas import ParsedInstruction
 
-    raw = "  Find two red cups, then a clean writing surface near the work desk.  "
+    raw = ("  Find all two red cups, then a clean writing surface for writing notes in a notebook "
+           "near the work desk.  ")
     payload = {
         "task_type": " MULTI_GOAL ", "eval_mode": " ALL_TARGETS_SUCCESS ",
         "targets": [
@@ -418,7 +476,7 @@ def test_parsed_projection_and_revision_preserve_immutable_semantics(monkeypatch
     assert plan.search_priors.support_objects == ["lamp"]
     assert plan.search_priors.affordances == ["writing"]
     assert plan.constraints[1].as_dict() == Constraint(
-        type="relation", subject="writing surface", relation="near", object="work desk",
+        type="relation", subject="writing_surface", relation="near", object="work desk",
         hardness="hard", verifier="vlm", source="llm",
     ).as_dict()
 
@@ -464,6 +522,206 @@ def test_parsed_projection_and_revision_preserve_immutable_semantics(monkeypatch
     forbidden.assert_not_called()
 
 
+@pytest.fixture
+def explicit_id_payload():
+    """Scripted declarations, not a claim about model extraction accuracy."""
+    return {
+        "targets": [
+            {"id": "Entity_A", "name": "surface", "aliases": ["work surface"],
+             "attributes": {"state": "clean"}},
+            {"id": "Entity_a", "name": "surface", "aliases": ["work surface"],
+             "role": "anchor", "terminal": False},
+        ],
+        "constraints": [
+            {"id": "Predicate_A", "type": "spatial", "subject": "Entity_A",
+             "relation": "near", "object": "Entity_a", "hardness": "hard"},
+            {"id": "Predicate_a", "type": "spatial", "subject": "Entity_a",
+             "relation": "facing", "object": "Entity_A", "hardness": "hard"},
+        ],
+    }
+
+
+@pytest.mark.parametrize("retain_task_spec", [True, False], ids=["cached", "without-task-spec"])
+def test_explicit_ids_disambiguate_duplicate_names_through_roundtrip(
+    monkeypatch, explicit_id_payload, retain_task_spec,
+):
+    from instruction import compiler, parser
+    from instruction.contracts import TaskSpec
+    from instruction_adapter.task_compat import runtime_plan
+    from prompting.schemas import ParsedInstruction
+
+    forbidden = Mock(side_effect=AssertionError("structural ID tests must not request a model"))
+    monkeypatch.setattr(parser, "get_client_and_model", forbidden)
+    monkeypatch.setattr(compiler, "parse_instruction_with_llm", forbidden)
+    raw = "Find the clean surface near the other surface, which faces it."
+    parsed = ParsedInstruction.model_validate(explicit_id_payload)
+    before = parsed.model_dump()
+    target_ids = ["Entity_A", "Entity_a"]
+    bindings = [("Predicate_A", "Entity_A", "Entity_a"),
+                ("Predicate_a", "Entity_a", "Entity_A")]
+    assert [t.id for t in parsed.targets] == target_ids
+    assert [(c.id, c.subject, c.object) for c in parsed.constraints] == bindings
+
+    plan = parser.plan_from_parsed_instruction(raw, parsed)
+    assert [t.id for t in plan.targets] == target_ids
+    assert [t.name for t in plan.targets] == ["surface", "surface"]
+    assert [(c.id, c.subject, c.object) for c in plan.constraints] == bindings
+    result = compiler.compile_parsed_instruction(raw, parsed, {"spatial"})
+    assert result.status == "success", result.diagnostics
+    task = result.task
+    assert task == task_from_parsed_plan(plan)
+    assert [t.id for t in task.targets] == target_ids
+    assert [(c.id, c.subject, c.object) for c in task.constraints] == bindings
+
+    projected = runtime_plan(task)
+    assert [t.id for t in projected.targets] == target_ids
+    assert [(c.id, c.subject, c.object) for c in projected.constraints] == bindings
+    assert [(c.id, c.subject_concept.id, c.object_concept.id)
+            for c in projected.constraints] == bindings
+    assert projected.constraints[0].subject_concept.attributes == {"state": "clean"}
+    assert not projected.constraints[0].object_concept.terminal
+    if not retain_task_spec:
+        del projected.diagnostics["task_spec"]
+    assert TaskSpec.from_dict(task.as_dict()) == task_from_parsed_plan(projected) == task
+    assert parsed.model_dump() == before
+    forbidden.assert_not_called()
+
+
+@pytest.mark.parametrize("id_field", [{}, {"id": ""}], ids=["omitted", "empty"])
+def test_implicit_ids_keep_positional_allocation_alongside_explicit_ids(id_field):
+    from instruction.compiler import compile_parsed_instruction
+    from instruction.contracts import TaskSpec
+    from instruction.parser import plan_from_parsed_instruction
+    from instruction_adapter.task_compat import runtime_plan
+    from prompting.schemas import ParsedInstruction
+
+    raw = "Find the clean cup near the work desk."
+    parsed = ParsedInstruction.model_validate({
+        "targets": [{"id": "Cup:Keep_ID", "name": "cup"},
+                    {**id_field, "name": " Work_Desk ", "role": "anchor", "terminal": False}],
+        "constraints": [
+            {"id": "Property:Keep_ID", "type": "state", "subject": "Cup:Keep_ID",
+             "value": "clean", "hardness": "hard"},
+            {**id_field, "type": "spatial", "subject": "cup", "relation": "near",
+             "object": "work desk", "hardness": "hard"},
+        ],
+    })
+    assert parsed.targets[1].id == parsed.constraints[1].id == ""
+    plan = plan_from_parsed_instruction(raw, parsed)
+    assert [t.id for t in plan.targets] == ["Cup:Keep_ID", "t1_work_desk"]
+    assert [c.id for c in plan.constraints] == ["Property:Keep_ID", ""]
+    result = compile_parsed_instruction(raw, parsed, {"state", "spatial"})
+    assert result.status == "success", result.diagnostics
+    task = result.task
+    assert task == task_from_parsed_plan(plan)
+    assert [t.id for t in task.targets] == ["Cup:Keep_ID", "t1_work_desk"]
+    assert [c.id for c in task.constraints] == ["Property:Keep_ID", "c1"]
+    assert (task.constraints[1].subject, task.constraints[1].object) == ("Cup:Keep_ID", "t1_work_desk")
+    projected = runtime_plan(task)
+    assert [c.id for c in projected.constraints] == ["Property:Keep_ID", "c1"]
+    del projected.diagnostics["task_spec"]
+    assert task_from_parsed_plan(projected) == TaskSpec.from_dict(task.as_dict()) == task
+
+
+@pytest.mark.parametrize("collection,diagnostic", [
+    ("targets", "Target IDs must be unique"),
+    ("constraints", "Constraint 'Predicate_A' id: must be unique"),
+])
+def test_duplicate_explicit_ids_are_invalid(explicit_id_payload, collection, diagnostic):
+    from instruction.compiler import compile_parsed_instruction
+    from prompting.schemas import ParsedInstruction
+
+    explicit_id_payload[collection][1]["id"] = explicit_id_payload[collection][0]["id"]
+    parsed = ParsedInstruction.model_validate(explicit_id_payload)
+    result = compile_parsed_instruction("Find one surface near the other.", parsed, {"spatial"})
+    assert result.status == "invalid" and result.task is None
+    assert result.diagnostics == (diagnostic,)
+
+
+@pytest.mark.parametrize("collection", ["targets", "constraints"])
+@pytest.mark.parametrize("explicit_index", [0, 1], ids=["explicit-first", "auto-first"])
+def test_explicit_and_auto_id_collisions_are_invalid(collection, explicit_index):
+    from instruction.compiler import compile_parsed_instruction
+    from prompting.schemas import ParsedInstruction
+
+    payload = {
+        "targets": [{"name": "cup"}, {"name": "desk", "role": "anchor", "terminal": False}],
+        "constraints": [
+            {"type": "state", "subject": "cup", "value": "clean", "hardness": "hard"},
+            {"type": "state", "subject": "desk", "value": "clean", "hardness": "hard"},
+        ],
+    }
+    auto_index = 1 - explicit_index
+    collision = (["t0_cup", "t1_desk"][auto_index] if collection == "targets" else f"c{auto_index}")
+    payload[collection][explicit_index]["id"] = collision
+    result = compile_parsed_instruction(
+        "Find a clean cup by the clean desk.", ParsedInstruction.model_validate(payload), {"state"},
+    )
+    assert result.status == "invalid" and result.task is None
+    diagnostic = ("Target IDs must be unique" if collection == "targets" else
+                  f"Constraint {collision!r} id: must be unique")
+    assert result.diagnostics == (diagnostic,)
+
+
+@pytest.mark.parametrize("field", ["subject", "object"])
+def test_explicit_id_references_are_case_sensitive(explicit_id_payload, field):
+    from instruction.compiler import compile_parsed_instruction
+    from prompting.schemas import ParsedInstruction
+
+    explicit_id_payload["constraints"][0][field] = "ENTITY_A"
+    result = compile_parsed_instruction(
+        "Find one surface near the other.", ParsedInstruction.model_validate(explicit_id_payload), {"spatial"},
+    )
+    assert result.status == "invalid" and result.task is None
+    assert len(result.diagnostics) == 1
+    assert result.diagnostics[0].startswith(
+        f"Constraint 'Predicate_A' {field}: unbound target reference 'ENTITY_A';")
+
+
+def test_explicit_ids_survive_reorder_and_rename_in_complete_revision(explicit_id_payload):
+    from instruction.compiler import compile_parsed_instruction
+    from instruction.contracts import TaskSpec
+    from instruction_adapter.task_compat import runtime_plan
+    from prompting.schemas import ParsedInstruction
+
+    raw = "Find the clean surface near the other surface, which faces it."
+    initial = compile_parsed_instruction(
+        raw, ParsedInstruction.model_validate(explicit_id_payload), {"spatial"}, revision=7,
+    )
+    assert initial.status == "success", initial.diagnostics
+    before = initial.task.as_dict()
+    # Supply a complete fresh interpretation, not a patch or a reused TaskSpec.
+    revised_payload = deepcopy(explicit_id_payload)
+    revised_payload["targets"].reverse()
+    revised_payload["targets"][0]["name"] = "work desk"
+    revised_payload["targets"][1]["name"] = "writing surface"
+    revised_payload["constraints"].reverse()
+    revised_parse = ParsedInstruction.model_validate(revised_payload)
+    revised = compile_parsed_instruction(raw, revised_parse, {"spatial"}, revision=8)
+    assert revised.status == "success", revised.diagnostics
+    task = revised.task
+    assert task.raw_instruction == raw and task.revision == 8
+    assert [(t.id, t.name, t.terminal) for t in task.targets] == [
+        ("Entity_a", "work desk", False), ("Entity_A", "writing surface", True),
+    ]
+    assert [c.id for c in task.constraints] == ["Predicate_a", "Predicate_A"]
+    assert {c.id: c for c in task.constraints} == {c.id: c for c in initial.task.constraints}
+    assert task.targets[1].attributes == {"state": "clean"}
+    assert TaskSpec.from_dict(task.as_dict()) == task
+
+    projected = runtime_plan(task, plan=runtime_plan(initial.task))
+    assert task_from_parsed_plan(projected) == task
+    assert [(c.id, c.subject_concept.id, c.object_concept.id) for c in projected.constraints] == [
+        ("Predicate_a", "Entity_a", "Entity_A"), ("Predicate_A", "Entity_A", "Entity_a"),
+    ]
+    assert projected.constraints[0].subject_concept.name == "work desk"
+    assert projected.constraints[0].object_concept.name == "writing surface"
+    del projected.diagnostics["task_spec"]
+    assert task_from_parsed_plan(projected, revision=8) == task
+    assert initial.task.as_dict() == before and initial.task.revision == 7
+    assert revised_parse.model_dump() == ParsedInstruction.model_validate(revised_payload).model_dump()
+
+
 @pytest.mark.parametrize("strict", [True, False])
 def test_parsed_projection_preserves_strict_dataset_fallback_policy(monkeypatch, strict):
     from instruction import parser
@@ -507,8 +765,7 @@ def test_parsed_projection_preserves_strict_dataset_fallback_policy(monkeypatch,
         "activity": "write", "required_resource": "surface"}}]}, set(), 1,
         "unsupported", id="unsupported-demand"),
     pytest.param("find cup", {"targets": [{"name": "cup"}], "constraints": [{
-        "type": "room", "value": "study", "hardness": "soft"}]}, set(), 1,
-        "success", id="soft-constraint"),
+        "type": "room", "value": "study", "hardness": "soft"}]}, set(), 1, "success", id="soft-constraint"),
 ])
 def test_parsed_compiler_uses_initial_gates_without_reparsing(
     monkeypatch, text, payload, capabilities, revision, status,
@@ -725,12 +982,9 @@ def _initial_compiler_replay(tmp_path, outputs, *, budget=2):
     return compiler, requests
 
 
-def test_demand_schema_orders_resource_inference_before_naming_without_repairing_output(tmp_path):
-    from prompting.schemas import ParsedTarget
+def test_initial_correction_rejects_nonterminal_resource_without_repairing_output(tmp_path):
     from llm_utils.structured_output import StructuredOutputError
 
-    schema = ParsedTarget.model_json_schema()
-    assert list(schema["properties"]).index("demand") < list(schema["properties"]).index("name")
     corrected = {"targets": [{"name": "ingredients", "terminal": False, "demand": {
         "activity": "clean", "manipulated_objects": ["ingredients"],
         "required_resource": "cleaning_equipment", "destination_hypotheses": []}}]}
@@ -776,6 +1030,36 @@ def test_initial_relation_schema_precedes_unary_properties():
 
     properties = list(ParsedInstruction.model_json_schema()["properties"])
     assert properties.index("constraints") < properties.index("targets")
+
+
+@pytest.mark.parametrize("field", ["subject", "object"])
+def test_initial_correction_gets_endpoint_error_and_preserves_requirements(tmp_path, field):
+    import json
+    from prompting.schemas import ParsedInstruction
+
+    raw = "Find the red cup, near the desk."
+    corrected = {
+        "targets": [{"id": "a", "name": "cup", "attributes": {"color": "red"}},
+                    {"id": "b", "name": "desk", "terminal": False}],
+        "constraints": [{"id": "r", "type": "spatial", "subject": "a", "relation": "near",
+                         "object": "b", "hardness": "hard"}],
+    }
+    invalid = deepcopy(corrected)
+    invalid["constraints"][0][field] = "missing-target"
+    compiler, requests = _initial_compiler_replay(tmp_path, [invalid, corrected], budget=60)
+    result = compiler.compile(raw, {"spatial"}, revision=8)
+    assert result.status == "success" and result.task.revision == 8
+    assert compiler.model_calls == len(requests) == 2
+    correction = json.loads(requests[1]["messages"][1]["content"])
+    assert correction["original_instruction"] == raw
+    assert correction["previous_interpretation"] == ParsedInstruction.model_validate(invalid).model_dump()
+    assert len(correction["diagnostics"]) == 1
+    assert correction["diagnostics"][0].startswith(
+        f"Constraint 'r' {field}: unbound target reference 'missing-target';")
+    assert result.task.raw_instruction == raw
+    assert result.task.targets[0].attributes == {"color": "red"}
+    assert [(c.id, c.subject, c.relation, c.object, c.hardness) for c in result.task.constraints] == [
+        ("r", "a", "near", "b", "hard")]
 
 
 @pytest.mark.parametrize("initial", [
@@ -886,7 +1170,7 @@ def test_initial_recovery_preserves_complete_explicit_requirements(tmp_path):
     assert task.targets[0].aliases == ("mug", "cup")
     assert task.targets[0].min_count == 2 and task.targets[0].attributes == {"color": "red"}
     assert [(c.type, c.subject, c.relation, c.object, c.hardness) for c in task.constraints] == [
-        ("spatial", "cup", "on", "table", "hard")]
+        ("spatial", "t0_cup", "on", "t1_table", "hard")]
     assert compiler.model_calls == len(requests) == 2
     assert [request["trace_label"] for request in requests] == ["initial_parse", "initial_correction"]
 
@@ -951,7 +1235,7 @@ def test_initial_grounding_cannot_make_unbudgeted_calls(monkeypatch, tmp_path, s
     provider = Mock(side_effect=AssertionError("unbudgeted grounding call"))
     monkeypatch.setattr(detector_adapter, "get_client_and_model", provider)
     monkeypatch.setenv("LLM_OFFLINE", "0")
-    payload = {"targets": [{"name": "armchair"}], "constraints": [{
+    payload = {"targets": [{"name": "armchair"}, {"name": "work desk", "terminal": False}], "constraints": [{
         "type": "spatial", "subject": "armchair", "relation": "near", "object": "work desk", "hardness": "hard"}]}
     compiler, requests = _initial_compiler_replay(tmp_path, [payload], budget=1)
     plan = compile_instruction_plan("Find the armchair near the work desk.", initial_compiler=compiler,
@@ -967,7 +1251,9 @@ def test_initial_recovery_uses_malformed_response_diagnostics(tmp_path):
     from llm_utils.structured_output import StructuredOutputError
 
     error = StructuredOutputError("truncated JSON", raw_content='{"targets": [')
-    compiler, requests = _initial_compiler_replay(tmp_path, [error, {"targets": [{"name": "chair"}]}])
+    compiler, requests = _initial_compiler_replay(tmp_path, [error, {
+        "targets": [{"name": "chair"}],
+    }])
     result = compiler.compile("Find a chair.", set())
     assert result.status == "success" and compiler.model_calls == len(requests) == 2
     assert [request["trace_label"] for request in requests] == ["initial_parse", "initial_correction"]
@@ -989,7 +1275,9 @@ def test_initial_single_parse_installs_session_without_accepting_candidates(monk
     from task.session import TaskSession
 
     monkeypatch.setenv("LLM_OFFLINE", "1")
-    compiler, requests = _initial_compiler_replay(tmp_path, [{"targets": [{"name": "chair"}]}], budget=1)
+    compiler, requests = _initial_compiler_replay(tmp_path, [{
+        "targets": [{"name": "chair"}],
+    }], budget=1)
     path = Path(__file__).resolve().parents[1] / "objnav_benchmark_with_process_obs.py"
     node = next(node for node in ast.parse(path.read_text()).body
                 if isinstance(node, ast.FunctionDef) and node.name == "_install_instruction_plan")
@@ -1060,3 +1348,39 @@ def test_initial_recovery_propagates_provider_refusal(monkeypatch, tmp_path, fai
     assert events[-1]["event"] == "request_refused"
     assert events[-1]["stage"] == requests[-1]["trace_label"]
     assert not any(event.get("task") or event["event"] == "admission" for event in events)
+
+
+@pytest.mark.parametrize("case", ["valid", "hash", "text", "unbound", "unsupported"])
+def test_fixed_task_loader_checks_artifact_without_language_calls(monkeypatch, tmp_path, case):
+    import hashlib
+    import json
+    from instruction import compiler
+    from instruction.contracts import ConstraintSpec, TargetSpec, TaskSpec
+    from instruction_adapter.compiler import RUNTIME_CONSTRAINT_TYPES
+
+    raw = "Find a red cup near the tray."
+    task = TaskSpec(raw, (TargetSpec("cup", "cup", attributes={"color": "red"}),
+                         TargetSpec("tray", "tray", terminal=False)),
+                    constraints=(ConstraintSpec("near", "spatial", "cup", "near", "tray"),), revision=4)
+    payload = task.as_dict()
+    if case == "unbound":
+        payload["constraints"][0]["object"] = "undeclared"
+    if case == "unsupported":
+        payload["constraints"][0]["type"] = "path exclusion"
+    path = tmp_path / "task.json"
+    path.write_text(json.dumps(payload))
+    expected = hashlib.sha256(path.read_bytes()).hexdigest() if case != "hash" else "0" * 64
+    text = raw if case != "text" else "Find a blue cup."
+    forbidden = Mock(side_effect=AssertionError("fixed loading cannot compile language"))
+    monkeypatch.setattr(compiler, "InitialInstructionCompiler", forbidden)
+    monkeypatch.setattr(compiler, "compile_instruction", forbidden)
+    monkeypatch.setattr(compiler, "parse_instruction_with_llm", forbidden)
+    if case == "valid":
+        loaded = compiler.load_fixed_task(path, expected, text, RUNTIME_CONSTRAINT_TYPES)
+        assert loaded == task and loaded.as_dict() == payload
+    else:
+        message = {"hash": "SHA256 mismatch", "text": "original instruction mismatch",
+                   "unbound": "unbound target reference", "unsupported": "unsupported constraints"}[case]
+        with pytest.raises(ValueError, match=message):
+            compiler.load_fixed_task(path, expected, text, RUNTIME_CONSTRAINT_TYPES)
+    forbidden.assert_not_called()

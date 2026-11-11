@@ -10,6 +10,7 @@ from instruction_adapter.relation_verifier import DynamicRelationService
 from verification.store import EvidenceStore
 from instruction.contracts import TaskSpec
 from instruction.compiler import task_from_parsed_plan
+from instruction_adapter.task_compat import runtime_plan
 from task.state import TaskProgress
 
 @dataclass
@@ -31,6 +32,7 @@ class TaskSession:
         prior_map_room_semantics: Optional evidence-versioned room labels.
         prior_map_diagnostics: Optional conflict/alignment diagnostics.
         vlm: VLM provider name used when constructing default matchers.
+        interpretation_locked: Keep the task contract fixed while allowing search revisions.
     """
 
     snapshot: SemanticMapSnapshot
@@ -54,6 +56,7 @@ class TaskSession:
     search_revision: int = 0
     search_hypotheses: dict[str, dict[str, Any]] = field(default_factory=dict)
     interpretation_history: list[dict[str, Any]] = field(default_factory=list)
+    interpretation_locked: bool = False
 
     def __post_init__(self) -> None:
         """Keep task services outside the scene; observations remain native values."""
@@ -62,6 +65,7 @@ class TaskSession:
         self.relation_pair_ledger = self.relation_pair_ledger or RelationPairLedger()
         data = self.plan.diagnostics.get("task_spec")
         self.spec = TaskSpec.from_dict(data) if data else task_from_parsed_plan(self.plan)
+        self.plan = runtime_plan(self.spec, plan=self.plan)
         self.verification_ledger = self.verification_ledger or EvidenceStore(self.spec.revision)
         self.progress = TaskProgress(self.spec)
         active = self.progress.active_target()
@@ -79,14 +83,15 @@ class TaskSession:
             plan: Compiled runtime plan carrying the immutable task contract.
 
         Raises:
-            ValueError: A changed contract reuses or decreases the revision.
+            ValueError: The contract is locked, or a changed contract reuses or decreases the revision.
         """
         data = plan.diagnostics.get("task_spec")
         spec = TaskSpec.from_dict(data) if data else task_from_parsed_plan(plan)
         if spec == self.spec:
-            if plan is self.plan:
+            same_plan = plan is self.plan
+            self.plan = runtime_plan(spec, plan=plan)
+            if same_plan:
                 return
-            self.plan = plan
             for concept in self.search_concepts:
                 if concept.id in self.search_hypotheses:
                     concept.detector_terms = list(self.search_hypotheses[concept.id]["detector_terms"])
@@ -95,11 +100,13 @@ class TaskSession:
                     target.detector_terms = list(self.search_hypotheses[target.id]["detector_terms"])
             self.search_revision += 1
             return
+        if self.interpretation_locked:
+            raise ValueError("Task interpretation is locked; only search revisions are allowed")
         if spec.revision <= self.spec.revision:
             raise ValueError("Changed task requires a newer revision")
         if spec.raw_instruction != self.spec.raw_instruction:
             self.interpretation_history = []
-        self.plan, self.spec = plan, spec
+        self.plan, self.spec = runtime_plan(spec, plan=plan), spec
         self.progress = TaskProgress(spec)
         self.verification_ledger = EvidenceStore(spec.revision)
         self.anchor_search_ledger = AnchorSearchLedger()

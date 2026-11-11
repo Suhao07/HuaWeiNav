@@ -38,6 +38,8 @@ class ConceptQuery:
     terminal: bool = False
     source: str = ""
     demand: dict[str, Any] = field(default_factory=dict)
+    attributes: dict[str, Any] = field(default_factory=dict)
+    constraints: list[dict[str, Any]] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -92,6 +94,7 @@ class TargetQuery:
             terminal=self.terminal,
             source=self.source,
             demand=dict(self.demand),
+            attributes=dict(self.attributes),
         )
 
 
@@ -114,6 +117,7 @@ class Constraint:
     source: str = ""
     object_concept: ConceptQuery | None = None
     subject_concept: ConceptQuery | None = None
+    id: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)

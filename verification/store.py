@@ -23,11 +23,13 @@ class EvidenceStore:
         self.records: dict[tuple, VerificationRecord] = {}
         self.history: list[VerificationRecord] = []
         self.visual_judgments: dict[str, Any] = {}
+        self.instance_observations: dict[str, Any] = {}
 
     def reset(self):
         self.records.clear()
         self.history.clear()
         self.visual_judgments.clear()
+        self.instance_observations.clear()
 
     def get(self, raw_instruction: str, candidate_uid: str, *,
             predicate_id: str = "final_stop", anchor_uid: str = "") -> VerificationRecord | None:
@@ -73,6 +75,7 @@ class EvidenceStore:
             predicate_id=result.predicate_id,
             anchor_uid=result.anchor_uid,
             verdict=result.verdict if images_valid else "unknown",
+            observed_category=result.observed_category,
             dependencies=dict(result.dependencies),
         )
         # 记录保留原始版本及对象对；新 anchor 使用独立索引。

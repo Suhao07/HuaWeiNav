@@ -4,7 +4,7 @@ from scene.query import CandidateSet, query_candidates
 from task.session import TaskSession
 
 
-def query_scene(session: TaskSession, *, step: int | None = None) -> CandidateSet:
+def query_scene(session: TaskSession, *, step: int | None = None, deferred_uids=()) -> CandidateSet:
     """Query observed candidates using the current task's evidence and priors.
 
     Args:
@@ -20,7 +20,7 @@ def query_scene(session: TaskSession, *, step: int | None = None) -> CandidateSe
         session.plan, session.progress, session.snapshot, session.verification_ledger,
         matcher=session.concept_matcher, anchor_ledger=session.anchor_search_ledger,
         step=step, prior_adapter=session.prior_map_policy_adapter,
-        prior_result=session.prior_result,
+        prior_result=session.prior_result, deferred_uids=deferred_uids,
     )
     demands = {target.id for target in session.spec.targets if target.demand}
     session.destination_hypotheses = [
@@ -103,9 +103,9 @@ class NavigationTools:
                 plan, task_revision=task_revision, search_revision=search_revision,
                 snapshot=snapshot, record=record)
 
-    def query_scene(self):
+    def query_scene(self, *, deferred_uids=()):
         """Return domain-ranked candidates without choosing a motion."""
-        result = query_scene(self.session)
+        result = query_scene(self.session, deferred_uids=deferred_uids)
         return {
             "candidates": [{"candidate_uid": c.obj.uid, "target_id": c.target_id,
                             "role": c.role, "label": c.canonical_label}
@@ -199,8 +199,10 @@ class NavigationTools:
             raw_instruction=self.session.spec.raw_instruction,
             instruction_plan=self.session.plan, candidate=candidate, evidence=evidence,
         )
-        if object_dependencies(source_snapshot, candidate_uid, result.anchor_uid) != object_dependencies(
-            self.session.snapshot, candidate_uid, result.anchor_uid
+        anchors = {result.anchor_uid, *(row["anchor_uid"] for row in
+                    result.view_objective.get("relation_outcomes", []))}
+        if object_dependencies(source_snapshot, candidate_uid, *anchors) != object_dependencies(
+            self.session.snapshot, candidate_uid, *anchors
         ):
             raise ValueError("Verification observation dependencies changed during inference")
         self.session.verification_ledger.put(self.session.spec.raw_instruction, candidate_uid, result)

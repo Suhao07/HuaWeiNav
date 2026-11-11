@@ -88,6 +88,7 @@ class VLMRelationVerifier:
                     crop_block, crop_archive, crop_digest = image_input(str(crop_path), crop_path.parent)
                     region = {"role": role, "instance_id": obj["id"],
                               "requested_concept": obj["requested_concept"], "demand": obj.get("demand", {}),
+                              "attributes": obj.get("attributes", {}), "constraints": obj.get("constraints", []),
                               "source_frame_id": view["id"], "source_image_sha256": digest,
                               "bbox_xyxy_in_source": box, "rgb_path": crop_archive,
                               "image_sha256": crop_digest,
@@ -132,12 +133,17 @@ class VLMRelationVerifier:
                      ("reference_identity", parsed.reference_identity), ("relation", parsed.relation))
         return {
             "verified": verdict == "true",
+            "dependencies": {f"image:{image['rgb_path']}": image["image_sha256"]
+                             for view in views for image in [view, *view["regions"]]},
+            "evidence_ids": sorted({image["image_sha256"]
+                                    for view in views for image in [view, *view["regions"]]}),
             "confidence": float(parsed.confidence),
             "need_better_view": verdict == "unknown",
             "identity_judgments": {
                 role: {"verdict": judgment.verdict, "reason": judgment.reason,
                        "instance_id": obj["id"], "requested_concept": obj["requested_concept"],
-                       "demand": obj.get("demand", {}),
+                       "demand": obj.get("demand", {}), "attributes": obj.get("attributes", {}),
+                       "constraints": obj.get("constraints", []),
                        "source_crop_sha256": sorted({region["presentation"]["source_crop_sha256"]
                            for view in views for region in view["regions"] if region["role"] == role})}
                 for role, obj, judgment in (("subject", subject, parsed.subject_identity),
@@ -165,6 +171,7 @@ class DynamicRelationService:
         relation: str,
         object_: dict[str, Any],
         evidence_views: list[dict[str, Any]],
+        predicate: dict[str, Any] | None = None,
         use_vlm: bool = True,
     ) -> SemanticEdge:
         callback = self.vlm_callback if use_vlm else None
@@ -172,6 +179,7 @@ class DynamicRelationService:
             subject=subject,
             relation=relation,
             object_=object_,
+            predicate=predicate,
             evidence_views=evidence_views,
             vlm_callback=callback,
         )

@@ -19,8 +19,8 @@ def is_anchor_first_relation_search(plan: Any) -> bool:
     return any(
         compact_key(getattr(c, "type", "")) in
         {"spatial", "relation", "object_relation", "co_occurrence"}
-        and getattr(c, "object_concept", None) is not None
-        and not c.object_concept.terminal
+        and any(concept is not None and not concept.terminal
+                for concept in (getattr(c, "subject_concept", None), getattr(c, "object_concept", None)))
         for c in getattr(plan, "constraints", ())
     )
 

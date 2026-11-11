@@ -17,6 +17,7 @@ from prompting.registry import (
     CONCEPT_MATCH_BATCH,
     FINAL_VERIFY,
     INSTRUCTION_PARSE,
+    INSTANCE_OBSERVE,
     RELATION_VERIFY,
 )
 from prompting.schemas import (
@@ -24,12 +25,14 @@ from prompting.schemas import (
     concept_batch_response_model,
     ParsedInstruction,
     ParsedRelationResult,
-    ParsedVerification,
+    instance_observation_response_model,
+    visual_verification_response_model,
 )
 from prompting.templates import (
     CONCEPT_GROUNDING_PROMPT,
     CONCEPT_MATCH_PROMPT,
     FINAL_VERIFIER_PROMPT,
+    INSTANCE_OBSERVER_PROMPT,
     INSTRUCTION_PARSE_PROMPT,
     RELATION_VERIFIER_PROMPT,
 )
@@ -38,6 +41,7 @@ from deployment.lvlm_server.smoke_client import image_data_url, request_json, re
 
 
 CheckFunction = Callable[[Any], list[str]]
+INSTRUCTION_SMOKE_TEXT = "Find a red book on a shelf."
 
 
 @dataclass(frozen=True)
@@ -62,18 +66,10 @@ class SchemaSmokeCase:
 
 
 def build_schema_cases(image_url: str) -> list[SchemaSmokeCase]:
-    """Build the five production schema calls required for server acceptance.
-
-    Args:
-        image_url: Base64 data URL for one representative navigation frame.
-
-    Returns:
-        Ordered smoke cases for parser, grounding, matching, relation, and final
-        verification.
-    """
+    """Build production-schema probes, including unbound-evidence guards."""
 
     instruction_payload = (
-        "Instruction: Find a red book on a shelf.\n"
+        f"Instruction: {INSTRUCTION_SMOKE_TEXT}\n"
         "Dataset target fallback: book"
     )
     grounding_payload = {
@@ -110,7 +106,9 @@ def build_schema_cases(image_url: str) -> list[SchemaSmokeCase]:
     final_payload = {
         "raw_instruction": "Find a book on a shelf.",
         "candidate": {"uid": "book_1"},
-        "image_role": "current_candidate_observation",
+        "image_role": "unbound_operator_frame",
+        "verification_predicates": [{"id": "candidate_identity", "type": "identity",
+                                     "value": "The candidate is the requested book on a shelf."}],
     }
 
     return [
@@ -152,17 +150,41 @@ def build_schema_cases(image_url: str) -> list[SchemaSmokeCase]:
             check=_check_relation,
         ),
         SchemaSmokeCase(
+            name="instance_observer",
+            trace_label=INSTANCE_OBSERVE.trace_label,
+            system_prompt=INSTANCE_OBSERVER_PROMPT,
+            user_content=[
+                {"type": "text", "text": json.dumps({
+                    "observation_id": "schema_smoke_view", "role": "unbound_operator_frame",
+                    "binding": "No selected instance, bounding box or goal reference is provided."})},
+                {"type": "image_url", "image_url": {"url": image_url}},
+            ],
+            response_format=instance_observation_response_model(["schema_smoke_view"], compare_reference=True),
+            check=_check_observation_guard,
+        ),
+        SchemaSmokeCase(
             name="final_instruction_verifier",
             trace_label=FINAL_VERIFY.trace_label,
             system_prompt=FINAL_VERIFIER_PROMPT,
             user_content=[
                 {"type": "text", "text": json.dumps(final_payload, ensure_ascii=False, indent=2)},
-                {"type": "image_url", "image_url": {"url": image_url}},
+                {"type": "text", "text": json.dumps({"bound_observations": {}, "reference_comparison": None})},
             ],
-            response_format=ParsedVerification,
+            response_format=visual_verification_response_model(["candidate_identity"]),
             check=_check_final_guard,
         ),
     ]
+
+
+def _check_observation_guard(parsed):
+    facts = parsed.observations.model_dump()["schema_smoke_view"]
+    comparison = parsed.reference_comparison
+    if (facts["observed_category"].strip().lower() not in ("", "unknown") or facts["visible_parts"]
+            or facts["support_and_attachment"].strip() or facts["visible_surface_content"].strip()
+            or facts["visible_context"] or not facts["uncertainties"] or comparison.verdict != "unknown"
+            or comparison.supporting_observation_ids):
+        return ["instance observer claimed evidence without a bound instance or reference"]
+    return []
 
 
 def run_schema_cases(
@@ -197,7 +219,8 @@ def run_schema_cases(
                 response_format=case.response_format,
                 trace_label=case.trace_label,
                 temperature=0,
-                max_tokens=1024,
+                max_tokens=4096 if case.response_format is ParsedInstruction else 1024,
+                parse_retries=0,
             )
             message = completion.choices[0].message
             parsed = message.parsed
@@ -231,15 +254,11 @@ def run_schema_cases(
 
 
 def _check_instruction(parsed: ParsedInstruction) -> list[str]:
-    """Check that instruction parsing produces an executable terminal target."""
+    from instruction.compiler import compile_parsed_instruction
+    from instruction_adapter.compiler import RUNTIME_CONSTRAINT_TYPES
 
-    targets = list(parsed.targets or [])
-    failures = []
-    if not targets:
-        failures.append("instruction parser returned no targets")
-    if not any(bool(target.terminal) for target in targets):
-        failures.append("instruction parser returned no terminal target")
-    return failures
+    result = compile_parsed_instruction(INSTRUCTION_SMOKE_TEXT, parsed, RUNTIME_CONSTRAINT_TYPES)
+    return [] if result.status == "success" else [f"{result.status}: {item}" for item in result.diagnostics]
 
 
 def _check_grounding(parsed: GroundingResult) -> list[str]:
@@ -272,17 +291,12 @@ def _check_relation(parsed: ParsedRelationResult) -> list[str]:
     return []
 
 
-def _check_final_guard(parsed: ParsedVerification) -> list[str]:
-    """Check consistency of the visual response; physical STOP is domain-owned."""
-
-    decision = _normalize(parsed.decision).replace(" ", "_")
-    failures = []
-    visual = bool(parsed.semantic_satisfied and parsed.view_sufficient_for_stop)
-    if bool(parsed.satisfied) and not visual:
-        failures.append("final verifier satisfied=true while visual predicates are false")
-    if decision == "accept" and not (bool(parsed.satisfied) and visual):
-        failures.append("final verifier decision=accept while visual predicates are false")
-    return failures
+def _check_final_guard(parsed) -> list[str]:
+    """An unbound operator image cannot establish candidate identity."""
+    identity = parsed.predicate_judgments.candidate_identity
+    if identity.verdict != "unknown" or identity.supporting_observation_ids:
+        return ["final verifier claimed candidate evidence from an unbound image"]
+    return []
 
 
 def _model_payload(model: Any) -> dict[str, Any]:

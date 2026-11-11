@@ -1,8 +1,10 @@
 """Single strict natural-language compiler. Dataset inputs use backend adapters."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+from dataclasses import replace
 from pathlib import Path
 
 from instruction.contracts import CompileResult, ConstraintSpec, TargetSpec, TaskSpec
@@ -11,29 +13,56 @@ from instruction.parser import (
 )
 
 
-def task_from_parsed_plan(plan, *, revision=1, source="language") -> TaskSpec:
-    """Freeze parsed semantics before any detector mapping or strategy choice."""
-    demand_constraints = tuple(ConstraintSpec(
-        id=f"demand:{t.id}", type="affordance", subject=t.id, value=t.demand,
-        hardness="hard", verifier="vlm", source="demand",
-    ) for t in plan.targets if t.demand and not any(
-        c.source == "demand" and c.subject == t.id for c in plan.constraints))
-    return TaskSpec(
+def task_from_parsed_plan(plan, *, revision=None, source=None) -> TaskSpec:
+    """Admit parsed semantics, or restore the authoritative runtime contract.
+
+    Explicit revision/source overrides preserve existing predicate IDs. Invalid
+    bindings raise ValueError before any detector mapping or strategy choice.
+    """
+    data = plan.diagnostics.get("task_spec")
+    if data:
+        task = TaskSpec.from_dict(data)
+        return replace(task, revision=task.revision if revision is None else revision,
+                       source=task.source if source is None else source)
+    task = TaskSpec(
         raw_instruction=plan.raw_instruction,
         targets=tuple(TargetSpec(
             id=t.id, name=t.name, role=t.role, terminal=t.terminal,
             min_count=t.min_count, aliases=tuple(t.aliases), attributes=t.attributes, demand=t.demand,
         ) for t in plan.targets),
         constraints=tuple(ConstraintSpec(
-            id=f"c{i}", type=c.type, subject=c.subject, relation=c.relation,
+            id=c.id or f"c{i}", type=c.type, subject=c.subject, relation=c.relation,
             object=c.object, value=c.value, hardness=c.hardness,
             verifier=c.verifier, source=c.source,
-        ) for i, c in enumerate(plan.constraints)) + demand_constraints,
-        revision=revision, ordered=plan.execution.ordered,
+        ) for i, c in enumerate(plan.constraints)),
+        revision=1 if revision is None else revision, ordered=plan.execution.ordered,
         exhaustive=plan.execution.exhaustive,
         completion_mode=plan.eval_mode,
-        search_priors=plan.search_priors.as_dict(), source=source,
+        search_priors=plan.search_priors.as_dict(), source=source or "language",
     )
+    demand_constraints = tuple(ConstraintSpec(
+        id=f"demand:{t.id}", type="affordance", subject=t.id, value=t.demand,
+        hardness="hard", verifier="vlm", source="demand",
+    ) for t in task.targets if t.demand and not any(
+        c.source == "demand" and c.subject == t.id for c in task.constraints))
+    if demand_constraints:
+        task = replace(task, constraints=task.constraints + demand_constraints)
+    return task
+
+
+def load_fixed_task(path, expected_sha256, text, capabilities) -> TaskSpec:
+    """Validate artifact integrity and execution support, not semantic correctness."""
+    payload = Path(path).read_bytes()
+    if hashlib.sha256(payload).hexdigest() != expected_sha256:
+        raise ValueError("Fixed TaskSpec SHA256 mismatch")
+    task = TaskSpec.from_dict(json.loads(payload))
+    if task.raw_instruction != text:
+        raise ValueError("Fixed TaskSpec original instruction mismatch")
+    unsupported = [c.id + ":" + c.type for c in task.constraints
+                   if c.hardness == "hard" and c.type not in capabilities]
+    if unsupported:
+        raise ValueError(f"Fixed TaskSpec unsupported constraints: {unsupported}")
+    return task
 
 
 def compile_instruction(text, capabilities, *, vlm="cognav", revision=1) -> CompileResult:

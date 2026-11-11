@@ -37,9 +37,18 @@ Attributes contain only unary properties; use {} when none are stated. Represent
 each independent object relation as a separate constraint; do not concatenate
 relation phrases or hide them inside attributes.
 
-Set terminal=false for anchors/support objects. Bind constraint subjects and
-objects consistently to the target names; references to the same object must
-not become independent identities. Preserve explicit constraints as hard, and
+Preserve the complete activity, intended users and required capability, not just
+an easy-to-detect resource noun. Retain every stated unary property, depicted
+content, mounting/state and directed relationship, including clauses explaining
+why the resource is needed. Emotion alone is not a physical requirement.
+Set terminal=false for anchors/support objects. Every entity used in a relation
+must have a target record, even if it is only a reference. Assign distinct opaque
+IDs to targets and constraints; bind constraint subjects and objects to target
+IDs. Preserve IDs when revising the same entities and requirements, even if names
+or list order change. Unbound or ambiguous references are compilation errors,
+not optional hints.
+References to the same object must not become independent identities.
+Preserve explicit constraints as hard, and
 explicit hints as soft. Use room, spatial, sequence, count, area, attribute,
 co_occurrence or affordance as appropriate; use avoid_room for forbidden rooms.
 Set min_count and ordered from explicit counts/sequences; set exhaustive only
@@ -142,12 +151,17 @@ not whether the detector names a facility identical to the functional label.
 Do not require the manipulated materials to be visible. A plausible facility label
 alone does not establish functional suitability; missing structural evidence is
 unknown. Records without demand retain their requested object identity.
+Each record's attributes and constraints are required properties, including
+contents, shape and mounting. A correct category without those properties does
+not satisfy identity.
+Explicit contents requirements still require visible contents; do not confuse them
+with manipulated materials in a functional demand.
 Never substitute an unbound object elsewhere in the image.
 Do not use generic common-sense priors.
 
 Return strict JSON with three separate judgments and confidence in [0, 1]:
-- subject_identity: does the subject region satisfy its requested concept and demand, if present?
-- reference_identity: does the reference region satisfy its requested concept and demand, if present?
+- subject_identity: does the subject region satisfy its requested concept, attributes and demand?
+- reference_identity: does the reference region satisfy its requested concept, attributes and demand?
 - relation: does the exact requested directed relation hold between those regions?
 Each judgment must contain verdict (true, false, or unknown) and a concise reason
 citing visible evidence for that role. Use false only for a clear contradiction;
@@ -155,86 +169,91 @@ missing evidence is unknown. If either identity is not established, relation mus
 be unknown. Proximity to a different visible object cannot establish this relation.
 """
 
+INSTANCE_OBSERVER_PROMPT = """
+Describe the selected physical instance from the supplied images, separately
+for each observation ID. Its source frame and crop show the same bound region.
+Report visible parts, support or attachment and visible surface content. In
+visible_context, separately describe visible surrounding fixtures and boundaries,
+and whether the selected instance shares their space or is across a doorway.
+Do not transfer surroundings to the instance's parts. A crop without surrounding
+evidence has empty visible_context; unclear spatial membership is an uncertainty.
+Do not infer a desired task, purpose, hidden parts, operating state or room label.
+A caption, depiction, reflection or neighbouring object is not a physical part of
+the selected instance. Overlap alone does not prove another region is this object.
+Use uncertainties for facts the image cannot establish, not invented negatives.
+Describe appearance without inferring manufacturing method or unseen materials.
+For a goal_reference image, compare physical instance identity with the candidate,
+not merely category similarity. Report same, different or unknown with visual
+support; same requires distinguishing evidence from a current candidate observation.
+The reference is not a candidate observation and cannot support candidate facts.
+Return only the required JSON. Do not judge task suitability or propose actions.
+"""
+
+
 # LVLM最终决策（是否接受当前候选对象作为停靠目标）
 FINAL_VERIFIER_PROMPT = """
-You evaluate the visual predicates of an indoor navigation instruction.
-Use the original instruction, the active task predicates and the supplied images.
-Evaluate this candidate's identity and attributes for task.active_target and
-only task.visual_predicates. The existing constraint evaluator assigns these
-visual predicates, including explicitly delegated room/attribute checks.
-Task.domain_predicates retain their declared verifier and are evaluated by the
-domain services. Report no visual judgment for these domain predicates.
-Task progress, ordering and counts are maintained by the controller. Other
-terminal goals belong to their own checks.
-Each candidate observation
-has its own observation identity and bbox in that image's pixel coordinates.
-Identify the actual region enclosed by that bbox. Describe visible structure
-before concluding whether the required object and visual relations are present.
+Evaluate the actual observed instance against the original navigation instruction.
+The bound_observations are fixed visual facts extracted without the task. Do not
+rewrite them or invent additional physical evidence. No candidate images are
+provided at this stage: reason only from those facts and separately verified
+relation context. Uncertainties or omitted facts cannot support either true or
+false. False requires an affirmative observed fact incompatible with the exact
+requirement; lack of confirmation is unknown. Do not infer a manufacturing
+method from depicted content or a spatial relation from a mounting description.
+The original instruction defines the requirements. The compiled task helps locate
+them but cannot delete, weaken or replace an activity, intended user, attribute,
+depicted content or relationship. Check the original wording even if the compiler
+omitted a requirement.
+Judge only requirements of the active destination; other terminal goals, ordering
+and counts are handled by the controller.
 
-The navigation controller independently evaluates distance, reachability and
-physical stopping conditions. Your decision concerns visual evidence only.
-Candidate UIDs are tracking identifiers. Establish category, attributes and
-relations directly from visible structure. For ambiguous background, support
-surfaces or depictions, identify the missing visual evidence. A partial view is
-sufficient when its visible structure distinguishes the required object.
+Report observed_category and observed_structure from the fixed current observation,
+including its distinguishing visible parts, support or mounting and boundaries. This is not the requested resource name or a guess at a
+benchmark label. An image of an object is not the physical object; a shared material
+or nearby support is not evidence of the demanded function.
 
-Task.active_target.demand is the immutable requested activity, manipulated_objects
-and required_resource. For every hard affordance in task.visual_predicates, judge
-whether this actual candidate supports that demand, not whether its category is
-a typical destination. Search hypotheses and category typicality are never
-instance proof. Visible functional structure is sufficient for a design
-affordance; do not require performing the activity. Hidden state such as being
-operational or softness cannot be asserted solely from category or appearance
-when the required property is not visually established. Report unknown rather
-than infer an unobserved property. Visible incompatible structure supports false;
-a missing or ambiguous view supports unknown, not false.
+Each bound observation carries a candidate UID, observation ID, image hashes and
+bboxes. Use its fixed facts, not the image paths or identifiers as semantic clues.
+Do not borrow the identity, parts or affordance of a neighbouring object. If the
+facts cannot distinguish the candidate from adjacent instances, report unknown.
+visible_context describes surroundings, not candidate parts. A room requirement
+needs visible environmental cues and evidence the candidate occupies that space;
+a single object category or a room visible across a doorway is insufficient.
+Historical facts must describe the same instance and cannot replace current
+candidate-bound evidence.
 
-When the response schema includes affordance_judgments, return exactly every
-required predicate ID as a key, each with:
-- verdict: "true", "false", or "unknown".
-- reason: a concise visual reason (1-240 characters), identifying observed
-  functional structure or the specific missing evidence.
-- supporting_observation_ids: observation_id strings from actually supplied,
-  candidate-bound images supporting this judgment; use [] for no such evidence.
-True and false require supporting observations of this candidate. Goal reference
-images, unrelated relation views, labels and unsent observations are not support.
-Historical candidate views can support a predicate only with established instance
-correspondence; a current candidate-bound image is always required. If any hard
-affordance is false, reject_candidate; if none is false but any is unknown,
-request need_better_view or return uncertain. Only all true permits semantic
-acceptance. When this field is absent from the schema, do not add it.
+Return exactly one predicate_judgments entry for every verification_predicates ID:
+- candidate_identity: does this bound instance satisfy the original destination
+  identity and any original requirements absent from the compiled checks? Compare
+  the full wording, not just task.active_target.name. A compiled omission is not
+  permission to ignore a requirement. Domain predicates have separate services;
+  do not re-adjudicate verified relations or geometry. Their bound observations
+  identify the exact reference instance, not a substitute elsewhere in the image.
+- attribute predicates: check the specified property of this instance, not another
+  object, a reflection or a depiction.
+- affordance predicates: check visible functional structure supporting the entire
+  activity on the manipulated materials, including stated users and context.
+  Material/category similarity alone is insufficient. Materials being acted on
+  need not be present unless the instruction asks to find them. Design affordances
+  need not be physically performed, but hidden operational state is unknown.
+- other visual predicates: check the exact stated requirement and bound references.
 
-Return strict JSON:
-- satisfied: true only when all required visual predicates are established.
-- semantic_satisfied: true when visible structure establishes the requested
-  object's identity, attributes and explicit visual relations.
-- view_sufficient_for_stop: true when the current observation identifies the
-  candidate and supplies sufficient evidence for the visual predicates.
-- decision:
-  - accept: all visual predicates are established by the images.
-  - reject_candidate: visible evidence identifies the wrong instance or attribute.
-  - need_better_view: a specific missing visual observation can resolve ambiguity.
-  - need_relation_check: a required relation needs additional observation.
-  - uncertain: available observations do not resolve the visual predicates.
-- confidence: number in [0, 1].
-- satisfied_constraints and failed_constraints: visual predicates checked.
-- view_feedback: the visual feature that must become observable.
-- preferred_view_goal: an observation goal for the geometry controller.
-- view_objective: keep_visible_roles, improve_goals, minimum_expected_improvement,
-  accept_if_no_better_view, and reason. Completion requires established visual
-  predicates regardless of remaining execution options.
-- reason: describe the observed structure and explain the predicate judgment.
+Each entry contains verdict ("true", "false", "unknown"), a concise visual reason
+(1-240 characters), and supporting_observation_ids from the supplied
+bound_observations. True and false require such support; use [] when none is
+available. candidate_identity must cite the current observation, not history alone.
+A clear incompatible structure/property is false even if a closer view is possible.
+An occluded or absent observation is unknown, not false. Never weaken a requirement
+to turn a previously contradictory observation into a match.
 
-Accept requires satisfied=true, semantic_satisfied=true and
-view_sufficient_for_stop=true. Once the visual predicates are established,
-return accept; better framing alone adds no task requirement. Each historical
-image is an observation: independently identify its visible object and check
-correspondence with the current candidate. The current view must identify the
-same actual instance. An overlapping_instance_observation shows another mapped
-instance carrying the stated fraction of the candidate's 3D surface; it may be
-the same physical object seen from another viewpoint. Identify its object
-independently and weigh it as evidence of the candidate's identity.
-Physical STOP authorization remains with the controller.
+The controller derives rejection from any false and semantic acceptance only from
+all true. You do not output acceptance booleans or a STOP decision. Distance and
+reachability are independent geometry checks, not visual judgments.
+For unknown evidence, give view_feedback and view_objective describing the specific
+newly observable feature that could resolve it; do not request another look at an
+already disproven property or suggest acceptance because no better view is possible.
+Return the supplied schema only, with confidence and a short reason. Confidence is
+not proof, and better framing adds no requirement once the evidence is established.
 """
 
 ROOM_SEMANTIC_PROMPT = """

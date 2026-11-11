@@ -693,7 +693,8 @@ def relation_scene(tmp_path):
     subject = NS(uid="cup-1", tag="cup", position=[0, 0, 0], bbox=[0, 0, 3, 3], nodes=[0], metadata={})
     anchor = NS(uid="table-1", tag="table", position=[.5, 0, 0], bbox=[4, 0, 7, 3], nodes=[0], metadata={})
     target = TargetQuery("cup", "cup")
-    plan = InstructionPlan("find the cup near the table", targets=[target], constraints=[
+    plan = InstructionPlan("find the cup near the table", targets=[target,
+        TargetQuery("reference", "table", role="anchor", terminal=False)], constraints=[
         Constraint(type="relation", subject="cup", relation="near", object="table")])
     mapper = NS(objects=[subject, anchor], target=plan.raw_instruction, relation_pair_ledger=RelationPairLedger())
     evaluator = ConstraintEvaluator()
@@ -713,6 +714,70 @@ def relation_scene(tmp_path):
               ledger=mapper.relation_pair_ledger, instruction_hash=instruction_hash(plan.raw_instruction))
 
 
+@pytest.mark.parametrize("predicate_id", ["candidate_identity", "attribute:goal:color"])
+def test_compiler_rejects_explicit_ids_that_hide_generated_predicates(predicate_id):
+    from instruction.compiler import compile_parsed_instruction
+    from prompting.schemas import ParsedInstruction
+
+    parsed = ParsedInstruction(targets=[{"id": "goal", "name": "cup", "attributes": {"color": "red"}}],
+        constraints=[{"id": predicate_id, "type": "attribute", "subject": "goal",
+                      "value": {"state": "clean"}, "hardness": "hard", "verifier": "vlm"}])
+    result = compile_parsed_instruction("Find a clean red cup.", parsed, {"attribute"})
+    assert result.status == "invalid" and result.task is None
+    assert "conflicts with a generated verification predicate" in result.diagnostics[0]
+
+
+@pytest.mark.parametrize("projection_change", ["reorder", "remove", "replace"])
+def test_relation_precheck_uses_authoritative_predicate_ids(relation_scene, projection_change):
+    from instruction.contracts import ConstraintSpec, TargetSpec, TaskSpec
+    from instruction_adapter.task_compat import runtime_plan
+
+    case = relation_scene
+    task = TaskSpec("Find the cup near the table and below the shelf.", (
+        TargetSpec("goal", "cup"), TargetSpec("table", "table", terminal=False),
+        TargetSpec("shelf", "shelf", terminal=False)), (
+        ConstraintSpec("near-table", "relation", "goal", "near", "table"),
+        ConstraintSpec("below-shelf", "relation", "goal", "below", "shelf")))
+    plan = runtime_plan(task)
+    if projection_change == "reorder":
+        plan.constraints.reverse()
+    elif projection_change == "remove":
+        plan.constraints.clear()
+    else:
+        plan.constraints[0].id = "invented"
+        plan.constraints[0].relation = "above"
+        plan.constraints[0].object = "shelf"
+    before = plan.as_dict()
+    case.mapper.objects = [case.subject]
+    result = case.evaluator.evaluate_before_final_verifier(
+        mapper=case.mapper, plan=plan, target=plan.targets[0],
+        candidate=candidate_from_object(case.subject), candidate_obj=case.subject, evidence={})
+    assert not result.satisfied and result.decision == "need_relation_check"
+    assert [(row["predicate_id"], row["relation"], row["anchor_concept_id"], row["status"])
+            for row in result.relation_outcomes] == [
+        ("near-table", "near", "table", "missing_anchor"),
+        ("below-shelf", "below", "shelf", "missing_anchor")]
+    assert plan.as_dict() == before
+    case.callback.assert_not_called()
+
+
+def test_relation_precheck_keeps_explicit_id_without_serialized_task(relation_scene):
+    from instruction_adapter.contracts import Constraint, InstructionPlan, TargetQuery
+
+    case = relation_scene
+    target = TargetQuery("goal", "cup")
+    plan = InstructionPlan(case.mapper.target, targets=[target,
+        TargetQuery("anchor", "table", terminal=False)], constraints=[
+        Constraint("relation", subject="goal", relation="near", object="anchor", id="placement")])
+    case.mapper.objects = [case.subject]
+    result = case.evaluator.evaluate_before_final_verifier(
+        mapper=case.mapper, plan=plan, target=target,
+        candidate=candidate_from_object(case.subject), candidate_obj=case.subject, evidence={})
+    assert result.relation_outcomes[0]["predicate_id"] == "placement"
+    assert result.relation_outcomes[0]["status"] == "missing_anchor"
+    case.callback.assert_not_called()
+
+
 def test_relation_unknown_anchor_keeps_requested_identity_separate_from_detector(relation_scene):
     from instruction_adapter.contracts import ConceptQuery
 
@@ -724,7 +789,9 @@ def test_relation_unknown_anchor_keeps_requested_identity_separate_from_detector
     target = TargetQuery("cup", "cup")
     constraint = Constraint("relation", subject="cup", relation="near", object="table",
                             object_concept=ConceptQuery("anchor", "table", detector_terms=["cup"]))
-    instruction = InstructionPlan(case.mapper.target, targets=[target], constraints=[constraint])
+    instruction = InstructionPlan(case.mapper.target, targets=[target,
+        TargetQuery("anchor", "table", role="anchor", terminal=False, concept=constraint.object_concept)],
+        constraints=[constraint])
     case.evaluator.register_mapper_objects(mapper=case.mapper)
     case.callback.return_value = {"verified": False, "need_better_view": True, "confidence": .5}
     result = case.evaluator.evaluate_before_final_verifier(
@@ -748,7 +815,8 @@ def test_relation_preserves_functional_demand_without_replacing_reference_identi
     demand = {"activity": "write", "manipulated_objects": ["notebook"],
               "required_resource": "stable writing surface"}
     target = TargetQuery("surface", "writing surface", demand=demand)
-    plan = InstructionPlan("Find somewhere to write near the table", targets=[target], constraints=[
+    plan = InstructionPlan("Find somewhere to write near the table", targets=[target,
+        TargetQuery("reference", "table", role="anchor", terminal=False)], constraints=[
         Constraint("relation", subject=target.name, relation="near", object="table")])
     case.evaluator.register_mapper_objects(mapper=case.mapper)
     result = case.evaluator.evaluate_before_final_verifier(

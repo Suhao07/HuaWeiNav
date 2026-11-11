@@ -1,3 +1,5 @@
+"""Scripted shared verifier contracts; these tests do not measure real VLM ability."""
+import json
 import types
 import pytest
 
@@ -9,6 +11,41 @@ from instruction_adapter.verifier import (
     _planner_hard_constraint_infeasible,
     hard_stop_constraints_from_evidence,
 )
+
+
+def _scripted_response(request, verdict="unknown"):
+    assert request["parse_retries"] == 0
+    if request["trace_label"] == "instance_observer":
+        content = request["messages"][1]["content"]
+        identities = [json.loads(item["text"])["observation_identity"]
+                      for item in content if item["type"] == "text"]
+        parsed = request["response_format"](observations={identity["observation_id"]: {
+            "observed_category": "chair", "visible_parts": ["seat", "back", "legs"],
+            "support_and_attachment": "Legs on the floor.", "visible_surface_content": "",
+            "visible_context": [], "uncertainties": []} for identity in identities})
+    else:
+        assert request["trace_label"] == "final_instruction_verifier"
+        assert all(item["type"] == "text" for item in request["messages"][1]["content"])
+        parsed = request["response_format"](observed_category="chair", observed_structure="Seat, back and legs.",
+            predicate_judgments={"candidate_identity": {"verdict": verdict,
+                "reason": "Scripted instance evidence.", "supporting_observation_ids": ["now"]}})
+    return types.SimpleNamespace(choices=[types.SimpleNamespace(message=types.SimpleNamespace(parsed=parsed))])
+
+
+@pytest.mark.parametrize("field,limit", [("observed_category", 80), ("observed_structure", 240)])
+def test_visual_instance_descriptions_have_guided_output_bounds(field, limit):
+    from pydantic import ValidationError
+    from prompting.schemas import visual_verification_response_model
+
+    model = visual_verification_response_model(["candidate_identity"])
+    assert model.model_json_schema()["properties"][field]["maxLength"] == limit
+    payload = {field: "x" * limit, "predicate_judgments": {
+        "candidate_identity": {"verdict": "unknown", "reason": "Instance is unresolved.",
+                               "supporting_observation_ids": []}}}
+    assert getattr(model.model_validate(payload), field) == "x" * limit
+    payload[field] += "x"
+    with pytest.raises(ValidationError):
+        model.model_validate(payload)
 
 
 @pytest.mark.parametrize("reason", ["disabled", "llm_offline", "pydantic_unavailable", "empty_response", "request_error"])
@@ -30,7 +67,7 @@ def test_disabled_verifier_returns_unknown(monkeypatch):
     assert result.diagnostics["unavailable"] == "disabled"
 
 
-def test_verifier_request_error_preserves_original_exception(monkeypatch):
+def test_verifier_request_error_preserves_original_exception(monkeypatch, tmp_path):
     import instruction_adapter.verifier as module
 
     failure = RuntimeError("provider unavailable")
@@ -42,8 +79,12 @@ def test_verifier_request_error_preserves_original_exception(monkeypatch):
     monkeypatch.setenv("LLM_OFFLINE", "0")
     monkeypatch.setattr(module, "HAS_PYDANTIC", True)
     monkeypatch.setattr(module, "get_client_and_model", fail_client)
+    image = tmp_path / "current.png"
+    image.write_bytes(b"frame")
     with pytest.raises(RuntimeError) as raised:
-        FinalInstructionVerifier().verify("find a chair", {}, CandidateInstance("c1", "chair"), {})
+        FinalInstructionVerifier().verify("find a chair", {}, CandidateInstance("c1", "chair"), {
+            "current_rgb_with_bbox_path": str(image), "geometry": {"bbox_xyxy": [0, 0, 3, 3]},
+            "observation_identity": {"candidate_uid": "c1", "task_revision": 1, "observation_id": "now"}})
     assert raised.value is failure
 
 
@@ -177,54 +218,71 @@ def test_planner_proof_can_mark_hard_stop_contract_infeasible():
     assert "collide" in reason
 
 
-@pytest.mark.parametrize("semantic,visual,physical,infeasible", [
-    (False, True, True, False), (True, False, True, False),
-    (True, True, False, False), (True, True, False, True),
-    (True, True, True, False),
-])
-def test_final_accept_requires_independent_predicates(monkeypatch, semantic, visual, physical, infeasible):
-    """A model's overall accept cannot override its own missing predicates."""
+@pytest.mark.parametrize("verdict", ["true", "false", "unknown"])
+@pytest.mark.parametrize("physical,infeasible", [(True, False), (False, False), (False, True)])
+def test_final_accept_requires_evidence_and_physical_contract(monkeypatch, tmp_path, verdict, physical, infeasible):
     import instruction_adapter.verifier as module
-    from prompting.schemas import ParsedVerification
-    parsed = ParsedVerification(satisfied=True, decision="accept", semantic_satisfied=semantic,
-                                view_sufficient_for_stop=visual)
-    parse = lambda **kwargs: types.SimpleNamespace(choices=[types.SimpleNamespace(
-        message=types.SimpleNamespace(parsed=parsed))])
+    image = tmp_path / "current.png"
+    image.write_bytes(b"frame")
+    requests = []
+    def parse(**kwargs):
+        requests.append(kwargs)
+        return _scripted_response(kwargs, verdict)
     client = types.SimpleNamespace(beta=types.SimpleNamespace(chat=types.SimpleNamespace(
         completions=types.SimpleNamespace(parse=parse))))
     monkeypatch.setenv("STRIVE_FINAL_VERIFIER", "on")
     monkeypatch.setenv("LLM_OFFLINE", "0")
     monkeypatch.setattr(module, "get_client_and_model", lambda vlm: (client, "test"))
     result = FinalInstructionVerifier().verify("find object", {}, CandidateInstance("u", "object"), {
+        "current_rgb_with_bbox_path": str(image), "geometry": {"bbox_xyxy": [0, 0, 3, 3]},
+        "observation_identity": {"candidate_uid": "u", "task_revision": 1, "observation_id": "now"},
         "hard_stop_constraints": {"satisfied": physical, "planner_infeasible": infeasible,
-                                  "planner_infeasibility_proof": "blocked" if infeasible else ""}})
-    assert result.accepted == (semantic and visual and physical)
-    assert result.semantic_satisfied == semantic
+                                  "planner_infeasibility_proof": "blocked" if infeasible else ""},
+        "relation_outcomes": [{"predicate_id": "c0", "status": "verified", "anchor_uid": "reference"}]})
+    assert [request["trace_label"] for request in requests] == [
+        "instance_observer", "final_instruction_verifier"]
+    assert result.view_objective["relation_outcomes"] == [
+        {"predicate_id": "c0", "status": "verified", "anchor_uid": "reference"}]
+    assert result.accepted == (verdict == "true" and physical)
+    assert result.semantic_satisfied == (verdict == "true")
+    if verdict == "false":
+        assert result.decision == "reject_candidate"
 
 
-def test_final_request_separates_execution_history_from_visual_evidence(monkeypatch):
+def test_final_request_separates_execution_history_from_visual_evidence(monkeypatch, tmp_path):
     import json
     import instruction_adapter.verifier as module
-    from prompting.schemas import ParsedVerification
+    image = tmp_path / "current.png"
+    image.write_bytes(b"frame")
     requests = []
     def parse(**kwargs):
         requests.append(kwargs)
-        return types.SimpleNamespace(choices=[types.SimpleNamespace(message=types.SimpleNamespace(
-            parsed=ParsedVerification(satisfied=False, decision="uncertain")))])
+        return _scripted_response(kwargs)
     client = types.SimpleNamespace(beta=types.SimpleNamespace(chat=types.SimpleNamespace(
         completions=types.SimpleNamespace(parse=parse))))
     monkeypatch.setenv("STRIVE_FINAL_VERIFIER", "on")
     monkeypatch.setenv("LLM_OFFLINE", "0")
     monkeypatch.setattr(module, "get_client_and_model", lambda vlm: (client, "test"))
     FinalInstructionVerifier().verify("find chair", {}, CandidateInstance("u", "chair", confidence=.99), {
-        "geometry": {"distance_to_object": .293},
+        "current_rgb_with_bbox_path": str(image),
+        "observation_identity": {"candidate_uid": "u", "task_revision": 1, "observation_id": "now"},
+        "geometry": {"distance_to_object": .293, "bbox_xyxy": [0, 0, 3, 3]},
         "view_control": {"budget_exhausted": True, "attempts": [{"semantic_satisfied": True}]},
         "final_verifier_attempt": {"budget_exhausted": True}, "bbox_verified": True})
-    payload = json.loads(requests[0]["messages"][1]["content"][0]["text"])
+    assert [request["trace_label"] for request in requests] == [
+        "instance_observer", "final_instruction_verifier"]
+    observer, final = requests
+    payload = json.loads(final["messages"][1]["content"][0]["text"])
     assert payload["candidate"] == {"uid": "u"}
+    assert payload["raw_instruction"] == "find chair"
     assert "evidence" not in payload
     assert "geometry" not in payload
-    assert "hard_constraints" not in requests[0]["response_format"].model_json_schema()["properties"]
+    for request in requests:
+        assert "hard_constraints" not in request["response_format"].model_json_schema()["properties"]
+        assert all(token not in json.dumps(request["messages"][1]["content"]) for token in (
+            "distance_to_object", "budget_exhausted", "semantic_satisfied", "bbox_verified", "0.99"))
+    assert "find chair" not in json.dumps(observer["messages"])
+    assert "image_url" not in json.dumps(final["messages"])
 
 
 def test_visual_task_scopes_user_semantics_to_active_target():
@@ -239,7 +297,8 @@ def test_visual_task_scopes_user_semantics_to_active_target():
     scoped = FinalInstructionVerifier._visual_task(plan, {"target_id": "book"})
     assert scoped["active_target"] == {"id": "book", "name": "book", "attributes": {}, "demand": {}}
     assert scoped["referenced_targets"] == [{"id": "shelf", "name": "shelf", "attributes": {}}]
-    assert scoped["visual_predicates"][0]["relation"] == "on"
+    assert scoped["domain_predicates"][0]["relation"] == "on"
+    assert scoped["visual_predicates"] == []
     assert "cup" not in str(scoped) and "predicted vocabulary" not in str(scoped)
     with pytest.raises(ValueError, match="explicit target_id"):
         FinalInstructionVerifier._visual_task(plan, {})
@@ -265,9 +324,9 @@ def test_visual_projection_uses_declared_constraint_owner_and_runtime_delegation
     assert projected["domain_predicates"][0]["verifier"] == "planner"
     assert all(item["verifier"] == "planner" for item in projected["visual_predicates"])
     next_target = FinalInstructionVerifier._visual_task(plan.as_dict(), {"target_id": "book"})
-    assert next_target["visual_predicates"][0]["relation"] == "on"
-    assert next_target["visual_predicates"][0]["verifier"] == "vlm"
-    assert next_target["domain_predicates"] == []
+    assert next_target["domain_predicates"][0]["relation"] == "on"
+    assert next_target["domain_predicates"][0]["verifier"] == "vlm"
+    assert next_target["visual_predicates"] == []
 
 
 def test_current_stop_requires_distance_even_with_pinned_reference():

@@ -40,6 +40,7 @@ class VerificationRecord:
     predicate_id: str = "final_stop"
     anchor_uid: str = ""
     verdict: str = "unknown"
+    observed_category: str = ""
     dependencies: dict[str, str] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
@@ -64,6 +65,7 @@ class VerificationResult:
     diagnostics: dict[str, Any] = field(default_factory=dict)
     task_revision: int | None = None
     target_uid: str = ""
+    observed_category: str = ""
     predicate_id: str = "final_stop"
     anchor_uid: str = ""
     evidence_ids: list[str] = field(default_factory=list)
