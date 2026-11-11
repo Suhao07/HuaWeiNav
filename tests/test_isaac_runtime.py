@@ -257,11 +257,11 @@ def test_last_model_call_motion_executes_before_budget_stop(monkeypatch, tmp_pat
     assert "espresso machine" in replay.sessions[0].detector_terms
     assert result["status"] == "completed" and result["reason"] == "decision_budget_exhausted"
     assert not result["task_complete"]
-    # The first frontier is baseline-owned; the periodic review uses the last
-    # model call, and that accepted second goal must actually execute.
-    assert result["moves"] == 2 and result["model_calls"] == 2
-    assert len([a for a, _ in replay.client.commands if a == "move"]) == 2
-    assert replay.parse_calls[0].call_count == 1
+    # 最后一次决策接纳的移动仍须执行，初始基线移动单独计入移动预算。
+    assert result["moves"] == 3 and result["model_calls"] == 2
+    assert result["initial_model_calls"] == 1
+    assert len([a for a, _ in replay.client.commands if a == "move"]) == 3
+    assert replay.parse_calls[0].call_count == 2
     assert replay.client.commands[-2][0] == "finish"
     assert replay.agents[0].tools.motion.active_request_id is None
     snapshots = [json.loads(line) for line in (tmp_path / "scene_snapshots.jsonl").read_text().splitlines()]
@@ -489,7 +489,7 @@ def _episode_replay(monkeypatch, output, *, initial_calls=1, parse=None, spec=No
 
     def make_agent(tools, trace_path, **kwargs):
         agent, parse_call = _agent(tools, output, max_model_calls=kwargs["max_model_calls"], parse=parse)
-        assert agent.model_calls == initial_calls
+        assert agent.model_calls == 0
         agents.append(agent)
         parse_calls.append(parse_call)
         return agent
@@ -1399,7 +1399,7 @@ def test_initial_admission_failures_retain_calls_without_motion(monkeypatch, tmp
                           "setup_exception": (RuntimeError, "setup failed")}[failure]
     with pytest.raises(exception, match=message):
         runtime.run_episode(public, tmp_path, max_model_calls=5)
-    factory.assert_called_once_with(max_model_calls=5,
+    factory.assert_called_once_with(max_model_calls=2,
         trace_path=tmp_path / "initial_interpretation.jsonl", vlm="self_hosted")
     initial.compile.assert_called_once()
     assert observation_map.call_count == int(failure == "setup_exception")
@@ -1411,24 +1411,29 @@ def test_initial_admission_failures_retain_calls_without_motion(monkeypatch, tmp
             save_dir=tmp_path, device="cuda:0", floor_world_z=0.08, ceiling_world_z=1.68)
     result = json.loads((tmp_path / "policy_result.json").read_text())
     assert result["status"] == "error" and result["reason"] == exception.__name__
-    assert result["model_calls"] == 2 and result["moves"] == 0
+    assert result["model_calls"] == result["moves"] == 0
+    assert result["initial_model_calls"] == 2
     assert not result["task_complete"]
-    assert "initial_interpretation" in result["model_calls_scope"]
+    assert "guided_selection_and_review_only" in result["model_calls_scope"]
     assert (tmp_path / "instruction_plan.json").exists() == (failure == "setup_exception")
 
 
 @pytest.mark.parametrize("initial_calls", [1, 2])
-def test_episode_startup_calls_share_guided_budget(monkeypatch, tmp_path, initial_calls):
+@pytest.mark.parametrize("budget", [1, 3])
+def test_episode_startup_calls_are_separate_from_guided_budget(monkeypatch, tmp_path, initial_calls, budget):
     from backends.isaac import runtime
 
     replay = _episode_replay(monkeypatch, tmp_path, initial_calls=initial_calls)
-    result = runtime.run_episode(replay.public, tmp_path, max_model_calls=3, max_moves=6,
+    result = runtime.run_episode(replay.public, tmp_path, max_model_calls=budget, max_moves=6,
                                  panorama_views=12, search_review_moves=1)
+    runtime.InitialInstructionCompiler.assert_called_once_with(max_model_calls=2,
+        trace_path=tmp_path / "initial_interpretation.jsonl", vlm="self_hosted")
     assert result["status"] == "completed" and result["reason"] == "decision_budget_exhausted"
-    assert result["model_calls"] == replay.agents[0].model_calls == 3
-    assert replay.parse_calls[0].call_count == 3 - initial_calls
-    # One initial baseline move, then one move per admitted periodic review.
-    assert result["moves"] == 1 + 3 - initial_calls
+    assert result["model_calls"] == replay.agents[0].model_calls == replay.parse_calls[0].call_count == budget
+    assert result["initial_model_calls"] == initial_calls
+    assert "guided_selection_and_review_only" in result["model_calls_scope"]
+    # 初始基线移动不消耗决策调用，已接纳的复查动作执行完再判断预算。
+    assert result["moves"] == 1 + budget
     assert sum(action == "move" for action, _ in replay.client.commands) == result["moves"]
     assert not result["task_complete"]
     assert replay.client.commands[-2][0] == "finish"
@@ -1459,7 +1464,7 @@ def test_fixed_task_skips_initial_calls_and_locks_whole_episode(monkeypatch, tmp
     assert result["initial_model_calls"] == 0 and result["model_calls"] == 3
     assert replay.parse_calls[0].call_count == 3 and result["moves"] == 4
     assert result["task_spec_sha256"] == digest and result["interpretation_locked"] is True
-    assert result["task_revision"] == revision and "prior_instruction_compilation_excluded" in result["model_calls_scope"]
+    assert result["task_revision"] == revision and "guided_selection_and_review_only" in result["model_calls_scope"]
     assert replay.sessions[0].interpretation_locked and replay.sessions[0].spec == task
     assert replay.sessions[0].interpretation_history == []
     assert not (tmp_path / "initial_interpretation.jsonl").exists()
@@ -1561,7 +1566,7 @@ def test_policy_cli_runs_bounded_episode_and_refuses_output_reuse(monkeypatch, t
     assert result["status"] == "completed" and result["reason"] == "decision_budget_exhausted"
     assert result["task_spec_sha256"] == digest and result["interpretation_locked"] is fixed
     assert result["initial_model_calls"] == (0 if fixed else 1) and result["model_calls"] == 3
-    assert result["moves"] == (4 if fixed else 3)
+    assert result["moves"] == 4
     assert replay.sessions[0].spec == task and result["task_revision"] == 4
     assert replay.initial.compile.call_count == (0 if fixed else 1)
     commands = list(replay.client.commands)

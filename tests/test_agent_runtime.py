@@ -82,8 +82,10 @@ def model_calls(calls):
     return (client, "replay-model"), requests
 
 
-def test_tool_loop_moves_verifies_and_finishes_from_domain_state(monkeypatch, tmp_path):
+@pytest.mark.parametrize("initial_calls", [0, 2])
+def test_tool_loop_moves_verifies_and_finishes_from_domain_state(monkeypatch, tmp_path, initial_calls):
     tools = make_tools(monkeypatch)
+    tools.session.plan.diagnostics["initial_model_calls"] = initial_calls
     specs = [
         ("observe", {}), ("query_scene", {}),
         ("query_viewpoints", {"candidate_uid": "cup-1"}),
@@ -99,6 +101,7 @@ def test_tool_loop_moves_verifies_and_finishes_from_domain_state(monkeypatch, tm
     client_model, requests = model_calls([tool_call(name=n, arguments=a, reason="replay") for n, a in specs])
     trace = tmp_path / "events.jsonl"
     runtime = AgentRuntime(tools, trace, max_model_calls=len(specs), client_model=client_model)
+    assert runtime.model_calls == 0
     assert tools.session.interpretation_locked is False
     assert "Frozen task override" not in runtime.system_prompt
     from prompting import templates
@@ -122,6 +125,9 @@ def test_tool_loop_moves_verifies_and_finishes_from_domain_state(monkeypatch, tm
     assert all(goal.goal_pose.position == (1, 0, 0) for goal in tools.motion.controller.sent)
     events = [json.loads(line) for line in trace.read_text().splitlines()]
     assert len(events) == 2 * len(specs)
+    assert [event["call_index"] for event in events if event["event"] == "proposed"] == list(range(1, len(specs) + 1))
+    assert runtime.model_calls == len(requests) == len(specs)
+    assert tools.session.plan.diagnostics["initial_model_calls"] == initial_calls
     assert len(runtime.history) == 4
     assert len(request_context(requests[-1])["recent_tools"]) == 4
     with pytest.raises(RuntimeError, match="budget"):
@@ -690,6 +696,7 @@ def test_search_revision_changes_candidate_retrieval_not_task_or_rejections(
     before = session.progress.as_dict()
     record_before = ledger.as_dict()
     assert query_scene(session).candidates == []
+    session.plan.diagnostics["initial_model_calls"] = 2
     payloads = [search_payload(mode, [term]) for term in ("couch", "couch", "sofa")]
     client_model, requests = model_calls(payloads)
     runtime = AgentRuntime(tools, tmp_path / "revisions.jsonl", max_model_calls=3, client_model=client_model)

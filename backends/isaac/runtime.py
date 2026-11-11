@@ -771,9 +771,8 @@ def run_episode(public_episode, output, *, port=9466, vlm="self_hosted", device=
         "frontier_source": "original_instruct_mapper", "model_provider": vlm,
         "mapping_height_band_world_m": [0.08, 1.68],
         "mapping_height_reference": "nominal_world_ground_z0_not_measured_body_support",
-        "model_calls_scope": (("guided_selection_and_review_only; prior_instruction_compilation_excluded"
-                               if fixed_task is not None else "initial_interpretation_plus_guided_selection_and_review")
-                              + "; model_usage counts all recorded model calls"),
+        "model_calls_scope": "guided_selection_and_review_only; initial_model_calls reported separately; "
+                             "model_usage counts recorded model responses by operation",
         "task_spec_sha256": task_spec_sha256, "interpretation_locked": fixed_task is not None,
         "moves_scope": "bounded waypoint commands; trajectory records simulator motion increments",
         "semantic_gt_used": False}
@@ -796,7 +795,7 @@ def run_episode(public_episode, output, *, port=9466, vlm="self_hosted", device=
     try:
         if fixed_task is None:
             initial_compiler = InitialInstructionCompiler(
-                max_model_calls=max_model_calls, trace_path=output / "initial_interpretation.jsonl", vlm=vlm)
+                max_model_calls=2, trace_path=output / "initial_interpretation.jsonl", vlm=vlm)
             plan = compile_instruction_plan(public_episode["instruction"], available_classes=None,
                                             vlm=vlm, initial_compiler=initial_compiler)
         else:
@@ -841,7 +840,7 @@ def run_episode(public_episode, output, *, port=9466, vlm="self_hosted", device=
             final_frame=final_packet, task_progress=session.progress.as_dict())
     except Exception as error:
         termination.update(status="error", reason=type(error).__name__, error=str(error),
-            model_calls=runtime.model_calls if runtime else (initial_compiler.model_calls if initial_compiler else 0),
+            model_calls=runtime.model_calls if runtime else 0,
             moves=controller.moves if controller else 0,
             task_complete=session.progress.completed if session else False)
         try:

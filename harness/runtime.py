@@ -167,7 +167,7 @@ class AgentRuntime:
         self.trace_path = Path(trace_path)
         self.trace_path.parent.mkdir(parents=True, exist_ok=True)
         self.max_model_calls = max_model_calls
-        self.model_calls = tools.session.plan.diagnostics.get("initial_model_calls", 0)
+        self.model_calls = 0
         self.history = []
         self._choice_context = None
         self.client, self.model = client_model or get_client_and_model(vlm)

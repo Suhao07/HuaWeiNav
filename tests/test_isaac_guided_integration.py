@@ -676,7 +676,8 @@ def test_episode_registers_current_terminal_prediction_not_stop_or_cancel(monkey
     assert result["predicted_target"] == ("couch" if successful else None)
     assert result["predicted_candidate_uid"] == "candidate"
     assert result["task_complete"] == successful
-    assert result["moves"] == len(receipts) and result["model_calls"] == 1
+    assert result["moves"] == len(receipts) and result["model_calls"] == 0
+    assert result["initial_model_calls"] == 1 and replay.parse_calls[0].call_count == 0
     assert result["reason"] == ("verified_finish" if successful else "movement_budget_exhausted")
     assert replay.verified.call_count == int(successful)
     session = replay.sessions[0]
