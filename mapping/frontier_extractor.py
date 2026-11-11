@@ -102,5 +102,6 @@ def append_traversable_candidate(
         return
     if not mapper.check_traversability(current_position, center):
         return
+    center = center.copy()
     center[2] = mapper.current_position[2]
     valid_centers.append((center, has_frontier, frontier_idxs))

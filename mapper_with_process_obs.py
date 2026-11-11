@@ -462,7 +462,7 @@ class Instruct_Mapper:
             whole_pcd = whole_pcd.voxel_down_sample(self.pcd_resolution)
             whole_pcd_points = whole_pcd.point.positions.cpu().numpy()
 
-        current_pcd_points = self.current_pcd.point.positions.cpu().numpy()
+        current_pcd_points = self.current_pcd.point.positions.cpu().numpy().copy()
         current_pcd_points[:, 2] = np.ones_like(current_pcd_points[:, 2]) * self.floor_height
         current_pcd = gpu_pointcloud_from_array(current_pcd_points,
                                                 np.ones_like(current_pcd_points) * 100,
@@ -1083,7 +1083,7 @@ class Instruct_Mapper:
             center_spheres = []
             center_labels = []
             for center_idx, node in enumerate(self.nodes):
-                center = node.position
+                center = node.position.copy()
                 center[2] = self.floor_height
                 sphere = o3d.geometry.TriangleMesh.create_sphere(radius=0.05)
                 if node.idx==current_node_idx:
@@ -1155,7 +1155,7 @@ class Instruct_Mapper:
                 room_labels += number_lable
 
                 for node in room_node.nodes:
-                    node_pos = node.position
+                    node_pos = node.position.copy()
                     node_pos[2] = self.floor_height
                     line = o3d.geometry.LineSet()
                     line.points = o3d.utility.Vector3dVector([room_node_pos, node_pos])
