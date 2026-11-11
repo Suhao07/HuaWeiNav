@@ -318,6 +318,80 @@ def test_builder_does_not_invent_unexecutable_pitch():
     assert optical_rotation_towards(np.zeros(2), np.zeros(2)) is None
 
 
+def _large_cloud_view_args():
+    """An observed center is 4m away while its visible near edge is only 1m away."""
+    points = np.array([[x, y, z] for x in (1., 4., 7.) for y in (-.25, 0., .25)
+                       for z in (1.25, 1.5, 1.75)])
+    return dict(object_points=points, object_position=np.array([4., 0., 1.5]),
+                original_bbox=(7, 7, 13, 13),
+                camera_intrinsic=np.array([[12., 0., 10.], [0., 12., 10.], [0., 0., 1.]]),
+                path_points=np.array([[0., 0., 1.5], [3., 0., 1.5]]), target_height=1.5,
+                success_distance=2., stop_criterion=1., arrival_tolerance=.25,
+                image_width=20, image_height=20)
+
+
+def test_explicit_stop_reference_requires_center_plus_margin_without_changing_visual_score():
+    args = _large_cloud_view_args()
+    surface, old_path = build_view_proposals(**args)
+    reference = args["object_position"].copy()
+    centered, path = build_view_proposals(**args, stop_reference_position=reference)
+    np.testing.assert_array_equal(path, old_path)
+    assert len(centered) == len(surface) > 0
+    for proposal, default in zip(centered, surface):
+        distance = float(np.linalg.norm(reference[:2] - proposal["position"][:2]))
+        assert proposal["distance_to_target"] == pytest.approx(distance)
+        assert proposal["stop_feasible"] == (distance + .25 <= 2.)
+        assert proposal["visible_surface_distance"] == default["distance_to_target"]
+        assert "visible_surface_distance" not in default
+        for key in ("score", "visible_ratio", "area_ratio", "center_score", "border_score",
+                    "distance_score", "predicted_quality", "pitch", "travel_distance"):
+            assert proposal[key] == default[key]
+    near_edge = next(p for p in centered if p["pose"][0] == 0.)
+    assert near_edge["visible_surface_distance"] == 1. < 2. < near_edge["distance_to_target"]
+    assert not near_edge["stop_feasible"]
+    assert rank_view_proposals(surface)[0]["pose"][0] == 0.
+    assert rank_view_proposals(centered)[0]["pose"][0] == 2.25
+    assert all(p["pose"][0] >= 2.25 for p in rank_view_proposals(centered, approach=True))
+    np.testing.assert_array_equal(reference, args["object_position"])
+
+
+@pytest.mark.parametrize("rho,feasible", [(.25 - 1e-9, True), (.25, True), (.25 + 1e-9, False)])
+def test_explicit_stop_reference_uses_xy_inclusive_arrival_budget(rho, feasible):
+    args = _large_cloud_view_args()
+    args.update(path_points=np.array([[2.25, 0., 10.], [2.25, 0., 10.]]), arrival_tolerance=rho)
+    proposals, _ = build_view_proposals(**args, stop_reference_position=np.array([4., 0., 99.]))
+    assert proposals
+    assert all(p["distance_to_target"] == 1.75 and p["stop_feasible"] == feasible for p in proposals)
+    assert bool(rank_view_proposals(proposals, approach=True)) == feasible
+
+
+@pytest.mark.parametrize("criterion", [1., .75])
+def test_explicit_stop_reference_truncates_at_center_radius_minus_arrival_margin(criterion):
+    args = _large_cloud_view_args()
+    # Binary-exact quarter-meter samples keep this an inclusive-radius test,
+    # rather than a test of linspace rounding just outside the boundary.
+    args.update(path_points=np.array([[0., 0., 1.5], [16., 0., 1.5]]), stop_criterion=criterion)
+    _, default_path = build_view_proposals(**args)
+    _, path = build_view_proposals(**args, stop_reference_position=args["object_position"])
+    assert default_path[0][0] == 7. + 2. * criterion  # Legacy surface radius, no arrival reserve.
+    assert path[0][0] == 4. + 2. * criterion - .25
+    assert path[-1][0] == 0.
+
+
+@pytest.mark.parametrize("points", [[], [[-1., 0., 1.5]], [[1., 0., 100.]]])
+def test_explicit_stop_reference_cannot_replace_missing_visible_cloud(points):
+    args = _large_cloud_view_args()
+    args.update(object_points=np.asarray(points).reshape(-1, 3), path_points=np.zeros((2, 3)))
+    proposals, _ = build_view_proposals(**args, stop_reference_position=np.array([1., 0., 1.5]))
+    assert proposals == []
+
+
+@pytest.mark.parametrize("reference", [[1., 0.], [[1., 0., 1.5]], [float("nan"), 0., 1.5]])
+def test_invalid_explicit_stop_reference_does_not_fall_back_to_surface(reference):
+    with pytest.raises(ValueError, match="stop_reference_position"):
+        build_view_proposals(**_large_cloud_view_args(), stop_reference_position=reference)
+
+
 def test_ranking_preserves_terminal_cost_approach_quality_ties_and_rho_motion():
     def proposal(uid, score, travel, stop):
         return dict(uid=uid, score=score, travel_distance=travel, stop_feasible=stop)

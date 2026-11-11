@@ -150,13 +150,17 @@ def build_view_proposals(
     image_height: int = 480,
     pitches: tuple[float, ...] = (0.0,),
     align_pitch: bool = False,
+    stop_reference_position: np.ndarray | None = None,
 ) -> tuple[list[dict[str, Any]], list[np.ndarray]]:
     r"""Build baseline geometry proposals in a right-handed Z-up map using NumPy.
 
     Interpolate at 0.25 map units, truncate at the last sample within
     success_distance * stop_criterion, then reverse (target-near first).
-    At each position choose pitch by (stop_feasible, score), with stop feasibility
-    defined by d_visible_xy + arrival_tolerance <= success_distance. Scoring is
+    At each position choose pitch by (stop_feasible, score). By default stopping
+    uses d_visible_xy + arrival_tolerance <= success_distance. With an explicit
+    reference c, use d = ||c_xy - v_xy||_2 instead, and reserve arrival_tolerance
+    in the truncation radius too. Projection and visual scores always use the
+    actual cloud; a reference alone cannot provide visible support. Scoring is
     shared with score_object_view; depth/occlusion and final verification remain
     the caller's responsibility. No model or backend is invoked.
 
@@ -175,17 +179,32 @@ def build_view_proposals(
         pitches: Executable camera elevations in radians; positive looks up.
         align_pitch: Use continuous target-center pitch instead of pitches.
             Only enable when the executor can actually align to that pitch.
+        stop_reference_position: Optional observed instance position (3,) in the
+            same map, never ground truth. Sets the XY reference for truncation,
+            stop_feasible and distance_to_target, not projection or visual score.
+            None preserves the existing surface-distance semantics.
     Returns:
         (proposals, sampled_path), both in the input map and in baseline sample
-        order, not ranked. Proposal fields match build_check_again_viewpoints.
-        travel_distance is XY displacement from path origin, NOT geodesic cost;
-        backends replace it before rank_view_proposals and, for active rechecks,
-        filter travel_distance > arrival_tolerance. Inputs are never mutated.
+        order, not ranked. Proposal fields match build_check_again_viewpoints;
+        an explicit stop reference additionally records visible_surface_distance
+        as a diagnostic. travel_distance is XY displacement from path origin,
+        NOT geodesic cost; backends replace it before rank_view_proposals and, for
+        active rechecks, filter travel_distance > arrival_tolerance. Inputs are
+        never mutated.
     Raises:
-        ValueError: Nonempty path_points do not have shape (N, 3).
+        ValueError: Nonempty path_points do not have shape (N, 3), or an explicit
+            stop_reference_position is not a finite (3,) position.
     """
     positions = np.asarray(object_points, dtype=float)
     object_position = np.asarray(object_position, dtype=float)
+    stop_positions = positions
+    truncation_radius = float(success_distance) * float(stop_criterion)
+    if stop_reference_position is not None:
+        stop_reference_position = np.asarray(stop_reference_position, dtype=float)
+        if stop_reference_position.shape != (3,) or not np.isfinite(stop_reference_position).all():
+            raise ValueError("stop_reference_position must be a finite (3,) position")
+        stop_positions = stop_reference_position[None, :]
+        truncation_radius -= arrival_tolerance
     path_points = np.array(path_points, dtype=float, copy=True)
     if path_points.size == 0:
         path_points = np.empty((0, 3), dtype=float)
@@ -195,9 +214,9 @@ def build_view_proposals(
     interpolated_path = interpolate_polyline(path_points, spacing=0.25)
     interpolated_path = truncate_at_stop_radius(
         interpolated_path,
-        object_positions=positions,
-        success_distance=success_distance,
-        stop_criterion=stop_criterion,
+        object_positions=stop_positions,
+        success_distance=truncation_radius,
+        stop_criterion=1.0,
     )
     # VLN historically evaluates candidates from target-near to current-near.
     interpolated_path = interpolated_path[::-1]
@@ -207,6 +226,8 @@ def build_view_proposals(
     path_origin = path_points[0] if len(path_points) else np.zeros(3)
     for point in interpolated_path:
         point = np.asarray(point, dtype=float)
+        reference_distance = (None if stop_reference_position is None else
+                              float(np.linalg.norm(stop_reference_position[:2] - point[:2])))
         # 先验执行器会俯仰对准当前观察中心，评分使用相同目标与相机高度。
         # theta = atan2(z_target - z_camera, ||target_xy - camera_xy||).
         candidate_pitches = ((float(np.arctan2(object_position[2] - point[2],
@@ -231,7 +252,9 @@ def build_view_proposals(
                 image_height=image_height,
             )
             if view is not None:
-                scored.append((view[1], view[0].score, float(pitch), view[0]))
+                stop_feasible = (view[1] if reference_distance is None else
+                                 reference_distance + arrival_tolerance <= success_distance)
+                scored.append((stop_feasible, view[0].score, float(pitch), view[0]))
         if not scored:
             continue
         stop_feasible, _, pitch, quality = max(scored, key=lambda row: row[:2])
@@ -248,7 +271,10 @@ def build_view_proposals(
                 "center_score": quality.center_score,
                 "border_score": quality.border_score,
                 "distance_score": quality.distance_score,
-                "distance_to_target": quality.distance_to_target,
+                "distance_to_target": (quality.distance_to_target if reference_distance is None
+                                       else reference_distance),
+                **({"visible_surface_distance": quality.distance_to_target}
+                   if reference_distance is not None else {}),
                 "predicted_quality": quality.predicted_quality,
                 "reason": "generic geometry proposal from visibility, centering, scale, border margin, and path distance",
             }
