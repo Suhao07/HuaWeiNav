@@ -340,6 +340,7 @@ class Instruct_Mapper:
         obstacle_points = self.obstacle_pcd.point.positions.cpu().numpy().copy()
 
         navigable_cells = self._visibility_cells(cluster_points, obstacle_points)
+        node_cells = self._visibility_grid_points([node.position for node in self.nodes], cluster_points)
 
         # get all the possible 2 nodes pair
         node_pairs = []
@@ -351,18 +352,7 @@ class Instruct_Mapper:
             node_i = self.nodes[i]
             node_j = self.nodes[j]
 
-            point1 = node_i.position.copy()
-            point2 = node_j.position.copy()
-
-            # find the closet point in cluster_points to point1 and point2
-            distance1 = np.linalg.norm(cluster_points[:, :2] - point1[:2], axis=1)
-            distance2 = np.linalg.norm(cluster_points[:, :2] - point2[:2], axis=1)
-
-            point1 = cluster_points[np.argmin(distance1)]
-            point2 = cluster_points[np.argmin(distance2)]
-
-            point1_map = translate_point_to_grid(point1, self.grid_resolution, self.voxel_dimension)[:2]
-            point2_map = translate_point_to_grid(point2, self.grid_resolution, self.voxel_dimension)[:2]
+            point1_map, point2_map = node_cells[i], node_cells[j]
 
             interpolate_points = bresenham(point1_map[0], point1_map[1], point2_map[0], point2_map[1])
             interpolate_points = list(interpolate_points)[1:-1]
@@ -1455,24 +1445,21 @@ class Instruct_Mapper:
                               valid_centers, episode_idx, step)
 
     def update_obj_node(self):
-        # update the obj, node edges
         tmp_pcd = self.useful_pcd.select_by_index(
             (self.useful_pcd.point.positions[:, 2] > self.floor_height + 0.88).nonzero()[0])
-
-        for node in self.nodes:
-            center = node.position
-            node_idx = node.idx
+        cluster_points = self.navigable_pcd.point.positions.cpu().numpy()
+        obstacle_points = tmp_pcd.point.positions.cpu().numpy()
+        # 一轮内点云不变，栅格与最近点投影按实体复用，避免每条边重建整图。
+        navigable_cells = self._visibility_cells(cluster_points, obstacle_points)
+        node_cells = self._visibility_grid_points([node.position for node in self.nodes], cluster_points)
+        object_cells = self._visibility_grid_points([obj.position for obj in self.objects], cluster_points)
+        for node, center in zip(self.nodes, node_cells):
             node_obj_idxs = []
-            for index, obj in enumerate(self.objects):
-                nwobj = self.objects[index]
-                objpos = nwobj.position
-                objpos[2] = self.floor_height
-
-                is_visible = self.is_visible(center, objpos, self.navigable_pcd.point.positions.cpu().numpy(), tmp_pcd.point.positions.cpu().numpy())
-
-                if is_visible:
+            for index, point in enumerate(object_cells):
+                ray = list(bresenham(center[0], center[1], point[0], point[1]))[1:-1]
+                if all(tuple(cell) in navigable_cells for cell in ray):
                     node_obj_idxs.append(index)
-            self.update_obj(node_idx, node_obj_idxs)
+            self.update_obj(node.idx, node_obj_idxs)
 
 
     def get_frontiers_offerd(self,
@@ -1551,21 +1538,15 @@ class Instruct_Mapper:
                    for dx, dy in ((0, 0), (0, 1), (1, 0), (1, 1))}
         return set(map(tuple, ground)) - blocked
 
+    def _visibility_grid_points(self, points, cluster_points):
+        # XY 最近点 argmin 保留等距时的首索引，与原逐对投影一致。
+        indices = [np.argmin(np.linalg.norm(cluster_points[:, :2] - np.asarray(point)[:2], axis=1))
+                   for point in points]
+        return translate_point_to_grid(cluster_points[indices], self.grid_resolution,
+                                       self.voxel_dimension)[:, :2]
+
     def is_visible(self, point1, point2, cluster_points, obstacle_points):
-        point1 = point1.copy()
-        point2 = point2.copy()
-        cluster_points = cluster_points.copy()
-        obstacle_points = obstacle_points.copy()
-
-        # find the closet point in cluster_points to point1 and point2
-        distance1 = np.linalg.norm(cluster_points[:, :2] - point1[:2], axis=1)
-        distance2 = np.linalg.norm(cluster_points[:, :2] - point2[:2], axis=1)
-
-        point1 = cluster_points[np.argmin(distance1)]
-        point2 = cluster_points[np.argmin(distance2)]
-
-        point1_map = translate_point_to_grid(point1, self.grid_resolution, self.voxel_dimension)[:2]
-        point2_map = translate_point_to_grid(point2, self.grid_resolution, self.voxel_dimension)[:2]
+        point1_map, point2_map = self._visibility_grid_points([point1, point2], cluster_points)
         navigable_cells = self._visibility_cells(cluster_points, obstacle_points)
 
         interpolate_points = bresenham(point1_map[0], point1_map[1], point2_map[0], point2_map[1])
