@@ -32,8 +32,9 @@ def segment_room(mapper, step_idx):
 
     save_intermediate_results = True
 
-    obs_pcd = obs_pcd.voxel_down_sample(voxel_size=0.05)
-    nav_pcd = nav_pcd.voxel_down_sample(voxel_size=0.05)
+    # Open3D 0.18 CUDA 哈希在重复体素化时丢格；后续投影在 CPU 上，采样也在此完成。
+    obs_pcd = obs_pcd.cpu().voxel_down_sample(voxel_size=0.05)
+    nav_pcd = nav_pcd.cpu().voxel_down_sample(voxel_size=0.05)
 
     # floor_pcd.voxel_down_sample(voxel_size=0.05)
     xyz = obs_pcd.point.positions.cpu().numpy()
