@@ -1348,8 +1348,9 @@ class Instruct_Mapper:
         # 没有 frontier 但足够大的 cluster 用于补充可能漏掉的通路节点。
         # cluster the remaing points
         with o3d.utility.VerbosityContextManager(o3d.utility.VerbosityLevel.Debug) as cm:
-            labels = np.array(
-                pcd_removed.cluster_dbscan(eps=0.08, min_points=4, print_progress=False))
+            # 批量转为整数数组，避免 object 数组逐标签触发 CUDA 标量运算。
+            labels = pcd_removed.cluster_dbscan(
+                eps=0.08, min_points=4, print_progress=False).cpu().numpy()
 
         cluster_result = analyze_frontier_clusters(
             self,
@@ -1485,16 +1486,16 @@ class Instruct_Mapper:
 
         # cluster the frontiers
         with o3d.utility.VerbosityContextManager(o3d.utility.VerbosityLevel.Debug) as cm:
-            labels = np.array(
-                frontiers_pcd.cluster_dbscan(eps=0.3, min_points=3, print_progress=False))
+            labels = frontiers_pcd.cluster_dbscan(
+                eps=0.3, min_points=3, print_progress=False).cpu().numpy()
 
         if len(labels) == 0:
             with o3d.utility.VerbosityContextManager(o3d.utility.VerbosityLevel.Debug) as cm:
-                labels = np.array(
-                    frontiers_pcd.cluster_dbscan(eps=0.3, min_points=1, print_progress=False))
+                labels = frontiers_pcd.cluster_dbscan(
+                    eps=0.3, min_points=1, print_progress=False).cpu().numpy()
             if len(labels) == 0:
                 return [], [], [], []
-        max_label = labels.max().cpu().numpy()
+        max_label = labels.max()
         # extract each cluster and rule out the small ones caluclate the center of each cluster
         frontier_clusters = []
         frontier_centers = []
@@ -2028,10 +2029,10 @@ class Instruct_Mapper:
 
         # use the dbscan to cluster the points
         with o3d.utility.VerbosityContextManager(o3d.utility.VerbosityLevel.Debug) as cm:
-            labels = np.array(pcd.cluster_dbscan(eps=0.12, min_points=12, print_progress=False))
+            labels = pcd.cluster_dbscan(eps=0.12, min_points=12, print_progress=False).cpu().numpy()
         if len(labels) == 0:
             return pcd
-        max_label = labels.max().cpu().numpy()
+        max_label = labels.max()
         # extract the max connect component
         max_cluster = []
         for i in range(max_label + 1):
