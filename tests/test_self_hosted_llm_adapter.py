@@ -6,6 +6,7 @@ import pytest
 from pydantic import BaseModel, ValidationError
 
 from llm_utils.cognav_llm_adapter import _CogNavParsedChat, get_client_and_model
+from llm_utils.lvlm_call_tracker import counts, reset_counts
 from llm_utils.self_hosted_llm_adapter import (
     HttpVlmSettings,
     SelfHostedOpenAICompatibleClient,
@@ -15,6 +16,14 @@ from llm_utils.structured_output import (
     extract_json_object,
     inject_json_schema,
 )
+
+
+@pytest.fixture(autouse=True)
+def isolated_traces(tmp_path, monkeypatch):
+    monkeypatch.setenv('STRIVE_LVLM_TRACE_DIR', str(tmp_path / 'model_requests'))
+    reset_counts()
+    yield
+    reset_counts()
 
 
 class _Decision(BaseModel):
@@ -177,6 +186,8 @@ def test_self_hosted_adapter_retries_invalid_json_and_validates_response() -> No
     assert result.choices[0].message.parsed.satisfied is True
     assert result.choices[0].message.parsed.decision == "accept"
     assert len(completions.requests) == 2
+    assert counts()['calls'] == counts()['responses'] == {'test_verifier': 2}
+    assert counts()['total_calls'] == counts()['total_responses'] == 2
     assert isinstance(completions.requests[0]["messages"][-1]["content"], list)
     assert "corrected JSON object" in completions.requests[1]["messages"][-1]["content"]
     original = completions.requests[0]["messages"]
@@ -324,6 +335,7 @@ def test_transport_failure_preserves_exception_without_format_retry(monkeypatch,
                                           **parse_kwargs)
     assert caught.value is failure
     assert len(calls) == 1
+    assert counts()['total_calls'] == 1 and counts()['total_responses'] == 0
     assert "parse_retries" not in calls[0]
 
 
@@ -421,6 +433,7 @@ def test_cognav_transport_value_error_is_not_wrapped(monkeypatch, parse_kwargs):
         adapter.parse(model="cognav", messages=[], response_format=_Decision, **parse_kwargs)
     assert caught.value is failure
     assert len(calls) == 1
+    assert counts()['total_calls'] == 1 and counts()['total_responses'] == 0
 
 
 @pytest.mark.parametrize("provider", ["self_hosted", "cognav"])
@@ -451,3 +464,4 @@ def test_cognav_default_parse_fallback_is_preserved(monkeypatch):
     result = adapter.parse(model="cognav", messages=[], response_format=_Decision)
     assert result.choices[0].message.parsed.satisfied is False
     assert len(completions.requests) == 1
+    assert counts()['total_calls'] == counts()['total_responses'] == 1

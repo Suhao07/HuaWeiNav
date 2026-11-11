@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Iterable, Mapping, Optional
 
-from llm_utils.lvlm_call_tracker import record_call, record_request
+from llm_utils.lvlm_call_tracker import record_response, record_request
 from llm_utils.structured_output import (
     StructuredOutputError,
     extract_json_object,
@@ -221,7 +221,7 @@ class _SelfHostedParsedChat:
             last_content = _message_text(completion)
             finish_reason = getattr(completion.choices[0], "finish_reason", None)
             usage = getattr(completion, "usage", None)
-            record_call(
+            record_response(
                 trace_label,
                 raw_response=last_content,
                 metadata={

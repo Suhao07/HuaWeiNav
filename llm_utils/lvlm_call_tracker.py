@@ -9,7 +9,8 @@ from collections import defaultdict
 from typing import Any
 
 
-_COUNTS: dict[str, int] = defaultdict(int)
+_REQUEST_COUNTS: dict[str, int] = defaultdict(int)
+_RESPONSE_COUNTS: dict[str, int] = defaultdict(int)
 _CACHE_HITS: dict[str, int] = defaultdict(int)
 _RAW_INDEX = 0
 _LOCK = Lock()
@@ -28,6 +29,7 @@ def record_request(kind: str, *, model: str, messages, response_format, paramete
     Returns:
         Unique ID used to associate the response with this exact input.
     """
+    kind = str(kind or "unknown")
     request_id = uuid4().hex
     trace_dir = os.getenv("STRIVE_LVLM_TRACE_DIR") or "outputs/model_requests"
     os.makedirs(trace_dir, exist_ok=True)
@@ -39,13 +41,16 @@ def record_request(kind: str, *, model: str, messages, response_format, paramete
     path = os.path.join(trace_dir, f"request_{request_id}.json")
     with open(path, "w", encoding="utf-8") as stream:
         json.dump(payload, stream, ensure_ascii=False, indent=2)
+    with _LOCK:
+        _REQUEST_COUNTS[kind] += 1
     return request_id
 
 
 def reset_counts() -> None:
     global _RAW_INDEX
     with _LOCK:
-        _COUNTS.clear()
+        _REQUEST_COUNTS.clear()
+        _RESPONSE_COUNTS.clear()
         _CACHE_HITS.clear()
         _RAW_INDEX = 0
 
@@ -70,17 +75,12 @@ def record_cache_hit(kind: str) -> None:
         _CACHE_HITS[str(kind or "unknown")] += 1
 
 
-def record_call(kind: str, *, raw_response: str = "", metadata: dict[str, Any] | None = None) -> None:
-    """Record one real LVLM/LLM request.
-
-    此记录保存计数、原始返回文本和 request_id。完整模型输入由 record_request
-    在发送前单独保存，响应通过 request_id 关联。
-    """
-
+def record_response(kind: str, *, raw_response: str = "", metadata: dict[str, Any] | None = None) -> None:
+    """Count returned content before validation, independently of dispatched requests."""
     global _RAW_INDEX
     kind = str(kind or "unknown")
     with _LOCK:
-        _COUNTS[kind] += 1
+        _RESPONSE_COUNTS[kind] += 1
         _RAW_INDEX += 1
         index = _RAW_INDEX
     trace_dir = os.getenv("STRIVE_LVLM_TRACE_DIR", "")
@@ -100,12 +100,16 @@ def record_call(kind: str, *, raw_response: str = "", metadata: dict[str, Any] |
 
 
 def counts() -> dict[str, Any]:
-    return {
-        "calls": dict(sorted(_COUNTS.items())),
-        "cache_hits": dict(sorted(_CACHE_HITS.items())),
-        "total_calls": int(sum(_COUNTS.values())),
-        "total_cache_hits": int(sum(_CACHE_HITS.values())),
-    }
+    with _LOCK:
+        return {
+            "calls_scope": "adapter_requests; excludes SDK-internal transport retries",
+            "calls": dict(sorted(_REQUEST_COUNTS.items())),
+            "responses": dict(sorted(_RESPONSE_COUNTS.items())),
+            "cache_hits": dict(sorted(_CACHE_HITS.items())),
+            "total_calls": int(sum(_REQUEST_COUNTS.values())),
+            "total_responses": int(sum(_RESPONSE_COUNTS.values())),
+            "total_cache_hits": int(sum(_CACHE_HITS.values())),
+        }
 
 
 def counts_compact() -> str:

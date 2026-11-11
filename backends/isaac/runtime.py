@@ -772,7 +772,8 @@ def run_episode(public_episode, output, *, port=9466, vlm="self_hosted", device=
         "mapping_height_band_world_m": [0.08, 1.68],
         "mapping_height_reference": "nominal_world_ground_z0_not_measured_body_support",
         "model_calls_scope": "guided_selection_and_review_only; initial_model_calls reported separately; "
-                             "model_usage counts recorded model responses by operation",
+                             "model_usage counts adapter requests and recorded responses by operation; "
+                             "SDK-internal transport retries excluded",
         "task_spec_sha256": task_spec_sha256, "interpretation_locked": fixed_task is not None,
         "moves_scope": "bounded waypoint commands; trajectory records simulator motion increments",
         "semantic_gt_used": False}

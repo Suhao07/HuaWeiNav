@@ -5,7 +5,7 @@ import time
 from types import SimpleNamespace
 
 from constants import COGNAV_MODEL_NAME, DEFAULT_VLM, GEMINI_MODEL_NAME, require_gemini_key
-from llm_utils.lvlm_call_tracker import record_call, record_request, record_parse_error
+from llm_utils.lvlm_call_tracker import record_response, record_request, record_parse_error
 from llm_utils.structured_output import (
     StructuredOutputError,
     extract_json_object as _extract_json_object,
@@ -69,7 +69,7 @@ class _CogNavParsedChat:
         )
         content = completion.choices[0].message.content
         trace_label = kwargs.get("trace_label") or getattr(response_format, "__name__", None) or "parse"
-        record_call(
+        record_response(
             str(trace_label),
             raw_response=str(content or ""),
             metadata={
@@ -168,7 +168,7 @@ class _TracingParsedCompletions:
                 response = self._inner.with_raw_response.parse(*args, **kwargs)
             payload = json.loads(response.text)
             choice = payload["choices"][0]
-            record_call(str(trace_label), raw_response=choice["message"].get("content") or "",
+            record_response(str(trace_label), raw_response=choice["message"].get("content") or "",
                         metadata={"client": "openai_compatible", "request_id": request_id,
                                   "provider_request_id": payload.get("id"),
                                   "finish_reason": choice.get("finish_reason"),

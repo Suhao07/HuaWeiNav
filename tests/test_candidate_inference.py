@@ -80,15 +80,35 @@ def test_parallel_inference_commits_in_input_order_or_propagates(tmp_path, monke
 
 
 def test_concurrent_trace_ids_preserve_all_calls(tmp_path, monkeypatch):
-    from llm_utils.lvlm_call_tracker import reset_counts, record_call, counts
+    from llm_utils.lvlm_call_tracker import reset_counts, record_request, record_response, record_cache_hit, counts
+    from prompting.schemas import ParsedVerification
     monkeypatch.setenv('STRIVE_LVLM_TRACE_DIR', str(tmp_path))
     reset_counts()
+
+    def record(i):
+        request_id = record_request('probe', model='fixture', messages=[str(i)],
+                                    response_format=ParsedVerification, parameters={})
+        if i % 2 == 0:
+            record_response('probe', raw_response=str(i), metadata={'request_id': request_id})
+        record_cache_hit('cached_probe')
+
     with ThreadPoolExecutor(max_workers=8) as pool:
-        list(pool.map(lambda i: record_call('probe', raw_response=str(i)), range(64)))
+        list(pool.map(record, range(64)))
+    requests = {r['request_id']: r for p in tmp_path.glob('request_*.json')
+                for r in [json.loads(p.read_text())]}
     rows = [json.loads(p.read_text()) for p in tmp_path.glob('[0-9]*.json')]
-    assert len(rows) == 64 and len({r['index'] for r in rows}) == 64
-    assert {r['raw_response'] for r in rows} == {str(i) for i in range(64)}
-    assert counts()['total_calls'] == 64
+    assert len(requests) == 64
+    assert len(rows) == 32 and len({r['index'] for r in rows}) == 32
+    assert {r['raw_response'] for r in rows} == {str(i) for i in range(0, 64, 2)}
+    assert all(requests[r['metadata']['request_id']]['messages'] == [r['raw_response']] for r in rows)
+    assert counts() == {
+        'calls_scope': 'adapter_requests; excludes SDK-internal transport retries',
+        'calls': {'probe': 64}, 'responses': {'probe': 32}, 'cache_hits': {'cached_probe': 64},
+        'total_calls': 64, 'total_responses': 32, 'total_cache_hits': 64,
+    }
+    reset_counts()
+    assert counts()['calls'] == counts()['responses'] == counts()['cache_hits'] == {}
+    assert counts()['total_calls'] == counts()['total_responses'] == counts()['total_cache_hits'] == 0
 
 
 def test_same_uid_changed_support_expires_signature():

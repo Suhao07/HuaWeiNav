@@ -4,6 +4,14 @@ from types import SimpleNamespace
 import pytest
 from prompting.schemas import ParsedVerification
 from llm_utils.cognav_llm_adapter import _TracingParsedCompletions
+from llm_utils.lvlm_call_tracker import counts, reset_counts
+
+
+@pytest.fixture(autouse=True)
+def isolated_counts():
+    reset_counts()
+    yield
+    reset_counts()
 
 
 def test_failed_request_keeps_exact_input_and_original_exception(tmp_path, monkeypatch):
@@ -23,6 +31,9 @@ def test_failed_request_keeps_exact_input_and_original_exception(tmp_path, monke
         adapter.parse(model="test-model", messages=messages, response_format=ParsedVerification,
                       temperature=0.0, trace_label="final_verify")
     assert error.value is failure
+    assert counts()['calls'] == {'final_verify': 1}
+    assert counts()['total_calls'] == 1
+    assert counts()['responses'] == {} and counts()['total_responses'] == 0
     paths = list(tmp_path.glob("request_*.json"))
     assert len(paths) == 1
     payload = json.loads(paths[0].read_text())
@@ -35,9 +46,7 @@ def test_failed_request_keeps_exact_input_and_original_exception(tmp_path, monke
 @pytest.mark.parametrize("recover", [True, False])
 def test_invalid_json_is_saved_before_validation_and_retried_once(tmp_path, monkeypatch, recover):
     from pydantic import ValidationError
-    from llm_utils.lvlm_call_tracker import reset_counts
     monkeypatch.setenv("STRIVE_LVLM_TRACE_DIR", str(tmp_path))
-    reset_counts()
     malformed = '{"satisfied":false "decision":"uncertain"}'
     contents = iter([malformed, '{}' if recover else malformed])
     requests = []
@@ -64,6 +73,8 @@ def test_invalid_json_is_saved_before_validation_and_retried_once(tmp_path, monk
     assert len(list(tmp_path.glob('error_*.json'))) == (1 if recover else 2)
     responses = [json.loads(p.read_text()) for p in sorted(tmp_path.glob('[0-9]*.json'))]
     assert responses[1]['metadata']['retry_of'] == responses[0]['metadata']['request_id']
+    assert counts()['calls'] == counts()['responses'] == {'parse': 2}
+    assert counts()['total_calls'] == counts()['total_responses'] == 2
 
 
 def test_verification_schema_declares_nested_fields():
@@ -240,6 +251,7 @@ def test_tracing_transport_value_error_is_unchanged(tmp_path, monkeypatch, model
         adapter.parse(model=model, messages=[], response_format=ParsedVerification, **parse_kwargs)
     assert caught.value is failure
     assert len(calls) == 1
+    assert counts()['total_calls'] == 1 and counts()['total_responses'] == 0
     assert 'parse_retries' not in calls[0]
 
 
@@ -287,4 +299,61 @@ def test_tracing_per_call_retry_budget_is_not_forwarded(tmp_path, monkeypatch):
     result = adapter.parse(model='test', messages=[], response_format=ParsedVerification, parse_retries=2)
     assert result.observed_category == ''
     assert len(calls) == 3
+    assert counts()['total_calls'] == counts()['total_responses'] == 3
     assert all('parse_retries' not in call for call in calls)
+
+
+@pytest.mark.parametrize('provider', ['openai', 'doubao', 'self_hosted'])
+@pytest.mark.parametrize('recover', [True, False])
+def test_sdk_transport_retries_belong_to_one_adapter_request(tmp_path, monkeypatch, provider, recover):
+    import httpx
+    from openai import OpenAI, InternalServerError
+    from llm_utils.cognav_llm_adapter import TracingOpenAICompatibleClient
+    from llm_utils.self_hosted_llm_adapter import SelfHostedOpenAICompatibleClient
+
+    monkeypatch.setenv('STRIVE_LVLM_TRACE_DIR', str(tmp_path))
+    calls = []
+
+    def handle(request):
+        calls.append(request)
+        if len(calls) == 1 or not recover:
+            return httpx.Response(503, headers={'retry-after-ms': '1'},
+                                  json={'error': {'message': 'fixture unavailable'}})
+        return httpx.Response(200, json=dict(id='fixture', model='test', created=0,
+            object='chat.completion', choices=[dict(index=0, finish_reason='stop',
+            message=dict(role='assistant', content=ParsedVerification(observed_category='chair').model_dump_json()))]))
+
+    with OpenAI(api_key='fixture-only', base_url='https://fixture.invalid/v1', max_retries=1,
+                http_client=httpx.Client(transport=httpx.MockTransport(handle))) as sdk:
+        adapter = (SelfHostedOpenAICompatibleClient(base_url='https://fixture.invalid/v1', client=sdk)
+                   if provider == 'self_hosted' else TracingOpenAICompatibleClient(sdk))
+        kwargs = dict(model='doubao-test' if provider == 'doubao' else 'test-model',
+                      messages=[], response_format=ParsedVerification, trace_label='verify')
+        if recover:
+            assert adapter.beta.chat.completions.parse(**kwargs).choices[0].message.parsed.observed_category == 'chair'
+        else:
+            with pytest.raises(InternalServerError):
+                adapter.beta.chat.completions.parse(**kwargs)
+    assert len(calls) == 2
+    assert counts()['calls'] == {'verify': 1}
+    assert counts()['total_calls'] == 1 and counts()['total_responses'] == int(recover)
+    assert counts()['responses'] == ({'verify': 1} if recover else {})
+    assert 'excludes SDK-internal transport retries' in counts()['calls_scope']
+    assert len(list(tmp_path.glob('request_*.json'))) == 1
+    assert len(list(tmp_path.glob('[0-9]*.json'))) == int(recover)
+
+
+def test_request_persistence_failure_prevents_dispatch_and_count(tmp_path, monkeypatch):
+    from unittest.mock import Mock
+    from llm_utils import lvlm_call_tracker as tracker
+
+    monkeypatch.setenv('STRIVE_LVLM_TRACE_DIR', str(tmp_path))
+    failure = OSError('request trace unavailable')
+    monkeypatch.setattr(tracker.json, 'dump', Mock(side_effect=failure))
+    dispatch = Mock()
+    adapter = _TracingParsedCompletions(SimpleNamespace(with_raw_response=SimpleNamespace(parse=dispatch)))
+    with pytest.raises(OSError) as caught:
+        adapter.parse(model='test-model', messages=[], response_format=ParsedVerification)
+    assert caught.value is failure
+    dispatch.assert_not_called()
+    assert counts()['total_calls'] == counts()['total_responses'] == 0
