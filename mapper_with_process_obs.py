@@ -1,4 +1,5 @@
 from loguru import logger
+from time import perf_counter
 import numpy as np
 from backends.habitat.geometry import HabitatMapperQueries
 
@@ -37,7 +38,7 @@ from planning.exploration_policy import (
     find_closest_viewpoint_in_room,
 )
 from planning.room_policy import select_nearest_frontier_room
-from prompting.templates import OBJECT_PROMPT, RELOCATE_PROMPT, ROOM_PROMPT
+from prompting.templates import OBJECT_PROMPT, RELOCATE_PROMPT
 from prior_map.simulation import refresh_mapper_prior_map_query
 from mapping.room_segmenter import (
     fallback_single_room as segmenter_fallback_single_room,
@@ -1311,6 +1312,7 @@ class Instruct_Mapper:
             logger.info(f"Min distance to frontiers: {min_distance_to_frontiers}")
 
         logger.info(f"Max distance Threshold: {max_distance}")
+        stage_started = perf_counter()
         intersections = self.calculate_intersections(current_navigable_position,
                                                      standing_position,
                                                      max_distance=max_distance)
@@ -1419,18 +1421,22 @@ class Instruct_Mapper:
             current_node_pcd=current_node_pcd,
             angles_current_node=angles_current_node,
         )
+        logger.info(f'mapper_stage=frontier_candidates step={step} seconds={perf_counter() - stage_started:.3f}')
 
-
-        # 新增 node 后同步三张图：object-node 图、node-node 可见边、room-node 图。
-        # update the obj, node edges
+        stage_started = perf_counter()
         self.update_obj_node()
+        logger.info(f'mapper_stage=object_node step={step} seconds={perf_counter() - stage_started:.3f} '
+                    f'nodes={len(self.nodes)} objects={len(self.objects)}')
 
         valid_centers = np.array([center for center, _, _ in valid_centers])
 
-        # check the visibility of the nodes in the graph
+        stage_started = perf_counter()
         self.update_edges()
+        logger.info(f'mapper_stage=node_edges step={step} seconds={perf_counter() - stage_started:.3f}')
 
+        stage_started = perf_counter()
         self.segment_room(step)
+        logger.info(f'mapper_stage=room_segment step={step} seconds={perf_counter() - stage_started:.3f}')
 
         self.update_node_true_frontier()
         self.update_room_state()
@@ -1698,26 +1704,8 @@ class Instruct_Mapper:
             f.write(f'Prompt_info: {prompt_info}\n')
             f.write(f'\n')
 
-        class Step(BaseModel):
-            explanation: str
-            output: str
-
-        class Reasoning(BaseModel):
-            steps: list[Step]
-            final_answer: int
-            reason: str
-
-        # 模型路由由统一适配器负责，所有导航模式使用相同的服务配置。
-        client, model_name = get_client_and_model(self.vlm)
-        completion = client.beta.chat.completions.parse(
-            model=model_name,
-            messages=[{"role": "system", "content": ROOM_PROMPT},
-                      {"role": "user", "content": prompt_info}],
-            response_format=Reasoning,
-            trace_label="room_selection",
-        )
-
-        answer = completion.choices[0].message.parsed
+        from planning.room_selection import choose_semantic_room
+        answer = choose_semantic_room(prompt_info, candidate_room_idxs, vlm=self.vlm)
         # save the answer to a txt file
         with open(f'{self.save_dir}/episode-{idx}/gpt_room/answer_{step}.txt', 'w') as f:
             f.write(f'Answer: {answer}\n')

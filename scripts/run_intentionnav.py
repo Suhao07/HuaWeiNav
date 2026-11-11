@@ -16,8 +16,14 @@ def main():
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--max-model-calls", type=int, default=60)
     parser.add_argument("--max-moves", type=int, default=30)
-    parser.add_argument("--panorama-views", type=int, default=4)
+    parser.add_argument("--panorama-views", type=int, choices=range(1, 13), default=12)
+    parser.add_argument("--decision-owner", choices=("baseline_guided",), default="baseline_guided")
+    parser.add_argument("--search-review-moves", type=int, default=10)
+    parser.add_argument("--task-spec", type=Path, help="fixed TaskSpec admitted independently of navigation")
+    parser.add_argument("--task-spec-sha256", help="expected hash from the independently audited artifact")
     args = parser.parse_args()
+    if (args.task_spec is None) != (args.task_spec_sha256 is None):
+        parser.error("--task-spec and --task-spec-sha256 must be supplied together")
     from scripts.serve_intentionnav import load_public_episode
     from backends.isaac.runtime import run_episode
 
@@ -29,7 +35,9 @@ def main():
         parser.error("output already contains a policy attempt; use a fresh run directory")
     result = run_episode(episode, output, port=args.port, vlm=args.vlm, device=args.device,
                          max_model_calls=args.max_model_calls, max_moves=args.max_moves,
-                         panorama_views=args.panorama_views)
+                         panorama_views=args.panorama_views, decision_owner=args.decision_owner,
+                         search_review_moves=args.search_review_moves,
+                         task_spec_path=args.task_spec, task_spec_sha256=args.task_spec_sha256)
     print(json.dumps(result, ensure_ascii=False, allow_nan=False), flush=True)
 
 

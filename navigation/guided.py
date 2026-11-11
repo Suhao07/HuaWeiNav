@@ -154,6 +154,10 @@ class GuidedPolicy:
                 self.record("candidate_evidence_updated", candidate_uid=uid,
                             evidence_fingerprint=self.evidence_fingerprint(uid),
                             action_epoch=self.action_epoch(uid))
+        self.observation_refreshed()
+
+    def observation_refreshed(self):
+        """Commit backend observation effects after shared evidence refresh succeeds."""
 
     def select(self, episode_idx=None):
         """Prefer an untried candidate view, then pending scans, then exploration."""

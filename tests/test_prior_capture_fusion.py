@@ -184,6 +184,25 @@ assert 'cv_utils.sam' not in sys.modules and 'config_utils' not in sys.modules
         with self.assertRaises(IndexError):
             perceiver.perceive(image)
 
+    def test_unknown_refinement_keeps_geometry_without_category_posterior(self):
+        from types import SimpleNamespace
+        from navigation.bbox_refinement import apply_refined_tag
+        from mapping.object_fusion import label_probabilities
+        from backends.isaac.perception import IsaacObservationMap
+        obj = _entity()
+        points = obj.pcd.point.positions.cpu().numpy().copy()
+        apply_refined_tag(SimpleNamespace(mapper=SimpleNamespace(target="display")), obj,
+                          "unknown", np.zeros((2, 2, 3), dtype=np.uint8))
+        self.assertEqual(float(obj.confidence), 0.)
+        self.assertEqual(label_probabilities(obj), {})
+        observation_map = IsaacObservationMap.__new__(IsaacObservationMap)
+        observation_map.mapper = SimpleNamespace(objects=[obj], initial_position=np.zeros(3))
+        observation_map.latest = {}
+        published, = observation_map.objects()
+        self.assertEqual(published.uid, obj.uid)
+        self.assertEqual(published.metadata["label_probabilities"], {})
+        np.testing.assert_array_equal(observation_map.points(obj.uid), points)
+
     def test_zero_weight_votes_do_not_inflate_positive_evidence(self):
         from copy import deepcopy
         from mapping.object_fusion import accumulate_label_vote, label_probabilities
