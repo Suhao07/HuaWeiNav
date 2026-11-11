@@ -57,7 +57,7 @@ def parse_instruction_with_llm(
             raise InstructionParseUnavailable(reason)
         return _fallback_plan(raw, dataset, reason)
 
-    raw = str(raw_instruction or "").strip()
+    raw = str(raw_instruction or "")
     dataset = normalize_term(dataset_target)
     if not HAS_PYDANTIC:
         return unavailable("pydantic_unavailable")
@@ -99,7 +99,7 @@ def plan_from_parsed_instruction(
     strict: bool = True,
 ) -> InstructionPlan:
     """复用已有解析，不再调用模型或改变初始解析语义。"""
-    raw = str(raw_instruction or "").strip()
+    raw = str(raw_instruction or "")
     dataset = normalize_term(dataset_target)
     invalid = []
     if strict:

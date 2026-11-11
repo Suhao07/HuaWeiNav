@@ -703,6 +703,204 @@ def test_physical_infeasibility_reports_limitation_and_preserves_stop_contract()
         assert not check(NS(), {"hard_stop_constraints": {"satisfied": False, key: True}})
 
 
+@pytest.fixture(params=["SEL084", "SEL148"])
+def authored_semantics_case(request):
+    """Scripted semantics test preservation, not model understanding accuracy."""
+    if request.param == "SEL084":
+        raw = "Before starting today's skincare routine, I need a steady backless seat at the vanity."
+        payload = {
+            "targets": [{"id": "seat", "name": "seat", "attributes": {"stability": "steady", "backrest": "absent"},
+                         "demand": {"activity": "sit before skincare", "manipulated_objects": [],
+                                    "required_resource": "seating"}},
+                        {"id": "vanity", "name": "vanity", "role": "anchor", "terminal": False}],
+            "constraints": [{"id": "at-vanity", "type": "spatial", "subject": "seat", "relation": "at",
+                             "object": "vanity", "hardness": "hard"}],
+        }
+    else:
+        raw = "When I lie down, I want that printed photo standing nearby to revisit happier times."
+        payload = {
+            "targets": [{"id": "photo", "name": "photo", "attributes": {"medium": "printed", "state": "standing"}},
+                        {"id": "bed", "name": "lying place", "role": "anchor", "terminal": False}],
+            "constraints": [{"id": "near-lying-place", "type": "spatial", "subject": "photo", "relation": "near",
+                             "object": "bed", "hardness": "hard"}],
+        }
+    return raw, payload
+
+
+def test_authored_failure_instruction_bindings_roundtrip_without_model(monkeypatch, authored_semantics_case):
+    from instruction import compiler, parser
+    from instruction.contracts import TaskSpec
+    from instruction_adapter.compiler import RUNTIME_CONSTRAINT_TYPES
+    from instruction_adapter.task_compat import runtime_plan
+    from prompting.schemas import ParsedInstruction
+
+    forbidden = Mock(side_effect=AssertionError("Authored bindings are not model extraction evidence"))
+    monkeypatch.setattr(parser, "get_client_and_model", forbidden)
+    monkeypatch.setattr(compiler, "parse_instruction_with_llm", forbidden)
+    raw, payload = authored_semantics_case
+    result = compiler.compile_parsed_instruction(raw, ParsedInstruction.model_validate(payload), RUNTIME_CONSTRAINT_TYPES)
+    assert result.status == "success", result.diagnostics
+    task = result.task
+    assert task.raw_instruction == raw
+    assert [t.id for t in task.targets] == [t["id"] for t in payload["targets"]]
+    assert task.targets[0].attributes == payload["targets"][0]["attributes"]
+    assert task.as_dict()["targets"][0]["demand"] == payload["targets"][0].get("demand", {})
+    assert task.targets[0].terminal and not task.targets[1].terminal
+    declared = payload["constraints"][0]
+    relation = task.constraints[0]
+    assert (relation.id, relation.subject, relation.relation, relation.object, relation.hardness) == (
+        declared["id"], declared["subject"], declared["relation"], declared["object"], "hard")
+    if task.targets[0].demand:
+        demand = task.constraints[1]
+        assert (demand.id, demand.type, demand.subject, demand.hardness) == (
+            f"demand:{task.targets[0].id}", "affordance", task.targets[0].id, "hard")
+        assert demand.value == task.targets[0].demand
+    before = task.as_dict()
+    with pytest.raises(TypeError):
+        task.targets[0].attributes["state"] = "changed"
+    exported = task.as_dict()
+    exported["targets"][0]["attributes"].clear()
+    assert task.as_dict() == before
+    projected = runtime_plan(task)
+    del projected.diagnostics["task_spec"]
+    assert compiler.task_from_parsed_plan(projected) == TaskSpec.from_dict(task.as_dict()) == task
+    forbidden.assert_not_called()
+
+
+@pytest.mark.parametrize("field", ["subject", "object"])
+@pytest.mark.parametrize("reference,diagnostic", [("", "missing"), ("undeclared", "unbound")])
+def test_authored_relations_reject_invalid_endpoints(authored_semantics_case, field, reference, diagnostic):
+    from instruction.compiler import compile_parsed_instruction
+    from instruction_adapter.compiler import RUNTIME_CONSTRAINT_TYPES
+    from prompting.schemas import ParsedInstruction
+
+    raw, payload = authored_semantics_case
+    relation = payload["constraints"][0]
+    relation[field] = reference
+    result = compile_parsed_instruction(raw, ParsedInstruction.model_validate(payload), RUNTIME_CONSTRAINT_TYPES)
+    assert result.status == "invalid" and result.task is None
+    assert len(result.diagnostics) == 1
+    assert result.diagnostics[0].startswith(f"Constraint {relation['id']!r} {field}: {diagnostic}")
+
+
+@pytest.mark.parametrize("recover", [True, False])
+def test_missing_relation_endpoint_uses_only_one_initial_correction(authored_semantics_case, tmp_path, recover):
+    from copy import deepcopy
+    from instruction.compiler import InitialInstructionCompiler
+    from instruction_adapter.compiler import RUNTIME_CONSTRAINT_TYPES
+    from prompting.schemas import ParsedInstruction
+
+    raw, payload = authored_semantics_case
+    missing = deepcopy(payload)
+    missing["constraints"][0]["object"] = ""
+    responses = iter([missing, payload if recover else missing])
+    requests = []
+
+    def parse(**kwargs):
+        requests.append(kwargs)
+        parsed = ParsedInstruction.model_validate(next(responses))
+        return NS(choices=[NS(message=NS(parsed=parsed, content=json.dumps(parsed.model_dump())))])
+
+    client = NS(beta=NS(chat=NS(completions=NS(parse=parse))))
+    trace = tmp_path / "endpoint-admission.jsonl"
+    compiler = InitialInstructionCompiler(max_model_calls=10, trace_path=trace,
+                                          client_model=(client, "scripted-not-a-model"))
+    result = compiler.compile(raw, RUNTIME_CONSTRAINT_TYPES)
+    assert result.status == ("success" if recover else "invalid"), result.diagnostics
+    assert len(requests) == compiler.model_calls == 2
+    assert [request["trace_label"] for request in requests] == ["initial_parse", "initial_correction"]
+    assert all(request["parse_retries"] == 0 for request in requests)
+    correction = json.loads(requests[1]["messages"][1]["content"])
+    assert correction["original_instruction"] == raw
+    assert correction["diagnostics"] == [
+        f"Constraint {payload['constraints'][0]['id']!r} object: missing target reference"]
+    assert correction["previous_interpretation"] == ParsedInstruction.model_validate(missing).model_dump()
+    if recover:
+        assert result.task.raw_instruction == raw
+        assert result.task.targets[0].attributes == payload["targets"][0]["attributes"]
+        assert result.task.constraints[0].object == payload["constraints"][0]["object"]
+        assert result.task.constraints[0].hardness == "hard"
+    admission = json.loads(trace.read_text().splitlines()[-1])
+    assert admission["task"] == (result.task.as_dict() if recover else None)
+
+
+def test_unresolved_authored_requirement_prevents_admission(authored_semantics_case):
+    from instruction.compiler import compile_parsed_instruction
+    from instruction_adapter.compiler import RUNTIME_CONSTRAINT_TYPES
+    from prompting.schemas import ParsedInstruction
+
+    raw, payload = authored_semantics_case
+    payload["unresolved"] = ["The intended reference object cannot be identified confidently."]
+    result = compile_parsed_instruction(raw, ParsedInstruction.model_validate(payload), RUNTIME_CONSTRAINT_TYPES)
+    assert result.status == "ambiguous" and result.task is None
+    assert result.diagnostics == tuple(payload["unresolved"])
+
+
+@pytest.mark.parametrize("entry", ["compiled", "legacy", "initial"])
+def test_raw_instruction_preserves_unicode_punctuation_and_repetition(monkeypatch, tmp_path, entry):
+    import hashlib
+    from instruction import parser
+    from instruction.compiler import InitialInstructionCompiler, compile_parsed_instruction, load_fixed_task, task_from_parsed_plan
+    from instruction.contracts import TaskSpec
+    from instruction_adapter.task_compat import runtime_plan
+    from prompting.schemas import ParsedInstruction
+
+    raw = "\t \u00a0找杯子，杯子。\r\n "
+    parsed = ParsedInstruction.model_validate({"targets": [{"id": "杯", "name": "杯子"}]})
+    parse = Mock(return_value=NS(choices=[NS(message=NS(parsed=parsed, content=parsed.model_dump_json()))]))
+    client_model = (NS(beta=NS(chat=NS(completions=NS(parse=parse)))), "scripted-not-a-model")
+    if entry == "legacy":
+        monkeypatch.setenv("LLM_OFFLINE", "0")
+        monkeypatch.setattr(parser, "get_client_and_model", lambda *args: client_model)
+        task = task_from_parsed_plan(parser.parse_instruction_with_llm(raw, strict=True))
+        assert parse.call_args.kwargs["messages"][1]["content"] == f"Instruction: {raw}\nDataset target fallback: None"
+    else:
+        result = (InitialInstructionCompiler(max_model_calls=2, trace_path=tmp_path / "parse.jsonl",
+                    client_model=client_model).compile(raw, set()) if entry == "initial"
+                  else compile_parsed_instruction(raw, parsed, set()))
+        assert result.status == "success", result.diagnostics
+        task = result.task
+        if entry == "initial":
+            assert json.loads(parse.call_args.kwargs["messages"][1]["content"])["original_instruction"] == raw
+    assert parse.call_count == int(entry != "compiled")
+    assert task.raw_instruction == raw
+    assert task.targets[0].id == "杯" and task.targets[0].name == "杯子"
+    assert TaskSpec.from_dict(task.as_dict()) == task
+    projected = runtime_plan(task)
+    assert projected.raw_instruction == raw
+    del projected.diagnostics["task_spec"]
+    assert task_from_parsed_plan(projected) == task
+    path = tmp_path / "task.json"
+    path.write_bytes(json.dumps(task.as_dict(), ensure_ascii=False).encode("utf-8"))
+    assert load_fixed_task(path, hashlib.sha256(path.read_bytes()).hexdigest(), raw, set()) == task
+
+
+@pytest.mark.parametrize("counts", [(2, 3), (0, 3), (2, -1)])
+def test_each_target_retains_its_own_positive_count(counts):
+    from instruction.compiler import compile_parsed_instruction, task_from_parsed_plan
+    from instruction.contracts import TaskSpec
+    from instruction_adapter.task_compat import runtime_plan
+    from prompting.schemas import ParsedInstruction
+
+    raw = "Two cups and three books."
+    payload = {"eval_mode": "all_targets_success",
+               "targets": [{"id": "a", "name": "cups", "min_count": counts[0]},
+                           {"id": "b", "name": "books", "min_count": counts[1]}]}
+    result = compile_parsed_instruction(raw, ParsedInstruction.model_validate(payload), {"count"})
+    if min(counts) <= 0:
+        assert result.status == "invalid" and result.task is None
+        assert any("count" in diagnostic for diagnostic in result.diagnostics)
+    else:
+        assert result.status == "success", result.diagnostics
+        assert result.task.raw_instruction == raw
+        assert [(t.id, t.min_count) for t in result.task.targets] == [("a", 2), ("b", 3)]
+        assert result.task.completion_mode == "all_targets_success"
+        assert TaskSpec.from_dict(result.task.as_dict()) == result.task
+        projected = runtime_plan(result.task)
+        del projected.diagnostics["task_spec"]
+        assert task_from_parsed_plan(projected) == result.task
+
+
 @pytest.fixture
 def relation_scene(tmp_path):
     """Keep real constraint, graph, cache and pair-ledger behavior in the replay."""
