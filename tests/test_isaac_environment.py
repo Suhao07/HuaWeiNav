@@ -502,13 +502,13 @@ class MemoryConnection:
         self.output.extend(payload)
 
 
-def http_request(bridge, body=b'{"action":"STOP"}', headers=None, path="/command", method="POST"):
+def http_request(bridge, body=b'{"action":"STOP"}', headers=None, path="/command", method="POST", run_token=None):
     """Run the HTTP handler entirely in memory and decode its wire response."""
     if headers is None:
         headers = [("Content-Type", "application/json"), ("Content-Length", str(len(body)))]
     raw = f"{method} {path} HTTP/1.0\r\n".encode()
     raw += b"".join(f"{key}: {value}\r\n".encode() for key, value in headers) + b"\r\n" + body
-    host = SimpleNamespace(bridge=bridge, shutdown_requested=False)
+    host = SimpleNamespace(bridge=bridge, shutdown_requested=False, run_token=run_token)
     connection = MemoryConnection(raw, host)
     server.CommandHandler(connection, ("127.0.0.1", 12345), host)
     response_headers, response = bytes(connection.output).split(b"\r\n\r\n", 1)
@@ -581,6 +581,30 @@ def test_http_simulator_failure_is_500_and_shutdown_flushes(tmp_path):
     assert result["pose"] == bridge.env.get_pose()
 
 
+@pytest.mark.parametrize("token", [None, "wrong-attempt", "fixture-attempt"])
+def test_http_shutdown_requires_launch_token_before_bridge_execution(tmp_path, monkeypatch, token):
+    """Reject missing/stale tokens without motion, and acknowledge the owned launch."""
+    from unittest.mock import Mock
+
+    bridge = bridge_at(tmp_path)
+    command = Mock(wraps=bridge.command)
+    monkeypatch.setattr(bridge, "command", command)
+    payload = {"action": "shutdown"}
+    if token is not None:
+        payload["run_token"] = token
+    before = (tmp_path / "trajectory.jsonl").read_bytes()
+    status, result, host = http_request(bridge, json.dumps(payload).encode(), run_token="fixture-attempt")
+    if token == "fixture-attempt":
+        assert status == 200 and result["zero_velocity"] and host.shutdown_requested
+        command.assert_called_once_with({"action": "shutdown"})
+    else:
+        assert status == 400 and result["error"] == "shutdown run token mismatch"
+        assert not host.shutdown_requested and not bridge.env.calls
+        command.assert_not_called()
+        assert (tmp_path / "trajectory.jsonl").read_bytes() == before
+        assert records(tmp_path / "actions.jsonl")[-1]["event"] == "rejected"
+
+
 def test_capture_directory_is_exclusive(tmp_path):
     """Never reuse a prior episode's capture directory."""
     bridge_at(tmp_path)
@@ -651,10 +675,45 @@ def test_main_thread_guard_without_starting_a_thread(tmp_path, monkeypatch):
     assert not bridge.env.calls
 
 
-def test_ready_and_single_loop_with_fake_httpserver(tmp_path, monkeypatch):
+@pytest.mark.parametrize("state", ["Z", "X"])
+def test_process_identity_reports_dead_lifetimes(monkeypatch, state):
+    original_read = Path.read_text
+    monkeypatch.setattr(Path, "read_text", lambda path: f"123 (fixture worker) {state} 1 123 123"
+                        if path == Path("/proc/123/stat") else original_read(path))
+    with pytest.raises(ProcessLookupError, match="no longer alive"):
+        server.process_identity(123)
+
+
+def rgbd_capture(env, root, frame_id):
+    """Persist real fixture arrays using the production portable capture writer."""
+    from prior_map.observations import write_frame
+
+    transform = np.array([[0, 0, 1, env.position[0]], [-1, 0, 0, env.position[1]],
+                          [0, -1, 0, env.position[2]], [0, 0, 0, 1]], dtype=float)
+    return write_frame(root, frame_id, np.arange(18, dtype=np.uint8).reshape(2, 3, 3),
+                       np.ones((2, 3), dtype=np.float32), np.eye(3), transform,
+                       valid_depth_fraction=1.0)
+
+
+@pytest.fixture
+def simulator_gpu():
+    return {"physical_index": 7, "uuid": "GPU-00112233-4455-6677-8899-aabbccddeeff",
+            "pci_bus_id": "00000000:E1:00.0"}
+
+
+def test_ready_and_single_loop_with_fake_httpserver(tmp_path, monkeypatch, simulator_gpu):
     """Test readiness and synchronous shutdown without binding or running an HTTP server."""
-    bridge = bridge_at(tmp_path)
+    bridge = bridge_at(tmp_path, capture=rgbd_capture)
     events = []
+
+    def devices(env, expected, log):
+        assert env is bridge.env and expected == simulator_gpu
+        assert (bridge.capture_root / "depth/000000.npy").is_file()
+        assert not (tmp_path / "server_ready.json").exists()
+        events.append("devices")
+        return {"fixture_device_receipt": True}
+
+    monkeypatch.setattr(server, "validate_simulator_device", devices)
 
     class FakeHTTPServer:
         """Emulate only the context manager and synchronous request loop."""
@@ -676,44 +735,99 @@ def test_ready_and_single_loop_with_fake_httpserver(tmp_path, monkeypatch):
             assert ready["port"] == 9466 and ready["pid"] > 0
             assert ready["isaac_version"] == "test-VERSION"
             assert ready["start_pose"] == bridge.env.get_pose()
+            assert ready["initial_observation"]["valid_depth_fraction"] == 1.0
+            assert ready["initial_observation_frame_id"] == 0
+            assert ready["gpu"] == {"fixture_device_receipt": True}
+            assert not (tmp_path / "server_ready.pending").exists()
             assert self.bridge is bridge
             events.append("request")
             self.shutdown_requested = True
 
     monkeypatch.setattr(server, "HTTPServer", FakeHTTPServer)
-    server.serve(bridge, 9466, "test-VERSION")
-    assert events == ["bind", "request", "close"]
+    server.serve(bridge, 9466, "test-VERSION", expected_gpu=simulator_gpu, device_log=tmp_path / "kit.log")
+    assert events == ["bind", "devices", "request", "close"]
+    assert [row["action"] for row in records(tmp_path / "trajectory.jsonl")] == ["START"]
 
 
-@pytest.mark.parametrize("failure", [None, "load_scene", "place_agent", "serve"])
-def test_cli_only_public_inputs_strips_argv_and_always_closes(tmp_path, monkeypatch, failure):
-    """Exercise CLI orchestration using fake modules and no simulator or server process."""
+@pytest.mark.parametrize("failure", [None, "startup", "wrong-cuda", "wrong-renderer",
+                                     "load_scene", "place_agent", "serve"])
+@pytest.mark.parametrize("renderer_gpu", [None, 3])
+def test_cli_only_public_inputs_strips_argv_and_always_closes(
+        tmp_path, monkeypatch, capsys, failure, simulator_gpu, renderer_gpu):
+    """Run real startup validation with only CUDA/Carb/Isaac hardware boundaries faked."""
+    from unittest.mock import Mock
+
     path = tmp_path / "public.json"
     path.write_text(json.dumps(public_episode()))
     output = tmp_path / "run"
     output.mkdir()
     env = FakeEnv()
     seen = []
+    other_gpu = dict(simulator_gpu, physical_index=5,
+                     uuid="GPU-10213243-5465-7687-98a9-bacbdcedfe0f", pci_bus_id="00000000:81:00.0")
 
     def factory(**kwargs):
-        assert sys.argv == ["serve_intentionnav.py"] and kwargs == {"gpu": 0}
+        assert sys.argv == ["serve_intentionnav.py", "--/physics/cudaDevice=0", f"--/log/file={output / 'kit-device.log'}"]
+        assert kwargs == {"gpu": 7 if renderer_gpu is None else renderer_gpu}
+        assert server.os.environ["CUDA_VISIBLE_DEVICES"] == simulator_gpu["uuid"]
+        assert server.os.environ["CUDA_DEVICE_ORDER"] == "PCI_BUS_ID"
+        (output / "kit-device.log").write_text(
+            renderer_log(prefix="10213243..", bus="81") if failure == "wrong-renderer" else renderer_log())
+        seen.append("env")
         return env
 
-    def fail(*args):
-        raise RuntimeError("injected failure")
+    def cuda_identity():
+        if failure == "startup":
+            raise RuntimeError("injected failure")
+        return {"uuid": (other_gpu if failure == "wrong-cuda" else simulator_gpu)["uuid"],
+                "logical_index": 0, "device_count": 1, "source": "CUDA driver cuDeviceGetUuid"}
 
-    def serve(bridge, port, version):
+    validate_startup = server.validate_startup_device
+
+    def preflight(device, log):
+        assert seen == ["env"] and not hasattr(env, "scene")
+        assert device == simulator_gpu and log == output / "kit-device.log"
+        seen.append("preflight")
+        return validate_startup(device, log)
+
+    def instrument(name):
+        original = getattr(env, name)
+
+        def call(*args):
+            seen.append(name)
+            if name == "close" and failure:
+                assert "Traceback (most recent call last)" in capsys.readouterr().err
+            if failure == name:
+                raise RuntimeError("injected failure")
+            return original(*args)
+
+        return Mock(side_effect=call)
+
+    for name in ("load_scene", "place_agent", "close"):
+        monkeypatch.setattr(env, name, instrument(name))
+
+    def serve(bridge, port, version, **kwargs):
+        assert kwargs == {"expected_gpu": simulator_gpu, "device_log": output / "kit-device.log",
+                          "run_token": None, "provenance": {}}
         assert port == 9466 and version == "test-VERSION"
         assert bridge.env.scene == ("scene", str(tmp_path / "scenes" / "scene" / "start_result_navigation.usd"))
         assert bridge.env.position == public_episode()["start_position"]
         assert bridge.env.start_quat == public_episode()["start_rotation_quat_wxyz"]
         seen.append("serve")
         if failure == "serve":
-            fail()
+            raise RuntimeError("injected failure")
 
-    monkeypatch.setenv("INTENTIONNAV_ROOT", str(tmp_path))
-    monkeypatch.setattr(sys, "argv", ["serve_intentionnav.py", "--public-episode", str(path),
-                                     "--data-root", str(tmp_path), "--output", str(output), "--gpu", "0"])
+    monkeypatch.setattr(server, "os", SimpleNamespace(environ={"INTENTIONNAV_ROOT": str(tmp_path)}))
+    argv = ["serve_intentionnav.py", "--public-episode", str(path),
+            "--data-root", str(tmp_path), "--output", str(output), "--gpu", "7"]
+    if renderer_gpu is not None:
+        argv += ["--renderer-gpu", str(renderer_gpu)]
+    monkeypatch.setattr(sys, "argv", argv)
+    monkeypatch.setattr(server, "gpu_inventory", Mock(return_value=[simulator_gpu, other_gpu]))
+    monkeypatch.setattr(server, "cuda_identity", Mock(side_effect=cuda_identity))
+    settings = {"/physics/cudaDevice": 0, "/renderer/activeGpu": 3}
+    monkeypatch.setitem(sys.modules, "carb", SimpleNamespace(settings=SimpleNamespace(get_settings=lambda: settings)))
+    monkeypatch.setattr(server, "validate_startup_device", Mock(side_effect=preflight))
     monkeypatch.setattr(sys, "path", list(sys.path))
     monkeypatch.setitem(sys.modules, "iss_env", SimpleNamespace(IsaacSimEnv=factory))
     monkeypatch.setitem(sys.modules, "walkable_map", SimpleNamespace(WalkableMap=FakeMap))
@@ -722,15 +836,92 @@ def test_cli_only_public_inputs_strips_argv_and_always_closes(tmp_path, monkeypa
     monkeypatch.setattr(server, "load_freemap", lambda *args: FakeMap())
     monkeypatch.setattr(server, "isaac_version_file", lambda module: "test-VERSION")
     monkeypatch.setattr(server, "serve", serve)
-    if failure in {"load_scene", "place_agent"}:
-        monkeypatch.setattr(env, failure, fail)
     if failure:
-        with pytest.raises(RuntimeError, match="injected failure"):
+        message = "allocated UUID" if failure in {"wrong-cuda", "wrong-renderer"} else "injected failure"
+        with pytest.raises(RuntimeError, match=message):
             server.main()
     else:
         server.main()
-        assert seen == ["serve"]
+    stages = ["env", "preflight", "load_scene", "place_agent", "serve"]
+    failed_stage = "preflight" if failure in {"startup", "wrong-cuda", "wrong-renderer"} else failure
+    expected = stages[:stages.index(failed_stage) + 1] if failure else stages
+    assert seen == [*expected, "close"]
+    if failed_stage == "preflight":
+        env.load_scene.assert_not_called()
+        env.place_agent.assert_not_called()
+        assert not (output / "capture").exists()
+    assert not (output / "server_ready.json").exists()
+    env.close.assert_called_once_with()
     assert env.closed
+
+
+@pytest.mark.parametrize("substitution", [None, "iss_env", "walkable_map"])
+def test_cli_attests_both_actual_external_sources_before_creating_env(tmp_path, monkeypatch, simulator_gpu, substitution):
+    """Hash both imported implementations and reject a module loaded from another path."""
+    from unittest.mock import Mock
+
+    output = tmp_path / "run"
+    source = output / "source"
+    (source / "scripts").mkdir(parents=True)
+    copied_script = source / "scripts/serve_intentionnav.py"
+    copied_script.write_text("# fixture copied source\n")
+    public = output / "public_episode.json"
+    public.write_text(json.dumps(public_episode()))
+    manifest = output / "source_manifest.json"
+    manifest.write_text(json.dumps(server.source_manifest(source)))
+    external = tmp_path / "official/eval/simulator"
+    external.mkdir(parents=True)
+    module_paths = {}
+    for name in ("iss_env", "walkable_map"):
+        path = external / (name + ".py")
+        path.write_text(f"# actual {name} implementation bytes\n")
+        module_paths[name] = path
+    imported_paths = dict(module_paths)
+    if substitution:
+        wrong_path = tmp_path / (substitution + ".py")
+        # Identical bytes at a different import origin must still be rejected.
+        wrong_path.write_bytes(module_paths[substitution].read_bytes())
+        imported_paths[substitution] = wrong_path
+    env = FakeEnv()
+    factory = Mock(return_value=env)
+    serve = Mock()
+    preflight = Mock(return_value={})
+    monkeypatch.setattr(server, "__file__", str(copied_script))
+    monkeypatch.setattr(server, "os", SimpleNamespace(environ={"INTENTIONNAV_ROOT": str(tmp_path / "official")}))
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    monkeypatch.setattr(sys, "argv", ["serve_intentionnav.py", "--public-episode", str(public),
+                                     "--data-root", str(tmp_path), "--output", str(output),
+                                     "--gpu", "7", "--run-token", "fixture-attempt"])
+    monkeypatch.setitem(sys.modules, "iss_env", SimpleNamespace(__file__=str(imported_paths["iss_env"]),
+                                                               IsaacSimEnv=factory))
+    monkeypatch.setitem(sys.modules, "walkable_map", SimpleNamespace(__file__=str(imported_paths["walkable_map"]),
+                                                                    WalkableMap=FakeMap))
+    monkeypatch.setitem(sys.modules, "backends.isaac.capture", SimpleNamespace(capture_frame=fake_capture))
+    monkeypatch.setitem(sys.modules, "isaacsim", SimpleNamespace())
+    monkeypatch.setattr(server, "gpu_inventory", Mock(return_value=[simulator_gpu]))
+    monkeypatch.setattr(server, "load_freemap", Mock(return_value=FakeMap()))
+    monkeypatch.setattr(server, "validate_startup_device", preflight)
+    monkeypatch.setattr(server, "isaac_version_file", Mock(return_value="fixture-version"))
+    monkeypatch.setattr(server, "serve", serve)
+    if substitution:
+        with pytest.raises(RuntimeError, match="unexpected external source"):
+            server.main()
+        factory.assert_not_called()
+        preflight.assert_not_called()
+        server.load_freemap.assert_not_called()
+        serve.assert_not_called()
+    else:
+        server.main()
+        provenance = serve.call_args.kwargs["provenance"]
+        for name, key in (("iss_env", "simulator_source"), ("walkable_map", "walkable_map_source")):
+            assert provenance[key] == {"path": str(module_paths[name]),
+                                       "sha256": server.hashlib.sha256(module_paths[name].read_bytes()).hexdigest()}
+        assert provenance["source_manifest_sha256"] == server.hashlib.sha256(manifest.read_bytes()).hexdigest()
+        assert serve.call_args.kwargs["run_token"] == "fixture-attempt"
+        factory.assert_called_once_with(gpu=7)
+        preflight.assert_called_once_with(simulator_gpu, output / "kit-device.log")
+        assert env.closed
+    assert not (output / "server_ready.json").exists()
 
 
 def test_version_is_read_from_installed_version_file(tmp_path, monkeypatch):
@@ -738,6 +929,241 @@ def test_version_is_read_from_installed_version_file(tmp_path, monkeypatch):
     (tmp_path / "VERSION").write_text("6.0.1-rc.test+build\n")
     monkeypatch.setenv("ISAACSIM_ROOT", str(tmp_path))
     assert server.isaac_version_file(SimpleNamespace()) == "6.0.1-rc.test+build"
+
+
+@pytest.mark.parametrize("failure", ["nan", "inf", "negative", "zero", "integer-depth", "black", "white",
+    "magenta", "checkerboard", "grayscale", "rgba", "misaligned", "corrupt-image", "missing-depth", "fraction",
+    "nan-fraction", "bool-fraction", "intrinsics-singular", "intrinsics-nan", "principal-point",
+    "left-handed", "noninvertible", "extrinsics-nan", "pose", "yaw", "journal", "extra-frame",
+    "depth-unit", "depth-convention", "path", "symlink"])
+def test_initial_rgbd_rejects_invalid_persisted_evidence(tmp_path, failure):
+    """Validate file bytes and geometry, not just plausible-looking readiness metadata."""
+    from PIL import Image
+
+    bridge = bridge_at(tmp_path, capture=rgbd_capture)
+    initial = bridge.command({"action": "observe"})
+    frame, root = initial["frame"], bridge.capture_root
+    depth_path, rgb_path = root / frame["depth_path"], root / frame["rgb_path"]
+    if failure in {"nan", "inf", "negative", "zero", "integer-depth"}:
+        depth = np.ones((2, 3), np.float32)
+        depth[0, 0] = {"nan": float("nan"), "inf": float("inf"), "negative": -1,
+                       "zero": 0, "integer-depth": 1}[failure]
+        if failure == "zero":
+            depth[:] = 0
+        if failure == "integer-depth":
+            depth = depth.astype(np.int32)
+        np.save(depth_path, depth)
+    elif failure in {"black", "white", "magenta", "checkerboard", "grayscale", "rgba", "misaligned"}:
+        shape = {"grayscale": (2, 3), "rgba": (2, 3, 4), "misaligned": (3, 3, 3)}.get(failure, (2, 3, 3))
+        rgb = np.arange(math.prod(shape), dtype=np.uint8).reshape(shape)
+        if failure in {"black", "white", "magenta"}:
+            rgb[:] = {"black": 0, "white": 255, "magenta": [255, 0, 255]}[failure]
+        if failure == "checkerboard":
+            rgb[:] = 0
+            rgb[0, ::2] = [255, 0, 255]
+        Image.fromarray(rgb).save(rgb_path)
+    elif failure == "corrupt-image":
+        rgb_path.write_bytes(b"not an image")
+    elif failure == "missing-depth":
+        depth_path.unlink()
+    elif failure in {"fraction", "nan-fraction", "bool-fraction"}:
+        frame["valid_depth_fraction"] = {"fraction": 0.5, "nan-fraction": float("nan"), "bool-fraction": True}[failure]
+    elif failure.startswith("intrinsics"):
+        frame["intrinsics"][0][0] = 0 if failure.endswith("singular") else float("nan")
+    elif failure == "principal-point":
+        frame["intrinsics"][0][2] = 100
+    elif failure in {"left-handed", "noninvertible", "extrinsics-nan"}:
+        transform = np.asarray(frame["camera_to_map"])
+        transform[:3, 0] *= -1 if failure == "left-handed" else 0 if failure == "noninvertible" else float("nan")
+        frame["camera_to_map"] = transform.tolist()
+    elif failure == "pose":
+        initial["pose"]["position"][0] += 1
+    elif failure == "yaw":
+        initial["pose"]["yaw"] = float("nan")
+    elif failure == "depth-unit":
+        frame["depth_unit"] = "mm"
+    elif failure == "depth-convention":
+        frame["depth_convention"] = "ray_distance"
+    elif failure == "path":
+        frame["rgb_path"] = str(rgb_path)
+    elif failure == "symlink":
+        other = tmp_path / "substituted.png"
+        rgb_path.rename(other)
+        rgb_path.symlink_to(other)
+    journal = root / "frames.jsonl"
+    journal.write_text(json.dumps(frame) + "\n")
+    if failure == "journal":
+        journal.write_text("{}\n")
+    elif failure == "extra-frame":
+        journal.write_text(journal.read_text() * 2)
+    with pytest.raises((RuntimeError, ValueError, OSError)):
+        server.validate_initial_observation(bridge, initial)
+
+
+def test_initial_rgbd_receipt_matches_real_files(tmp_path):
+    bridge = bridge_at(tmp_path, capture=rgbd_capture)
+    initial = bridge.command({"action": "observe"})
+    receipt = server.validate_initial_observation(bridge, initial)
+    assert receipt["frame"] == initial["frame"]
+    assert receipt["valid_depth_fraction"] == 1
+    for file in receipt["files"].values():
+        assert file["sha256"] == server.hashlib.sha256(Path(file["path"]).read_bytes()).hexdigest()
+
+
+@pytest.mark.parametrize("name", ["server_ready.json", "server_ready.pending"])
+def test_stale_ready_never_observes_or_binds(tmp_path, monkeypatch, simulator_gpu, name):
+    bridge = bridge_at(tmp_path, capture=rgbd_capture)
+    stale = tmp_path / name
+    stale.write_text("stale fixture")
+    monkeypatch.setattr(server, "HTTPServer", lambda *a: pytest.fail("must not bind"))
+    with pytest.raises(FileExistsError, match="stale"):
+        server.serve(bridge, 9466, "fixture", expected_gpu=simulator_gpu, device_log=tmp_path / "log")
+    assert stale.read_text() == "stale fixture"
+    assert not (bridge.capture_root / "frames.jsonl").exists()
+
+
+@pytest.mark.parametrize("failure", ["capture", "device", "timeout"])
+def test_failed_preflight_never_publishes_ready(tmp_path, monkeypatch, simulator_gpu, failure):
+    from unittest.mock import Mock
+
+    bridge = bridge_at(tmp_path, capture=rgbd_capture)
+    http = Mock(server_address=("127.0.0.1", 9466))
+
+    class FakeHTTPServer:
+        def __enter__(self):
+            return http
+
+        def __exit__(self, *args):
+            pass
+
+    monkeypatch.setattr(server, "HTTPServer", lambda *args: FakeHTTPServer())
+    if failure == "capture":
+        monkeypatch.setattr(bridge, "command", Mock(side_effect=RuntimeError("capture failed")))
+    else:
+        error = TimeoutError("fixture deadline") if failure == "timeout" else RuntimeError("device failed")
+        monkeypatch.setattr(server, "validate_simulator_device", Mock(side_effect=error))
+    with pytest.raises((RuntimeError, TimeoutError)):
+        server.serve(bridge, 9466, "fixture", expected_gpu=simulator_gpu, device_log=tmp_path / "log")
+    assert not list(tmp_path.glob("server_ready.*"))
+    http.handle_request.assert_not_called()
+
+
+def renderer_log(prefix="00112233..", bus="E1", active="Yes: 0", index=3):
+    """Model the supported multiline Kit GPU table, not an ordinal-only request."""
+    return ("| GPU | Name | Active | LDA | Memory | Vendor | UUID |\n"
+            f"| {index} | fixture GPU | {active} | | 100 | 10de | |\n"
+            f"| | | | | | | {prefix} |\n"
+            f"| | | | | | {bus} | |\n")
+
+
+@pytest.mark.parametrize("failure", [None, "no-table", "inactive", "wrong-bus", "wrong-uuid", "short-uuid",
+                                     "ambiguous", "two-active", "latest-inactive", "truncated"])
+def test_renderer_requires_unique_active_uuid_and_pci(tmp_path, simulator_gpu, failure):
+    inventory = [simulator_gpu]
+    text = renderer_log()
+    if failure == "no-table":
+        text = "requested active_gpu=7"
+    elif failure == "inactive":
+        text = renderer_log(active="No")
+    elif failure == "wrong-bus":
+        text = renderer_log(bus="81")
+    elif failure == "wrong-uuid":
+        text = renderer_log(prefix="99887766..")
+    elif failure == "short-uuid":
+        text = renderer_log(prefix="0011..")
+    elif failure == "ambiguous":
+        inventory.append(dict(simulator_gpu, uuid=simulator_gpu["uuid"][:-1] + "0"))
+    elif failure == "two-active":
+        text += renderer_log(index=4).split("\n", 1)[1]
+    elif failure == "latest-inactive":
+        text += renderer_log(active="No")
+    elif failure == "truncated":
+        text = text.rsplit("\n", 2)[0]
+    path = tmp_path / "kit.log"
+    path.write_text(text)
+    if failure:
+        with pytest.raises(RuntimeError):
+            server.renderer_identity(path, inventory)
+    else:
+        receipt = server.renderer_identity(path, inventory)
+        assert receipt["uuid"] == simulator_gpu["uuid"] and receipt["renderer_index"] == 3
+        path.write_text(text + "later log output\n")
+        assert server.renderer_identity(path, inventory, byte_length=receipt["receipt_bytes"]) == receipt
+
+
+@pytest.mark.parametrize("failure", [None, "count", "init", "uuid"])
+def test_cuda_uuid_is_driver_bytes_not_visible_device_setting(monkeypatch, simulator_gpu, failure):
+    import ctypes
+    import uuid
+    from unittest.mock import Mock
+
+    def count(ptr):
+        ctypes.cast(ptr, ctypes.POINTER(ctypes.c_int))[0] = 2 if failure == "count" else 1
+        return 0
+
+    def device(ptr, ordinal):
+        assert ordinal == 0
+        ctypes.cast(ptr, ctypes.POINTER(ctypes.c_int))[0] = 19
+        return 0
+
+    def identity(ptr, actual_device):
+        assert actual_device.value == 19
+        ctypes.memmove(ptr, uuid.UUID(simulator_gpu["uuid"][4:]).bytes, 16)
+        return 1 if failure == "uuid" else 0
+
+    driver = SimpleNamespace(cuInit=Mock(return_value=1 if failure == "init" else 0),
+        cuDeviceGetCount=Mock(side_effect=count), cuDeviceGet=Mock(side_effect=device),
+        cuDeviceGetUuid=Mock(side_effect=identity))
+    monkeypatch.setattr(server.ctypes, "CDLL", Mock(return_value=driver))
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "wrong-requested-value")
+    if failure:
+        with pytest.raises(RuntimeError):
+            server.cuda_identity()
+    else:
+        assert server.cuda_identity() == {"uuid": simulator_gpu["uuid"], "logical_index": 0,
+            "device_count": 1, "source": "CUDA driver cuDeviceGetUuid"}
+        assert driver.cuDeviceGetUuid.argtypes == [ctypes.c_void_p, ctypes.c_int]
+
+
+@pytest.mark.parametrize("mode", ["cpu", "gpu", "wrong-cuda", "wrong-renderer", "settings-only",
+                                  "cpu-ordinal", "gpu-ordinal", "unknown-physics", "invalid-view",
+                                  "missing-view", "invalid-override", "forced-gpu-on-cpu-view"])
+def test_device_validation_requires_observed_renderer_and_physx(tmp_path, monkeypatch, simulator_gpu, mode):
+    from unittest.mock import Mock
+
+    log = tmp_path / "kit.log"
+    log.write_text(renderer_log())
+    monkeypatch.setattr(server, "gpu_inventory", lambda: [simulator_gpu])
+    cuda = {"uuid": simulator_gpu["uuid"], "logical_index": 0, "device_count": 1,
+            "source": "CUDA driver cuDeviceGetUuid"}
+    if mode == "wrong-cuda":
+        cuda["uuid"] = "wrong"
+    if mode == "wrong-renderer":
+        log.write_text(renderer_log(bus="81"))
+    if mode == "settings-only":
+        log.write_text("/renderer/activeGpu=3")
+    monkeypatch.setattr(server, "cuda_identity", lambda: cuda)
+    settings = {"/physics/cudaDevice": 0, "/renderer/activeGpu": 3}
+    monkeypatch.setitem(sys.modules, "carb", SimpleNamespace(settings=SimpleNamespace(get_settings=lambda: settings)))
+    gpu = mode in {"gpu", "gpu-ordinal"}
+    context = SimpleNamespace(is_gpu_dynamics_enabled=lambda: gpu,
+        get_broadphase_type=lambda: "unknown" if mode == "unknown-physics" else "GPU" if gpu else "MBP")
+    ordinal = 1 if mode == "gpu-ordinal" else 0 if gpu or mode == "cpu-ordinal" else -1
+    view = None if mode == "missing-view" else SimpleNamespace(
+        device_ordinal=ordinal, is_valid=mode != "invalid-view")
+    manager = SimpleNamespace(get_physics_simulation_view=lambda: view)
+    monkeypatch.setitem(sys.modules, "isaacsim.core.simulation_manager", SimpleNamespace(SimulationManager=manager))
+    override = 7 if mode == "invalid-override" else 1 if mode == "forced-gpu-on-cpu-view" else -1
+    interface = SimpleNamespace(get_overwrite_gpu_setting=lambda: override)
+    monkeypatch.setitem(sys.modules, "omni.physx", SimpleNamespace(get_physx_interface=lambda: interface))
+    env = SimpleNamespace(_world=SimpleNamespace(get_physics_context=lambda: context))
+    if mode not in {"cpu", "gpu"}:
+        with pytest.raises(RuntimeError):
+            server.validate_simulator_device(env, simulator_gpu, log)
+    else:
+        result = server.validate_simulator_device(env, simulator_gpu, log)
+        assert result["physics"]["device"] == ("cuda:0" if gpu else "cpu")
+        assert result["physics"]["cuda_ordinal"] == ordinal
 
 
 def test_json_large_int_rejected_as_coordinate():
