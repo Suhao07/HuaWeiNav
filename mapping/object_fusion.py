@@ -83,15 +83,14 @@ def merge_object_observation(argmax_entity, entity):
 
 
 def accumulate_label_vote(argmax_entity, new_tag, n2, c2):
-    """Add n2 points voting new_tag with confidence c2, then re-decide the tag.
-
-    Votes weigh w=c^alpha n (alpha=2); confidences of one label average with
-    those weights. The tag keeps ori unless w_new >= w_ori.
-    """
+    """按票重 w=c²n 加权更新同类置信度，再比较类别票重。"""
     alpha = 2
     ori_tag = argmax_entity.tag
+    if c2**alpha * n2 == 0:
+        return
 
-    if new_tag not in argmax_entity.num_list.keys():
+    if (new_tag not in argmax_entity.num_list
+            or argmax_entity.conf_list[new_tag]**alpha * argmax_entity.num_list[new_tag] == 0):
         argmax_entity.num_list[new_tag] = n2
         argmax_entity.conf_list[new_tag] = c2
     else:
@@ -106,20 +105,11 @@ def accumulate_label_vote(argmax_entity, new_tag, n2, c2):
         argmax_entity.tag = new_tag
         argmax_entity.confidence = argmax_entity.conf_list[new_tag]
     else:
-        # 部分 verifier 路径会临时把 tag 置为 nothing
-        # 以退出当前候选，但历史类别字典可能来自旧版本日志或其它
-        # 路径而缺 key。这里补齐默认值，避免地图关联阶段崩溃。
-        if ori_tag not in argmax_entity.num_list:
-            argmax_entity.num_list[ori_tag] = 1
-        if ori_tag not in argmax_entity.conf_list:
-            argmax_entity.conf_list[ori_tag] = argmax_entity.confidence
         n1 = argmax_entity.num_list[ori_tag]
         n2 = argmax_entity.num_list[new_tag]
         c1 = argmax_entity.conf_list[ori_tag]
         c2 = argmax_entity.conf_list[new_tag]
-        w1 = (c1**alpha * n1) / (c1**alpha * n1 + c2**alpha * n2)
-        w2 = 1 - w1
-        if w1 > w2:
+        if c1**alpha * n1 > c2**alpha * n2:
             argmax_entity.tag = ori_tag
             argmax_entity.confidence = c1
         else:
@@ -131,7 +121,7 @@ def label_probabilities(entity):
     """Category posterior from the fusion's own votes: p(l)=c_l^2 n_l / sum_k c_k^2 n_k."""
     votes = {tag: float(entity.conf_list[tag]) ** 2 * float(n) for tag, n in entity.num_list.items()}
     total = sum(votes.values())
-    return {tag: vote / total for tag, vote in votes.items()}
+    return {tag: vote / total for tag, vote in votes.items() if vote > 0} if total > 0 else {}
 
 def merge_duplicate_instances(entities, voxel_m):
     """Merge instances describing one surface; observation-to-instance fusion never re-merges.
@@ -215,18 +205,14 @@ def associate_object_entities(ref_entities, eval_entities, *, target, is_target_
                     if overlap_score > 0.85 and overlap_score1 > 0.85 and overlap_score2 > 0.85:
                         argmax_entity.num_list.pop(argmax_entity.tag)
                         argmax_entity.conf_list.pop(argmax_entity.tag)
-                        source_tag = entity.tag if entity.tag in entity.num_list else target
                         argmax_entity.tag = target
                         argmax_entity.pcd = eval_pcd
                         argmax_entity.position = entity.position
                         # 同一实例关联成功后同步图像与其 bbox，供证据版本比较。
                         argmax_entity.rgb, argmax_entity.bbox = entity.rgb, entity.bbox
                         argmax_entity.confidence = entity.confidence
-                        argmax_entity.num_list[target] = entity.num_list.get(source_tag, 1)
-                        argmax_entity.conf_list[target] = entity.conf_list.get(
-                            source_tag,
-                            [entity.confidence],
-                        )
+                        argmax_entity.num_list[target] = entity.num_list[entity.tag]
+                        argmax_entity.conf_list[target] = entity.conf_list[entity.tag]
                     else:
                         entity.pcd = eval_pcd
                         ref_entities.append(entity)

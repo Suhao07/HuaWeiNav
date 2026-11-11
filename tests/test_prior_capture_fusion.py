@@ -107,6 +107,53 @@ class CaptureFusionTest(unittest.TestCase):
         with self.assertRaises(IndexError):
             perceiver.perceive(image)
 
+    def test_zero_weight_votes_do_not_inflate_positive_evidence(self):
+        from copy import deepcopy
+        from mapping.object_fusion import accumulate_label_vote, label_probabilities
+        for tag in ("chair", "table"):
+            for n, confidence in ((8, 0.), (0, .9)):
+                obj = _entity()
+                before = deepcopy((obj.num_list, obj.conf_list, obj.tag, obj.confidence))
+                accumulate_label_vote(obj, tag, n, confidence)
+                self.assertEqual((obj.num_list, obj.conf_list, obj.tag, obj.confidence), before)
+                self.assertEqual(label_probabilities(obj), {"chair": 1.})
+        for tag in ("chair", "table"):
+            obj = _entity(score=0.)
+            accumulate_label_vote(obj, tag, 8, 0.)
+            self.assertEqual(label_probabilities(obj), {})
+            accumulate_label_vote(obj, tag, 8, .9)
+            self.assertEqual(obj.tag, tag)
+            self.assertEqual(obj.num_list[tag], 8)
+            self.assertEqual(obj.confidence, .9)
+            self.assertEqual(label_probabilities(obj), {tag: 1.})
+
+    def test_target_alias_keeps_observed_votes_through_background_fusion(self):
+        from mapping.object_fusion import label_probabilities
+        first, observed = _entity(), _entity(.01, .9)
+        refs, _ = associate_object_entities([first], [observed], target="seat",
+                                             is_target_tag=lambda tag: tag == "chair")
+        self.assertIs(refs[0], first)
+        self.assertEqual(first.tag, "seat")
+        self.assertEqual(first.num_list, {"seat": 8})
+        self.assertEqual(first.conf_list, {"seat": .9})
+        background = _entity(.01, .2)
+        refs, indices = associate_object_entities(refs, [background], target="seat",
+                                                  is_target_tag=lambda tag: False)
+        self.assertEqual(indices, [0])
+        self.assertEqual(first.num_list, {"seat": 8, "chair": 8})
+        self.assertEqual(first.tag, "seat")
+        self.assertAlmostEqual(label_probabilities(first)["seat"], .81 / (.81 + .04))
+
+    def test_unknown_observations_still_merge_geometrically(self):
+        from mapping.object_fusion import label_probabilities
+        first, same = _entity(score=0.), _entity(.01, 0.)
+        refs, indices = associate_object_entities([], [first, same], target="", is_target_tag=lambda tag: False)
+        self.assertEqual(indices, [0, 0])
+        self.assertEqual(len(refs), 1)
+        self.assertEqual(refs[0].uid, first.uid)
+        self.assertEqual(refs[0].pcd.point.positions.shape[0], 16)
+        self.assertEqual(label_probabilities(refs[0]), {})
+
     def test_task_free_fusion_keeps_identity_and_evidence_indices(self):
         first, same, separate = _entity(), _entity(.01, .9), _entity(2.)
         refs, indices = associate_object_entities([], [first, same, separate],
