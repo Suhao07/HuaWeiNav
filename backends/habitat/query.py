@@ -40,11 +40,8 @@ def select_observed_candidate(agent, *, episode_idx=None, step=0, deferred_uids=
                                                         current_node_idx=mapper.current_node_idx)
     session.prior_map_policy_adapter = mapper.prior_map_policy_adapter
     session.prior_result = mapper.search_prior_result
-    result = query_scene(session, step=step)
+    result = query_scene(session, step=step, deferred_uids=deferred_uids)
     selected = result.selected
-    if selected is not None and selected.obj.uid in deferred_uids:
-        selected = next((item for item in result.candidates if item.obj.uid not in deferred_uids), None)
-        result.reason = "candidate_waiting_for_new_observation" if selected is None else result.reason
     agent.selected_candidate = selected
     if selected is not None and selected.role == "anchor":
         session.anchor_search_ledger.mark(

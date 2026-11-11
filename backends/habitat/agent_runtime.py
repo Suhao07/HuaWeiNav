@@ -36,13 +36,7 @@ class HabitatEvidenceVerifier:
             evidence=evidence, step=agent.episode_steps,
         )
         if not checked.satisfied:
-            return VerificationResult(
-                False, "need_relation_check" if checked.decision == "need_relation_check" else "uncertain",
-                confidence=checked.confidence, reason=checked.reason,
-                task_revision=agent.task.spec.revision, target_uid=candidate.uid,
-                failed_constraints=checked.failed_constraints,
-                diagnostics={"constraint_eval": checked.as_dict()},
-            )
+            return checked.to_verification_result(task_revision=agent.task.spec.revision, target_uid=candidate.uid)
         # 预筛生成的关系证据与最终验证、reducer 使用同一个 evidence 包。
         evidence.update(checked.evidence)
         return agent.final_instruction_verifier.verify(
@@ -126,9 +120,7 @@ class HabitatNavigationTools(NavigationTools):
 
     def query_scene(self):
         """Return candidates with an available observation/execution opportunity."""
-        result = super().query_scene()
-        result["candidates"] = [item for item in result["candidates"]
-                                if item["candidate_uid"] not in self.deferred_candidates]
+        result = super().query_scene(deferred_uids=self.deferred_candidates)
         result["deferred_candidate_uids"] = sorted(self.deferred_candidates)
         return result
 

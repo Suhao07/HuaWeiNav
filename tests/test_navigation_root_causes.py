@@ -397,7 +397,7 @@ def test_guided_anchor_search_preserves_ledger_without_target_verification(
         rotate_toward_object_for_recheck=lambda agent: True, tilt_camera=tilt))
     ns = methods("objnav_agent_with_process_obs.py", {"final_instruction_check"}, {"logger": Mock()})
     anchor = NS(uid="anchor", position=np.ones(3))
-    task = NS(spec=NS(revision=1), plan=NS(diagnostics={}),
+    task = NS(spec=NS(revision=1, raw_instruction="find the book on the table"), plan=NS(diagnostics={}),
               progress=NS(completed=False), anchor_search_ledger=AnchorSearchLedger(),
               verification_ledger=EvidenceStore(1), constraint_evaluator=Mock())
     agent = NS(task=task, episode_steps=step, episode_samples=1, object_final=anchor,
@@ -412,9 +412,10 @@ def test_guided_anchor_search_preserves_ledger_without_target_verification(
     runtime.model_calls, runtime.max_model_calls = calls, 5
     guided = GuidedNavigation.__new__(GuidedNavigation)
     guided.agent, guided.runtime, guided.directory = agent, runtime, tmp_path
-    guided.search_review_step, guided.search_review_interval = 0, 100
+    guided.initialize_state(deferred_candidates=set(), review_interval=100)
+    guided.search_review_step = 0
     guided.submit, guided.defer_candidate = Mock(), Mock()
-    guided.tools = NS(publish_object_viewpoints=Mock())
+    guided.tools = NS(session=task, publish_object_viewpoints=Mock())
     assert guided.verify((0., 0., 0.)) == expected
     record = task.anchor_search_ledger.get("find the book on the table", "reference", "anchor")
     assert record.status == "searched_no_terminal_found" and record.step == step
@@ -474,7 +475,8 @@ def test_search_review_preserves_baseline_option_set_and_interval(reachable):
             {"node_idx": 0, "raw_distance_m": 2.},
             {"node_idx": 1, "raw_distance_m": 5. if reachable == 2 else float("inf")},
             {"node_idx": 2, "raw_distance_m": float("inf")}] }))
-    guided.search_review_step, guided.search_review_interval = 0, 100
+    guided.initialize_state(deferred_candidates=set(), review_interval=100)
+    guided.search_review_step = 0
     selected = reachable - 1
     guided.runtime = NS(model_calls=0, max_model_calls=5,
                         choose_frontier=Mock(return_value=f"node:{selected}"))
@@ -592,8 +594,10 @@ def test_visual_history_is_scoped_to_task_revision():
 
 def test_uncertain_exhausted_view_defers_candidate_until_new_observation(monkeypatch):
     import sys
+    from dataclasses import replace
     from backends.habitat.guided_runtime import GuidedNavigation
     from instruction_adapter.view_control import ViewControlState
+    from scene.contracts import Pose3D, SemanticMapSnapshot
     monkeypatch.setitem(sys.modules, "navigation.goal_approach_controller",
                         NS(rotate_toward_object_for_recheck=lambda agent: True,
                            tilt_camera=lambda agent, pitch: True))
@@ -604,29 +608,41 @@ def test_uncertain_exhausted_view_defers_candidate_until_new_observation(monkeyp
                                                  position=np.ones(3)),
                mapper=NS(current_position=np.zeros(3), current_rotation=np.eye(3)[:, ::-1]),
                _observation_identity=lambda uid: {"observation_id": "0:30"},
-               task=NS(spec=NS(revision=1)), need_check_again=False,
-               selected_candidate=NS(role="primary"),
+               task=NS(spec=NS(revision=1)), planner=NS(_goal_radius=.25), need_check_again=False,
+               selected_candidate=NS(role="primary", target_id="goal"),
                last_check_again_evidence={}, final_stop_decision="uncertain",
                check_again=Mock(), final_instruction_check=Mock(return_value=False),
                _continue_better_view_control=lambda: False, view_control_state=state)
     guided = GuidedNavigation.__new__(GuidedNavigation)
     guided.agent, guided.record = agent, Mock()
-    guided.search_review_step, guided.search_review_interval = 0, 100
-    guided.deferred_candidates = set()
-    guided.deferred_evidence, guided.candidate_view_states = {}, {}
-    guided.tools = NS(refresh_scene=Mock(), objects={"obj": agent.object_final})
+    guided.initialize_state(deferred_candidates=set(), review_interval=100)
+    guided.search_review_step = 0
+    frame = {"id": "0:30", "position": [0., 0., 0.], "rotation": np.eye(3).tolist(),
+             "object_boxes": {"obj": [0, 0, 2, 2]}, "observed_object_uids": ["obj"]}
+    session = NS(snapshot=SemanticMapSnapshot(30., Pose3D((0., 0., 0.)),
+                                             metadata={"observation_images": [frame]}))
+    guided.tools = NS(session=session, refresh_scene=Mock(), objects={"obj": agent.object_final})
     assert guided.verify((0, 0, 0)) == "recovery"
+    fingerprint = guided.evidence_fingerprint("obj")
     assert guided.deferred_candidates == {"obj"}
     guided.observation_updated()
     assert guided.deferred_candidates == {"obj"} and state.active
     agent.object_final.rgb[0,0] = 1
     guided.observation_updated()
+    assert guided.evidence_fingerprint("obj") != fingerprint
+    assert guided.deferred_candidates == {"obj"} and guided.action_epoch("obj") == 0
+    session.snapshot = replace(session.snapshot, metadata={"observation_images": [
+        {**frame, "id": "0:31", "position": [1., 0., 0.]}]})
+    guided.observation_updated()
     assert guided.deferred_candidates == set() and state.active and state.exhausted
+    assert guided.action_epoch("obj") == 1
     assert guided.candidate_view_states[(1, "obj")] is state
     guided.defer_candidate("new view also exhausted")
     agent.object_final.rgb[0,0] = 0
+    session.snapshot = replace(session.snapshot, metadata={"observation_images": [frame]})
     guided.observation_updated()
-    assert guided.deferred_candidates == {"obj"}  # A → B → A consumes A only once
+    assert guided.deferred_candidates == {"obj"}  # Revisiting camera A after B is not a new view.
+    assert guided.action_epoch("obj") == 1
 
 
 def test_viewpoint_query_removes_reached_and_unreachable_motion_goals(monkeypatch):

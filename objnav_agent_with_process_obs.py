@@ -1320,16 +1320,9 @@ class HM3D_Objnav_Agent:
                 )
                 evidence = constraint_eval.evidence
             if constraint_eval is not None and not constraint_eval.satisfied:
-                result = VerificationResult(
+                result = constraint_eval.to_verification_result(
                     task_revision=self.task.spec.revision,
                     target_uid=candidate.uid,
-                    satisfied=False,
-                    decision="need_relation_check" if constraint_eval.decision == "need_relation_check" else "uncertain",
-                    confidence=constraint_eval.confidence,
-                    satisfied_constraints=constraint_eval.satisfied_constraints,
-                    failed_constraints=constraint_eval.failed_constraints,
-                    reason=constraint_eval.reason,
-                    diagnostics={"constraint_eval": constraint_eval.as_dict()},
                 )
             else:
                 evidence = self._attach_view_control_context(evidence, candidate)
@@ -1379,16 +1372,9 @@ class HM3D_Objnav_Agent:
                 )
                 evidence = constraint_eval.evidence
             if constraint_eval is not None and not constraint_eval.satisfied:
-                result = VerificationResult(
+                result = constraint_eval.to_verification_result(
                     task_revision=self.task.spec.revision,
                     target_uid=candidate.uid,
-                    satisfied=False,
-                    decision="need_relation_check" if constraint_eval.decision == "need_relation_check" else "uncertain",
-                    confidence=constraint_eval.confidence,
-                    satisfied_constraints=constraint_eval.satisfied_constraints,
-                    failed_constraints=constraint_eval.failed_constraints,
-                    reason=constraint_eval.reason,
-                    diagnostics={"constraint_eval": constraint_eval.as_dict()},
                 )
             else:
                 evidence = self._attach_view_control_context(evidence, candidate)
@@ -1463,6 +1449,7 @@ class HM3D_Objnav_Agent:
         if instruction_mode:
             self.instruction_decision = result.decision
         self.final_stop_decision = result.decision
+        self.final_verification_result = result
         if result.accepted:
             relation_edges = list((evidence or {}).get("relation_edges") or [])
             if plan is not None:
