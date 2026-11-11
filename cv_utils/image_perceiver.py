@@ -3,9 +3,6 @@ import torch
 
 from constants import *
 
-from .sam import MMDINO_Grounded_SAM
-
-
 class ImagePerceiver:
 
     def __init__(self, classes, box_threshold=0.3, text_threshold=0.3, device="cuda"):
@@ -64,6 +61,7 @@ class MMDINOSAM_Perceiver(ImagePerceiver):
                  device="cuda"):
         super().__init__(classes, box_threshold, text_threshold, device)
 
+        from .sam import MMDINO_Grounded_SAM
         self.sam = MMDINO_Grounded_SAM(classes, box_threshold, text_threshold, no_gpt_seg,
                                        device)
 

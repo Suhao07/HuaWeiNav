@@ -5,10 +5,6 @@ from mmdet.apis import DetInferencer
 from segment_anything import SamPredictor, build_sam
 from torchvision.ops import nms
 
-from config_utils import (GROUNDING_DINO_CHECKPOINT, GROUNDING_DINO_CONFIG,
-                          SAM_CHECKPOINT)
-
-
 class MMDINO_Grounded_SAM:
 
     TARGET_PRESENCE_THRESHOLD = 0.5
@@ -21,6 +17,9 @@ class MMDINO_Grounded_SAM:
                  text_threshold=0.25,
                  no_gpt_seg=False,
                  device="cuda"):
+        from config_utils import (GROUNDING_DINO_CHECKPOINT, GROUNDING_DINO_CONFIG,
+                                  SAM_CHECKPOINT)
+
         self.classes = list(classes)
         self.BOX_THRESHOLD = box_threshold
         self.TEXT_THRESHOLD = text_threshold

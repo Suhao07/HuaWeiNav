@@ -74,6 +74,55 @@ class CaptureFusionTest(unittest.TestCase):
             self.assertAlmostEqual(proposal['visible_ratio'], 6/8)
             self.assertAlmostEqual(proposal['center_score'], 1.)
 
+    def test_mapper_initializes_with_injected_perceiver_without_loading_models(self):
+        from pathlib import Path
+        import subprocess
+        import sys
+        code = '''
+import importlib.abc
+import sys
+class BlockModels(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname in {'cv_utils.sam', 'config_utils'} or fullname.split('.')[0] in {'mmdet', 'mmengine', 'segment_anything'}:
+            raise AssertionError(fullname)
+sys.meta_path.insert(0, BlockModels())
+import numpy as np
+import quaternion
+from cv_utils.image_perceiver import ImagePerceiver
+from mapper_with_process_obs import Instruct_Mapper
+perceiver = ImagePerceiver(classes=['chair'], device='cpu:0')
+intrinsic = np.array([[40., 0., 31.5], [0., 40., 23.5], [0., 0., 1.]])
+mapper = Instruct_Mapper(intrinsic, perceiver=perceiver, device='cpu:0', floor_height=-1.5)
+mapper.initialize(np.array([2., 1.5, -3.]), quaternion.quaternion(1., 0., 0., 0.), object())
+assert mapper.object_perceiver is perceiver
+assert perceiver.classes == ['chair']
+np.testing.assert_array_equal(mapper.initial_position, [2., -3., 1.5])
+np.testing.assert_array_equal(mapper.current_position, [0., 0., 0.])
+assert mapper.scene_pcd.is_empty() and mapper.navigable_pcd.is_empty()
+assert mapper.node_cnt == 1 and mapper.current_node_idx == 0
+assert mapper.lower_img.shape == (48, 64)
+assert mapper.trav_map.device.type == 'cpu'
+assert 'cv_utils.sam' not in sys.modules and 'config_utils' not in sys.modules
+'''
+        result = subprocess.run([sys.executable, '-B', '-c', code],
+                                cwd=Path(__file__).resolve().parents[1],
+                                capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_default_mapper_perceiver_keeps_constructor_arguments(self):
+        from unittest.mock import patch, sentinel
+        import mapper_with_process_obs as module
+        categories = [{'name': 'chair'}, {'name': 'custom category'}]
+        expected = ['chair', 'custom category']
+        expected.extend(name for name in module.INTEREST_OBJECTS if name not in expected)
+        intrinsic = np.array([[40., 0., 31.5], [0., 40., 23.5], [0., 0., 1.]])
+        with patch.object(module, 'MMDINOSAM_Perceiver', return_value=sentinel.perceiver) as factory:
+            mapper = module.Instruct_Mapper(intrinsic, categories=categories,
+                                            no_gpt_seg=True, device='cpu:0')
+        factory.assert_called_once_with(classes=expected, no_gpt_seg=True, device='cpu:0')
+        self.assertIs(mapper.object_perceiver, sentinel.perceiver)
+        self.assertEqual(categories, [{'name': 'chair'}, {'name': 'custom category'}])
+
     def test_task_free_perceiver_keeps_vocabulary_and_empty_target_group(self):
         from cv_utils.image_perceiver import ImagePerceiver
         from unittest.mock import Mock

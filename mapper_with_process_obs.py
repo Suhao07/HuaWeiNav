@@ -134,7 +134,9 @@ class Instruct_Mapper:
                 classes.append(obj)
         logger.info("number of classes: {}".format(len(classes)))
 
-        if perceiver == "glee":
+        if isinstance(perceiver, ImagePerceiver):
+            self.object_perceiver = perceiver
+        elif perceiver == "glee":
             self.object_perceiver = GLEE_Perceiver(classes=classes, device=device)
         elif perceiver == "ramsam":
             self.object_perceiver = RAMDINOSAM_Perceiver(classes=classes, device=device)
