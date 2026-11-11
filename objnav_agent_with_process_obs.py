@@ -26,8 +26,7 @@ from instruction_adapter.verifier import (
     instruction_hash,
 )
 from instruction_adapter.view_control import ViewControlState
-from mapping_utils.geometry import (gpu_cluster_filter, gpu_merge_pointcloud,
-                                    project_to_camera)
+from mapping_utils.geometry import gpu_merge_pointcloud, project_to_camera
 from mapping_utils.path_planning import path_planning
 from mapping_utils.projection import (bresenham_3d, translate_grid_to_point,
                                       translate_point_to_grid,
@@ -37,28 +36,18 @@ from navigation.action_controller import (
     habitat_waypoint,
     next_action_to_waypoint,
 )
-from navigation.detection_artifacts import (
-    detection_step_dir,
-    save_candidate_object_pointclouds,
-    save_combined_view,
-    save_detection_overlay,
-    save_object_view,
-    save_real_object_pointcloud,
-)
 from navigation.goal_approach_controller import (
     action_after_instruction_reject,
     distance_to_object,
     rotate_toward_object_for_recheck,
     tilt_camera,
 )
-from navigation.object_cluster_merger import merge_candidate_objects, sort_target_objects_last
-from navigation.object_view_projector import project_object_view
 from navigation.observation_pipeline import (
     collect_panoramic_observations,
     merge_temporary_pointclouds,
+    process_panoramic_detections,
     save_observation_pointcloud,
 )
-from navigation.panoramic_detection import build_triplet, filter_center_panel, pose_triplet
 from navigation.path_progress import action_after_replan
 from navigation.planner_loop import run_observation_mapping_cycle
 from navigation.view_verification_controller import select_check_again_viewpoint
@@ -237,119 +226,9 @@ class HM3D_Objnav_Agent:
         logger.info(self.mapper.current_obj_indices)
 
     def rotate_segmentation(self, images, depths, positions, rotations, *, partial=False):
-        """Run panoramic object detection and update mapper object memory.
+        """Run the shared panoramic detection pipeline with the original projection."""
 
-        Parameters are the twelve RGB/depth/pose buffers collected by
-        ``rotate_panoramic``. The method keeps the high-level orchestration in
-        the agent, while detector slicing, artifact writing, instance merging,
-        view projection, and bbox tag refinement live in dedicated modules.
-        """
-
-        _, w, _ = images[0].shape
-        C_objs = []
-        step_dir = detection_step_dir(self)
-
-        for i in range(len(images)):
-            triplet = build_triplet(images, depths, i, self.mapper.camera_intrinsic, circular=not partial)
-            B_classes, B_boxes, B_masks, B_confidences, \
-                C_classes, C_boxes, C_masks, C_confidences = \
-                    self.mapper.object_perceiver.perceive(
-                        triplet.image,
-                        target=self.mapper.target,
-                        target_list=self.task.detector_terms if self.task is not None else None,
-                        save_dir=self.save_dir,
-                        episode_idx=self.episode_samples - 1,
-                        episode_step=self.episode_steps,
-                    )
-            save_combined_view(step_dir, i, triplet.image, triplet.depth_vis)
-
-            current_pos, current_rot, depths_list = pose_triplet(positions, rotations, depths, triplet)
-            B_detection = filter_center_panel(
-                B_classes,
-                B_boxes,
-                B_masks,
-                B_confidences,
-                image_width=w,
-            )
-            if B_detection.has_boxes:
-                save_detection_overlay(step_dir, "B", i, triplet.image, B_detection)
-                B_objs = self.mapper.get_object_entities_pano(
-                    triplet.depth,
-                    triplet.image,
-                    current_pos,
-                    current_rot,
-                    B_detection.classes,
-                    B_detection.boxes,
-                    B_detection.masks,
-                    B_detection.confidences,
-                    depths_list,
-                )
-                self.mapper.objects, obj_indices = self.mapper.associate_object_entities(
-                    self.mapper.objects,
-                    B_objs,
-                )
-                self.mapper.current_obj_indices += obj_indices
-                self.mapper.object_pcd = self.mapper.update_object_pcd()
-
-            C_detection = filter_center_panel(
-                C_classes,
-                C_boxes,
-                C_masks,
-                C_confidences,
-                image_width=w,
-            )
-            if not C_detection.has_boxes:
-                continue
-
-            save_detection_overlay(step_dir, "C", i, triplet.image, C_detection)
-            C_objs.append(self.mapper.get_object_entities_pano(
-                triplet.depth,
-                triplet.image,
-                current_pos,
-                current_rot,
-                C_detection.classes,
-                C_detection.boxes,
-                C_detection.masks,
-                C_detection.confidences,
-                depths_list,
-            ))
-
-        save_candidate_object_pointclouds(step_dir, C_objs)
-
-        # C 类对象来自多视角候选，先按几何 overlap 合成物理实例，
-        # 再进入 bbox 视觉复核；这样 VLM 不会对重复实例反复调用。
-        real_C_objs = merge_candidate_objects(C_objs)
-        for i, obj in enumerate(real_C_objs):
-            obj.pcd = gpu_cluster_filter(obj.pcd)
-            save_real_object_pointcloud(step_dir, obj, i)
-
-        from navigation.bbox_refinement import refine_candidates
-        candidates = []
-        for i, obj in enumerate(real_C_objs):
-            evidence = project_object_view(self, obj, images, rotations, torch, partial=partial)
-            if evidence is None:
-                continue
-            save_object_view(step_dir, i, evidence.image, evidence.bbox_xyxy)
-            candidates.append((i, obj, evidence))
-        label_records = refine_candidates(self, candidates)
-
-        real_C_objs = sort_target_objects_last(real_C_objs, self.mapper.target)
-
-        self.mapper.objects, obj_indices = self.mapper.associate_object_entities(
-            self.mapper.objects, real_C_objs)
-        self.mapper.current_obj_indices += obj_indices
-        if label_records:
-            from navigation.semantic_label_cache import matching_instance, instance_signature
-            for obj in real_C_objs:
-                if obj.uid in label_records:
-                    instance = matching_instance(obj.pcd.point.positions.cpu().numpy(), self.mapper.objects)
-                    if instance is not None:
-                        record = label_records[obj.uid]
-                        record.instance_dependency = instance_signature(instance)
-                        self.semantic_label_evidence[instance.uid] = record
-        self.object_pcd = self.mapper.update_object_pcd()
-
-        self.mapper.current_obj_indices = list(set(self.mapper.current_obj_indices))
+        process_panoramic_detections(self, images, depths, positions, rotations, partial=partial)
 
     def concat_panoramic(self, images):
         try:

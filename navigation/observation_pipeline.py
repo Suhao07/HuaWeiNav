@@ -1,9 +1,4 @@
-"""Observation utilities for VLN agent.
-
-The panoramic segmentation loop is still in the agent because it touches many
-mutable runtime buffers. This module starts the split by extracting reusable
-point-cloud merge and observation-artifact helpers.
-"""
+"""Shared panoramic detection pipeline and observation collection/artifact helpers."""
 
 from __future__ import annotations
 
@@ -12,10 +7,22 @@ from typing import Any
 import numpy as np
 import open3d as o3d
 import quaternion
+import torch
 from loguru import logger
 
 from artifact_utils.path_builder import episode_subdir
-from mapping_utils.geometry import gpu_merge_pointcloud, gpu_pointcloud_from_array
+from mapping_utils.geometry import gpu_cluster_filter, gpu_merge_pointcloud, gpu_pointcloud_from_array
+from navigation.detection_artifacts import (
+    detection_step_dir,
+    save_candidate_object_pointclouds,
+    save_combined_view,
+    save_detection_overlay,
+    save_object_view,
+    save_real_object_pointcloud,
+)
+from navigation.object_cluster_merger import merge_candidate_objects, sort_target_objects_last
+from navigation.object_view_projector import project_object_view
+from navigation.panoramic_detection import build_triplet, filter_center_panel, pose_triplet
 
 
 def reset_panoramic_buffers(agent: Any) -> None:
@@ -71,6 +78,126 @@ def collect_panoramic_observations(agent: Any, rotate_times: int = 12) -> tuple[
         agent.update_trajectory()
 
     return temporary_images, temporary_positions, temporary_rotations
+
+
+def process_panoramic_detections(agent, images, depths, positions, rotations, *, partial=False, project_view=None):
+    """Update panoramic object memory with optional view projection and return per-view detection counts."""
+
+    _, w, _ = images[0].shape
+    C_objs = []
+    step_dir = detection_step_dir(agent)
+    view_stats = []
+
+    for i in range(len(images)):
+        triplet = build_triplet(images, depths, i, agent.mapper.camera_intrinsic, circular=not partial)
+        B_classes, B_boxes, B_masks, B_confidences, \
+            C_classes, C_boxes, C_masks, C_confidences = \
+                agent.mapper.object_perceiver.perceive(
+                    triplet.image,
+                    target=agent.mapper.target,
+                    target_list=agent.task.detector_terms if agent.task is not None else None,
+                    save_dir=agent.save_dir,
+                    episode_idx=agent.episode_samples - 1,
+                    episode_step=agent.episode_steps,
+                )
+        save_combined_view(step_dir, i, triplet.image, triplet.depth_vis)
+
+        current_pos, current_rot, depths_list = pose_triplet(positions, rotations, depths, triplet)
+        B_detection = filter_center_panel(
+            B_classes,
+            B_boxes,
+            B_masks,
+            B_confidences,
+            image_width=w,
+        )
+        if B_detection.has_boxes:
+            save_detection_overlay(step_dir, "B", i, triplet.image, B_detection)
+            B_objs = agent.mapper.get_object_entities_pano(
+                triplet.depth,
+                triplet.image,
+                current_pos,
+                current_rot,
+                B_detection.classes,
+                B_detection.boxes,
+                B_detection.masks,
+                B_detection.confidences,
+                depths_list,
+            )
+            agent.mapper.objects, obj_indices = agent.mapper.associate_object_entities(
+                agent.mapper.objects,
+                B_objs,
+            )
+            agent.mapper.current_obj_indices += obj_indices
+            agent.mapper.object_pcd = agent.mapper.update_object_pcd()
+
+        C_detection = filter_center_panel(
+            C_classes,
+            C_boxes,
+            C_masks,
+            C_confidences,
+            image_width=w,
+        )
+        view_stats.append({
+            "view_index": i,
+            "background_detections": len(B_detection.classes),
+            "target_detections": len(C_detection.classes),
+        })
+        if not C_detection.has_boxes:
+            continue
+
+        save_detection_overlay(step_dir, "C", i, triplet.image, C_detection)
+        C_objs.append(agent.mapper.get_object_entities_pano(
+            triplet.depth,
+            triplet.image,
+            current_pos,
+            current_rot,
+            C_detection.classes,
+            C_detection.boxes,
+            C_detection.masks,
+            C_detection.confidences,
+            depths_list,
+        ))
+
+    save_candidate_object_pointclouds(step_dir, C_objs)
+
+    # C 类对象来自多视角候选，先按几何 overlap 合成物理实例，
+    # 再进入 bbox 视觉复核；这样 VLM 不会对重复实例反复调用。
+    real_C_objs = merge_candidate_objects(C_objs)
+    for i, obj in enumerate(real_C_objs):
+        obj.pcd = gpu_cluster_filter(obj.pcd)
+        save_real_object_pointcloud(step_dir, obj, i)
+
+    from navigation.bbox_refinement import refine_candidates
+    candidates = []
+    for i, obj in enumerate(real_C_objs):
+        if project_view is None:
+            evidence = project_object_view(agent, obj, images, rotations, torch, partial=partial)
+        else:
+            evidence = project_view(obj)
+        if evidence is None:
+            continue
+        save_object_view(step_dir, i, evidence.image, evidence.bbox_xyxy)
+        candidates.append((i, obj, evidence))
+    label_records = refine_candidates(agent, candidates)
+
+    real_C_objs = sort_target_objects_last(real_C_objs, agent.mapper.target)
+
+    agent.mapper.objects, obj_indices = agent.mapper.associate_object_entities(
+        agent.mapper.objects, real_C_objs)
+    agent.mapper.current_obj_indices += obj_indices
+    if label_records:
+        from navigation.semantic_label_cache import matching_instance, instance_signature
+        for obj in real_C_objs:
+            if obj.uid in label_records:
+                instance = matching_instance(obj.pcd.point.positions.cpu().numpy(), agent.mapper.objects)
+                if instance is not None:
+                    record = label_records[obj.uid]
+                    record.instance_dependency = instance_signature(instance)
+                    agent.semantic_label_evidence[instance.uid] = record
+    agent.object_pcd = agent.mapper.update_object_pcd()
+
+    agent.mapper.current_obj_indices = list(set(agent.mapper.current_obj_indices))
+    return view_stats
 
 
 def merge_temporary_pointclouds(agent: Any) -> Any:

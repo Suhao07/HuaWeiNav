@@ -140,11 +140,15 @@ def test_habitat_observation_forwards_live_terms_through_perceiver_to_grounding(
     class ObservationProcessed(Exception):
         pass
 
-    ns = methods("objnav_agent_with_process_obs.py", {"rotate_segmentation"}, {
+    ns = {
         "detection_step_dir": Mock(return_value="unused"),
         "build_triplet": Mock(return_value=NS(image=image, depth_vis=None)),
-        # End after the real perceive -> segment -> grounding chain, before artifact IO/fusion.
-        "save_combined_view": Mock(side_effect=ObservationProcessed)})
+        "save_combined_view": Mock(side_effect=ObservationProcessed)}
+    pipeline_path = ROOT / "navigation/observation_pipeline.py"
+    pipeline = next(node for node in ast.parse(pipeline_path.read_text()).body
+                    if isinstance(node, ast.FunctionDef) and node.name == "process_panoramic_detections")
+    exec(compile(ast.Module(body=[pipeline], type_ignores=[]), str(pipeline_path), "exec"), ns)
+    ns = methods("objnav_agent_with_process_obs.py", {"rotate_segmentation"}, ns)
     mapper = NS(object_perceiver=perceiver, target="chair", camera_intrinsic=np.eye(3),
                 perception_target_list=["stale anchor"], target_list=["stale target"],
                 objects=[NS(tag="historical label")])

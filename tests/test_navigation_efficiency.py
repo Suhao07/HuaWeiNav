@@ -94,18 +94,19 @@ def test_instance_overlap_requires_unique_bidirectional_match():
 
 @pytest.mark.parametrize("empty_first_frame", [False, True])
 def test_partial_scan_resumes_missing_headings_and_keeps_sensor_alignment(monkeypatch, tmp_path, empty_first_frame):
-    import sys, importlib.util
+    import ast
     from pathlib import Path
-    monkeypatch.setitem(sys.modules, 'open3d', NS())
-    monkeypatch.setitem(sys.modules, 'quaternion', NS())
-    monkeypatch.setitem(sys.modules, 'loguru', NS(logger=NS()))
     cloud = NS(voxel_down_sample=lambda resolution: object())
     def empty_cloud(points, colors, device):
         assert points.shape == colors.shape == (0, 3)
         return cloud
-    monkeypatch.setitem(sys.modules, 'mapping_utils.geometry', NS(gpu_merge_pointcloud=lambda *a:cloud, gpu_pointcloud_from_array=empty_cloud))
-    spec = importlib.util.spec_from_file_location('scan_under_test', Path(__file__).parents[1]/'navigation/observation_pipeline.py')
-    module = importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+    path = Path(__file__).parents[1] / 'navigation/observation_pipeline.py'
+    functions = [node for node in ast.parse(path.read_text()).body if isinstance(node, ast.FunctionDef)
+                 and node.name in {'reset_panoramic_buffers', 'collect_adaptive_observations'}]
+    namespace = {'np': np, 'Any': object, 'gpu_merge_pointcloud': lambda *a: cloud,
+                 'gpu_pointcloud_from_array': empty_cloud}
+    exec(compile(ast.Module(body=functions, type_ignores=[]), str(path), 'exec'), namespace)
+    module = NS(**namespace)
     mapper = NS(current_position=np.zeros(3), pcd_resolution=.1, current_navigable_pcd=cloud, current_pcd=cloud,
                 objects=[NS(tag='chair')], _is_target_tag=lambda tag:tag=='chair')
     agent=NS(mapper=mapper, task=NS(spec=NS(revision=1)), semantic_scan_headings={}, episode_steps=1,
