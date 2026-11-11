@@ -258,12 +258,15 @@ def test_open_vocabulary_initialization_matches_decoder_prompt_order(tmp_path, b
     assert detector.text_prompt_list.tolist() == ["chair", "office chair", "desk"]
 
 
-def test_traversability_preserves_both_input_poses():
+def test_traversability_preserves_both_input_poses(monkeypatch):
+    import sys
+    from backends.habitat.geometry import HabitatMapperQueries
+    monkeypatch.setitem(sys.modules, "habitat_sim", NS(ShortestPath=NS))
     paths = []
-    ns = methods("mapper_with_process_obs.py", {"check_traversability"}, {
-        "np": np, "habitat_sim": NS(ShortestPath=NS)})
+    ns = methods("mapper_with_process_obs.py", {"check_traversability"}, {"np": np})
     mapper = NS(floor_height=-.8, initial_position=np.array([1., 2., 3.]),
                 env=NS(sim=NS(pathfinder=NS(find_path=lambda path: paths.append(path) or True))))
+    mapper.geometry_queries = HabitatMapperQueries(mapper)
     start, end = np.array([4., 5., .15]), np.array([7., 8., .4])
     before = start.copy(), end.copy()
     assert ns["check_traversability"](mapper, start, end)
