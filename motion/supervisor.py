@@ -6,7 +6,9 @@
 from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass
+import math
 from threading import RLock
+from time import monotonic, sleep
 from typing import Any, TYPE_CHECKING
 from uuid import uuid4
 
@@ -173,8 +175,44 @@ class MotionSupervisor:
             self.control_epoch += 1
             if self.active_request_id is None:
                 return
-            self.phase = "cancel_requested"
+            self.phase = "cancel_requested" if self.active_goal_id is not None else "unknown"
             self.controller.cancel(self.active_goal_id)
+
+    def cancel_and_wait(self, *, timeout=5.0, poll_interval=0.05):
+        """Cancel the owned request and wait a bounded time for real termination.
+
+        Args:
+            timeout: Maximum polling duration in seconds; zero allows one poll.
+            poll_interval: Positive delay between nonterminal backend polls.
+
+        Returns:
+            The backend's terminal ActiveGoalPoll, or None if already idle.
+
+        Raises:
+            TimeoutError: Cancellation was not confirmed; ownership stays held.
+            ValueError: Timing arguments are nonfinite or out of range.
+            Exception: Backend failure, without inventing a STOP receipt or
+                releasing ownership. Controller calls must themselves be bounded.
+        """
+        if not math.isfinite(timeout) or timeout < 0:
+            raise ValueError("Cancellation timeout must be finite and nonnegative")
+        if not math.isfinite(poll_interval) or poll_interval <= 0:
+            raise ValueError("Cancellation poll interval must be finite and positive")
+        # Serialize with submit/poll so a newly admitted request cannot be
+        # mistaken for the request being cancelled during this bounded wait.
+        with self._lock:
+            if self.active_request_id is None:
+                return None
+            deadline = monotonic() + timeout
+            self.cancel()
+            while True:
+                feedback = self.poll_active()
+                if not feedback.tracking_active:
+                    return feedback
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(f"Cancellation not confirmed for request {self.active_request_id}")
+                sleep(min(poll_interval, remaining))
 
     def hold(self, status=None):
         """Request backend HOLD and invalidate outstanding motion proposals."""
