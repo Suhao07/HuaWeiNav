@@ -254,18 +254,8 @@ def _blocking_node(mapper: Any, position: np.ndarray, *, block_current: bool) ->
         return None
     nodes_positions = np.array([node.position for node in nodes], dtype=float)
     nodes_positions = nodes_positions + mapper.initial_position
-    nodes_positions[:, 2] = mapper.initial_position[2] - 0.88
-    nodes_positions = nodes_positions[:, [0, 2, 1]]
     current_node_position = position + mapper.initial_position
-    current_node_position = np.array([
-        current_node_position[0],
-        mapper.initial_position[2] - 0.88,
-        current_node_position[1],
-    ])
-    distances = [
-        mapper.env.sim.geodesic_distance(current_node_position, node_position)
-        for node_position in nodes_positions
-    ]
+    distances = mapper.geometry_queries.node_distances(current_node_position, nodes_positions)
     min_idx = int(np.argmin(distances))
     if distances[min_idx] < 1.35 * 0.7:
         return nodes[min_idx]

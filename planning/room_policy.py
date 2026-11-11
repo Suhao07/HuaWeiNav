@@ -35,18 +35,8 @@ def select_nearest_frontier_room(mapper: Any) -> RoomSelection:
 
     nodes_positions = np.array([node.position for node in frontier_nodes], dtype=float)
     nodes_positions = nodes_positions + mapper.initial_position
-    nodes_positions[:, 2] = mapper.initial_position[2] - 0.88
-    nodes_positions = nodes_positions[:, [0, 2, 1]]
-
     current_node_position = mapper.current_position + mapper.initial_position
-    current_node_position = np.array(
-        [current_node_position[0], mapper.initial_position[2] - 0.88, current_node_position[1]],
-        dtype=float,
-    )
-    distances = [
-        float(mapper.env.sim.geodesic_distance(current_node_position, node_position))
-        for node_position in nodes_positions
-    ]
+    distances = mapper.geometry_queries.node_distances(current_node_position, nodes_positions)
     prior_scores = [_prior_room_score_for_node(mapper, node) for node in frontier_nodes]
     bias_m = _prior_room_distance_bias_m(mapper)
     adjusted_distances = [

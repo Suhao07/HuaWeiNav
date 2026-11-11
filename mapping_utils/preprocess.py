@@ -1,7 +1,7 @@
 import numpy as np
 
 
-def calc_depth_img(camera_intrinsic, min_depth, max_depth):
+def calc_depth_img(camera_intrinsic, min_depth, max_depth, image_shape=None):
     """
     计算最小深度和最大深度球面投影到深度图上的z轴深度值
 
@@ -14,8 +14,11 @@ def calc_depth_img(camera_intrinsic, min_depth, max_depth):
     - min_depth_image: (H, W) 深度图，对应 min_depth 球面
     - max_depth_image: (H, W) 深度图，对应 max_depth 球面
     """
-    w = int(round(2 * camera_intrinsic[0, 2] + 1))
-    h = int(round(2 * camera_intrinsic[1, 2] + 1))
+    if image_shape is None:
+        w = int(round(2 * camera_intrinsic[0, 2] + 1))
+        h = int(round(2 * camera_intrinsic[1, 2] + 1))
+    else:
+        h, w = image_shape
 
     # fx, fy = camera_intrinsic[0, 0], camera_intrinsic[1, 1]
     # cx, cy = camera_intrinsic[0, 2], camera_intrinsic[1, 2]

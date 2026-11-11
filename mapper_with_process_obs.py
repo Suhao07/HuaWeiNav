@@ -1,5 +1,6 @@
 from loguru import logger
 import numpy as np
+from backends.habitat.geometry import HabitatMapperQueries
 
 from mapping_utils.geometry import *
 from mapping_utils.preprocess import *
@@ -93,7 +94,9 @@ class Instruct_Mapper:
                  no_gpt_seg=False,
                  device='cuda:0',
                  env=None,
-                 vlm='cognav'):
+                 vlm='cognav',
+                 geometry_queries=None,
+                 image_shape=None):
         self.device = device
         self.pcd_device = o3d.core.Device(device.upper())
 
@@ -152,8 +155,9 @@ class Instruct_Mapper:
         self.save_dir = save_dir
 
         self.env = env
+        self.geometry_queries = geometry_queries if geometry_queries is not None else HabitatMapperQueries(self)
 
-        self.lower_img, self.upper_img = calc_depth_img(camera_intrinsic, 0.51, 4.9)
+        self.lower_img, self.upper_img = calc_depth_img(camera_intrinsic, 0.51, 4.9, image_shape=image_shape)
 
     def initialize(self, position, rotation, env):
         self.env = env
@@ -488,14 +492,8 @@ class Instruct_Mapper:
 
             interpolate_points[:, 2] = np.ones_like(interpolate_points[:, 2]) * self.floor_height
 
-            traversable_points = []
-            # use self.env.sim.is_navigable to check the navigability of interpolate_points
-            for point in interpolate_points:
-                point_sim = point + self.initial_position
-                point_sim = [point_sim[0], point_sim[2], point_sim[1]]
-                if self.env.sim.is_navigable(point_sim):
-                    traversable_points.append(point)
-            traversable_points = np.array(traversable_points)
+            navigable = self.geometry_queries.navigable_mask(interpolate_points + self.initial_position)
+            traversable_points = np.array([point for point, allowed in zip(interpolate_points, navigable) if allowed])
 
             interpolate_colors = np.ones_like(interpolate_points) * 100
             self.current_navigable_pcd = gpu_pointcloud_from_array(interpolate_points,
@@ -512,14 +510,9 @@ class Instruct_Mapper:
             )
             current_navigable_pcd_position[:, 2] = np.ones_like(
                 current_navigable_pcd_position[:, 2]) * self.floor_height
-            traversable_points = []
-            # use self.env.sim.is_navigable to check the navigability of interpolate_points
-            for point in current_navigable_pcd_position:
-                point_sim = point + self.initial_position
-                point_sim = [point_sim[0], point_sim[2], point_sim[1]]
-                if self.env.sim.is_navigable(point_sim):
-                    traversable_points.append(point)
-            traversable_points = np.array(traversable_points)
+            navigable = self.geometry_queries.navigable_mask(current_navigable_pcd_position + self.initial_position)
+            traversable_points = np.array([point for point, allowed in zip(current_navigable_pcd_position, navigable)
+                                           if allowed])
 
             self.navigable_pcd = gpu_merge_pointcloud(self.navigable_pcd,
                                                       self.current_navigable_pcd)
@@ -2058,21 +2051,7 @@ class Instruct_Mapper:
         start[2] = self.floor_height
         end[2] = self.floor_height
 
-        start = start + self.initial_position
-        start = [start[0], start[2], start[1]]
-        end = end + self.initial_position
-        end = [end[0], end[2], end[1]]
-
-        path = habitat_sim.ShortestPath()
-        path.requested_start = start
-        path.requested_end = end
-
-        found_path = self.env.sim.pathfinder.find_path(path)
-
-        if found_path:
-            return True
-        else:
-            return False
+        return self.geometry_queries.path_exists(start + self.initial_position, end + self.initial_position)
 
 
     def segment_room(self, step_idx):
@@ -2130,10 +2109,7 @@ class Instruct_Mapper:
                 coeff = penal_coeff * coeff
 
         # calculate the geometric distance from the current position to the end position
-        current_position = self.env.sim.get_agent_state().position
-        end_position = end.position + self.initial_position
-        end_position = [end_position[0], current_position[1], end_position[1]]
-        distance_to_end = self.env.sim.geodesic_distance(current_position, end_position)
+        distance_to_end = self.geometry_queries.distance_from_agent(end.position + self.initial_position)
 
         distance_to_end = coeff * distance_to_end
 

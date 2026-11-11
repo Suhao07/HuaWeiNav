@@ -117,6 +117,129 @@ def records(path):
     return [json.loads(line) for line in path.read_text().splitlines()]
 
 
+def test_paths_report_connectivity_not_endpoint_walkability(tmp_path):
+    wm = FakeMap(np.ones((5, 9)), np.arange(9), np.arange(5))
+    wm.grid[:, 4] = 0
+    env = FakeEnv(position=(1., 2., 1.5))
+    bridge = bridge_at(tmp_path, wm=wm, env=env)
+    target = [7., 2., 0.]
+    assert bridge.planner.is_walkable(target[:2])
+    before = bridge._trajectory.read_bytes()
+    explored = list(wm.explored_positions)
+
+    result = bridge.command({"action": "paths", "positions": [target]})
+    assert result == [{"position": target, "path": [], "path_length": None}]
+    assert bridge._trajectory.read_bytes() == before
+    assert wm.explored_positions == explored
+    assert env.calls == []
+
+    env.position = [6., 2., 1.5]
+    result = bridge.command({"action": "paths", "positions": [target]})
+    assert result[0]["path_length"] == pytest.approx(1.)
+    assert result[0]["path"][0] == env.position
+    assert result[0]["path"][-1] == [7., 2., 1.5]
+    assert bridge._trajectory.read_bytes() == before
+    assert wm.explored_positions == explored
+    assert env.calls == []
+
+
+def test_paths_do_not_certify_requested_height(tmp_path):
+    env = FakeEnv(position=(0., 0., 1.5))
+    bridge = bridge_at(tmp_path, env=env)
+    positions = [[1., 0., height] for height in (-3., 0., 1.5, 8.)]
+    before = bridge._trajectory.read_bytes()
+    result = bridge.command({"action": "paths", "positions": positions})
+
+    assert [row["position"] for row in result] == positions
+    assert all(row["path_length"] == pytest.approx(1.) for row in result)
+    assert all(row["path"] == result[0]["path"] for row in result)
+    assert all(point[2] == 1.5 for row in result for point in row["path"])
+    assert bridge._trajectory.read_bytes() == before
+    assert env.calls == []
+
+
+def test_xy_queries_are_pose_independent_and_do_not_certify_height(tmp_path):
+    wm = FakeMap(np.ones((5, 9)), np.arange(9), np.arange(5))
+    wm.grid[:, 4] = 0
+    env = FakeEnv(position=(1., 2., 1.5))
+    bridge = bridge_at(tmp_path, wm=wm, env=env)
+    before = bridge._trajectory.read_bytes()
+    explored = list(wm.explored_positions)
+    positions = [[1., 2.], [7., 2.], [4., 2.], [100., 2.]]
+    pairs = [{"start": positions[0], "end": positions[1]},
+             {"start": [6., 2.], "end": positions[1]},
+             {"start": [6., 2.], "end": [6., 2.]}]
+    walkability = bridge.command({"action": "walkability_xy", "positions": positions})
+    paths = bridge.command({"action": "paths_xy", "pairs": pairs})
+    assert walkability["geometry_domain"] == paths["geometry_domain"] == "freemap_xy"
+    assert [row["position"] for row in walkability["results"]] == positions
+    assert [row["walkable"] for row in walkability["results"]] == [True, True, False, False]
+    assert paths["results"][0] == {**pairs[0], "path": [], "path_length": None}
+    assert paths["results"][1] == {**pairs[1], "path": [[6., 2.], [7., 2.]], "path_length": 1.}
+    assert paths["results"][2]["path_length"] == 0
+    env.position = [-100., -100., 9.]
+    env.yaw = 2.1
+    assert bridge.command({"action": "walkability_xy", "positions": positions}) == walkability
+    assert bridge.command({"action": "paths_xy", "pairs": pairs}) == paths
+    assert bridge._trajectory.read_bytes() == before
+    assert wm.explored_positions == explored
+    assert env.calls == []
+
+
+def test_xy_paths_preserve_existing_motion_queries_without_snapping(tmp_path):
+    wm = FakeMap()
+    wm.grid[4:13, 8] = 0
+    start, end = [-.57, .03], [.61, -.02]
+    env = FakeEnv(position=(*start, 1.5))
+    bridge = bridge_at(tmp_path, wm=wm, env=env)
+    pairs = [{"start": start, "end": end}, {"start": start, "end": [0., 0.]}]
+    result = bridge.command({"action": "paths_xy", "pairs": pairs})["results"]
+    old = bridge.command({"action": "paths", "positions": [[*end, 8.]]})[0]
+    assert result[0]["path"] == [point[:2] for point in old["path"]]
+    assert result[0]["path_length"] == old["path_length"]
+    assert result[0]["path"][0] == start and result[0]["path"][-1] == end
+    assert result[0]["path_length"] > math.dist(start, end)
+    assert all(bridge.planner.segment_is_clear(a, b) for a, b in zip(result[0]["path"], result[0]["path"][1:]))
+    assert result[1] == {**pairs[1], "path": [], "path_length": None}
+    assert env.calls == []
+
+
+@pytest.mark.parametrize("command", [
+    {"action": "walkability_xy"},
+    {"action": "walkability_xy", "positions": [[0., 0., 1.5]]},
+    {"action": "walkability_xy", "positions": [[True, 0.]]},
+    {"action": "walkability_xy", "positions": [[0., float("nan")]]},
+    {"action": "walkability_xy", "positions": [[0., 0.]] * 257},
+    {"action": "paths_xy", "pairs": None},
+    {"action": "paths_xy", "pairs": [{"start": [0., 0.]}]},
+    {"action": "paths_xy", "pairs": [{"start": [0., 0.], "end": [1., 1.], "snap": True}]},
+    {"action": "paths_xy", "pairs": [{"start": [0., 0., 0.], "end": [1., 1.]}]},
+    {"action": "paths_xy", "pairs": [{"start": [0., 0.], "end": [float("inf"), 1.]}]},
+    {"action": "paths_xy", "pairs": [{"start": [0., 0.], "end": ["1", 1.]}]},
+    {"action": "paths_xy", "pairs": [{"start": [0., 0.], "end": [1., 1.]}] * 257},
+])
+def test_xy_queries_reject_invalid_inputs_before_journaling(tmp_path, command):
+    bridge = bridge_at(tmp_path)
+    before = bridge._trajectory.read_bytes(), bridge._journal.read_bytes()
+    with pytest.raises(CommandError):
+        bridge.command(command)
+    assert (bridge._trajectory.read_bytes(), bridge._journal.read_bytes()) == before
+    assert bridge.env.calls == []
+
+
+@pytest.mark.parametrize("action,field,value", [
+    ("walkability_xy", "positions", [0., 0.]),
+    ("paths_xy", "pairs", {"start": [-.5, 0.], "end": [-.5, 0.]}),
+])
+def test_xy_query_empty_and_maximum_batches(tmp_path, action, field, value):
+    bridge = bridge_at(tmp_path)
+    assert bridge.command({"action": action, field: []}) == {"geometry_domain": "freemap_xy", "results": []}
+    result = bridge.command({"action": action, field: [value] * 256})
+    assert len(result["results"]) == 256
+    assert all(row == result["results"][0] for row in result["results"])
+    assert bridge.env.calls == []
+
+
 def test_thin_obstacle_and_out_of_bounds():
     """Block a one-cell wall even when the official map reports permissive LOS."""
     wm = FakeMap(grid=np.ones((5, 101)), x_coords=np.linspace(0, 1, 101),

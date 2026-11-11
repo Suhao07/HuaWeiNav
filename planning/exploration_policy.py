@@ -40,6 +40,8 @@ def find_closest_nodes(mapper: Any, nodes: list[Any]) -> Any | None:
     if not nodes:
         return None
     distance = _geodesic_distances_to_nodes(mapper, nodes)
+    if not np.isfinite(distance).any():
+        return None
     baseline_idx = int(np.argmin(distance))
     prior_scores = np.array([_frontier_prior_score(mapper, node) for node in nodes], dtype=float)
     bias_m = _prior_frontier_distance_bias_m(mapper)
@@ -153,15 +155,9 @@ def _geodesic_distances_to_nodes(mapper: Any, nodes: list[Any]) -> np.ndarray:
         Distance array aligned with ``nodes``.
     """
 
-    current_position = np.asarray(mapper.env.sim.get_agent_state().position, dtype=float)
     nodes_positions = np.array([node.position for node in nodes], dtype=float)
     nodes_positions = nodes_positions + mapper.initial_position
-    nodes_positions[:, 2] = current_position[1]
-    nodes_positions = nodes_positions[:, [0, 2, 1]]
-    return np.array([
-        float(mapper.env.sim.geodesic_distance(current_position, node_position))
-        for node_position in nodes_positions
-    ])
+    return np.array(mapper.geometry_queries.distances_from_agent(nodes_positions))
 
 
 def _prior_frontier_bias_enabled(mapper: Any) -> bool:
@@ -389,21 +385,36 @@ def select_baseline_exploration_node(agent, *, episode_idx, step, relocate=None,
     relocate = agent.relocate if relocate is None else relocate
     use_gpt_relocate = agent.gpt_relocate if use_gpt_relocate is None else use_gpt_relocate
     room = mapper.room_nodes[mapper.nodes[agent.current_node_idx].room_idx]
-    node = (mapper.explore_in_room_relocate(room) if relocate else mapper.explore_in_room(room))
+    def choose_room():
+        # 房间局部探索会修改状态，跨房间决策需读取修改后的状态。
+        if relocate or use_gpt_relocate:
+            return mapper.get_candidate_room_fully_explored(
+                agent.instruct_goal, idx=episode_idx, step=step)
+        plan = agent.task.plan if agent.task is not None else None
+        return mapper.get_candidate_room_fully_explored_by_distance(
+            agent.instruct_goal, idx=episode_idx, step=step, plan=plan)
+
+    return select_room_first(
+        current_room=room, rooms=mapper.room_nodes,
+        local_choice=lambda current: (mapper.explore_in_room_relocate(current)
+                                     if relocate else mapper.explore_in_room(current)),
+        remaining_choice=lambda: mapper.explore_after_fully_explored(),
+        room_choice=choose_room,
+        closest_in_room=lambda selected: mapper.find_closet_viewpoint_in_room(selected),
+        semantic=bool(relocate or use_gpt_relocate))
+
+
+def select_room_first(*, current_room, rooms, local_choice, remaining_choice,
+                      room_choice, closest_in_room, semantic):
+    """先局部探索，再按更新后的房间状态选择剩余节点或跨房间目标。"""
+    node = local_choice(current_room)
     if node is not None:
         return node, "current_room"
-    if all(room.state != 0 for room in mapper.room_nodes):
-        return mapper.explore_after_fully_explored(), "remaining_nodes"
-    if relocate or use_gpt_relocate:
-        room = mapper.get_candidate_room_fully_explored(agent.instruct_goal, idx=episode_idx, step=step)
-        source = "room_semantic_policy"
-    else:
-        # 无指令巡视复用距离策略；None 表示没有任务合同，而非伪造空目标。
-        plan = agent.task.plan if agent.task is not None else None
-        room = mapper.get_candidate_room_fully_explored_by_distance(
-            agent.instruct_goal, idx=episode_idx, step=step, plan=plan)
-        source = "room_distance_policy"
-    return (mapper.find_closet_viewpoint_in_room(room) if room is not None else None), source
+    if all(room.state != 0 for room in rooms):
+        return remaining_choice(), "remaining_nodes"
+    room = room_choice()
+    source = "room_semantic_policy" if semantic else "room_distance_policy"
+    return (closest_in_room(room) if room is not None else None), source
 
 
 def select_coverage_frontier(nodes, distances, tie_distance):

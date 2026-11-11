@@ -73,6 +73,7 @@ def validate_command(request):
         raise CommandError("command must be an object with an action")
     action = request["action"]
     fields = {"observe": set(), "look": {"yaw"}, "viewpoints": {"position"},
+              "paths": {"positions"}, "walkability_xy": {"positions"}, "paths_xy": {"pairs"},
               "move": {"position", "yaw", "max_distance"}, "STOP": set(),
               "finish": set(), "shutdown": set()}
     if action not in fields:
@@ -82,6 +83,25 @@ def validate_command(request):
     result = {"action": action}
     if action in {"move", "viewpoints"}:
         result["position"] = finite_vector(request.get("position"), "position")
+    if action in {"paths", "walkability_xy"}:
+        positions = request.get("positions")
+        size = 3 if action == "paths" else 2
+        if not isinstance(positions, list) or len(positions) > 256:
+            raise CommandError("positions must be an array of at most 256 coordinate arrays")
+        if any(not isinstance(position, list) for position in positions):
+            raise CommandError("positions must contain coordinate arrays")
+        result["positions"] = [finite_vector(position, "position", size) for position in positions]
+    if action == "paths_xy":
+        pairs = request.get("pairs")
+        if not isinstance(pairs, list) or len(pairs) > 256:
+            raise CommandError("pairs must be an array of at most 256 start/end objects")
+        result["pairs"] = []
+        for pair in pairs:
+            if not isinstance(pair, dict) or set(pair) != {"start", "end"}:
+                raise CommandError("each path pair must contain exactly start and end")
+            if not isinstance(pair["start"], list) or not isinstance(pair["end"], list):
+                raise CommandError("path endpoints must be XY arrays")
+            result["pairs"].append({key: finite_vector(pair[key], key, 2) for key in ("start", "end")})
     if action in {"move", "look"}:
         result["yaw"] = finite_number(request.get("yaw"), "yaw")
     if action == "move":
@@ -295,6 +315,14 @@ class IsaacEnvironment:
                 result = {"pose": self._update("LOOK", self.env.look_at_yaw, command["yaw"])}
             elif action == "viewpoints":
                 result = self._viewpoints(command["position"])
+            elif action == "paths":
+                result = self._paths(command["positions"])
+            elif action == "walkability_xy":
+                result = {"geometry_domain": "freemap_xy", "results": [
+                    {"position": position, "walkable": self.planner.is_walkable(position)}
+                    for position in command["positions"]]}
+            elif action == "paths_xy":
+                result = self._paths_xy(command["pairs"])
             elif action == "move":
                 result = self._move(command["position"], command["yaw"], command["max_distance"])
             else:
@@ -328,6 +356,26 @@ class IsaacEnvironment:
                                                "source": "official_freemap_action_proposer"}})
         return {"frame": frame, "capture_root": str(self.capture_root),
                 "pose": pose, "frontiers": frontiers}
+
+    def _paths(self, positions):
+        """在当前相机高度返回 XY 最短路，目标 Z 不参与可达性判定。"""
+        pose = self.env.get_pose()
+        start, height = pose["position"][:2], float(pose["position"][2])
+        results = []
+        for position in positions:
+            path = self.planner.plan(start, position[:2])
+            results.append({"position": list(position),
+                            "path": [[float(x), float(y), height] for x, y in path] if path is not None else [],
+                            "path_length": float(self.planner.path_length(path)) if path is not None else None})
+        return results
+
+    def _paths_xy(self, pairs):
+        results = []
+        for pair in pairs:
+            path = self.planner.plan(pair["start"], pair["end"])
+            results.append({**pair, "path": [list(point) for point in path] if path is not None else [],
+                            "path_length": float(self.planner.path_length(path)) if path is not None else None})
+        return {"geometry_domain": "freemap_xy", "results": results}
 
     def _viewpoints(self, position):
         start = self.env.get_pose()["position"][:2]

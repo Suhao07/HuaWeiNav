@@ -45,7 +45,7 @@ def _objects_json(mapper: Any, *, rounded: bool, skip_unknown: bool) -> list[dic
         if skip_unknown and obj.tag in ("unknown", "furniture"):
             continue
         size = _object_size(obj)
-        confidence = obj.confidence.numpy().item()
+        confidence = float(obj.confidence)
         if rounded:
             out.append({
                 "index": index,

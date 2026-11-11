@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
+from backends.habitat.geometry import HabitatMapperQueries
 from planning.exploration_policy import find_closest_nodes
 from planning.room_policy import select_nearest_frontier_room
 from prior_map.alignment import PriorMapAlignment
@@ -23,7 +24,7 @@ def _node(idx: int, position, room_idx: int = 0):
 
 
 def _mapper(tmp_path, *, prior_result=None, runtime=None):
-    return SimpleNamespace(
+    mapper = SimpleNamespace(
         initial_position=np.asarray((0.0, 0.0, 0.0), dtype=float),
         current_position=np.asarray((0.0, 0.0, 0.0), dtype=float),
         env=SimpleNamespace(sim=_FakeSim()),
@@ -40,6 +41,8 @@ def _mapper(tmp_path, *, prior_result=None, runtime=None):
         ),
         nodes=(),
     )
+    mapper.geometry_queries = HabitatMapperQueries(mapper)
+    return mapper
 
 
 def test_active_frontier_prior_off_preserves_nearest_node(tmp_path) -> None:

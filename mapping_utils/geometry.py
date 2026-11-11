@@ -17,8 +17,7 @@ def get_pointcloud_from_depth(rgb: np.ndarray, depth: np.ndarray, intrinsic: np.
 
     filter_z, filter_x = np.where(depth > 0)
     depth_values = depth[filter_z, filter_x]
-    pixel_z = (depth.shape[0] - 1 - filter_z -
-               intrinsic[1][2]) * depth_values / intrinsic[1][1]
+    pixel_z = (intrinsic[1][2] - filter_z) * depth_values / intrinsic[1][1]
     pixel_x = (filter_x - intrinsic[0][2]) * depth_values / intrinsic[0][0]
     pixel_y = depth_values
     color_values = rgb[filter_z, filter_x]
@@ -54,8 +53,7 @@ def get_pointcloud_from_depth_mask(depth: np.ndarray,
     filter_x = filter_x[depth_values > 0]
     depth_values = depth_values[depth_values > 0]
 
-    pixel_z = (depth.shape[0] - 1 - filter_z -
-               intrinsic[1][2]) * depth_values / intrinsic[1][1]
+    pixel_z = (intrinsic[1][2] - filter_z) * depth_values / intrinsic[1][1]
     pixel_x = (filter_x - intrinsic[0][2]) * depth_values / intrinsic[0][0]
     pixel_y = depth_values
     point_values = np.stack([pixel_x, pixel_z, -pixel_y], axis=-1)

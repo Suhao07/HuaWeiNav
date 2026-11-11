@@ -43,8 +43,8 @@ def segment_room(mapper, step_idx):
 
     # print(xyz)
     xyz_full = xyz.copy()
-    floor_zero_level = -0.8
-    floor_height = 0.8
+    floor_zero_level = mapper.floor_height
+    floor_height = mapper.ceiling_height
     ## Slice below the ceiling ##
     xyz = xyz[xyz[:, 2] < floor_height]
     xyz = xyz[xyz[:, 2] >= floor_zero_level + 0.2]

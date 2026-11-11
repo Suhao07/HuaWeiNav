@@ -4,8 +4,52 @@ import pytest
 import numpy as np
 from navigation_core.view_geometry import interpolate_polyline
 from navigation.semantic_label_cache import LabelEvidence, reusable_label, matching_instance
-from planning.exploration_policy import select_coverage_frontier
+from planning.exploration_policy import (
+    select_baseline_exploration_node, select_coverage_frontier, select_room_first,
+)
 from instruction_adapter.view_control import ViewControlState
+
+@pytest.mark.parametrize("semantic", [True, False])
+def test_shared_room_first_order_and_local_side_effects(semantic):
+    events, room, node = [], NS(state=0), object()
+    def local(current):
+        assert current is room
+        events.append("local")
+        current.state = 1
+        return None
+    def remaining():
+        events.append("remaining")
+        return node
+    assert select_room_first(current_room=room, rooms=[room], local_choice=local,
+        remaining_choice=remaining, room_choice=lambda: events.append("room"),
+        closest_in_room=lambda selected: events.append("closest"), semantic=semantic) == (node, "remaining_nodes")
+    assert events == ["local", "remaining"]
+    room.state = 0
+    events.clear()
+    def choose():
+        events.append("room")
+        return room
+    def closest(selected):
+        assert selected is room
+        events.append("closest")
+        return node
+    result = select_room_first(current_room=room, rooms=[room],
+        local_choice=lambda current: events.append("local"), remaining_choice=remaining,
+        room_choice=choose, closest_in_room=closest, semantic=semantic)
+    assert result == (node, "room_semantic_policy" if semantic else "room_distance_policy")
+    assert events == ["local", "room", "closest"]
+
+
+def test_habitat_relocation_callback_mutation_precedes_room_exhaustion():
+    events, room, node = [], NS(state=0), NS(room_idx=0)
+    def relocate(current):
+        events.append("reset_and_relocate")
+        current.state = 1
+    mapper = NS(nodes=[node], room_nodes=[room], explore_in_room_relocate=relocate,
+                explore_after_fully_explored=lambda: events.append("remaining") or node)
+    agent = NS(mapper=mapper, current_node_idx=0, relocate=True, gpt_relocate=True)
+    assert select_baseline_exploration_node(agent, episode_idx=0, step=0) == (node, "remaining_nodes")
+    assert events == ["reset_and_relocate", "remaining"]
 
 
 def test_path_sampling_preserves_short_segment_endpoint_and_max_spacing():

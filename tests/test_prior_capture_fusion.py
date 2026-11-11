@@ -123,6 +123,34 @@ assert 'cv_utils.sam' not in sys.modules and 'config_utils' not in sys.modules
         self.assertIs(mapper.object_perceiver, sentinel.perceiver)
         self.assertEqual(categories, [{'name': 'chair'}, {'name': 'custom category'}])
 
+    def test_room_segmentation_uses_configured_height_band(self):
+        from tempfile import TemporaryDirectory
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from mapping import room_segmenter
+        points = np.array([[0., 0., -1.5], [.2, 0., -1.25], [.4, 0., .4],
+                           [.6, 0., .6]], dtype=np.float32)
+        cloud = gpu_pointcloud_from_array(points, np.zeros_like(points), o3d.core.Device('CPU:0'))
+        floor = cloud.select_by_index([0])
+        node = SimpleNamespace(idx=0, room_idx=-1, has_frontier=False)
+        with TemporaryDirectory() as directory:
+            mapper = SimpleNamespace(scene_pcd=cloud, navigable_pcd=floor, nodes=[node],
+                floor_height=-1.5, ceiling_height=.5, save_dir=directory,
+                episode_idx=0, update_iterations=1, grid_resolution=.1,
+                voxel_dimension=np.array([500, 500, 20]), current_node_idx=0,
+                current_global_frontier_map_idxs=[], get_nodes_positions=lambda: np.zeros((1, 3)),
+                find_closet_viewpoint_in_room=lambda room: None)
+            with patch.object(room_segmenter, 'project_room', wraps=room_segmenter.project_room) as project:
+                room_segmenter.segment_room(mapper, 1)
+            obstacle_points = project.call_args_list[0].args[0]
+            footprint_points = project.call_args_list[1].args[0]
+            self.assertEqual(len(obstacle_points), 2)
+            np.testing.assert_allclose(sorted(obstacle_points[:, 2]), [-1.25, .4])
+            np.testing.assert_allclose(sorted(footprint_points[:, 2]), [-1.5, -1.5, -1.25, .4])
+            self.assertEqual(node.room_idx, 0)
+            self.assertEqual(mapper.room_nodes[0].nodes, [node])
+        np.testing.assert_array_equal(cloud.point.positions.numpy(), points)
+
     def test_task_free_perceiver_keeps_vocabulary_and_empty_target_group(self):
         from cv_utils.image_perceiver import ImagePerceiver
         from unittest.mock import Mock
