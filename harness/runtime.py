@@ -88,6 +88,66 @@ class ToolCall(ToolArguments):
     interpretation_update: InterpretationUpdate | None = None
 
 
+def _model_table(rows):
+    def value(item):
+        if isinstance(item, float):
+            return round(item, 3)
+        if isinstance(item, (list, tuple)):
+            return [value(part) for part in item]
+        if isinstance(item, dict):
+            return {key: value(part) for key, part in item.items()}
+        return item
+
+    columns = list(dict.fromkeys(key for row in rows for key in row))
+    return {"columns": columns, "rows": [[value(row.get(key)) for key in columns] for row in rows]}
+
+
+def compact_guided_context(observation, options):
+    objects = []
+    for obj in observation["objects"]:
+        row = {key: obj[key] for key in ("uid", "label", "position", "confidence", "room_id",
+                                       "bbox2d_xyxy", "visible_viewpoints", "verified_state")}
+        row.update(label_probabilities=obj["metadata"].get("label_probabilities"),
+                   observed_frame=obj["metadata"].get("frame_id"))
+        objects.append(row)
+    frontiers = []
+    for node in observation["frontiers"]:
+        metadata = node["metadata"]
+        row = {key: node[key] for key in ("uid", "position", "room_id", "score")}
+        row.update({key: metadata[key] for key in ("frame_id", "path_length", "reachable", "supported")
+                    if key in metadata})
+        if "frontier_idxs" in metadata:
+            row["frontier_cell_count"] = len(metadata["frontier_idxs"])
+        frontiers.append(row)
+    identities, views, branches = [], [], []
+    for option in options:
+        identity = {key: option[key] for key in ("action_uid", "frontier_uid", "candidate_uid", "kind")
+                    if key in option}
+        identities.append(identity)
+        if option.get("kind") == "viewpoint":
+            metadata = option.get("metadata", {})
+            row = {**identity, **{key: option[key] for key in ("uid", "room_id", "visible_objects", "explored")
+                                 if key in option}, **option.get("pose", {})}
+            row.update({key: metadata[key] for key in ("pitch", "travel_distance", "path_length",
+                "stop_feasible", "visible_ratio", "area_ratio", "distance_to_target", "recommended",
+                "source", "visibility") if key in metadata})
+            quality = metadata.get("predicted_quality", {})
+            row.update({"quality_" + key: val for key, val in quality.items()})
+            row.update({"quality_" + key: metadata[key] for key in
+                        ("score", "center_score", "border_score", "distance_score")
+                        if key in metadata and key not in quality})
+            views.append(row)
+        else:
+            row = {key: val for key, val in option.items() if key != "frontier_idxs"}
+            if "frontier_idxs" in option:
+                row["frontier_cell_count"] = len(option["frontier_idxs"])
+            branches.append(row)
+    projected = {**observation, "objects": _model_table(objects), "frontiers": _model_table(frontiers),
+                 "verification_records": [f"verification:{index}"
+                                          for index in range(len(observation["verification_records"]))]}
+    return projected, identities, {"viewpoints": _model_table(views), "frontiers": _model_table(branches)}
+
+
 class AgentRuntime:
     """Execute one model/tool turn at a time with a run-owned budget and trace.
 
@@ -126,7 +186,15 @@ class AgentRuntime:
             "receipt or proof of task completion. Destination hypotheses are revisable observed "
             "facility candidates, not replacements for the original demand. An instance rejection "
             "does not reject every realization of that resource; keep all original functional "
-            "and attribute requirements when choosing another candidate.\n\n"
+            "and attribute requirements when choosing another candidate. "
+            "Guided choices use columns/rows tables for objects, frontiers and option_geometry; "
+            "each row follows its table's columns. Join geometry to options by exact action_uid "
+            "or frontier_uid. No candidates are omitted. Geometry and scores are displayed to "
+            "three decimals; execution uses the original unrounded domain state. Quality values "
+            "are predictions requiring fresh verification, not observed satisfaction. "
+            "Frontier cell counts describe coverage, not a navigation path. "
+            "Image captions reference observation.observation_images by id; object_boxes are xyxy. "
+            "Guided verification_records lists basis IDs whose full records are in search_context.basis.\n\n"
             "Revision protocol: search_updates replaces only detector_terms for a supplied concept_id; "
             "copy basis_ids from search_context.basis and cite only supplied evidence. "
             "interpretation_update proposes a complete corrected instruction structure, with a reason "
@@ -415,8 +483,8 @@ class AgentRuntime:
                 continue
             image.update(image_status="available", request_image_ref=archived, image_sha256=digest)
             image_blocks.extend([
-                {"type": "text", "text": "Current observation frame and visible object UIDs "
-                 "(object_boxes are xyxy): " + json.dumps(image, ensure_ascii=False)},
+                {"type": "text", "text": "Current observation image: " + json.dumps(image["id"])
+                 + "; metadata in observation.observation_images."},
                 block,
             ])
         basis = {"instruction": {"type": "original_instruction"}}
@@ -428,7 +496,14 @@ class AgentRuntime:
                       for index, record in enumerate(observation["verification_records"])})
         observation["search_context"]["basis"] = basis
         context = {"observation": observation, "recent_tools": self.history[-4:], **context}
-        content = [{"type": "text", "text": json.dumps(context, ensure_ascii=False)}, *image_blocks]
+        if "options" in context:
+            context["observation"], context["options"], context["option_geometry"] = compact_guided_context(
+                observation, context["options"])
+            context["recent_tools"] = [
+                {**{key: value for key, value in event.items() if key != "options"},
+                 **({"option_count": len(event["options"])} if "options" in event else {})}
+                for event in self.history[-4:]]
+        content = [{"type": "text", "text": json.dumps(context, ensure_ascii=False, separators=(",", ":"))}, *image_blocks]
         return [{"role": "system", "content": system_prompt}, {"role": "user", "content": content}]
 
     def record_event(self, event):

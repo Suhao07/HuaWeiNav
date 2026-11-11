@@ -1,6 +1,7 @@
 """Replay Agent calls through real task/query/motion/verifier tool bindings."""
 from types import SimpleNamespace
-from dataclasses import replace
+from copy import deepcopy
+from dataclasses import asdict, replace
 from pathlib import Path
 import base64
 import hashlib
@@ -9,13 +10,13 @@ import re
 
 import pytest
 
-from harness.runtime import AgentRuntime, ToolCall
+from harness.runtime import AgentRuntime, ToolCall, compact_guided_context
 from harness.tools import NavigationTools
 from instruction.contracts import TaskSpec, TargetSpec
 from instruction_adapter.task_compat import runtime_plan
 from motion.contracts import NavigationStatus, NavigationStatusCode
 from motion.supervisor import MotionSupervisor
-from scene.contracts import ObjectNodeSnapshot, Pose3D, SemanticMapSnapshot, ViewpointSnapshot
+from scene.contracts import FrontierSnapshot, ObjectNodeSnapshot, Pose3D, SemanticMapSnapshot, ViewpointSnapshot
 from task.session import TaskSession
 from verification.contracts import VerificationResult
 
@@ -395,6 +396,90 @@ def request_context(request):
     return json.loads(request["messages"][1]["content"][0]["text"])
 
 
+def _table_rows(table):
+    """Decode tables while rejecting duplicate columns or misaligned rows."""
+    assert set(table) == {"columns", "rows"}
+    assert len(table["columns"]) == len(set(table["columns"]))
+    assert all(len(row) == len(table["columns"]) for row in table["rows"])
+    return [dict(zip(table["columns"], row)) for row in table["rows"]]
+
+
+def test_compact_guided_tables_preserve_geometry_associations_and_quality(monkeypatch):
+    tools = make_tools(monkeypatch)
+    pose = Pose3D((1.234567, -2.345678, 3.456789), (.123456, .234567, .345678, .876543),
+                  frame_id="mapper_local", stamp=12.345678)
+    tools.session.snapshot = replace(tools.session.snapshot, robot_pose=pose, objects=(
+        ObjectNodeSnapshot("cup-1", "cup", pose.position, confidence=.987654,
+            bbox2d_xyxy=(1.234567, 2.345678, 30.456789, 40.567891), room_id="kitchen",
+            visible_viewpoints=("view-1", "view-2"), verified_state="rejected",
+            metadata={"label_probabilities": {"cup": .876543, "bowl": .123457}, "frame_id": "frame:17"}),
+    ), frontiers=(FrontierSnapshot("node:1", pose.position, room_id="hall", score=.765432,
+        metadata={"frame_id": "mapper_local", "path_length": 5.678912, "reachable": True,
+                  "supported": False, "frontier_idxs": [[1, 2], [3, 4], [5, 6]]}),))
+    quality = {"score": .654321, "center_score": .765432, "area_ratio": .345678,
+               "visible_ratio": .876543, "projected_points": 37, "occlusion_score": .123456}
+    options = [{"action_uid": "approach:view-1", "candidate_uid": "cup-1", "kind": "viewpoint",
+        "uid": "view-1", "room_id": "kitchen", "visible_objects": ["cup-1", "table-1"],
+        "explored": False, "pose": pose.as_dict(), "metadata": {
+            "pitch": -.123456, "travel_distance": 2.345678, "path_length": 3.456789,
+            "stop_feasible": False, "visible_ratio": .456789, "area_ratio": .234567,
+            "distance_to_target": .987654, "recommended": True, "source": "projection",
+            "visibility": {"status": "predicted", "confidence": .567891},
+            "predicted_quality": quality, "score": 9.9, "center_score": 8.8,
+            "border_score": .222222, "distance_score": .333333,
+        }}, {"action_uid": "explore:node:1", "frontier_uid": "node:1", "kind": "frontier",
+             "position": pose.position, "raw_distance_m": 5.678912, "reachable": True,
+             "supported": False, "frame_id": "mapper_local", "frontier_idxs": [[1, 2], [3, 4]]}]
+    observation = tools.observe()
+    observation["verification_records"] = [{"confidence": .987654}]
+    observation["search_context"]["basis"] = {
+        "instruction": {"type": "original_instruction"},
+        "verification:0": {"type": "stored_judgment", "record": {"confidence": .987654}},
+    }
+    before, options_before, snapshot_before = deepcopy((observation, options, tools.session.snapshot))
+
+    projected, identities, geometry = compact_guided_context(observation, options)
+
+    assert _table_rows(projected["objects"]) == [{
+        "uid": "cup-1", "label": "cup", "position": [1.235, -2.346, 3.457],
+        "confidence": .988, "room_id": "kitchen", "bbox2d_xyxy": [1.235, 2.346, 30.457, 40.568],
+        "visible_viewpoints": ["view-1", "view-2"], "verified_state": "rejected",
+        "label_probabilities": {"cup": .877, "bowl": .123}, "observed_frame": "frame:17",
+    }]
+    assert _table_rows(projected["frontiers"]) == [{
+        "uid": "node:1", "position": [1.235, -2.346, 3.457], "room_id": "hall", "score": .765,
+        "frame_id": "mapper_local", "path_length": 5.679, "reachable": True,
+        "supported": False, "frontier_cell_count": 3,
+    }]
+    assert identities == [
+        {"action_uid": "approach:view-1", "candidate_uid": "cup-1", "kind": "viewpoint"},
+        {"action_uid": "explore:node:1", "frontier_uid": "node:1", "kind": "frontier"},
+    ]
+    assert _table_rows(geometry["viewpoints"]) == [{
+        **identities[0], "uid": "view-1", "room_id": "kitchen", "visible_objects": ["cup-1", "table-1"],
+        "explored": False, "position": [1.235, -2.346, 3.457],
+        "orientation_xyzw": [.123, .235, .346, .877], "frame_id": "mapper_local", "stamp": 12.346,
+        "pitch": -.123, "travel_distance": 2.346, "path_length": 3.457, "stop_feasible": False,
+        "visible_ratio": .457, "area_ratio": .235, "distance_to_target": .988, "recommended": True,
+        "source": "projection", "visibility": {"status": "predicted", "confidence": .568},
+        **{"quality_" + key: round(value, 3) for key, value in quality.items()},
+        "quality_border_score": .222, "quality_distance_score": .333,
+    }]
+    assert _table_rows(geometry["frontiers"]) == [{
+        **identities[1], "position": [1.235, -2.346, 3.457], "raw_distance_m": 5.679,
+        "reachable": True, "supported": False, "frame_id": "mapper_local", "frontier_cell_count": 2,
+    }]
+    assert projected["verification_records"] == ["verification:0"]
+    assert [projected["search_context"]["basis"][uid]["record"]
+            for uid in projected["verification_records"]] == before["verification_records"]
+    assert {key: value for key, value in projected.items()
+            if key not in {"objects", "frontiers", "verification_records"}} == {
+        key: value for key, value in before.items()
+        if key not in {"objects", "frontiers", "verification_records"}}
+    assert observation == before and options == options_before
+    assert tools.session.snapshot == snapshot_before
+
+
 def decision_call(runtime, mode):
     if mode == "frontier":
         return runtime.choose_frontier([
@@ -418,6 +503,99 @@ def decision_payload(mode):
 
 
 @pytest.mark.parametrize("mode", ["frontier", "recovery"])
+def test_large_guided_context_keeps_last_candidate_and_bounds_repeated_options(monkeypatch, tmp_path, mode):
+    tools = make_tools(monkeypatch)
+    count = 225  # Later discoveries must not disappear behind a prefix/TopK cap.
+    cells = [[index, index + 1] for index in range(200)]
+    objects = tuple(ObjectNodeSnapshot(f"cup:{i}", "cup", (i + .123456, 0, 0),
+                    visible_viewpoints=(f"view:{i}",)) for i in range(count))
+    views = tuple(ViewpointSnapshot(f"view:{i}", Pose3D((i + .234567, 0, 0)),
+                  visible_objects=(f"cup:{i}",), metadata={"predicted_quality": {"score": .876543}})
+                  for i in range(count))
+    frontiers = tuple(FrontierSnapshot(f"node:{i}", (i + .345678, 1, 0),
+                     metadata={"frontier_idxs": cells, "frame_id": "map", "path_length": i + .456789})
+                     for i in range(count))
+    tools.session.snapshot = replace(tools.session.snapshot, objects=objects, viewpoints=views, frontiers=frontiers)
+    options = [{"frontier_uid": node.uid, "action_uid": f"explore:{node.uid}", "kind": "frontier",
+                "position": node.position, **node.metadata} for node in frontiers]
+    if mode == "recovery":
+        options.extend({**asdict(view), "action_uid": f"approach:{view.uid}", "kind": "viewpoint",
+                        "candidate_uid": obj.uid} for obj, view in zip(objects, views))
+    raw = json.dumps({"observation": tools.observe(), "options": options})
+    assert len(raw) > 330_000
+    options_before, snapshot_before = deepcopy((options, tools.session.snapshot))
+    field = "frontier_uid" if mode == "frontier" else "action_uid"
+    payload = {field: options[-1][field], "reason": "Inspect the last discovered candidate"}
+    client_model, requests = model_calls([payload, payload])
+    runtime = AgentRuntime(tools, tmp_path / "large.jsonl", max_model_calls=2, client_model=client_model)
+    for _ in range(2):
+        selected = (runtime.choose_frontier(options, options[0][field], {"reason": "review"})
+                    if mode == "frontier" else runtime.choose_recovery(options, {"reason": "exhausted"}))
+        assert selected == options[-1][field]
+    for request in requests:
+        context = request_context(request)
+        assert request["response_format"].schema()["properties"][field]["enum"] == [o[field] for o in options]
+        assert context["options"] == [{key: value for key, value in option.items()
+                                      if key in {"action_uid", "frontier_uid", "candidate_uid", "kind"}}
+                                     for option in options]
+        assert [row["uid"] for row in _table_rows(context["observation"]["objects"])] == [o.uid for o in objects]
+        assert [row["uid"] for row in _table_rows(context["observation"]["frontiers"])] == [f.uid for f in frontiers]
+        branches = _table_rows(context["option_geometry"]["frontiers"])
+        assert [row["frontier_uid"] for row in branches] == [f.uid for f in frontiers]
+        assert all(row["frontier_cell_count"] == len(cells) for row in branches)
+        projected_views = _table_rows(context["option_geometry"]["viewpoints"])
+        assert [(row["action_uid"], row["candidate_uid"], row["uid"]) for row in projected_views] == (
+            [(f"approach:{v.uid}", o.uid, v.uid) for o, v in zip(objects, views)] if mode == "recovery" else [])
+        assert "frontier_idxs" not in request["messages"][1]["content"][0]["text"]
+        assert len(request["messages"][1]["content"][0]["text"]) < len(raw) / 2
+    previous = request_context(requests[-1])["recent_tools"]
+    assert previous == [{**{key: value for key, value in runtime.history[0].items() if key != "options"},
+                         "option_count": len(options)}]
+    assert all(event["options"] == options_before for event in runtime.history)
+    trace = [json.loads(line) for line in runtime.trace_path.read_text().splitlines()]
+    assert trace == json.loads(json.dumps(runtime.history))
+    assert options == options_before and tools.session.snapshot == snapshot_before
+    assert tools.motion.controller.sent == []
+
+
+@pytest.mark.parametrize("empty", [True, False])
+def test_guided_tables_allow_empty_lists_and_missing_optional_metadata(monkeypatch, tmp_path, empty):
+    tools = make_tools(monkeypatch)
+    tools.session.snapshot = replace(tools.session.snapshot,
+        objects=() if empty else tools.session.snapshot.objects,
+        frontiers=() if empty else (FrontierSnapshot("node:empty", (0, 0, 0)),
+            FrontierSnapshot("node:known", (1, 0, 0), metadata={"path_length": .123456, "reachable": False})))
+    options = [] if empty else [
+        {"action_uid": "view:sparse", "kind": "viewpoint", "candidate_uid": "cup-1"},
+        {"frontier_uid": "node:empty", "frontier_idxs": []},
+        {"frontier_uid": "node:known", "reachable": False},
+    ]
+    before, options_before = deepcopy((tools.observe(), options))
+    runtime = AgentRuntime(tools, tmp_path / "sparse.jsonl", client_model=(object(), "unused"))
+    plain = request_context({"messages": runtime._messages("tool")})
+    guided = request_context({"messages": runtime._messages("guided", options=options)})
+    assert "option_geometry" not in plain
+    for key in ("objects", "frontiers"):
+        assert plain["observation"][key] == json.loads(json.dumps(before[key]))
+    if empty:
+        assert guided["options"] == []
+        assert all(table == {"columns": [], "rows": []} for table in (
+            guided["observation"]["objects"], guided["observation"]["frontiers"],
+            *guided["option_geometry"].values()))
+    else:
+        obj, = _table_rows(guided["observation"]["objects"])
+        assert all(obj[key] is None for key in ("label_probabilities", "observed_frame", "room_id", "bbox2d_xyxy"))
+        sparse, known = _table_rows(guided["observation"]["frontiers"])
+        assert sparse["path_length"] is None and sparse["reachable"] is None
+        assert known["path_length"] == .123 and known["reachable"] is False
+        assert _table_rows(guided["option_geometry"]["viewpoints"]) == [options[0]]
+        assert _table_rows(guided["option_geometry"]["frontiers"]) == [
+            {"frontier_uid": "node:empty", "frontier_cell_count": 0, "reachable": None},
+            {"frontier_uid": "node:known", "frontier_cell_count": None, "reachable": False}]
+    assert tools.observe() == before and options == options_before
+
+
+@pytest.mark.parametrize("mode", ["frontier", "recovery"])
 def test_guided_requests_share_skills_and_real_scoped_task_evidence(monkeypatch, tmp_path, mode):
     from instruction.contracts import ConstraintSpec
     tools = make_tools(monkeypatch)
@@ -430,7 +608,7 @@ def test_guided_requests_share_skills_and_real_scoped_task_evidence(monkeypatch,
     tools.session.install_plan(runtime_plan(task))
     ledger = tools.session.verification_ledger
     record = ledger.put(task.raw_instruction, "cup-1", VerificationResult(
-        False, "need_better_view", task_revision=2, target_uid="cup-1",
+        False, "need_better_view", confidence=.987654, task_revision=2, target_uid="cup-1",
         predicate_id="beside", anchor_uid="table-1", failed_constraints=["beside"],
         reason="Anchor is occluded", evidence_ids=["frame:checked-1"],
         dependencies={"object:cup-1": "observed-version"},
@@ -438,6 +616,13 @@ def test_guided_requests_share_skills_and_real_scoped_task_evidence(monkeypatch,
     # Neither another instruction nor another revision is evidence for this task.
     ledger.put("find something else", "cup-1", VerificationResult(True, "accept", task_revision=2))
     ledger.put(task.raw_instruction, "cup-old", VerificationResult(True, "accept", task_revision=1))
+    basis = {"instruction": {"type": "original_instruction"},
+             "verification:0": {"type": "stored_judgment", "record": record.as_dict()}}
+    tools.session.revise_search([{"concept_id": "cup", "detector_terms": ["mug"],
+        "basis_ids": ["verification:0"], "basis": {"verification:0": basis["verification:0"]},
+        "reason": "Try another retrieval term for the occluded instance"}],
+        task_revision=2, search_revision=0, snapshot=tools.session.snapshot)
+    search_before = deepcopy(tools.observe()["search_context"])
     before = tools.session.progress.as_dict()
     client_model, requests = model_calls([decision_payload(mode)])
     runtime = AgentRuntime(tools, tmp_path / "guided.jsonl", client_model=client_model)
@@ -459,8 +644,11 @@ def test_guided_requests_share_skills_and_real_scoped_task_evidence(monkeypatch,
     observation = context["observation"]
     assert observation["task"] == task.as_dict()
     assert observation["progress"] == before
-    assert observation["verification_records"] == [record.as_dict()]
-    assert observation["verification_records"][0]["verdict"] == "unknown"
+    assert observation["verification_records"] == ["verification:0"]
+    assert observation["search_context"]["basis"]["verification:0"]["record"] == record.as_dict()
+    assert observation["search_context"]["basis"]["verification:0"]["record"]["verdict"] == "unknown"
+    assert observation["search_context"] == {**search_before, "basis": basis}
+    assert tools.observe()["search_context"] == search_before
     assert "event" in context and context["recent_tools"] == []
     assert tools.session.progress.as_dict() == before
     assert not tools.propose_finish()["accepted"]
@@ -696,9 +884,10 @@ def test_current_observation_frames_become_actual_image_blocks(monkeypatch, tmp_
     assert len(content) == 5
     for index, frame in enumerate(frames):
         label, image = content[1 + 2 * index:3 + 2 * index]
-        assert label["type"] == "text" and frame["id"] in label["text"]
-        assert all(uid in label["text"] for uid in frame["observed_object_uids"])
-        assert json.dumps(frame["object_boxes"]) in label["text"]
+        assert label == {"type": "text", "text": "Current observation image: " + json.dumps(frame["id"])
+                         + "; metadata in observation.observation_images."}
+        projected = observation["observation_images"][index]
+        assert {key: projected[key] for key in frame} == frame
         assert image["type"] == "image_url"
         data_url = image["image_url"]["url"]
         assert data_url.startswith("data:image/png;base64,")
@@ -916,19 +1105,41 @@ def test_plain_decision_cannot_use_changed_context(monkeypatch, tmp_path, mode, 
 
 
 @pytest.mark.parametrize("mode", ["frontier", "recovery"])
-@pytest.mark.parametrize("change", ["none", "task", "search", "snapshot", "progress", "control_epoch", "held"])
+@pytest.mark.parametrize("change", ["none", "task", "search", "snapshot", "pose", "progress", "control_epoch", "held"])
 def test_guided_submission_rechecks_and_consumes_choice(monkeypatch, tmp_path, mode, change):
     tools = make_tools(monkeypatch)
-    client_model, _ = model_calls([decision_payload(mode)])
-    runtime = AgentRuntime(tools, tmp_path / "guard.jsonl", client_model=client_model)
-    decision_call(runtime, mode)
     session = tools.session
+    pose = Pose3D((1.123411, 2.234522, 3.345633), (.123456, 0, 0, .992350), frame_id="mapper_local")
+    view = replace(session.snapshot.viewpoints[0], pose=pose)
+    frontier = FrontierSnapshot("node:2", pose.position, metadata={"frame_id": pose.frame_id})
+    session.snapshot = replace(session.snapshot, viewpoints=(view,), frontiers=(frontier,))
+    snapshot = session.snapshot
+    client_model, requests = model_calls([decision_payload(mode)])
+    runtime = AgentRuntime(tools, tmp_path / "guard.jsonl", client_model=client_model)
+    if mode == "frontier":
+        runtime.choose_frontier([{"frontier_uid": frontier.uid, "position": frontier.position}], frontier.uid, {})
+        arguments = {"frontier_uid": frontier.uid}
+    else:
+        runtime.choose_recovery([{**asdict(view), "action_uid": "approach:u", "kind": "viewpoint",
+                                  "candidate_uid": "cup-1"}], {})
+        arguments = {"candidate_uid": "cup-1", "viewpoint_uid": view.uid}
+    geometry = request_context(requests[0])["option_geometry"]
+    displayed, = _table_rows(geometry["frontiers" if mode == "frontier" else "viewpoints"])
+    assert displayed["position"] == [1.123, 2.235, 3.346]
+    assert runtime._choice_context[0] is snapshot
+    assert runtime._choice_context[1]["task"] == session.spec.as_dict()
     if change == "task":
         session.install_plan(runtime_plan(replace(session.spec, revision=2, exhaustive=True)))
     elif change == "search":
         session.search_revision += 1
     elif change == "snapshot":
         session.snapshot = replace(session.snapshot)
+    elif change == "pose":
+        changed_pose = replace(pose, position=(pose.position[0] + .00001, *pose.position[1:]))
+        assert changed_pose != pose
+        assert [round(value, 3) for value in changed_pose.position] == displayed["position"]
+        session.snapshot = replace(snapshot, viewpoints=(replace(view, pose=changed_pose),),
+                                   frontiers=(replace(frontier, position=changed_pose.position),))
     elif change == "progress":
         session.progress.completed = True
     elif change in {"control_epoch", "held"}:
@@ -938,12 +1149,16 @@ def test_guided_submission_rechecks_and_consumes_choice(monkeypatch, tmp_path, m
 
     def submit():
         with runtime.choice_guard():
-            tools.submit_motion(session.spec.revision, tools.motion.control_epoch, "guided",
-                                candidate_uid="cup-1", viewpoint_uid="view-1")
+            tools.submit_motion(session.spec.revision, tools.motion.control_epoch, "guided", **arguments)
 
     if change == "none":
         submit()
-        assert len(tools.motion.controller.sent) == 1
+        goal, = tools.motion.controller.sent
+        assert goal.goal_pose.position == pose.position
+        assert goal.goal_pose.frame_id == pose.frame_id
+        if mode == "recovery":
+            assert goal.goal_pose == pose
+        assert tools.motion.active_intent.metadata["task_revision"] == session.spec.revision
     else:
         error = RuntimeError if change in {"control_epoch", "held"} else ValueError
         with pytest.raises(error):
