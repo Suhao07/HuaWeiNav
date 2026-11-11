@@ -205,6 +205,19 @@ def test_canonical_native_position_preserves_y_sign():
     assert _plane_xy_from_xyz((10., -10., 1.), 'map_z_up', 'position_xyz') == (10., -10.)
 
 
+def test_empty_category_posterior_does_not_fall_back_to_label_or_alias():
+    from prior_map.query import _concept_relevance
+    empty = PriorObject(uid='unclassified', label='monitor', aliases=('screen',),
+                        exact=True, confidence=0., label_probabilities={})
+    plain = PriorObject(uid='plain', label='monitor')
+    for obj in (empty, plain):
+        restored = PriorObject.from_dict(obj.to_dict())
+        assert restored.label_probabilities == obj.label_probabilities
+    assert _concept_relevance(empty, {'monitor', 'screen'}) == 0.
+    assert _concept_relevance(plain, {'monitor'}) == 1.
+    assert _concept_relevance(empty, {'unclassified'}) == 1.
+
+
 def test_minority_label_votes_rank_by_category_posterior():
     """p(monitor) is the concept relevance; a canonical roundtrip keeps it."""
     def obj(uid, label, probabilities):

@@ -1103,7 +1103,7 @@ def _concept_relevance(obj: Any, query_terms: Sequence[str]) -> float:
 
     r = max(m({uid}), sum_l p(l) m(T_l)), with T_label = {label} ∪ aliases and
     T_l = {l} for other observed labels; m is ``_best_match_score``. Without an
-    observed posterior p = {label: 1}, so r equals the plain label/alias match.
+    observed posterior (None), p = {label: 1}; an empty posterior has no label match.
 
     Args:
         obj: Prior object with label, aliases and optional label_probabilities.
@@ -1113,7 +1113,8 @@ def _concept_relevance(obj: Any, query_terms: Sequence[str]) -> float:
         Score in ``[0, 1]``.
     """
 
-    probabilities = obj.label_probabilities or {obj.label: 1.0}
+    probabilities = ({obj.label: 1.0} if obj.label_probabilities is None
+                     else obj.label_probabilities)
     expected = 0.0
     for label, probability in probabilities.items():
         terms = {_normalize(label)}

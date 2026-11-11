@@ -110,7 +110,7 @@ class PriorObject:
         source: Source component or file that produced this object.
         aliases: Alternative labels used for concept matching.
         label_probabilities: Observed category posterior p(l) over detector
-            labels, sum_l p(l)=1. Empty means ``label`` is certain.
+            labels, sum_l p(l)=1. None uses the label; empty means no category evidence.
         metadata: JSON-friendly extension fields.
     """
 
@@ -122,7 +122,7 @@ class PriorObject:
     confidence: float = 0.5
     source: str = ""
     aliases: Tuple[str, ...] = ()
-    label_probabilities: Dict[str, float] = field(default_factory=dict)
+    label_probabilities: Optional[Dict[str, float]] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -139,7 +139,7 @@ class PriorObject:
         if self.position_xyz is not None:
             _validate_vector(self.position_xyz, 3, "PriorObject.position_xyz")
         _validate_confidence(self.confidence, "PriorObject.confidence")
-        for value in self.label_probabilities.values():
+        for value in (self.label_probabilities or {}).values():
             _validate_confidence(value, "PriorObject.label_probabilities")
         if self.label_probabilities and abs(sum(self.label_probabilities.values()) - 1.0) > 1e-6:
             raise ValueError("PriorObject.label_probabilities must sum to 1")
