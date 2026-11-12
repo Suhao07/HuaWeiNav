@@ -142,6 +142,8 @@ class TaskSpec:
                 obj = resolve_target_reference(
                     self.targets, obj, predicate_id=constraint.id, field="object",
                 )
+                if ctype in RELATION_CONSTRAINT_TYPES and subject == obj:
+                    raise ValueError(f"Constraint {constraint.id!r}: object relations require distinct target entities")
             bound.append(replace(constraint, subject=subject, object=obj))
         object.__setattr__(self, "constraints", tuple(bound))
 

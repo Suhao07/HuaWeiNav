@@ -743,15 +743,17 @@ def authored_semantics_case(request):
             "targets": [{"id": "seat", "name": "seat", "attributes": {"stability": "steady", "backrest": "absent"},
                          "demand": {"activity": "sit before skincare", "manipulated_objects": [],
                                     "required_resource": "seating"}},
-                        {"id": "vanity", "name": "vanity", "role": "anchor", "terminal": False}],
+                        {"id": "vanity", "name": "vanity", "role": "anchor", "terminal": False, "demand": None}],
             "constraints": [{"id": "at-vanity", "type": "spatial", "subject": "seat", "relation": "at",
                              "object": "vanity", "hardness": "hard"}],
         }
     else:
         raw = "When I lie down, I want that printed photo standing nearby to revisit happier times."
         payload = {
-            "targets": [{"id": "photo", "name": "photo", "attributes": {"medium": "printed", "state": "standing"}},
-                        {"id": "bed", "name": "lying place", "role": "anchor", "terminal": False}],
+            # photo 无声明用途，SEL148 保留 demand 缺失分支；SEL084 走有 demand 分支。
+            "targets": [{"id": "photo", "name": "photo", "demand": None,
+                         "attributes": {"medium": "printed", "state": "standing"}},
+                        {"id": "bed", "name": "lying place", "role": "anchor", "terminal": False, "demand": None}],
             "constraints": [{"id": "near-lying-place", "type": "spatial", "subject": "photo", "relation": "near",
                              "object": "bed", "hardness": "hard"}],
         }
@@ -775,7 +777,8 @@ def test_authored_failure_instruction_bindings_roundtrip_without_model(monkeypat
     assert task.raw_instruction == raw
     assert [t.id for t in task.targets] == [t["id"] for t in payload["targets"]]
     assert task.targets[0].attributes == payload["targets"][0]["attributes"]
-    assert task.as_dict()["targets"][0]["demand"] == payload["targets"][0].get("demand", {})
+    # TaskSpec 把空需求归一为 {}，demand 现在是必填键，因此按声明值比较。
+    assert task.as_dict()["targets"][0]["demand"] == (payload["targets"][0]["demand"] or {})
     assert task.targets[0].terminal and not task.targets[1].terminal
     declared = payload["constraints"][0]
     relation = task.constraints[0]
@@ -877,7 +880,7 @@ def test_raw_instruction_preserves_unicode_punctuation_and_repetition(monkeypatc
     from prompting.schemas import ParsedInstruction
 
     raw = "\t \u00a0找杯子，杯子。\r\n "
-    parsed = ParsedInstruction.model_validate({"targets": [{"id": "杯", "name": "杯子"}]})
+    parsed = ParsedInstruction.model_validate({"targets": [{"id": "杯", "name": "杯子", "demand": None}]})
     parse = Mock(return_value=NS(choices=[NS(message=NS(parsed=parsed, content=parsed.model_dump_json()))]))
     client_model = (NS(beta=NS(chat=NS(completions=NS(parse=parse)))), "scripted-not-a-model")
     if entry == "legacy":
@@ -915,8 +918,8 @@ def test_each_target_retains_its_own_positive_count(counts):
 
     raw = "Two cups and three books."
     payload = {"eval_mode": "all_targets_success",
-               "targets": [{"id": "a", "name": "cups", "min_count": counts[0]},
-                           {"id": "b", "name": "books", "min_count": counts[1]}]}
+               "targets": [{"id": "a", "name": "cups", "demand": None, "min_count": counts[0]},
+                           {"id": "b", "name": "books", "demand": None, "min_count": counts[1]}]}
     result = compile_parsed_instruction(raw, ParsedInstruction.model_validate(payload), {"count"})
     if min(counts) <= 0:
         assert result.status == "invalid" and result.task is None

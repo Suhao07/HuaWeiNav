@@ -254,8 +254,8 @@ def test_empty_vocabulary_runtime_grounding_never_requests_model(monkeypatch, an
                  "attributes": {"state": "clean"}, "demand": {
                      "activity": "write", "manipulated_objects": ["notebook"],
                      "required_resource": "usable surface", "destination_hypotheses": ["table"]}},
-                {"id": "lamp", "name": "lamp", "aliases": ["desk light"], "role": "anchor", "terminal": False},
-                {"id": "desk", "name": "work desk", "aliases": ["work desk"], "role": "anchor", "terminal": False},
+                {"id": "lamp", "name": "lamp", "aliases": ["desk light"], "role": "anchor", "terminal": False, "demand": None},
+                {"id": "desk", "name": "work desk", "aliases": ["work desk"], "role": "anchor", "terminal": False, "demand": None},
             ],
             "constraints": [
                 {"id": "near-desk", "type": "relation", "subject": "writing surface", "relation": "near",

@@ -38,8 +38,8 @@ class _ScriptedStructuredClient:
         schema = kwargs["response_format"]
         if schema is ParsedInstruction:
             parsed = ParsedInstruction.model_validate({
-                "targets": [{"id": "book", "name": "book", "attributes": {"color": "red"}},
-                            {"id": "shelf", "name": "shelf", "role": "anchor", "terminal": False}],
+                "targets": [{"id": "book", "name": "book", "attributes": {"color": "red"}, "demand": None},
+                            {"id": "shelf", "name": "shelf", "role": "anchor", "terminal": False, "demand": None}],
                 "constraints": [{"id": "on-shelf", "type": "spatial", "subject": "book",
                                  "relation": "on", "object": "shelf", "hardness": "hard"}],
             })

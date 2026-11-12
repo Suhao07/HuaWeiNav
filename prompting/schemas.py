@@ -45,25 +45,25 @@ class ReasoningStep(BaseModel):
 
 
 class ParsedDemand(BaseModel):
-    activity: str = Field(description="The activity the user intends to perform.")
+    activity: str = Field(description="Verbatim original sentences giving this destination's need and situation, including motivation, timing, posture, participants, intended placement and purpose. Copy the whole instruction for a single destination.")
     manipulated_objects: list[str] = Field(default_factory=list,
-        description="Materials acted on during the activity, not the destination resource.")
+        description="Inputs the user acts on with the resource. Requested outputs, people, destinations and references are not inputs; use [] when none are stated.")
     required_resource: str = Field(
-        description="The resource or capability needed to perform the activity on those materials.")
+        description="The named destination's required capability for this use. An explicitly requested object remains the resource; describe what that object enables, not a support on which to put it. A source provides the requested output, as general or specific as the original wording.")
     destination_hypotheses: list[str] = Field(default_factory=list,
-        description="Possible facilities providing the resource; search hypotheses, not required identities.")
+        description="Possible realizations of the destination consistent with its stated identity and intended use; search hypotheses, not additional requirements or supporting objects.")
 
 
 class ParsedTarget(BaseModel):
     id: str = Field(default="", description="Opaque entity ID. Preserve it when revising the same entity; use it in constraint references.")
-    demand: ParsedDemand | None = Field(default=None,
-        description="For an implicit destination, infer the activity and needed resource before naming its target. Null for explicit objects and reference anchors.")
+    demand: ParsedDemand | None = Field(
+        description="Required for an explicit or implicit destination's stated need or use. Preserve the full use clause in activity and the needed capability in required_resource. Null for reference anchors or destinations with no stated use.")
     name: str = Field(default="",
         description="The requested object identity, or the functional resource described by demand.required_resource; not the manipulated material.")
     role: str = Field(default="primary", description="primary, secondary, anchor, or support")
     aliases: list[str] = Field(default_factory=list)
     attributes: dict[str, Any] = Field(default_factory=dict,
-        description="Unary properties of this object. Another entity's relative placement belongs in constraints, even when described among this object's features.")
+        description="Stated unary properties of this entity, including depicted content. The object's identity is its name, not its material. Properties of a requested output belong in demand.required_resource; relations to other physical entities belong in constraints.")
     min_count: int = 1
     terminal: bool = Field(default=True,
         description="True for a navigation destination, including a demanded resource; false only for reference anchors or support objects.")
@@ -81,16 +81,21 @@ class ParsedConstraint(BaseModel):
 
 
 class ParsedInstruction(BaseModel):
+    # 自回归生成先明确原文角色与用途，再选择实体和属性，避免先选类别后补理由。
+    instruction_reading: str = Field(default="", max_length=1200,
+        description="Brief semantic reading of the complete original request, before selecting targets. State the destination resource, what it enables, which entities are references, inputs, outputs or depicted content, and whether each location describes an existing relation or a future use. Attribute each modifier to its own entity and preserve the original level of specificity.")
     task_type: str = "object_goal"
     eval_mode: str = "any_target_success"
-    constraints: list[ParsedConstraint] = Field(default_factory=list,
-        description="Extract each directed entity-to-entity relation separately before assigning unary target properties, including relative placements embedded in noun phrases.")
+    # 流式生成关系前需要已声明的实体 ID。
     targets: list[ParsedTarget] = Field(default_factory=list)
+    constraints: list[ParsedConstraint] = Field(default_factory=list,
+        description="Bind every stated entity-to-entity relation to the declared target IDs, including relative placements embedded in noun phrases. Unary target properties do not replace relations.")
     room_hints: list[str] = Field(default_factory=list)
     support_objects: list[str] = Field(default_factory=list)
     affordances: list[str] = Field(default_factory=list)
     requires_runtime_relation: bool = False
-    unresolved: list[str] = Field(default_factory=list)
+    unresolved: list[str] = Field(default_factory=list,
+        description="Only alternative meanings of the instruction that cannot be resolved from its wording. An unknown scene location, unseen object or missing observation is a search task, so leaves this list empty.")
     ordered: bool = False
     exhaustive: bool = False
 

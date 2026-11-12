@@ -525,8 +525,8 @@ def test_canonical_id_name_collision_never_transfers_anchor_predicates(
     raw = "Find a red chair beside a blue chair."
     endpoints = ("chair", "red-chair") if reverse_relation else ("red-chair", "chair")
     parsed = ParsedInstruction(
-        targets=[{"id": "red-chair", "name": "chair", "attributes": {"color": "red"}},
-                 {"id": "chair", "name": "chair", "role": "anchor", "terminal": False}],
+        targets=[{"id": "red-chair", "name": "chair", "attributes": {"color": "red"}, "demand": None},
+                 {"id": "chair", "name": "chair", "role": "anchor", "terminal": False, "demand": None}],
         constraints=[{"id": "beside", "type": "spatial", "subject": endpoints[0],
                       "relation": "beside", "object": endpoints[1], "hardness": "hard"},
                      {"id": "anchor-blue", "type": "color", "subject": "chair",

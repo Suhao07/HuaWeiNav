@@ -19,23 +19,42 @@ Interpret the indoor navigation instruction using the instruction-understanding
 skill below. Return only structured JSON matching the supplied schema. There are
 no scene observations at this stage; do not invent observed objects or states.
 
-Represent navigation destinations and actual reference anchors in targets.
-For an explicit object, use its name and equivalent object-name aliases, with
-demand=null. A descriptive clause is not an alias; leave aliases empty rather
-than inserting the object's attributes or relationships as another name.
-For an implied resource, create a terminal=true destination whose name describes
-the resource that enables the activity. Attach demand to that resource target:
-activity, manipulated_objects, required_resource and destination_hypotheses.
-The material being acted on belongs in manipulated_objects, not as the resource
-or an anchor target. Add a material as a navigation target only if the instruction
-separately asks to navigate to it. Facility alternatives are hypotheses, not
-identity aliases. Extract entity-to-entity predicates into constraints before
-writing unary attributes. A noun phrase can describe several entities: a second
-entity's relative placement is a directed relation, not a property of the first
-entity. Resolve the subject and reference of each placement from the wording.
-Attributes contain only unary properties; use {} when none are stated. Represent
-each independent object relation as a separate constraint; do not concatenate
-relation phrases or hide them inside attributes.
+Begin with instruction_reading: a concise account of the complete situation,
+its destination resource and each entity's role, using only the original wording.
+Then express that meaning as targets and constraints. Resolve the use before
+choosing a destination name; keep the semantic reading distinct from search guesses.
+An explicitly requested object is the destination and retains its identity in
+name. Its demand describes what that object enables, rather than a support on
+which to place it. An implicit destination is named by the required capability.
+Possible facilities are search hypotheses, not additional identities.
+For obtaining something from a stated source, the source is the destination.
+Its demand is to provide the requested output, preserving the output's original
+level of specificity. Output properties belong to this provision requirement;
+attributes describe the destination itself. Depicted content is an attribute of
+its physical display. Category names are identities, not materials.
+
+Declare all physical entities that locate the destination, including references
+embedded in its noun phrase. "I need an object by/at/under another object" locates
+the requested object even when its intended use will happen later. Represent
+that reference as a nonterminal target and bind a hard directed relation between
+the two entity IDs. Copying the phrase into demand does not replace this edge.
+A desired relocation, such as wanting something to put elsewhere, is intended
+use context rather than evidence of the object's existing position.
+The speaker's future posture and viewpoint belong in demand, not in a physical
+person target or a relation from an object to itself. A described place does not
+locate the speaker. An object's own posture belongs in its attributes.
+
+For each destination with a stated need or use, populate demand even when the
+object is explicitly named. In activity, copy the complete original sentences
+relevant to that destination, including motivation, timing, posture, participants,
+intended placement and purpose. For a single destination, copy the whole request.
+required_resource states what this named destination must enable or provide in
+that situation. Materials acted on go in manipulated_objects; outputs obtained
+from a source stay in required_resource. Use demand=null for references and for
+destinations with no stated use.
+Use equivalent object names in aliases, stated unary properties in attributes,
+and separate constraints for independent relationships between declared entities.
+Use {} for absent attributes.
 
 Preserve the complete activity, intended users and required capability, not just
 an easy-to-detect resource noun. Retain every stated unary property, depicted
@@ -61,8 +80,8 @@ Representation examples, not facts about the current instruction:
   anchor; a separate hard spatial constraint is (carton, below, trolley).
   The carton's placement cannot be stored as a trolley attribute or alias.
 - "I need to dry this wet scarf": a terminal drying resource has demand activity
-  drying, manipulated_objects=[scarf], required_resource=a place suitable for
-  drying fabric. A clothesline is a possible search hypothesis, not a required
+  "I need to dry this wet scarf", manipulated_objects=[scarf], required_resource=
+  a place suitable for drying fabric. A clothesline is a possible search hypothesis, not a required
   identity; scarf is not the destination. Infer a capability, not a fixed facility.
 Resolve each directed relation in the wording without unnecessary inversion.
 

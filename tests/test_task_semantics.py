@@ -120,12 +120,28 @@ def test_task_binding_exposes_missing_unbound_and_ambiguous_references(field, re
             constraints=(ConstraintSpec("constraint-ID", "spatial", relation="near", **fields),))
 
 
-def test_unbound_initial_reference_is_corrected_once_without_weakening(tmp_path):
+@pytest.mark.parametrize("constraint_type", ["spatial", "relation", "object relation", "co occurrence"])
+@pytest.mark.parametrize("reference", ["a", "workbench", "work surface"])
+def test_physical_relation_requires_distinct_bound_entities(constraint_type, reference):
+    from instruction.contracts import ConstraintSpec, TargetSpec, TaskSpec
+
+    with pytest.raises(ValueError, match="constraint-ID.*distinct target entities"):
+        TaskSpec("Find a workbench", targets=(TargetSpec("a", "workbench", aliases=("work surface",)),),
+                 constraints=(ConstraintSpec("constraint-ID", constraint_type, "a", "near", reference),))
+    task = TaskSpec("Visit the workbench again", targets=(TargetSpec("a", "workbench"),),
+                    constraints=(ConstraintSpec("sequence-ID", "sequence", "a", "after", "a"),))
+    assert task.constraints[0].subject == task.constraints[0].object == "a"
+
+
+@pytest.mark.parametrize("reference", ["vanity", "seat"])
+def test_invalid_initial_reference_is_corrected_once_without_weakening(tmp_path, reference):
     raw = "Find a steady backless seat at the vanity."
-    initial = {"targets": [{"name": "seat", "attributes": {"back": "backless", "support": "steady"}}],
+    initial = {"targets": [{"name": "seat", "attributes": {"back": "backless", "support": "steady"},
+                            "demand": None}],
                "constraints": [{"type": "spatial", "subject": "seat", "relation": "near",
-                                "object": "vanity", "hardness": "hard"}]}
-    corrected = {**initial, "targets": [*initial["targets"], {"name": "vanity", "terminal": False}]}
+                                "object": reference, "hardness": "hard"}]}
+    corrected = {**initial, "targets": [*initial["targets"], {"name": "vanity", "terminal": False, "demand": None}],
+                 "constraints": [{**initial["constraints"][0], "object": "vanity"}]}
     compiler, requests = _initial_compiler_replay(tmp_path, [initial, corrected])
     result = compiler.compile(raw, {"spatial"})
     assert result.status == "success" and compiler.model_calls == len(requests) == 2
@@ -397,7 +413,7 @@ def test_legacy_explicit_affordance_receives_stable_predicate_id(monkeypatch, ba
 
     raw = "Find a surface able to support a large bowl."
     _structured_parser_provider(monkeypatch, {
-        "targets": [{"name": "surface"}],
+        "targets": [{"name": "surface", "demand": None}],
         "constraints": [{"type": "affordance", "subject": "surface", "value": "support a large bowl",
                          "hardness": "hard", "verifier": "vlm"}],
     })
@@ -415,7 +431,7 @@ def test_explicit_object_instruction_does_not_acquire_a_demand(monkeypatch):
     # Both representations of color remain exercised, each with its own wording.
     raw = "Find the red chair; it must be red."
     requests = _structured_parser_provider(monkeypatch, {
-        "targets": [{"name": "chair", "attributes": {"color": "red"}}],
+        "targets": [{"name": "chair", "attributes": {"color": "red"}, "demand": None}],
         "constraints": [{"type": "attribute", "subject": "chair", "value": {"color": "red"},
                          "hardness": "hard", "verifier": "vlm"}],
     })
@@ -444,13 +460,13 @@ def test_parsed_projection_and_revision_preserve_immutable_semantics(monkeypatch
         "task_type": " MULTI_GOAL ", "eval_mode": " ALL_TARGETS_SUCCESS ",
         "targets": [
             {"name": " Cup ", "aliases": ["mug", "MUG"], "min_count": 2,
-             "attributes": {"colors": ["red"]}},
+             "attributes": {"colors": ["red"]}, "demand": None},
             {"name": "writing_surface", "role": " SECONDARY ", "min_count": 1,
              "attributes": {"state": "clean"},
              "demand": {"activity": "write notes", "manipulated_objects": ["notebook"],
                         "required_resource": "usable writing surface",
                         "destination_hypotheses": ["table", "TABLE", "counter"]}},
-            {"name": "work desk", "role": "anchor", "terminal": False},
+            {"name": "work desk", "role": "anchor", "terminal": False, "demand": None},
         ],
         "constraints": [
             {"type": " SEQUENCE ", "subject": " Cup ", "object": "writing_surface"},
@@ -468,7 +484,7 @@ def test_parsed_projection_and_revision_preserve_immutable_semantics(monkeypatch
     assert plan.as_dict() == parser.parse_instruction_with_llm(raw, strict=True).as_dict()
     assert len(requests) == 1
     assert parsed.model_dump() == before
-    assert plan.raw_instruction == raw.strip() and plan.dataset_target == ""
+    assert plan.raw_instruction == raw and plan.dataset_target == ""
     assert plan.task_type == "multi_goal" and plan.eval_mode == "all_targets_success"
     assert plan.valid and plan.execution.ordered and plan.execution.exhaustive
     assert plan.diagnostics["requires_runtime_relation"] is True
@@ -487,7 +503,7 @@ def test_parsed_projection_and_revision_preserve_immutable_semantics(monkeypatch
     assert result.status == "success", result.diagnostics
     task = result.task
     assert task == task_from_parsed_plan(plan, revision=7)
-    assert task.raw_instruction == raw.strip() and task.revision == 7
+    assert task.raw_instruction == raw and task.revision == 7
     assert [(t.id, t.name, t.role, t.min_count, t.terminal) for t in task.targets] == [
         ("t0_cup", "cup", "primary", 2, True),
         ("t1_writing_surface", "writing surface", "secondary", 1, True),
@@ -528,9 +544,9 @@ def explicit_id_payload():
     return {
         "targets": [
             {"id": "Entity_A", "name": "surface", "aliases": ["work surface"],
-             "attributes": {"state": "clean"}},
+             "attributes": {"state": "clean"}, "demand": None},
             {"id": "Entity_a", "name": "surface", "aliases": ["work surface"],
-             "role": "anchor", "terminal": False},
+             "role": "anchor", "terminal": False, "demand": None},
         ],
         "constraints": [
             {"id": "Predicate_A", "type": "spatial", "subject": "Entity_A",
@@ -597,8 +613,8 @@ def test_implicit_ids_keep_positional_allocation_alongside_explicit_ids(id_field
 
     raw = "Find the clean cup near the work desk."
     parsed = ParsedInstruction.model_validate({
-        "targets": [{"id": "Cup:Keep_ID", "name": "cup"},
-                    {**id_field, "name": " Work_Desk ", "role": "anchor", "terminal": False}],
+        "targets": [{"id": "Cup:Keep_ID", "name": "cup", "demand": None},
+                    {**id_field, "name": " Work_Desk ", "role": "anchor", "terminal": False, "demand": None}],
         "constraints": [
             {"id": "Property:Keep_ID", "type": "state", "subject": "Cup:Keep_ID",
              "value": "clean", "hardness": "hard"},
@@ -645,7 +661,7 @@ def test_explicit_and_auto_id_collisions_are_invalid(collection, explicit_index)
     from prompting.schemas import ParsedInstruction
 
     payload = {
-        "targets": [{"name": "cup"}, {"name": "desk", "role": "anchor", "terminal": False}],
+        "targets": [{"name": "cup", "demand": None}, {"name": "desk", "role": "anchor", "terminal": False, "demand": None}],
         "constraints": [
             {"type": "state", "subject": "cup", "value": "clean", "hardness": "hard"},
             {"type": "state", "subject": "desk", "value": "clean", "hardness": "hard"},
@@ -727,8 +743,8 @@ def test_parsed_projection_preserves_strict_dataset_fallback_policy(monkeypatch,
     from instruction import parser
     from prompting.schemas import ParsedInstruction
 
-    payload = {"targets": [{"name": "", "terminal": True},
-                           {"name": " Desk ", "role": "anchor", "terminal": False}]}
+    payload = {"targets": [{"name": "", "terminal": True, "demand": None},
+                           {"name": " Desk ", "role": "anchor", "terminal": False, "demand": None}]}
     requests = _structured_parser_provider(monkeypatch, payload)
     plan = parser.plan_from_parsed_instruction(
         "look near desk", ParsedInstruction.model_validate(payload),
@@ -751,20 +767,20 @@ def test_parsed_projection_preserves_strict_dataset_fallback_policy(monkeypatch,
     pytest.param("find it", {"unresolved": ["which object?"]}, set(), 1,
                  "ambiguous", id="unresolved-before-invalid"),
     pytest.param("find it", {}, set(), 1, "invalid", id="no-target"),
-    pytest.param("near desk", {"targets": [{"name": "desk", "terminal": False}]},
+    pytest.param("near desk", {"targets": [{"name": "desk", "terminal": False, "demand": None}]},
                  set(), 1, "invalid", id="anchor-only"),
-    pytest.param("find cup", {"targets": [{"name": "cup"}]}, set(), 0,
+    pytest.param("find cup", {"targets": [{"name": "cup", "demand": None}]}, set(), 0,
                  "invalid", id="invalid-revision"),
     pytest.param("find surface", {"targets": [{"name": "surface", "demand": {
         "activity": "", "required_resource": "surface"}}]}, {"affordance"}, 1,
         "invalid", id="invalid-demand"),
-    pytest.param("avoid bedroom", {"targets": [{"name": "cup"}], "constraints": [{
+    pytest.param("avoid bedroom", {"targets": [{"name": "cup", "demand": None}], "constraints": [{
         "type": "avoid_room", "value": "bedroom", "hardness": "hard"}]}, {"relation"}, 1,
         "unsupported", id="unsupported-hard-constraint"),
     pytest.param("find surface", {"targets": [{"name": "surface", "demand": {
         "activity": "write", "required_resource": "surface"}}]}, set(), 1,
         "unsupported", id="unsupported-demand"),
-    pytest.param("find cup", {"targets": [{"name": "cup"}], "constraints": [{
+    pytest.param("find cup", {"targets": [{"name": "cup", "demand": None}], "constraints": [{
         "type": "room", "value": "study", "hardness": "soft"}]}, set(), 1, "success", id="soft-constraint"),
 ])
 def test_parsed_compiler_uses_initial_gates_without_reparsing(
@@ -997,7 +1013,7 @@ def test_initial_correction_rejects_nonterminal_resource_without_repairing_outpu
 
 
 @pytest.mark.parametrize("raw,payload", [
-    ("Find a chair.", {"targets": [{"name": "chair"}]}),
+    ("Find a chair.", {"targets": [{"name": "chair", "demand": None}]}),
     ("Find a place to wash socks.", {"targets": [{"name": "washing resource", "demand": {
         "activity": "wash socks", "manipulated_objects": ["socks"],
         "required_resource": "washing resource", "destination_hypotheses": ["basin"]}}]}),
@@ -1025,11 +1041,14 @@ def test_initial_valid_interpretation_compiles_in_one_call(tmp_path, raw, payloa
     assert events[-1]["task"] == result.task.as_dict()
 
 
-def test_initial_relation_schema_precedes_unary_properties():
-    from prompting.schemas import ParsedInstruction
+def test_initial_schema_resolves_meaning_before_entities_and_relations():
+    from prompting.schemas import ParsedInstruction, ParsedTarget
 
     properties = list(ParsedInstruction.model_json_schema()["properties"])
-    assert properties.index("constraints") < properties.index("targets")
+    assert properties[0] == "instruction_reading"
+    assert properties.index("targets") < properties.index("constraints")
+    target_properties = list(ParsedTarget.model_json_schema()["properties"])
+    assert target_properties.index("demand") < target_properties.index("name") < target_properties.index("attributes")
 
 
 @pytest.mark.parametrize("field", ["subject", "object"])
@@ -1039,8 +1058,8 @@ def test_initial_correction_gets_endpoint_error_and_preserves_requirements(tmp_p
 
     raw = "Find the red cup, near the desk."
     corrected = {
-        "targets": [{"id": "a", "name": "cup", "attributes": {"color": "red"}},
-                    {"id": "b", "name": "desk", "terminal": False}],
+        "targets": [{"id": "a", "name": "cup", "attributes": {"color": "red"}, "demand": None},
+                    {"id": "b", "name": "desk", "terminal": False, "demand": None}],
         "constraints": [{"id": "r", "type": "spatial", "subject": "a", "relation": "near",
                          "object": "b", "hardness": "hard"}],
     }
@@ -1063,7 +1082,7 @@ def test_initial_correction_gets_endpoint_error_and_preserves_requirements(tmp_p
 
 
 @pytest.mark.parametrize("initial", [
-    {}, None, {"targets": [{"name": "socks", "terminal": False}]},
+    {}, None, {"targets": [{"name": "socks", "terminal": False, "demand": None}]},
 ])
 @pytest.mark.parametrize("budget", [2, 20])
 def test_initial_invalid_interpretation_recovers_once(tmp_path, initial, budget):
@@ -1100,9 +1119,9 @@ def test_initial_invalid_interpretation_recovers_once(tmp_path, initial, budget)
 
 
 @pytest.mark.parametrize("initial,status,diagnostics", [
-    ({"targets": [{"name": "chair"}], "unresolved": ["which chair?", "which room?"]},
+    ({"targets": [{"name": "chair", "demand": None}], "unresolved": ["which chair?", "which room?"]},
      "ambiguous", ("which chair?", "which room?")),
-    ({"targets": [{"name": "chair"}], "constraints": [{
+    ({"targets": [{"name": "chair", "demand": None}], "constraints": [{
         "type": "avoid_room", "value": "bedroom", "hardness": "hard"}]},
      "unsupported", ("c0:avoid room",)),
 ])
@@ -1121,7 +1140,7 @@ def test_initial_ambiguous_or_unsupported_returns_original_diagnostics(tmp_path,
 ])
 def test_initial_recovery_shares_a_strict_budget(tmp_path, budget, expected_calls, stage):
     compiler, requests = _initial_compiler_replay(tmp_path,
-        [{}, {"targets": [{"name": "chair"}]}], budget=budget)
+        [{}, {"targets": [{"name": "chair", "demand": None}]}], budget=budget)
     result = compiler.compile("Find a chair.", set())
     assert result.status == "budget_exhausted" and result.task is None
     assert result.diagnostics == (stage,)
@@ -1131,9 +1150,9 @@ def test_initial_recovery_shares_a_strict_budget(tmp_path, budget, expected_call
 @pytest.mark.parametrize("corrected,status", [
     pytest.param({}, "invalid", id="empty-targets"),
     pytest.param(None, "invalid", id="empty-response"),
-    pytest.param({"targets": [{"name": "chair", "terminal": False}]}, "invalid", id="no-destination"),
+    pytest.param({"targets": [{"name": "chair", "terminal": False, "demand": None}]}, "invalid", id="no-destination"),
     pytest.param({"unresolved": ["which one?"]}, "ambiguous", id="unresolved"),
-    pytest.param({"targets": [{"name": "chair"}], "constraints": [{
+    pytest.param({"targets": [{"name": "chair", "demand": None}], "constraints": [{
         "type": "avoid_room", "value": "bedroom", "hardness": "hard"}]}, "unsupported", id="unsupported"),
     pytest.param("malformed", "invalid", id="malformed-response"),
 ])
@@ -1152,8 +1171,10 @@ def test_initial_recovery_never_retries_an_invalid_correction(tmp_path, correcte
 
 
 def test_initial_recovery_preserves_complete_explicit_requirements(tmp_path):
-    corrected = {"targets": [{"name": "cup", "aliases": ["mug"], "min_count": 2, "attributes": {"color": "red"}},
-                             {"name": "table", "terminal": False}, {"name": "chair"}],
+    corrected = {"targets": [{"name": "cup", "aliases": ["mug"], "min_count": 2,
+                              "attributes": {"color": "red"}, "demand": None},
+                             {"name": "table", "terminal": False, "demand": None},
+                             {"name": "chair", "demand": None}],
                  "constraints": [{"type": "spatial", "subject": "cup", "relation": "on",
                                   "object": "table", "hardness": "hard"}],
                  "ordered": True, "exhaustive": True, "eval_mode": "all_targets_success"}
@@ -1203,7 +1224,7 @@ def test_parsed_all_targets_mode_cannot_complete_after_one_target():
     from verification.contracts import CandidateInstance, VerificationResult
 
     result = compile_parsed_instruction("Find both a cup and a chair.", ParsedInstruction(
-        eval_mode="all_targets_success", targets=[{"name": "cup"}, {"name": "chair"}]), set())
+        eval_mode="all_targets_success", targets=[{"name": "cup", "demand": None}, {"name": "chair", "demand": None}]), set())
     task = result.task
     assert not task.ordered and not task.exhaustive
     state = TaskProgress(task)
@@ -1216,9 +1237,9 @@ def test_parsed_all_targets_mode_cannot_complete_after_one_target():
 
 
 @pytest.mark.parametrize("invalid", [
-    {"targets": [{"name": "chair"}, {"name": ""}]},
-    {"targets": [{"name": "chair"}], "constraints": [{"type": "", "value": "avoid bedroom", "hardness": "hard"}]},
-    {"targets": [{"name": "chair", "min_count": 0}]},
+    {"targets": [{"name": "chair", "demand": None}, {"name": "", "demand": None}]},
+    {"targets": [{"name": "chair", "demand": None}], "constraints": [{"type": "", "value": "avoid bedroom", "hardness": "hard"}]},
+    {"targets": [{"name": "chair", "min_count": 0, "demand": None}]},
 ])
 def test_initial_lossy_structures_require_recovery(tmp_path, invalid):
     compiler, requests = _initial_compiler_replay(tmp_path, [invalid, invalid])
@@ -1235,7 +1256,8 @@ def test_initial_grounding_cannot_make_unbudgeted_calls(monkeypatch, tmp_path, s
     provider = Mock(side_effect=AssertionError("unbudgeted grounding call"))
     monkeypatch.setattr(detector_adapter, "get_client_and_model", provider)
     monkeypatch.setenv("LLM_OFFLINE", "0")
-    payload = {"targets": [{"name": "armchair"}, {"name": "work desk", "terminal": False}], "constraints": [{
+    payload = {"targets": [{"name": "armchair", "demand": None},
+                           {"name": "work desk", "terminal": False, "demand": None}], "constraints": [{
         "type": "spatial", "subject": "armchair", "relation": "near", "object": "work desk", "hardness": "hard"}]}
     compiler, requests = _initial_compiler_replay(tmp_path, [payload], budget=1)
     plan = compile_instruction_plan("Find the armchair near the work desk.", initial_compiler=compiler,
@@ -1252,7 +1274,7 @@ def test_initial_recovery_uses_malformed_response_diagnostics(tmp_path):
 
     error = StructuredOutputError("truncated JSON", raw_content='{"targets": [')
     compiler, requests = _initial_compiler_replay(tmp_path, [error, {
-        "targets": [{"name": "chair"}],
+        "targets": [{"name": "chair", "demand": None}],
     }])
     result = compiler.compile("Find a chair.", set())
     assert result.status == "success" and compiler.model_calls == len(requests) == 2
@@ -1276,7 +1298,7 @@ def test_initial_single_parse_installs_session_without_accepting_candidates(monk
 
     monkeypatch.setenv("LLM_OFFLINE", "1")
     compiler, requests = _initial_compiler_replay(tmp_path, [{
-        "targets": [{"name": "chair"}],
+        "targets": [{"name": "chair", "demand": None}],
     }], budget=1)
     path = Path(__file__).resolve().parents[1] / "objnav_benchmark_with_process_obs.py"
     node = next(node for node in ast.parse(path.read_text()).body
