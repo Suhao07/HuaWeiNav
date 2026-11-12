@@ -592,7 +592,7 @@ def test_visual_history_is_scoped_to_task_revision():
     assert state.task_revision == 2 and state.pinned_visual_evidence == {}
 
 
-def test_uncertain_exhausted_view_defers_candidate_until_new_observation(monkeypatch):
+def test_uncertain_exhausted_view_stays_deferred_under_new_passive_observation(monkeypatch):
     import sys
     from dataclasses import replace
     from backends.habitat.guided_runtime import GuidedNavigation
@@ -634,15 +634,10 @@ def test_uncertain_exhausted_view_defers_candidate_until_new_observation(monkeyp
     session.snapshot = replace(session.snapshot, metadata={"observation_images": [
         {**frame, "id": "0:31", "position": [1., 0., 0.]}]})
     guided.observation_updated()
-    assert guided.deferred_candidates == set() and state.active and state.exhausted
-    assert guided.action_epoch("obj") == 1
+    # 验证视角预算已耗尽：从新位置被动再见到候选不构成新证据，不得重开。
+    assert guided.deferred_candidates == {"obj"} and state.active and state.exhausted
+    assert guided.action_epoch("obj") == 0
     assert guided.candidate_view_states[(1, "obj")] is state
-    guided.defer_candidate("new view also exhausted")
-    agent.object_final.rgb[0,0] = 0
-    session.snapshot = replace(session.snapshot, metadata={"observation_images": [frame]})
-    guided.observation_updated()
-    assert guided.deferred_candidates == {"obj"}  # Revisiting camera A after B is not a new view.
-    assert guided.action_epoch("obj") == 1
 
 
 def test_viewpoint_query_removes_reached_and_unreachable_motion_goals(monkeypatch):

@@ -514,6 +514,32 @@ def test_retry_requires_new_observed_camera_coverage(monkeypatch, tmp_path, offl
     assert not agent.task.progress.completed
 
 
+@pytest.mark.parametrize("backend", ["core", "habitat", "isaac"])
+def test_exhausted_view_budget_ignores_passive_coverage_until_new_anchor(
+        monkeypatch, tmp_path, offline_replay, backend):
+    from scene.contracts import ObjectNodeSnapshot
+
+    guided, agent, _ = replay_policy(backend, monkeypatch, tmp_path)
+    assert guided.select(0)
+    finished(guided, NavigationStatusCode.REACHED)
+    state = guided.candidate_view_states[(1, "u")]
+    state.start("u", {}, {"observation_identity": {"task_revision": 1}})
+    state.exhausted = True
+    _observed_view(agent.task)
+    guided.defer_candidate("view_options_exhausted")
+    _observed_view(agent.task, position=(1., 0., 0.))
+    guided.observation_updated()
+    assert guided.deferred_candidates == {"u"} and guided.action_epoch("u") == 0
+    _relation_feedback(guided, agent, "missing_anchor")
+    guided.tools.refresh_scene = Mock()
+    guided.refresh_scene = Mock()
+    agent.task.snapshot = replace(agent.task.snapshot, objects=(*agent.task.snapshot.objects,
+        ObjectNodeSnapshot("new-anchor", "table", (2., 0., 0.))))
+    guided.observation_updated()
+    assert guided.deferred_candidates == set() and guided.action_epoch("u") == 1
+    assert not agent.task.progress.completed
+
+
 @pytest.mark.parametrize("status", ["missing_anchor", "rejected_relation", "insufficient_evidence"])
 def test_relation_retry_uses_relevant_anchor_not_target_pixels(monkeypatch, tmp_path, offline_replay, status):
     from scene.contracts import ObjectNodeSnapshot

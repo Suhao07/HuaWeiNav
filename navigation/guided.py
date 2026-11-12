@@ -102,6 +102,19 @@ class GuidedPolicy:
         return anchors
 
     def observation_context(self, uid):
+        """Return the evidence tokens whose growth can change this candidate's verdict.
+
+        Args:
+            uid: Observed instance under the current task revision.
+
+        Returns:
+            Set of hashable tokens: ``(predicate_id, anchor_uid)`` for every
+            observed anchor of an unresolved relation, plus ``("view", ...)``
+            entries for each distinct camera pose that covered the candidate.
+            视角预算耗尽后不再产生 view token：验证器已从候选自身视点取证到
+            上限，探索途中被动路过的再次观测不构成新证据；此后只有新参照物
+            或任务版本变化才能重开该候选。
+        """
         session = self.tools.session
         pending = self.unresolved_relations(uid)
         tokens = set()
@@ -110,6 +123,9 @@ class GuidedPolicy:
             anchors = self.relation_anchor_uids(uid, row)
             tokens.update((row["predicate_id"], anchor) for anchor in anchors)
             groups.extend((uid, anchor) for anchor in anchors)
+        state = self.candidate_view_states.get((self.revision, uid))
+        if state is not None and state.budget_exhausted():
+            return tokens
         for group in groups:
             views = self.observed_views.setdefault((self.revision, *group), [])
             for image in session.snapshot.metadata.get("observation_images", []):
