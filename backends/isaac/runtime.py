@@ -339,20 +339,53 @@ class IsaacNavigationTools(NavigationTools):
         self.exploration_map.begin_observation()
         self.exploration_map.add(packet)
         self.exploration_map.finish_observation()
-        bbox, count, support = visible_projection(self.observation_map.points(candidate_uid), depth,
+        from navigation_core.surface_evidence import measure_instance_surface
+
+        image = Image.open(root / frame["rgb_path"]).convert("RGB")
+        masks = self.observation_map.mapper.object_perceiver.sam.segment_current_target(
+            np.asarray(image), obj.label)
+        _, _, support = visible_projection(self.observation_map.points(candidate_uid), depth,
             frame["intrinsics"], frame["camera_to_map"], return_support=True)
+        camera_to_map = np.asarray(frame["camera_to_map"])
+        map_to_camera = np.linalg.inv(camera_to_map)
+        optical = support @ map_to_camera[:3, :3].T + map_to_camera[:3, 3]
+        intrinsic = np.asarray(frame["intrinsics"], dtype=float)
+        pixels = optical @ intrinsic.T
+        projected = np.column_stack((np.rint(pixels[:, :2] / pixels[:, 2:3]), optical[:, 2]))
+        surface_intrinsic = intrinsic.copy()
+        # 共享反投影使用 cy-1；光学坐标转换后保持 Isaac 原始像素中心。
+        surface_intrinsic[1, 2] += 1
+        surface, instance_mask, indices = measure_instance_surface(projected, depth, masks,
+            surface_intrinsic, camera_to_map[:3, :3] @ np.diag([1., -1., -1.]),
+            camera_to_map[:3, 3], np.asarray(packet["pose"]["position"]),
+            depth_tolerance=0.15, min_support_pixels=10)
+        support = support[indices]
+        count = len(support)
+        bbox = None
+        if surface["surface_match"]:
+            x1, y1, x2, y2 = surface["bbox_xyxy"]
+            bbox = [x1, y1, x2 + 1, y2 + 1]
         quality = None if bbox is None else score_points_view(object_points=support, original_bbox=bbox,
             camera_intrinsic=np.asarray(frame["intrinsics"]), camera_to_map=np.asarray(frame["camera_to_map"]),
             success_distance=2.0, image_width=depth.shape[1], image_height=depth.shape[0])
         robot_xy = np.asarray(packet["pose"]["position"][:2])
         distance = (float(np.linalg.norm(np.asarray(obj.position)[:2] - robot_xy))
                     if bbox is not None else None)
-        surface_distance = (float(np.linalg.norm(support[:, :2] - robot_xy, axis=1).min())
-                            if bbox is not None else None)
+        surface_distance = surface["distance_to_object"]
         observation_identity = {"candidate_uid": candidate_uid,
             "task_revision": self.session.spec.revision, "observation_id": str(frame["frame_id"])}
+        directory = self.output / "verification"
+        directory.mkdir(exist_ok=True)
+        surface_path = directory / f"{frame['frame_id']:06d}-surface.npz"
+        np.savez_compressed(surface_path, observation_identity=json.dumps(observation_identity),
+            rgb=np.asarray(image), depth_m=depth, instance_masks=masks, selected_mask=instance_mask,
+            projected_uv_depth=projected, matched_projection_indices=indices,
+            camera_intrinsic=surface_intrinsic, camera_to_map=camera_to_map,
+            base_position=np.asarray(packet["pose"]["position"]))
         evidence = {"observation_status": "current" if bbox is not None else "need_observation",
             "observation_identity": observation_identity,
+            "instance_surface": {**surface, "observation_identity": observation_identity,
+                                 "evidence_path": str(surface_path)},
             "geometry": {"visible_projected_points": count,
                 "projection_failed_in_final_view": bbox is None,
                 "distance_to_object": distance, "distance_source": "observed_instance_position_xy",
@@ -375,12 +408,16 @@ class IsaacNavigationTools(NavigationTools):
                       "panorama_views": 1, "captured_frames": 1, "perception_frames": 0})
         with (self.output / "scene_snapshots.jsonl").open("a") as stream:
             stream.write(json.dumps(asdict(self.session.snapshot), allow_nan=False) + "\n")
-        directory = self.output / "verification"
-        directory.mkdir(exist_ok=True)
         if bbox is not None:
-            image = Image.open(root / frame["rgb_path"]).convert("RGB")
+            import cv2
+
             crop_path = directory / f"{frame['frame_id']:06d}-crop.png"
             overlay_path = directory / f"{frame['frame_id']:06d}-overlay.png"
+            overlay = np.array(image)
+            contours, _ = cv2.findContours(instance_mask.astype(np.uint8), cv2.RETR_EXTERNAL,
+                                           cv2.CHAIN_APPROX_SIMPLE)
+            cv2.drawContours(overlay, contours, -1, (0, 255, 255), 2)
+            image = Image.fromarray(overlay)
             image.crop(bbox).save(crop_path)
             ImageDraw.Draw(image).rectangle(bbox, outline="red", width=3)
             image.save(overlay_path)

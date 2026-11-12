@@ -20,6 +20,7 @@ def test_distance_uses_current_region_and_raw_surface():
     assert result['surface_match']
     assert result['distance_to_object'] >= 2.
     assert indices.tolist() == [0, 1, 2]
+    np.testing.assert_allclose(result['visible_support_span_map_xyz_m'], [.2, 0., .2])
     # A predicted point in front of the surface cannot supply a near distance.
     args[0][:3, 2] = .8
     result, _, indices = measure_instance_surface(*args)
@@ -39,6 +40,31 @@ def test_occluded_single_and_ambiguous_support_require_observation():
     args[2][1] = False
     args[2][1, 5:9, 5:9] = True
     assert measure_instance_surface(*args)[0]['surface_status'] == 'ambiguous_instance'
+
+
+def test_combined_mask_preserves_competing_current_instance_support():
+    args = list(sample())
+    args[0] = np.array([[2, 2, 2.], [3, 2, 2.], [2, 3, 2.],
+                        [6, 6, 2.], [7, 6, 2.], [6, 7, 2.]])
+    left = args[2][0].copy()
+    right = np.zeros_like(left)
+    right[5:9, 5:9] = True
+    combined = left | right
+    # 单个实例的遮挡碎片和重复检测不构成两个独立身份假设。
+    args[2] = np.stack([combined, combined, left])
+    assert measure_instance_surface(*args)[0]['surface_match']
+    args[2] = np.stack([combined, left, right])
+    result, region, indices = measure_instance_surface(*args)
+    assert result['surface_status'] == 'ambiguous_instance'
+    assert not result['surface_match'] and result['distance_to_object'] is None
+    assert not region.any() and not len(indices)
+    assert result['competing_mask_support'] == {
+        'combined_mask_id': 0, 'combined_support_count': 6,
+        'alternative_mask_ids': [1, 2], 'alternative_support_counts': [3, 3]}
+    # 另一检测必须有足够的当前深度支撑，单像素误匹配不足以建立竞争。
+    args[2][2] = False
+    args[2][2, 6, 6] = True
+    assert measure_instance_surface(*args)[0]['surface_match']
 
 
 def test_mapper_preprocessing_preserves_sensor_depth_and_mapping_values():

@@ -503,6 +503,18 @@ def _episode_replay(monkeypatch, output, *, initial_calls=1, parse=None, spec=No
                            sessions=sessions, agents=agents, parse_calls=parse_calls)
 
 
+def _sam(*boxes):
+    """Authored current-frame instance regions for the replayed geometry, one mask per [u1, v1, u2, v2)."""
+
+    def segment(image, label):
+        masks = np.zeros((len(boxes), image.shape[0], image.shape[1]), dtype=bool)
+        for index, (u1, v1, u2, v2) in enumerate(boxes):
+            masks[index, v1:v2, u1:u2] = True
+        return masks
+
+    return SimpleNamespace(sam=SimpleNamespace(segment_current_target=Mock(side_effect=segment)))
+
+
 def _surface_map():
     points, _, _, _ = projection_fixture()
     surfaces = {"candidate": points, "anchor": points + [2., 0., 0.],
@@ -512,6 +524,7 @@ def _surface_map():
     return SimpleNamespace(objects=lambda: objects, points=Mock(side_effect=surfaces.__getitem__),
         mapper=SimpleNamespace(initial_position=np.array([0., 0., 1.5]), current_obj_indices=[],
             objects=[SimpleNamespace(uid=obj.uid, tag=obj.label) for obj in objects],
+            object_perceiver=_sam((2, 3, 7, 7)),
             _is_target_tag=Mock(side_effect=lambda tag: tag == "chair")),
         add_panorama=Mock(side_effect=AssertionError("unexpected detector call")))
 

@@ -18,7 +18,7 @@ from scene.contracts import ObjectNodeSnapshot, Pose3D, ViewpointSnapshot
 from verification.contracts import VerificationResult
 
 from test_isaac_runtime import (FakeClient, FakeExplorationMap, FrameClient, _agent,
-                                _episode_replay, _frame_packet, _session, _surface_map,
+                                _episode_replay, _frame_packet, _sam, _session, _surface_map,
                                 _tools, offline_only, projection_fixture)
 
 
@@ -424,7 +424,8 @@ def test_surface_distance_is_depth_filtered_diagnostic_not_stop_reference(monkey
     obj = ObjectNodeSnapshot("obj", "chair", (.01, .01, 1.5))
     session = _session()
     session.snapshot = replace(session.snapshot, objects=(obj,))
-    observation_map = SimpleNamespace(points=Mock(return_value=all_points))
+    observation_map = SimpleNamespace(points=Mock(return_value=all_points),
+        mapper=SimpleNamespace(object_perceiver=_sam((2, 3, 7, 7))))
     tools = _tools(session, FrameClient([packet]), tmp_path, observation_map)
     score = Mock(wraps=score_points_view)
     monkeypatch.setattr(runtime, "score_points_view", score)
@@ -466,15 +467,17 @@ def test_large_cloud_cannot_finish_at_near_edge_before_observed_center_radius(tm
     session = _session()
     session.snapshot = replace(session.snapshot, objects=(neighbour, obj))
     front_x = 1. if robot_x == 0. else 7.
-    packet = _frame_packet(tmp_path, 73, np.full((20, 20), front_x - robot_x if visible else 0.))
+    packet = _frame_packet(tmp_path, 73, np.full((40, 40), front_x - robot_x if visible else 0.))
     packet["pose"]["position"] = [robot_x, 0., 1.5]
     camera = np.eye(4)
     camera[:3, :3] = optical_rotation_towards(np.zeros(2), np.array([1., 0.]))
     camera[:3, 3] = packet["pose"]["position"]
     packet["frame"]["camera_to_map"] = camera.tolist()
-    packet["frame"]["intrinsics"] = [[10., 0., 10.], [0., 10., 10.], [0., 0., 1.]]
+    # 实例表面按像素栅格取证：焦距需让云团在两种机位下都展开到 >=10 个不同像素。
+    packet["frame"]["intrinsics"] = [[80., 0., 20.], [0., 80., 20.], [0., 0., 1.]]
     observation_map = SimpleNamespace(points=Mock(side_effect=lambda uid: (
-        points if uid == "obj" else near - [5., 0., 0.])))
+        points if uid == "obj" else near - [5., 0., 0.])),
+        mapper=SimpleNamespace(object_perceiver=_sam((4, 4, 37, 37))))
     tools = _tools(session, FrameClient([packet]), tmp_path, observation_map)
     evidence = tools.capture_evidence("obj")
     geometry = evidence["geometry"]
@@ -628,12 +631,13 @@ def _candidate_episode(monkeypatch, tmp_path):
     original_points = observation_map.points.side_effect
 
     def points(uid):
-        surface = original_points(uid).copy()
         if uid == "candidate":
-            surface[:, :2] *= .25  # Fresh visible support is within the required XY stop radius.
-        return surface
+            # 新鲜可见支撑在所需 XY 停止半径内，并展开到至少 10 个不同像素。
+            return np.array([[x, y, 1.] for y in range(5) for x in range(3)])
+        return original_points(uid).copy()
 
     replay.observation_map.points = Mock(side_effect=points)
+    replay.observation_map.mapper.object_perceiver = _sam((0, 0, 3, 5))
     replay.exploration.viewpoints = (ViewpointSnapshot("view", Pose3D((1., 0., 1.5)),
                                                         visible_objects=("candidate",)),)
     monkeypatch.setattr(runtime.IsaacNavigationTools, "query_scene", lambda tools: {

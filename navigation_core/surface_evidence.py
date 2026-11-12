@@ -44,7 +44,9 @@ def measure_instance_surface(projected_uv_depth, depth_m, masks, intrinsic,
         if count >= min_support_pixels:
             matches.append((count, mask_id, mask, indices))
     matches.sort(key=lambda item: item[0], reverse=True)
-    matched = bool(matches) and matches[0][0] > len(surface_pixels) / 2
+    majority = [item for item in matches if item[0] > len(surface_pixels) / 2]
+    matched = bool(majority) and all(np.array_equal(item[2], majority[0][2])
+                                      for item in majority[1:])
     facts = {
         'surface_match': False,
         'surface_status': 'ambiguous_instance' if matches else 'insufficient_surface_support',
@@ -58,6 +60,22 @@ def measure_instance_surface(projected_uv_depth, depth_m, masks, intrinsic,
     if not matched:
         return facts, np.zeros_like(depth_m, dtype=bool), np.empty(0, dtype=int)
     count, mask_id, mask, indices = matches[0]
+    pixels = np.unique(uv[indices], axis=0)
+    alternatives = [(other_id, other_mask[pixels[:, 1], pixels[:, 0]])
+                    for _, other_id, other_mask, _ in matches if other_id != mask_id]
+    # 独立检测的互斥支撑若合计占多数，组合 mask 的归属仍有歧义；不推断物体是否物理相连。
+    for index, (left_id, left) in enumerate(alternatives):
+        if left.sum() < min_support_pixels:
+            continue
+        for right_id, right in alternatives[index + 1:]:
+            if (right.sum() >= min_support_pixels and not np.any(left & right)
+                    and np.count_nonzero(left | right) > count / 2):
+                facts['competing_mask_support'] = {
+                    'combined_mask_id': int(mask_id), 'combined_support_count': count,
+                    'alternative_mask_ids': [int(left_id), int(right_id)],
+                    'alternative_support_counts': [int(left.sum()), int(right.sum())],
+                }
+                return facts, np.zeros_like(depth_m, dtype=bool), np.empty(0, dtype=int)
     # 距离取主要连续区域的实测支撑，排除分割碎片中的孤立近点。
     _, components = cv2.connectedComponents(np.asarray(mask, dtype=np.uint8))
     labels = components[uv[indices, 1], uv[indices, 0]]
@@ -77,5 +95,6 @@ def measure_instance_surface(projected_uv_depth, depth_m, masks, intrinsic,
     y, x = np.nonzero(region)
     facts.update(surface_match=True, surface_status='matched', mask_id=int(mask_id),
                  support_count=len(pixels), bbox_xyxy=[int(x.min()), int(y.min()), int(x.max()), int(y.max())],
+                 visible_support_span_map_xyz_m=np.ptp(world, axis=0).tolist(),
                  distance_to_object=float(np.linalg.norm(world[:, :2]-base_position[:2], axis=1).min()))
     return facts, region, indices
