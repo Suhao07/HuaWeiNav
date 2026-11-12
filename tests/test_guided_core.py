@@ -699,6 +699,46 @@ def test_empty_relation_recovery_reselects_other_candidates(monkeypatch, tmp_pat
     assert not agent.task.progress.completed
 
 
+@pytest.mark.parametrize("decision", ["interpretation_conflict", "reject_candidate"])
+@pytest.mark.parametrize("outcome", ["revised", "unresolved", "locked", "budget"])
+def test_verification_review_uses_decision_not_rephotographing(monkeypatch, tmp_path, offline_replay, outcome, decision):
+    guided, agent, _ = replay_policy("core", monkeypatch, tmp_path)
+    guided.select(0)
+    finished(guided, NavigationStatusCode.REACHED)
+    guided.capture_verification = Mock(return_value=GuidedVerification(
+        "u", "target", "goal", decision, False))
+    guided.view_state.start("u", {"improve_goals": ["old view objective"]}, {})
+    guided.continue_view_control = Mock()
+    guided.feedback_views = Mock()
+    guided.exploration_options = Mock()
+    agent.task.interpretation_locked = outcome == "locked"
+    if outcome == "budget":
+        guided.runtime.model_calls = guided.runtime.max_model_calls
+    elif outcome == "revised":
+        guided.runtime.choose_recovery.side_effect = lambda *args: setattr(
+            agent.task, "spec", replace(agent.task.spec, revision=2))
+    state = guided.verify((1., 0., 0.))
+    if decision == "reject_candidate" and outcome == "locked":
+        assert state == "select"
+    else:
+        assert state == "recovery"
+        assert not guided.view_state.active and not guided.deferred_candidates
+        state = guided.recover(guided.recovery_context)
+        expected = {"revised": "select", "unresolved": "interpretation_conflict",
+                    "locked": "interpretation_conflict", "budget": "decision_budget_exhausted"}[outcome]
+        assert state == ("select" if decision == "reject_candidate" and outcome == "unresolved" else expected)
+    retained = decision == "reject_candidate" and outcome in {"unresolved", "locked"}
+    assert guided.deferred_candidates == ({"u"} if retained else set())
+    if outcome in {"locked", "budget"}:
+        guided.runtime.choose_recovery.assert_not_called()
+    else:
+        guided.runtime.choose_recovery.assert_called_once_with([], guided.recovery_context)
+    guided.continue_view_control.assert_not_called()
+    guided.feedback_views.assert_not_called()
+    guided.exploration_options.assert_not_called()
+    assert guided.tools.motion.active_request_id is None and not agent.task.progress.completed
+
+
 @pytest.mark.parametrize("backend", ["habitat", "isaac"])
 def test_refresh_before_terminal_record_cannot_repeat_zero_travel_candidates(
         monkeypatch, tmp_path, offline_replay, backend):
@@ -797,6 +837,18 @@ def test_loop_blocked_recovers_without_observation_or_verification():
     guided.verify.assert_not_called()
     execution.frontier_arrived.assert_not_called()
     execution.finish_success.assert_not_called()
+
+
+def test_loop_unresolved_interpretation_is_terminal_without_success():
+    guided, execution, controller, _ = loop_fixture()
+    guided.verify.return_value = "recovery"
+    guided.recover.return_value = "interpretation_conflict"
+    guided.recovery_context = {"reason": "interpretation_conflict", "candidate_uid": "u"}
+    assert run_guided_loop(guided, execution) == "interpretation_conflict"
+    guided.recover.assert_called_once_with(guided.recovery_context, 42)
+    guided.select.assert_not_called()
+    execution.finish_success.assert_not_called()
+    controller.cancel.assert_not_called()
 
 
 @pytest.mark.parametrize("code", [NavigationStatusCode.REACHED, NavigationStatusCode.RUNNING])

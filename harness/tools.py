@@ -194,6 +194,7 @@ class NavigationTools:
             **object_dependencies(source_snapshot, candidate_uid),
         }
         evidence["target_id"] = target.id
+        evidence["interpretation_locked"] = self.session.interpretation_locked
         candidate = candidate_from_object(obj, canonical_label=target.name)
         result = self.verifier.verify(
             raw_instruction=self.session.spec.raw_instruction,

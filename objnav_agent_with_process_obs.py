@@ -922,6 +922,7 @@ class HM3D_Objnav_Agent:
         from backends.habitat.scene import current_observation
 
         evidence = dict(evidence or {})
+        evidence["interpretation_locked"] = self.task.interpretation_locked
         evidence["observation_images"] = [current_observation(self)]
         if self.view_control_state.active and self.view_control_state.candidate_uid == candidate.uid:
             context = self.view_control_state.as_context()

@@ -82,7 +82,7 @@ def model_calls(calls):
     return (client, "replay-model"), requests
 
 
-@pytest.mark.parametrize("mode", ["frontier", "recovery"])
+@pytest.mark.parametrize("mode", ["frontier", "recovery", "empty_recovery"])
 @pytest.mark.parametrize("failure_kind", ["length", "schema"])
 @pytest.mark.parametrize("budget,recover", [(1, True), (2, True), (2, False)])
 def test_guided_format_retry_charges_each_request(monkeypatch, tmp_path, mode, failure_kind, budget, recover):
@@ -96,7 +96,10 @@ def test_guided_format_retry_charges_each_request(monkeypatch, tmp_path, mode, f
     monkeypatch.setenv("STRIVE_LVLM_TRACE_DIR", str(trace_dir))
     reset_counts()
     requests = []
-    valid = {**decision_payload(mode), "search_updates": [], "interpretation_update": None}
+    valid = {**decision_payload("recovery" if mode == "empty_recovery" else mode),
+             "search_updates": [], "interpretation_update": None}
+    if mode == "empty_recovery":
+        valid["action_uid"] = None
     uid_key = "frontier_uid" if mode == "frontier" else "action_uid"
     invalid = ('{"reason":"' + "Repeat this explanation. " * 100 if failure_kind == "length"
                else json.dumps({**valid, uid_key: "option:unlisted"}))
@@ -116,13 +119,17 @@ def test_guided_format_retry_charges_each_request(monkeypatch, tmp_path, mode, f
     runtime = AgentRuntime(tools, tmp_path / "events.jsonl", max_model_calls=budget,
                            client_model=(client, "fixture"))
 
+    def choose():
+        return (runtime.choose_recovery([], {"reason": "rejected_candidate_review"})
+                if mode == "empty_recovery" else decision_call(runtime, mode))
+
     if budget == 2 and recover:
-        selected = decision_call(runtime, mode)
-        assert selected == valid[uid_key]
+        selected = choose()
+        assert selected == valid.get("frontier_uid", valid.get("action_uid"))
         assert runtime.history[-1]["call_index"] == 2
     else:
         with pytest.raises(ValueError):
-            decision_call(runtime, mode)
+            choose()
         assert runtime.history == []
     assert runtime.model_calls == len(requests) == budget
     assert counts()["calls"] == counts()["responses"] == {"navigation_agent": budget}
@@ -134,10 +141,26 @@ def test_guided_format_retry_charges_each_request(monkeypatch, tmp_path, mode, f
         assert requests[1]["messages"][:-1] == requests[0]["messages"]
         assert invalid not in json.dumps(requests[1]["messages"])
     with pytest.raises(RuntimeError, match="budget"):
-        decision_call(runtime, mode)
+        choose()
     assert len(requests) == budget
     assert tools.motion.controller.sent == [] and not tools.session.progress.completed
     reset_counts()
+
+
+@pytest.mark.parametrize("interpretation_locked", [False, True])
+def test_verification_uses_task_owner_interpretation_authority(monkeypatch, interpretation_locked):
+    tools = make_tools(monkeypatch, interpretation_locked=interpretation_locked)
+    captured = []
+    verifier = tools.verifier
+
+    def verify(**kwargs):
+        captured.append(kwargs["evidence"])
+        return verifier.verify(**kwargs)
+
+    tools.verifier = SimpleNamespace(verify=verify)
+    tools.evidence_provider = lambda uid: {"arrival_frame": "frame-1", "interpretation_locked": not interpretation_locked}
+    tools.verify_target("cup-1", "cup", 1)
+    assert captured[0]["interpretation_locked"] is interpretation_locked
 
 
 @pytest.mark.parametrize("initial_calls", [0, 2])
@@ -1512,6 +1535,46 @@ def test_interpretation_corrects_material_goal_and_archives_revision(
         decision_call(runtime, mode)
 
 
+@pytest.mark.parametrize("decision", ["interpretation_conflict", "reject_candidate"])
+@pytest.mark.parametrize("revise", [False, True])
+def test_interpretation_recovery_without_motion_options(interpretation_tools, tmp_path, revise, decision):
+    from pydantic import ValidationError
+
+    tools = interpretation_tools
+    session = tools.session
+    conflict = VerificationResult(False, decision, target_uid="cup-1",
+        task_revision=1, reason="candidate_identity: cup is material in 'dry my wet cup'.")
+    session.verification_ledger.put(session.spec.raw_instruction, "cup-1", conflict)
+    payload = interpretation_payload("recovery", basis_ids=["instruction", "verification:0"])
+    payload["action_uid"] = None
+    if not revise:
+        payload["interpretation_update"] = None
+
+    def decision(request):
+        schema = request["response_format"]
+        assert schema.model_json_schema()["properties"]["action_uid"]["type"] == "null"
+        with pytest.raises(ValidationError):
+            schema(**{**payload, "action_uid": "invented-motion"})
+        context = request_context(request)
+        assert context["options"] == []
+        record = context["observation"]["search_context"]["basis"]["verification:0"]["record"]
+        assert record["decision"] == conflict.decision and record["reason"] == conflict.reason
+        return payload
+
+    client_model, requests = model_calls([decision])
+    runtime = AgentRuntime(tools, tmp_path / "conflict-recovery.jsonl", max_model_calls=1,
+                           client_model=client_model)
+    reason = "interpretation_conflict" if conflict.decision == "interpretation_conflict" else "rejected_candidate_review"
+    assert runtime.choose_recovery([], {"reason": reason}) is None
+    assert runtime._choice_context is None
+    assert session.spec.revision == (2 if revise else 1)
+    assert len(session.interpretation_history) == int(revise)
+    assert len(requests) == runtime.model_calls == 1
+    assert tools.motion.controller.sent == [] and not session.progress.completed
+    with pytest.raises(RuntimeError, match="budget"):
+        runtime.choose_recovery([], {"reason": "interpretation_conflict"})
+
+
 def test_complete_interpretation_installs_with_one_decision_call(interpretation_tools, tmp_path):
     tools = interpretation_tools
     payload = interpretation_payload("step")
@@ -1919,6 +1982,7 @@ def test_final_builder_persists_current_covisible_frame_before_attach(habitat_ev
     override = {"observation_images": previous,
                 "geometry": {"distance_to_object": 2., "required_stop_distance": 1.}}
     attached = agent._attach_view_control_context(override, candidate)
+    assert attached["interpretation_locked"] is agent.task.interpretation_locked
     assert attached["observation_images"] == [frame]
     assert not attached["hard_stop_constraints"]["satisfied"]
     assert override["observation_images"] == previous

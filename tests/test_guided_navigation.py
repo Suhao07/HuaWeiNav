@@ -312,9 +312,9 @@ def test_candidate_discovery_does_not_postpone_search_review(monkeypatch):
     (100, 5, False, "uncertain", "select"),
     (100, 0, True, "uncertain", "verified_finish"),
     (100, 0, False, "need_better_view", "recovery"),
-    (99, 0, False, "reject_candidate", "select"),
-    (100, 0, False, "reject_candidate", "select"),
-    (100, 5, False, "reject_candidate", "select"),
+    (99, 0, False, "reject_candidate", "recovery"),
+    (100, 0, False, "reject_candidate", "recovery"),
+    (100, 5, False, "reject_candidate", "recovery"),
 ])
 def test_unverified_candidate_enters_periodic_review_without_authorizing_stop(
         monkeypatch, step, calls, complete, decision, expected):
@@ -323,7 +323,7 @@ def test_unverified_candidate_enters_periodic_review_without_authorizing_stop(
     from instruction_adapter.view_control import ViewControlState
     monkeypatch.setitem(sys.modules, "navigation.goal_approach_controller", NS(
         rotate_toward_object_for_recheck=lambda agent: True, tilt_camera=lambda agent, pitch: True))
-    agent = NS(episode_steps=step, task=NS(spec=NS(revision=1)),
+    agent = NS(episode_steps=step, task=NS(spec=NS(revision=1), interpretation_locked=False),
                selected_candidate=NS(role="primary", target_id="goal"),
                object_final=NS(uid="candidate", position=np.ones(3)),
                mapper=NS(current_position=np.zeros(3), current_rotation=np.eye(3)[:, ::-1]),
@@ -334,6 +334,7 @@ def test_unverified_candidate_enters_periodic_review_without_authorizing_stop(
                _continue_better_view_control=Mock(return_value=False))
     guided = GuidedNavigation.__new__(GuidedNavigation)
     guided.agent, guided.record, guided.defer_candidate = agent, Mock(), Mock()
+    guided.tools = NS(session=agent.task)
     guided.initialize_state(deferred_candidates=set(), review_interval=100)
     guided.search_review_step = 0
     # Pending relation search defers immediately; periodic review covers visual uncertainty.
@@ -341,9 +342,10 @@ def test_unverified_candidate_enters_periodic_review_without_authorizing_stop(
     assert guided.verify((0., 0., 0.)) == expected
     assert guided.runtime.model_calls == calls and guided.search_review_step == 0
     if expected == "recovery":
-        assert guided.recovery_context == {
+        context = {"reason": "rejected_candidate_review", "candidate_uid": "candidate"} if decision == "reject_candidate" else {
             "reason": "prolonged_unverified_candidate", "candidate_uid": "candidate",
             "decision": decision, "relation_outcomes": [], "steps_since_review": 100}
+        assert guided.recovery_context == context
         guided.defer_candidate.assert_not_called()
     elif expected == "select":
         guided.defer_candidate.assert_called_once_with(decision)

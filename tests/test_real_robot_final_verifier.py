@@ -44,8 +44,9 @@ def test_robot_capture_reaches_visual_model_and_keeps_domain_stop_independent(tm
     def parse(**kwargs):
         requests.append(kwargs)
         content = kwargs["messages"][1]["content"]
-        assert kwargs["parse_retries"] == 0
         if kwargs["trace_label"] == "instance_observer":
+            # 观察器授权一次计入预算的格式重生成；终验保持单次判定。
+            assert kwargs["parse_retries"] == 1
             current_id = json.loads(content[0]["text"])["observation_identity"]["observation_id"]
             verdict = kwargs["response_format"](observations={current_id: {
                 "observed_category": "table", "visible_parts": ["flat top", "legs"],
@@ -53,10 +54,13 @@ def test_robot_capture_reaches_visual_model_and_keeps_domain_stop_independent(tm
                 "visible_context": visible_context, "uncertainties": []}})
         else:
             assert kwargs["trace_label"] == "final_instruction_verifier"
-            assert all(item["type"] == "text" for item in content)
-            bound = json.loads(content[1]["text"])["bound_observations"]
+            assert kwargs["parse_retries"] == 0
+            assert any(item["type"] == "image_url" for item in content)
+            bound = next(value["bound_observations"] for item in content if item["type"] == "text"
+                         if "bound_observations" in (value := json.loads(item["text"])))
             current_id = next(uid for uid, record in bound.items() if record["current"])
             verdict = kwargs["response_format"](observed_category="invented desk", observed_structure="Invented drawers.",
+                interpretation_conflicts=[],
                 confidence=1.0, predicate_judgments={"candidate_identity": {
                     "verdict": "true", "reason": "This bound region shows a table.",
                     "supporting_observation_ids": [current_id]}})
@@ -84,20 +88,23 @@ def test_robot_capture_reaches_visual_model_and_keeps_domain_stop_independent(tm
     assert "predicted-label" not in json.dumps(content)
     assert "distance_to_target" not in json.dumps(content)
     final_content = final["messages"][1]["content"]
-    assert all(item["type"] == "text" for item in final_content)
-    bound = json.loads(final_content[1]["text"])["bound_observations"]
-    record = bound[binding["observation_identity"]["observation_id"]]
+    assert [item for item in final_content if item["type"] == "image_url"] == [content[1]]
+    bound = next(value["bound_observations"] for item in final_content if item["type"] == "text"
+                 if "bound_observations" in (value := json.loads(item["text"])))
+    observation_id = binding["observation_identity"]["observation_id"]
+    record = bound[observation_id]
     assert record["observation_identity"] == binding["observation_identity"]
     assert record["images"][0]["bbox_xyxy"] == [1, 2, 3, 4]
     assert record["images"][0]["image_sha256"] == binding["image_sha256"]
-    assert record["facts"] == {
+    assert "facts" not in record and record["current"] is True
+    archived = result["diagnostics"]["bound_observations"][observation_id]
+    assert archived["facts"] == {
         "observed_category": "table", "visible_parts": ["flat top", "legs"],
         "support_and_attachment": "Legs on the floor.", "visible_surface_content": "",
         "visible_context": visible_context, "uncertainties": []}
-    assert record["current"] is True
-    assert result["diagnostics"]["bound_observations"] == bound
-    assert result["observed_category"] == "table"
-    assert result["diagnostics"]["observed_structure"] == "flat top, legs; Legs on the floor."
+    assert {key: value for key, value in archived.items() if key != "facts"} == record
+    assert result["observed_category"] == "invented desk"
+    assert result["diagnostics"]["observed_structure"] == "Invented drawers."
     assert result["satisfied"] is False
     assert result["hard_constraints"]["satisfied"] is False
 

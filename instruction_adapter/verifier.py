@@ -355,7 +355,8 @@ class FinalInstructionVerifier:
         if parsed is None:
             completion = client.beta.chat.completions.parse(
                 model=model, messages=messages, response_format=response_model,
-                trace_label=INSTANCE_OBSERVE.trace_label, temperature=0.0, parse_retries=0)
+                trace_label=INSTANCE_OBSERVE.trace_label, temperature=0.0,
+                max_tokens=256 + 768 * len(bindings) + 256 * int(compare_reference), parse_retries=1)
             parsed = completion.choices[0].message.parsed
             if parsed is None:
                 raise ValueError("Instance observer response has no structured facts")
@@ -395,16 +396,29 @@ class FinalInstructionVerifier:
                    "task": self._visual_task(plan_dict or {}, evidence),
                    "candidate": {"uid": candidate.uid}}
         active = payload["task"].get("active_target", {})
+        # 只有任务所有者明确开放解释修订时，视觉义务才直接取自原文；直接调用仍遵守固定合同。
+        original_instruction = (semantic.get("source") == "language"
+                                and evidence.get("interpretation_locked") is False)
+        payload["verification_basis"] = "original_instruction" if original_instruction else "fixed_task"
+        if original_instruction:
+            scope = {"id": active["id"]}
+            if sum(target.get("terminal", True) for target in semantic["targets"]) > 1:
+                scope["compiled_scope_hint"] = active
+            if "goal_reference_image" in active.get("attributes", {}):
+                scope["attributes"] = {"goal_reference_image": active["attributes"]["goal_reference_image"]}
+            payload["task"]["active_target"] = scope
+            payload["task"]["visual_predicates"] = []
         predicates = [{"id": "candidate_identity", "type": "identity", "subject": active.get("id", ""),
                        "value": "The bound instance meets the original destination requirements, including compiled omissions."}]
         predicates.extend({"id": f"attribute:{active['id']}:{key}", "type": "attribute",
                            "subject": active["id"], "value": {key: value}}
-                          for key, value in active.get("attributes", {}).items())
+                          for key, value in active.get("attributes", {}).items()
+                          if not original_instruction or key == "goal_reference_image")
         predicates.extend(predicate for predicate in payload["task"].get("visual_predicates", [])
                           if predicate.get("hardness", "hard") == "hard")
         payload["verification_predicates"] = predicates
         predicate_ids = [predicate["id"] for predicate in predicates]
-        response_model = visual_verification_response_model(predicate_ids)
+        response_model = visual_verification_response_model(predicate_ids, original_instruction=original_instruction)
         sent_current_ids: set[str] = set()
         sent_candidate_ids: set[str] = set()
         content: list[dict[str, Any]] = [
@@ -425,6 +439,16 @@ class FinalInstructionVerifier:
             image_bindings[id(block)] = {"image_ref": reference, "image_sha256": digest}
             return block
 
+        surface = evidence.get("instance_surface", evidence.get("geometry", {}))
+        depth_support = None
+        if (surface.get("surface_match")
+                and surface.get("observation_identity") == evidence.get("observation_identity")
+                and "visible_support_span_map_xyz_m" in surface):
+            depth_support = {
+                "scope": "partial depth-aligned support within the selected mask",
+                "span_map_xyz_m": surface["visible_support_span_map_xyz_m"],
+                "sample_count": surface["support_count"],
+            }
         for key in ("current_rgb_with_bbox_path", "object_crop_path", "centered_view_path"):
             path = str(evidence.get(key) or "")
             if path in seen_image_paths:
@@ -445,6 +469,7 @@ class FinalInstructionVerifier:
                     "role": "current_candidate_observation", "image_kind": key,
                     "observation_identity": evidence.get("observation_identity", {}),
                     "bbox_xyxy_in_this_image": bbox,
+                    "depth_support": depth_support,
                 }, ensure_ascii=False)})
                 content.append(block)
         from .semantic_edges import relation_view_is_bound
@@ -531,12 +556,18 @@ class FinalInstructionVerifier:
             sent_candidate_ids.clear()
             parsed = response_model(
                 reason="Visual verification requires a current candidate-bound image.",
+                interpretation_conflicts=[],
                 view_objective={"keep_visible_roles": ["candidate"],
                                 "improve_goals": ["obtain a current instance-bound observation"]},
                 predicate_judgments={uid: {
                     "verdict": "unknown", "reason": "No current candidate-bound image was sent.",
                     "supporting_observation_ids": [],
-                } for uid in predicate_ids})
+                } for uid in predicate_ids},
+                **({"instruction_judgments": [{
+                    "instruction_quote": raw_instruction, "requirement": "Original destination requirements.",
+                    "verdict": "unknown", "reason": "No current candidate-bound image was sent.",
+                    "supporting_observation_ids": [],
+                }]} if original_instruction else {}))
         else:
             client, model = get_client_and_model(self.vlm)
             from llm_utils.structured_output import request_fingerprint
@@ -545,9 +576,15 @@ class FinalInstructionVerifier:
             bound_observations, reference_comparison, relations, observation_key = self._observe_instance(
                 content, candidate.uid, revision, image_bindings, client, model, reuse)
             sent_candidate_ids.update(bound_observations)
-            semantic_content = [content[0], {"type": "text", "text": json.dumps({
-                "bound_observations": bound_observations,
-                "reference_comparison": reference_comparison}, ensure_ascii=False)}]
+            semantic_content = [content[0]]
+            for description, image in zip(content[1::2], content[2::2]):
+                if json.loads(description["text"])["role"] == "current_candidate_observation":
+                    semantic_content.extend([description, image])
+            semantic_content.append({"type": "text", "text": json.dumps({
+                "bound_observations": {
+                    uid: {key: value for key, value in record.items() if key != "facts" or not record["current"]}
+                    for uid, record in bound_observations.items()},
+                "reference_comparison": reference_comparison}, ensure_ascii=False)})
             semantic_content.extend({"type": "text", "text": json.dumps(context, ensure_ascii=False)}
                                     for context in relations)
             messages = [{"role": "system", "content": FINAL_VERIFIER_PROMPT},
@@ -570,13 +607,14 @@ class FinalInstructionVerifier:
                 record_cache_hit("final_visual_judgment")
 
         parsed = response_model.model_validate(parsed.model_dump()).model_copy(deep=True)
-        if bound_observations:
-            current_facts = bound_observations[sorted(sent_current_ids)[0]]["facts"]
-            parsed.observed_category = current_facts["observed_category"]
-            parsed.observed_structure = "; ".join(filter(None, [
-                ", ".join(current_facts["visible_parts"]), current_facts["support_and_attachment"],
-                current_facts["visible_surface_content"]]))[:240]
         judgments = parsed.predicate_judgments.model_dump()
+        if original_instruction:
+            for index, item in enumerate(parsed.instruction_judgments):
+                if not item.instruction_quote.strip() or item.instruction_quote not in raw_instruction:
+                    raise ValueError("Visual requirement must quote the original instruction verbatim")
+                if not item.requirement.strip():
+                    raise ValueError("Visual requirement must state its meaning")
+                judgments[f"instruction:{index}"] = item.model_dump()
         if "goal_reference_image" in active.get("attributes", {}):
             reference_id = f"attribute:{active['id']}:goal_reference_image"
             comparison = reference_comparison or {"verdict": "unknown", "reason": "No reference comparison.",
@@ -600,13 +638,23 @@ class FinalInstructionVerifier:
         if identity["verdict"] == "true" and (not parsed.observed_category.strip() or not parsed.observed_structure.strip()):
             identity.update(reported_verdict="true", verdict="unknown",
                             validation_reason="Instance identity requires an observed category and distinguishing structure.")
+        # 解释冲突以原文为依据，不能转成候选的视觉反证。
+        conflicts = [conflict.model_dump() for conflict in parsed.interpretation_conflicts]
+        for conflict in conflicts:
+            if not conflict["instruction_quote"].strip() or conflict["instruction_quote"] not in raw_instruction:
+                raise ValueError("Interpretation conflict must quote the original instruction verbatim")
+            judgment = judgments[conflict["predicate_id"]]
+            judgment.update(reported_verdict=judgment.get("reported_verdict", judgment["verdict"]),
+                            verdict="unknown", validation_reason="Requirement interpretation is unresolved.")
         confidence = parsed.confidence
         false_ids = [uid for uid, judgment in judgments.items() if judgment["verdict"] == "false"]
         unknown_ids = [uid for uid, judgment in judgments.items() if judgment["verdict"] == "unknown"]
-        semantic_satisfied = not false_ids and not unknown_ids
+        semantic_satisfied = not conflicts and not false_ids and not unknown_ids
         view_sufficient = not unknown_ids
         parsed_satisfied = semantic_satisfied
-        if false_ids:
+        if conflicts:
+            decision = "interpretation_conflict"
+        elif false_ids:
             decision = "reject_candidate"
         elif unknown_ids:
             decision = "need_better_view" if parsed.view_objective.improve_goals else "uncertain"
@@ -631,13 +679,25 @@ class FinalInstructionVerifier:
         preferred_view_goal = str(getattr(parsed, "preferred_view_goal", "") or "")
         reason = str(getattr(parsed, "reason", "") or "")
         if false_ids or unknown_ids:
-            reason = "; ".join(filter(None, [reason, "Visual requirements not established: " + ", ".join(
-                false_ids + unknown_ids)]))
+            unresolved = []
+            for uid in false_ids + unknown_ids:
+                judgment = judgments[uid]
+                if "instruction_quote" in judgment:
+                    unresolved.append(f"{uid} [{judgment['instruction_quote']}]: "
+                                      f"{judgment['requirement']} — {judgment['verdict']}: {judgment['reason']}")
+                else:
+                    unresolved.append(uid)
+            reason = "; ".join(filter(None, [reason, "Visual requirements not established: " + "; ".join(unresolved)]))
         if view_guidance and not view_feedback and decision == "need_better_view":
             view_feedback = "; ".join(view_guidance)
         if view_guidance_goal and not preferred_view_goal and decision == "need_better_view":
             preferred_view_goal = view_guidance_goal
         view_objective = parsed.view_objective.model_dump(exclude_defaults=True)
+        if conflicts:
+            reason = "Interpretation conflicts: " + "; ".join(
+                f"{item['predicate_id']}: {item['reason']} (instruction: {item['instruction_quote']})"
+                for item in conflicts)
+            view_feedback, preferred_view_goal, view_objective = "", "", {}
         if decision == "need_better_view" and not view_objective:
             view_objective = {
                 "keep_visible_roles": ["candidate"],
@@ -698,8 +758,12 @@ class FinalInstructionVerifier:
                 "source": "missing_candidate_image" if predicate_ids and not sent_current_ids else "vlm",
                 "image_sources": image_refs,
                 "excluded_history": excluded_history,
+                "verification_basis": payload["verification_basis"],
+                **({"instruction_reading": parsed.instruction_reading} if original_instruction else {}),
                 "predicate_judgments": judgments,
+                "interpretation_conflicts": conflicts,
                 "bound_observations": bound_observations,
+                "depth_support": depth_support,
                 "instance_observation_key": observation_key,
                 "reference_comparison": reference_comparison,
                 "observed_structure": parsed.observed_structure,

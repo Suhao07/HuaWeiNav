@@ -60,7 +60,7 @@ class _ScriptedStructuredClient:
                 reference_comparison={"verdict": "unknown", "reason": "No reference image.",
                                       "supporting_observation_ids": []})
         elif schema.__name__ == "VisualVerification":
-            parsed = schema(predicate_judgments={"candidate_identity": {
+            parsed = schema(interpretation_conflicts=[], predicate_judgments={"candidate_identity": {
                 "verdict": "unknown", "reason": "Unbound image.", "supporting_observation_ids": []}})
         else:
             raise AssertionError(f"unexpected schema: {schema}")
@@ -148,6 +148,7 @@ def test_schema_smoke_rejects_unbound_reference_claim(verdict, support) -> None:
 
 def test_schema_smoke_rejects_unbound_identity_claim() -> None:
     parsed = visual_verification_response_model(["candidate_identity"])(
+        interpretation_conflicts=[],
         predicate_judgments={"candidate_identity": {
             "verdict": "true", "reason": "A book is visible.",
             "supporting_observation_ids": ["invented"]}})

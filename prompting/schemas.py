@@ -223,25 +223,52 @@ class ParsedVerification(BaseModel):
 
 class VisualPredicateJudgment(BaseModel):
     """Candidate-bound evidence for an identity, property or functional requirement."""
-    verdict: Literal["true", "false", "unknown"]
     reason: str = Field(min_length=1, max_length=240)
     supporting_observation_ids: list[str]
+    verdict: Literal["true", "false", "unknown"]
 
     class Config:
         extra = "forbid"
 
 
-def visual_verification_response_model(predicate_ids):
-    """Require one evidence judgment for every active visual obligation."""
+class InstructionRequirementJudgment(BaseModel):
+    instruction_quote: str = Field(min_length=1)
+    requirement: str = Field(min_length=1, max_length=240)
+    reason: str = Field(min_length=1, max_length=240)
+    supporting_observation_ids: list[str]
+    verdict: Literal["true", "false", "unknown"]
+
+    class Config:
+        extra = "forbid"
+
+
+def visual_verification_response_model(predicate_ids, *, original_instruction=False):
+    """Require evidence for fixed predicates and, when authorized, original wording."""
     if not predicate_ids or any(not isinstance(uid, str) or not uid for uid in predicate_ids) or len(set(predicate_ids)) != len(predicate_ids):
         raise ValueError("Visual predicates require unique nonempty IDs")
     from pydantic import create_model
     judgments = create_model(
         "VisualPredicateJudgments", __config__={"extra": "forbid"},
         **{uid: (VisualPredicateJudgment, ...) for uid in predicate_ids})
-    return create_model(
-        "VisualVerification", __base__=ParsedVerification,
-        predicate_judgments=(judgments, ...))
+    conflict = create_model(
+        "InterpretationConflict", __config__={"extra": "forbid"},
+        predicate_id=(Literal[tuple(predicate_ids)], ...),
+        instruction_quote=(str, Field(min_length=1)),
+        reason=(str, Field(min_length=1, max_length=240)))
+    fields = {}
+    if original_instruction:
+        fields["instruction_reading"] = (str, ParsedInstruction.model_fields["instruction_reading"])
+    for name in ("observed_category", "observed_structure"):
+        field = ParsedVerification.model_fields[name]
+        fields[name] = (field.annotation, field)
+    if original_instruction:
+        fields["instruction_judgments"] = (list[InstructionRequirementJudgment], Field(min_length=1))
+    fields["interpretation_conflicts"] = (list[conflict], Field(max_length=len(predicate_ids)))
+    fields["predicate_judgments"] = (judgments, ...)
+    # 生成顺序是推理依赖：原文含义、可见证据、逐项判断先于汇总和下一视角。
+    fields.update({name: (field.annotation, field)
+                   for name, field in ParsedVerification.model_fields.items() if name not in fields})
+    return create_model("VisualVerification", __config__={"extra": "forbid"}, **fields)
 
 
 class ParsedRoomSemantic(BaseModel):

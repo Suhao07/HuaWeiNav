@@ -271,16 +271,23 @@ class AgentRuntime:
             "views and reachable exploration branches. Use unresolved evidence and travel cost. "
             "The navigation driver owns motion, verification and STOP. Return a RecoveryChoice "
             "with an exact action_uid from options, your reason, and search_updates for any "
-            "justified retrieval revision (otherwise []).\n\n" + self.decision_context,
+            "justified retrieval revision (otherwise []). When options is empty, action_uid "
+            "must be null. Review the recorded judgment against the original instruction and "
+            "current observation: decide whether the task interpretation is wrong or the instance "
+            "really fails the requirement. Propose interpretation_update only for an error in "
+            "the interpretation, otherwise return null. With no adopted correction, a candidate "
+            "rejection remains in force; an explicit interpretation_conflict ends unresolved.\n\n" + self.decision_context,
             options=options, event=reason,
         )
         choice_type = self._response_type("RecoveryChoice", messages,
-            action_uid=(Literal[tuple(option["action_uid"] for option in options)], ...),
+            action_uid=(Literal[tuple(option["action_uid"] for option in options)] if options else type(None), ...),
             reason=(str, ...))
         completion = self._parse_choice(messages, choice_type)
         choice = completion.choices[0].message.parsed
         revision, updates = self._apply_decision_updates(choice, source_snapshot, messages)
         selected = None if revision else choice.action_uid
+        if selected is None:
+            self._choice_context = None
         self.record_event({"event": "recovery_choice", "call_index": self.model_calls,
                         "options": options, "trigger": reason, "search_updates": updates,
                         "selected_uid": selected, "reason": choice.reason,

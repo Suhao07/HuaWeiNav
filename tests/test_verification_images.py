@@ -20,9 +20,10 @@ def _bound_evidence(path, uid="u", revision=1):
 
 
 def _stage_requests(requests, trace):
-    """Select actual provider calls, asserting both stages disable parse retries."""
-    assert all(request["trace_label"] in {"instance_observer", "final_instruction_verifier"}
-               and request["parse_retries"] == 0 for request in requests)
+    """Select stage requests, asserting observer/final parse retry limits."""
+    retries = {"instance_observer": 1, "final_instruction_verifier": 0}
+    assert all(request["trace_label"] in retries
+               and request["parse_retries"] == retries[request["trace_label"]] for request in requests)
     return [request for request in requests if request["trace_label"] == trace]
 
 
@@ -51,18 +52,39 @@ def _observer_reply(request, facts=None, comparison=None):
     return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(parsed=parsed))])
 
 
+def _observation_packet(content):
+    """Find observer summaries by key, independent of forwarded image pairs."""
+    return next(payload for item in content if item["type"] == "text"
+                if "bound_observations" in (payload := json.loads(item["text"])))
+
+
+def _assert_current_images(final, observer):
+    """Require exactly the observer's current images and their binding metadata."""
+    expected = []
+    for description, image in zip(observer[::2], observer[1::2]):
+        metadata = json.loads(description["text"])
+        if metadata["role"] == "current_candidate_observation":
+            expected.append(({key: value for key, value in metadata.items()
+                              if key not in {"image_ref", "image_sha256"}}, image))
+    actual = [(json.loads(final[index - 1]["text"]), item)
+              for index, item in enumerate(final) if item["type"] == "image_url"]
+    assert 1 <= len(actual) <= 3
+    assert actual == expected
+
+
 def _visual_reply(request, verdict="unknown"):
     """Instantiate each actual request schema with scripted, current-bound reports."""
     if request["trace_label"] == "instance_observer":
         return _observer_reply(request)
     assert request["trace_label"] == "final_instruction_verifier"
     content = request["messages"][1]["content"]
-    assert all(item["type"] == "text" for item in content)
+    assert any(item["type"] == "image_url" for item in content)
     payload = json.loads(content[0]["text"])
-    observations = json.loads(content[1]["text"])["bound_observations"]
+    observations = _observation_packet(content)["bound_observations"]
     current = next(uid for uid, record in observations.items() if record["current"])
     parsed = request["response_format"](
         observed_category="chair", observed_structure="A seat and back supported by legs.", confidence=1.0,
+        interpretation_conflicts=[],
         predicate_judgments={p["id"]: {"verdict": verdict, "reason": "Scripted instance observation.",
                                       "supporting_observation_ids": [current]}
                              for p in payload["verification_predicates"]})
@@ -139,14 +161,17 @@ def test_each_image_uses_its_own_observed_box_and_identity(tmp_path, monkeypatch
     result = module.FinalInstructionVerifier(evidence_dir=str(tmp_path / "blobs")).verify(
         "find chair", {}, CandidateInstance("u", "chair", bbox_2d=[100,200,300,400]), evidence)
     _assert_stages(requests, ["instance_observer", "final_instruction_verifier"])
-    content = _stage_requests(requests, "instance_observer")[0]["messages"][1]["content"]
+    observer = _stage_requests(requests, "instance_observer")[0]
+    assert observer["max_tokens"] == 1792  # Two distinct observation IDs.
+    content = observer["messages"][1]["content"]
     texts = [json.loads(item["text"]) for item in content if item["type"] == "text"]
     final = _stage_requests(requests, "final_instruction_verifier")[0]["messages"][1]["content"]
     assert json.loads(final[0]["text"])["candidate"] == {"uid": "u"}
     assert texts[0]["bbox_xyxy_in_this_image"] == [1,2,3,4]
     assert texts[1]["bbox_xyxy_in_this_image"] == [5,6,7,8]
     assert texts[1]["observation_identity"]["observation_id"] == "earlier"
-    records = json.loads(final[1]["text"])["bound_observations"]
+    _assert_current_images(final, content)
+    records = _observation_packet(final)["bound_observations"]
     assert set(records) == {"current", "earlier"}
     for text in texts:
         record = records[text["observation_identity"]["observation_id"]]
@@ -189,6 +214,8 @@ def test_overlapping_instance_view_is_sent_without_its_map_label(tmp_path, monke
                              "image:" + result.diagnostics["image_sources"][str(overlap)]]}
     assert "sofa" not in json.dumps(content)
     assert content[-1]["type"] == "image_url" and len(result.evidence_ids) == 2
+    final = _stage_requests(requests, "final_instruction_verifier")[0]["messages"][1]["content"]
+    _assert_current_images(final, content)
 
 
 def test_exact_visual_cache_rechecks_current_physical_stop(tmp_path, monkeypatch):
@@ -208,7 +235,11 @@ def test_exact_visual_cache_rechecks_current_physical_stop(tmp_path, monkeypatch
             return _observer_reply(kwargs, {"observed_category": category, "visible_parts": ["seat"],
                 "support_and_attachment": "Legs.", "visible_surface_content": "",
                 "visible_context": [], "uncertainties": []})
-        return _visual_reply(kwargs, "true")
+        completion = _visual_reply(kwargs, "true")
+        block = next(item for item in kwargs["messages"][1]["content"] if item["type"] == "image_url")
+        sent = base64.b64decode(block["image_url"]["url"].split(",", 1)[1])
+        completion.choices[0].message.parsed.observed_category = scripted_categories[sent]
+        return completion
     client = SimpleNamespace(beta=SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(parse=parse))))
     monkeypatch.setattr(module, 'get_client_and_model', lambda _: (client,'test'))
     monkeypatch.setenv('LLM_OFFLINE','0')
@@ -272,6 +303,7 @@ def test_goal_reference_is_sent_separately_and_recorded_as_image_dependency(tmp_
 
     _assert_stages(requests, ["instance_observer", "final_instruction_verifier"])
     observer = _stage_requests(requests, "instance_observer")[0]
+    assert observer["max_tokens"] == 1280  # One observation ID plus reference comparison overhead.
     content = observer["messages"][1]["content"]
     assert len(content) == 4
     assert json.loads(content[0]["text"])["role"] == "current_candidate_observation"
@@ -284,8 +316,8 @@ def test_goal_reference_is_sent_separately_and_recorded_as_image_dependency(tmp_
     assert "not merely category similarity" in INSTANCE_OBSERVER_PROMPT
     assert "reference is not a candidate observation" in INSTANCE_OBSERVER_PROMPT
     final = _stage_requests(requests, "final_instruction_verifier")[0]["messages"][1]["content"]
-    assert all(item["type"] == "text" for item in final)
-    assert set(json.loads(final[1]["text"])["bound_observations"]) == {"current"}
+    _assert_current_images(final, content)
+    assert set(_observation_packet(final)["bound_observations"]) == {"current"}
     for source, block in ((current, content[1]), (reference, content[3])):
         assert block["image_url"]["url"].startswith("data:image/png;base64,")
         sent_bytes = base64.b64decode(block["image_url"]["url"].split(",", 1)[1])
@@ -367,10 +399,19 @@ def test_visual_schema_requires_exact_complete_predicate_judgments():
     model = visual_verification_response_model(ids)
     judgment = {"verdict": "unknown", "reason": "Occluded resource.", "supporting_observation_ids": []}
     complete = {uid: dict(judgment) for uid in ids}
-    parsed = model(predicate_judgments=complete)
+    parsed = model(predicate_judgments=complete, interpretation_conflicts=[])
     assert parsed.predicate_judgments.model_dump() == complete
     schema = model.model_json_schema()
-    assert schema["required"] == ["predicate_judgments"]
+    assert set(schema["required"]) == {"predicate_judgments", "interpretation_conflicts"}
+    conflict = {"predicate_id": "demand:goal", "instruction_quote": "dry my cup",
+                "reason": "The cup is manipulated material, not the destination."}
+    assert model(predicate_judgments=complete, interpretation_conflicts=[conflict]).interpretation_conflicts[0].model_dump() == conflict
+    for invalid in ({**conflict, "predicate_id": "invented"}, {**conflict, "instruction_quote": ""},
+                    {**conflict, "reason": ""}, {"predicate_id": "demand:goal"}):
+        with pytest.raises(ValidationError):
+            model(predicate_judgments=complete, interpretation_conflicts=[invalid])
+    with pytest.raises(ValidationError):
+        model(predicate_judgments=complete)
     assert schema["additionalProperties"] is False
     nested = schema["$defs"]["VisualPredicateJudgments"]
     assert set(nested["required"]) == set(complete)
@@ -381,25 +422,26 @@ def test_visual_schema_requires_exact_complete_predicate_judgments():
         "preferred_view_goal", "view_objective", "reason"}
     for missing in ids:
         with pytest.raises(ValidationError):
-            model(predicate_judgments={uid: value for uid, value in complete.items() if uid != missing})
+            model(predicate_judgments={uid: value for uid, value in complete.items() if uid != missing},
+                  interpretation_conflicts=[])
     for incomplete in ({}, {**complete, "invented": judgment}):
         with pytest.raises(ValidationError):
-            model(predicate_judgments=incomplete)
+            model(predicate_judgments=incomplete, interpretation_conflicts=[])
     for invalid in ({**judgment, "verdict": True}, {**judgment, "verdict": "maybe"},
                     {**judgment, "reason": ""}, {**judgment, "reason": "x" * 241},
                     {**judgment, "decision": "accept"},
                     {"verdict": "true", "reason": "Visible structure."}):
         with pytest.raises(ValidationError):
-            model(predicate_judgments={**complete, "demand:goal": invalid})
+            model(predicate_judgments={**complete, "demand:goal": invalid}, interpretation_conflicts=[])
     with pytest.raises(ValidationError):
         model()
     for legacy in ({"decision": "accept"}, {"satisfied": True}, {"semantic_satisfied": True},
                    {"view_sufficient_for_stop": True}, {"affordance_judgments": complete}):
         with pytest.raises(ValidationError):
-            model(predicate_judgments=complete, **legacy)
+            model(predicate_judgments=complete, interpretation_conflicts=[], **legacy)
     for confidence in (-.1, 1.1):
         with pytest.raises(ValidationError):
-            model(predicate_judgments=complete, confidence=confidence)
+            model(predicate_judgments=complete, interpretation_conflicts=[], confidence=confidence)
     for invalid_ids in ([], [None], [""], ["duplicate", "duplicate"]):
         with pytest.raises(ValueError):
             visual_verification_response_model(invalid_ids)
@@ -429,7 +471,7 @@ def visual_case(monkeypatch, tmp_path):
     response = {"observed_category": "desk", "observed_structure": "An exposed horizontal top on four legs.",
                 "confidence": .95, "reason": "Scripted visual reports.",
                 "view_objective": {"improve_goals": ["expose the candidate's usable top and support"]},
-                "predicate_judgments": reports}
+                "predicate_judgments": reports, "interpretation_conflicts": []}
 
     facts = {"observed_category": "desk", "visible_parts": ["exposed horizontal top", "four legs"],
              "support_and_attachment": "Freestanding on the floor.",
@@ -441,7 +483,7 @@ def visual_case(monkeypatch, tmp_path):
         if kwargs["trace_label"] == "instance_observer":
             return _observer_reply(kwargs, facts, comparison)
         assert kwargs["trace_label"] == "final_instruction_verifier"
-        assert all(item["type"] == "text" for item in kwargs["messages"][1]["content"])
+        assert any(item["type"] == "image_url" for item in kwargs["messages"][1]["content"])
         parsed = kwargs["response_format"](**response)
         return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(parsed=parsed))])
 
@@ -488,7 +530,7 @@ def test_affordance_task_projection_preserves_demand_and_ids_without_search_prio
         "candidate_identity", "demand:goal", "design:goal"}
 
 
-def test_original_instruction_reaches_only_text_reasoner_and_remains_detached(visual_case):
+def test_original_instruction_reaches_only_final_verifier_and_remains_detached(visual_case):
     import json
     from copy import deepcopy
 
@@ -508,7 +550,7 @@ def test_original_instruction_reaches_only_text_reasoner_and_remains_detached(vi
     assert "notebook" not in json.dumps(observer["messages"][1])
     final = _stage_requests(case.requests(), "final_instruction_verifier")[0]
     content = final["messages"][1]["content"]
-    assert all(item["type"] == "text" for item in content)
+    _assert_current_images(content, observer["messages"][1]["content"])
     assert json.loads(content[0]["text"])["raw_instruction"] == raw
     assert case.plan == before
 
@@ -566,31 +608,65 @@ def test_canonical_id_name_collision_never_transfers_anchor_predicates(
     assert (plan.as_dict() if hasattr(plan, "as_dict") else plan) == before
 
 
-def test_affordance_request_sends_current_candidate_bytes_and_records_judgments(visual_case):
+@pytest.mark.parametrize("image_count", [1, 3])
+@pytest.mark.parametrize("measurement_identity", ["current", "stale", "absent"])
+def test_affordance_request_sends_current_candidate_bytes_and_records_judgments(
+        visual_case, image_count, measurement_identity):
     import json
     from copy import deepcopy
+    from PIL import Image
 
     case = visual_case
+    for key, color in [("object_crop_path", "red"), ("centered_view_path", "green")][:image_count - 1]:
+        path = case.current.with_name(key + ".png")
+        Image.new("RGB", (8, 8), color).save(path)
+        case.evidence[key] = str(path)
+    if image_count == 3:
+        case.evidence["object_crop_bbox_xyxy"] = [1, 1, 5, 5]
+    expected_depth = None
+    if measurement_identity != "absent":
+        identity = dict(case.evidence["observation_identity"])
+        if measurement_identity == "stale":
+            identity["observation_id"] = "earlier"
+        case.evidence["instance_surface"] = {
+            "surface_match": True, "observation_identity": identity, "support_count": 12,
+            "visible_support_span_map_xyz_m": [1.2, .5, .1],
+        }
+        if measurement_identity == "current":
+            expected_depth = {"scope": "partial depth-aligned support within the selected mask",
+                              "span_map_xyz_m": [1.2, .5, .1], "sample_count": 12}
     before = deepcopy((case.plan, case.evidence))
     result = case.verify()
     assert result.accepted and result.task_revision == 4
     _assert_stages(case.requests(), ["instance_observer", "final_instruction_verifier"])
     final = _stage_requests(case.requests(), "final_instruction_verifier")[0]["messages"][1]["content"]
     assert json.loads(final[0]["text"])["task"]["active_target"]["demand"] == case.task["targets"][0]["demand"]
-    assert all(item["type"] == "text" for item in final)
-    content = _stage_requests(case.requests(), "instance_observer")[0]["messages"][1]["content"]
-    bound = json.loads(content[0]["text"])
-    assert bound["observation_identity"] == case.evidence["observation_identity"]
-    assert bound["bbox_xyxy_in_this_image"] == [0, 0, 7, 7]
-    record = json.loads(final[1]["text"])["bound_observations"]["camera:4"]
-    assert record["observation_identity"] == bound["observation_identity"]
-    assert record["facts"] == case.facts and record["current"] is True
+    observer = _stage_requests(case.requests(), "instance_observer")[0]
+    assert observer["max_tokens"] == 1024  # One observation ID, even with three images.
+    content = observer["messages"][1]["content"]
+    _assert_current_images(final, content)
+    metadata = [json.loads(item["text"]) for item in content if item["type"] == "text"]
+    assert [bound["image_kind"] for bound in metadata] == [
+        "current_rgb_with_bbox_path", "object_crop_path", "centered_view_path"][:image_count]
+    for bound, image in zip(metadata, content[1::2]):
+        assert bound["role"] == "current_candidate_observation"
+        assert bound["observation_identity"] == case.evidence["observation_identity"]
+        assert bound["bbox_xyxy_in_this_image"] == (
+            [1, 1, 5, 5] if bound["image_kind"] == "object_crop_path" else [0, 0, 7, 7])
+        assert bound["depth_support"] == expected_depth
+        sent_bytes = base64.b64decode(image["image_url"]["url"].split(",", 1)[1])
+        assert sent_bytes == Path(case.evidence[bound["image_kind"]]).read_bytes()
+        assert sent_bytes == Path(bound["image_ref"]).read_bytes()
+        assert bound["image_ref"] in result.evidence_ids
+        assert result.dependencies["image:" + bound["image_ref"]] == bound["image_sha256"]
+    record = _observation_packet(final)["bound_observations"]["camera:4"]
+    assert record["observation_identity"] == case.evidence["observation_identity"]
+    assert "facts" not in record and record["current"] is True
     assert record["images"] == [{"image_ref": bound["image_ref"], "image_sha256": bound["image_sha256"],
-                                 "bbox_xyxy": bound["bbox_xyxy_in_this_image"]}]
-    assert result.diagnostics["bound_observations"] == {"camera:4": record}
-    sent_bytes = base64.b64decode(content[1]["image_url"]["url"].split(",", 1)[1])
-    assert sent_bytes == case.current.read_bytes() == Path(result.evidence_ids[0]).read_bytes()
+                                 "bbox_xyxy": bound["bbox_xyxy_in_this_image"]} for bound in metadata]
+    assert result.diagnostics["bound_observations"] == {"camera:4": {**record, "facts": case.facts}}
     assert result.diagnostics["predicate_judgments"] == case.reports
+    assert result.diagnostics["depth_support"] == expected_depth
     assert result.diagnostics["sent_current_observation_ids"] == ["camera:4"]
     assert set(result.satisfied_constraints) == set(case.reports)
     assert (case.plan, case.evidence) == before
@@ -644,6 +720,50 @@ def test_soft_affordance_does_not_replace_required_identity_judgment(visual_case
     result = case.verify()
     assert result.accepted
     assert set(result.diagnostics["predicate_judgments"]) == {"candidate_identity"}
+
+
+@pytest.mark.parametrize("verdict", ["true", "false", "unknown"])
+@pytest.mark.parametrize("support", [[], ["camera:4"]])
+def test_interpretation_conflict_suspends_candidate_judgment_and_clears_pending_pair(visual_case, verdict, support):
+    from copy import deepcopy
+    from instruction.contracts import TaskSpec, TargetSpec
+    from task.reducer import apply_verification
+    from task.state import TaskProgress
+
+    case = visual_case
+    conflicts = [{"predicate_id": "design:goal", "instruction_quote": "work with my notebook",
+                  "reason": "The notebook is the material; the destination is a work surface."}]
+    case.response["interpretation_conflicts"] = conflicts
+    case.reports["design:goal"].update(verdict=verdict, supporting_observation_ids=support)
+    before = deepcopy((case.plan, case.evidence, case.response))
+    result = case.verify()
+    assert result.decision == "interpretation_conflict" and result.verdict == "unknown"
+    assert not result.accepted and not result.semantic_satisfied
+    assert "design:goal" not in result.failed_constraints + result.satisfied_constraints
+    assert result.diagnostics["predicate_judgments"]["design:goal"]["verdict"] == "unknown"
+    assert result.diagnostics["interpretation_conflicts"] == conflicts
+    assert not result.view_feedback and not result.preferred_view_goal
+    assert not result.view_objective.get("improve_goals")
+    ledger = EvidenceStore(task_revision=4)
+    record = ledger.put(case.task["raw_instruction"], case.candidate.uid, result)
+    assert record.verdict == "unknown" and not ledger.is_hard_rejected(case.task["raw_instruction"], case.candidate.uid)
+    assert conflicts[0]["instruction_quote"] in record.reason and conflicts[0]["reason"] in record.reason
+    target = TargetSpec("goal", "work surface")
+    progress = TaskProgress(TaskSpec(case.task["raw_instruction"], (target,), revision=4))
+    progress.mode = "better_view_for_verified_pair"
+    progress.pending_verified_pair = {"candidate_uid": case.candidate.uid, "target_id": target.id}
+    assert not apply_verification(progress, target, case.candidate, result, case.evidence)
+    assert progress.mode == "search" and not progress.pending_verified_pair
+    assert not progress.target_progress[target.id].rejected_candidate_uids
+    assert (case.plan, case.evidence, case.response) == before
+
+
+@pytest.mark.parametrize("quote", ["invented instruction", " "])
+def test_interpretation_conflict_requires_literal_source_quote(visual_case, quote):
+    visual_case.response["interpretation_conflicts"] = [{
+        "predicate_id": "design:goal", "instruction_quote": quote, "reason": "Wrong entity attribution."}]
+    with pytest.raises(ValueError, match="quote the original instruction"):
+        visual_case.verify()
 
 
 @pytest.mark.parametrize("verdict,decision", [("false", "reject_candidate"), ("unknown", "need_better_view")])
@@ -803,9 +923,9 @@ def test_final_relation_context_keeps_pair_regions_without_rejudging_relation(vi
                and json.loads(item["text"])["role"] == "earlier_candidate_observation"]
     assert bool(earlier) is bound
     content = _stage_requests(case.requests(), "final_instruction_verifier")[0]["messages"][1]["content"]
-    assert all(item["type"] == "text" for item in content)
-    texts = [json.loads(item["text"]) for item in content]
-    contexts = texts[2:]
+    _assert_current_images(content, observer)
+    texts = [json.loads(item["text"]) for item in content if item["type"] == "text"]
+    contexts = [item for item in texts if item.get("role") == "verified_relation_observation"]
     assert bool(contexts) is bound
     assert "relation:goal" not in {p["id"] for p in texts[0]["verification_predicates"]}
     assert texts[0]["task"]["domain_predicates"][0]["id"] == "relation:goal"
@@ -815,7 +935,7 @@ def test_final_relation_context_keeps_pair_regions_without_rejudging_relation(vi
             "candidate_uid": "candidate", "task_revision": 4, "observation_id": "pair:earlier"}
         assert contexts == [{"role": "verified_relation_observation", "predicate_id": "relation:goal",
                              "subject": subject, "reference": reference, "relation": "near", "observation": view}]
-        assert texts[1]["bound_observations"]["pair:earlier"]["current"] is False
+        assert _observation_packet(content)["bound_observations"]["pair:earlier"]["current"] is False
         assert "pair:earlier" in result.diagnostics["sent_candidate_observation_ids"]
 
 
@@ -862,8 +982,8 @@ def test_affordance_cache_fingerprint_uses_actual_response_schema(visual_case, m
     assert case.verify().accepted and case.verify().accepted
     _assert_stages(case.requests(), ["instance_observer", "final_instruction_verifier"])
     factory = module.visual_verification_response_model
-    monkeypatch.setattr(module, "visual_verification_response_model", lambda ids: create_model(
-        "RevisedAffordanceVerification", __base__=factory(ids), schema_revision=(int, 2)))
+    monkeypatch.setattr(module, "visual_verification_response_model", lambda ids, **kwargs: create_model(
+        "RevisedAffordanceVerification", __base__=factory(ids, **kwargs), schema_revision=(int, 2)))
     assert case.verify().accepted
     expected = ["instance_observer", "final_instruction_verifier", "final_instruction_verifier"]
     _assert_stages(case.requests(), expected)
@@ -913,16 +1033,18 @@ def test_scripted_observer_is_blind_to_task_labels_priors_and_execution_history(
             '"task"', "search_priors", "destination_hypotheses", "detector_terms"))
         metadata = json.loads(observer["messages"][1]["content"][0]["text"])
         assert set(metadata) == {"role", "image_kind", "observation_identity", "bbox_xyxy_in_this_image",
-                                 "image_ref", "image_sha256"}
+                                 "image_ref", "image_sha256", "depth_support"}
+        assert metadata["depth_support"] is None
     finals = _stage_requests(case.requests(), "final_instruction_verifier")
     payloads = [json.loads(request["messages"][1]["content"][0]["text"]) for request in finals]
     assert [payload["raw_instruction"] for payload in payloads] == [
         "private-original-requirements", "changed-original-requirements"]
     assert payloads[0]["task"]["active_target"]["name"] == "private-target-name"
     assert payloads[1]["task"]["active_target"]["name"] == "changed-target-name"
-    packets = [json.loads(request["messages"][1]["content"][1]["text"]) for request in finals]
+    packets = [_observation_packet(request["messages"][1]["content"]) for request in finals]
     assert packets[0] == packets[1]
-    assert packets[1]["bound_observations"]["camera:4"]["facts"] == case.facts
+    assert "facts" not in packets[1]["bound_observations"]["camera:4"]
+    assert changed.diagnostics["bound_observations"]["camera:4"]["facts"] == case.facts
 
 
 @pytest.mark.parametrize("image_kind,visible_context,uncertainties", [
@@ -990,12 +1112,12 @@ def test_scripted_visible_context_stays_bound_without_resolving_room(
     metadata = [json.loads(item["text"]) for item in observer["messages"][1]["content"] if item["type"] == "text"]
     assert metadata[0]["image_kind"] == image_kind
     final_content = final["messages"][1]["content"]
-    assert all(item["type"] == "text" for item in final_content)
+    _assert_current_images(final_content, observer["messages"][1]["content"])
     task_payload = json.loads(final_content[0]["text"])
     assert task_payload["raw_instruction"] == raw
     assert task_payload["task"]["visual_predicates"] == [room]
     assert {p["id"] for p in task_payload["verification_predicates"]} == {"candidate_identity", "room:goal"}
-    records = json.loads(final_content[1]["text"])["bound_observations"]
+    records = _observation_packet(final_content)["bound_observations"]
     assert set(records) == {"camera:4", "earlier"}
     for item in metadata:
         record = records[item["observation_identity"]["observation_id"]]
@@ -1003,11 +1125,12 @@ def test_scripted_visible_context_stays_bound_without_resolving_room(
         assert record["images"] == [{"image_ref": item["image_ref"], "image_sha256": item["image_sha256"],
                                      "bbox_xyxy": item["bbox_xyxy_in_this_image"]}]
     assert records["camera:4"]["current"] is True and records["earlier"]["current"] is False
-    assert records["camera:4"]["facts"] == before[2]
+    assert "facts" not in records["camera:4"]
     assert records["earlier"]["facts"] == historical_facts
-    assert result.diagnostics["bound_observations"] == records
-    assert result.observed_category == "chair"
-    assert result.diagnostics["observed_structure"] == "seat, back, legs; Legs on the floor."
+    assert result.diagnostics["bound_observations"] == {
+        **records, "camera:4": {**records["camera:4"], "facts": before[2]}}
+    assert result.observed_category == case.response["observed_category"]
+    assert result.diagnostics["observed_structure"] == case.response["observed_structure"]
     assert result.diagnostics["predicate_judgments"] == case.response["predicate_judgments"]
     assert not result.accepted and not result.semantic_satisfied and result.decision == "need_better_view"
     assert result.hard_constraints["satisfied"] is True
@@ -1016,9 +1139,10 @@ def test_scripted_visible_context_stays_bound_without_resolving_room(
 
 
 @pytest.mark.parametrize("final_category,final_structure", [
-    ("invented resource", "Invented usable parts."), ("", ""),
+    ("workbench", "A thick worktop supported by trestles."),
+    ("", "A thick worktop supported by trestles."), ("workbench", ""), ("", ""),
 ])
-def test_scripted_current_facts_cannot_be_rewritten_by_final_or_history(
+def test_scripted_final_owns_identity_without_rewriting_observer_or_history(
         visual_case, tmp_path, monkeypatch, final_category, final_structure):
     from copy import deepcopy
     from PIL import Image
@@ -1045,37 +1169,46 @@ def test_scripted_current_facts_cannot_be_rewritten_by_final_or_history(
     case.parse.side_effect = parse
     before = deepcopy(case.facts)
     result, repeated = case.verify(), case.verify()
-    expected_structure = "exposed horizontal top, four legs; Freestanding on the floor.; An empty top."
+    complete_identity = bool(final_category.strip() and final_structure.strip())
     for value in (result, repeated):
-        assert value.accepted and value.observed_category == "desk"
-        assert value.diagnostics["observed_structure"] == expected_structure
+        assert value.accepted is complete_identity
+        assert value.semantic_satisfied is complete_identity
+        assert value.observed_category == final_category
+        assert value.diagnostics["observed_structure"] == final_structure
+        assert value.decision == ("accept" if complete_identity else "need_better_view")
+        identity = value.diagnostics["predicate_judgments"]["candidate_identity"]
+        assert identity["verdict"] == ("true" if complete_identity else "unknown")
+        if not complete_identity:
+            assert identity["reported_verdict"] == "true"
         assert value.diagnostics["bound_observations"]["camera:4"]["facts"] == before
         assert value.diagnostics["bound_observations"]["aaa:earlier"]["facts"]["observed_category"] == "historical cabinet"
     assert case.facts == before
     _assert_stages(case.requests(), ["instance_observer", "final_instruction_verifier"])
-    # Applying the authoritative current facts must not mutate the cached final response.
+    observer, final = case.requests()
+    _assert_current_images(final["messages"][1]["content"], observer["messages"][1]["content"])
+    # Validating final identity must not mutate the cached final response.
     cached = next(iter(case.verifier.evidence_store.visual_judgments.values()))
     assert cached.observed_category == final_category and cached.observed_structure == final_structure
 
 
-@pytest.mark.parametrize("missing_fact", ["category", "structure"])
-def test_scripted_final_cannot_fill_missing_current_instance_facts(visual_case, missing_fact):
+@pytest.mark.parametrize("missing_fact", ["category", "structure", "both"])
+def test_scripted_final_can_fill_missing_observer_identity_from_current_image(visual_case, missing_fact):
     case = visual_case
-    if missing_fact == "category":
+    if missing_fact in {"category", "both"}:
         case.facts["observed_category"] = ""
-    else:
+    if missing_fact in {"structure", "both"}:
         case.facts.update(visible_parts=[], support_and_attachment="", visible_surface_content="")
     case.facts["uncertainties"] = ["Current region is occluded."]
     case.facts["visible_context"] = ["A separate stove and sink are visible beside the occluded candidate."]
     result = case.verify()
     assert result.diagnostics["bound_observations"]["camera:4"]["facts"] == case.facts
-    assert not result.accepted and result.decision == "need_better_view"
-    assert result.diagnostics["predicate_judgments"]["candidate_identity"]["verdict"] == "unknown"
-    if missing_fact == "category":
-        assert not result.observed_category
-    else:
-        assert not result.diagnostics["observed_structure"]
+    assert result.accepted and result.decision == "accept"
+    assert result.diagnostics["predicate_judgments"]["candidate_identity"]["verdict"] == "true"
+    assert result.observed_category == case.response["observed_category"]
+    assert result.diagnostics["observed_structure"] == case.response["observed_structure"]
     _assert_stages(case.requests(), ["instance_observer", "final_instruction_verifier"])
+    observer, final = case.requests()
+    _assert_current_images(final["messages"][1]["content"], observer["messages"][1]["content"])
 
 
 @pytest.mark.parametrize("comparison_verdict,expected", [("same", "true"), ("different", "false"), ("unknown", "unknown")])
@@ -1110,10 +1243,11 @@ def test_scripted_reference_comparison_overrides_final_and_requires_current_supp
     assert result.decision == {"true": "accept", "false": "reject_candidate", "unknown": "need_better_view"}[verdict]
     assert result.diagnostics["reference_comparison"] == case.comparison
     final = _stage_requests(case.requests(), "final_instruction_verifier")[0]["messages"][1]["content"]
-    packet = json.loads(final[1]["text"])
+    packet = _observation_packet(final)
     assert packet["reference_comparison"] == case.comparison
     assert set(packet["bound_observations"]) == {"camera:4", "earlier"}
-    assert all(item["type"] == "text" for item in final)
+    observer = _stage_requests(case.requests(), "instance_observer")[0]["messages"][1]["content"]
+    _assert_current_images(final, observer)
 
 
 @pytest.mark.parametrize("compare_reference", [False, True])

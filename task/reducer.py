@@ -73,7 +73,7 @@ def apply_verification(
                 "view_quality_facts": dict(evidence.get("view_quality_facts") or {}),
             },
         }
-    elif result.decision in ("reject_candidate", "reject_relation"):
+    elif result.decision in ("reject_candidate", "reject_relation", "interpretation_conflict"):
         if state.pending_pair_candidate_uid() == candidate.uid:
             _clear_pending_pair(state)
         if result.decision == "reject_candidate":

@@ -81,6 +81,7 @@ def test_scripted_two_stage_verifier_uses_production_adapter_and_traces(tmp_path
     observation = {"observations": {"now": facts}}
     final = visual_verification_response_model(["candidate_identity"])(
         observed_category="invented category", observed_structure="Invented structure",
+        interpretation_conflicts=[],
         predicate_judgments={"candidate_identity": {"verdict": verdict,
             "reason": "Scripted response, not a model capability judgment.",
             "supporting_observation_ids": ["now"]}}).model_dump()
@@ -103,12 +104,18 @@ def test_scripted_two_stage_verifier_uses_production_adapter_and_traces(tmp_path
     assert "backless seat" not in json.dumps(observer_request)
     assert "untrusted detector label" not in json.dumps(completions.requests)
     assert base64.b64decode(observer_request["messages"][1]["content"][1]["image_url"]["url"].split(",", 1)[1]) == image.read_bytes()
-    assert all(item["type"] == "text" for item in final_request["messages"][1]["content"])
-    bound = json.loads(final_request["messages"][1]["content"][1]["text"])["bound_observations"]["now"]
-    assert bound["facts"] == facts
+    content = final_request["messages"][1]["content"]
+    assert [item for item in content if item["type"] == "image_url"] == [
+        observer_request["messages"][1]["content"][1]]
+    packet = next(value for item in content if item["type"] == "text"
+                  if "bound_observations" in (value := json.loads(item["text"])))
+    bound = packet["bound_observations"]["now"]
+    assert "facts" not in bound
+    assert result.diagnostics["bound_observations"]["now"]["facts"] == facts
     assert bound["images"][0]["image_sha256"] == sha256(image.read_bytes()).hexdigest()
     assert result.accepted is (verdict == "true")
-    assert result.observed_category == "chair"
+    assert result.observed_category == "invented category"
+    assert result.diagnostics["observed_structure"] == "Invented structure"
     assert result.decision == {"true": "accept", "false": "reject_candidate", "unknown": "uncertain"}[verdict]
     requests = {item["request_id"]: item for path in (tmp_path / "requests").glob("request_*.json")
                 for item in [json.loads(path.read_text())]}
@@ -123,6 +130,56 @@ def test_scripted_two_stage_verifier_uses_production_adapter_and_traces(tmp_path
     if guided == "1":
         schema = observer_request["extra_body"]["guided_json"]
         assert "visible_context" in schema["$defs"]["ObservedInstanceFacts"]["required"]
+
+
+@pytest.mark.parametrize("observation_count", [1, 5])
+@pytest.mark.parametrize("recover", [True, False])
+def test_instance_observer_retries_with_all_bound_views(tmp_path, monkeypatch, observation_count, recover):
+    import json
+    from instruction_adapter.verifier import FinalInstructionVerifier
+
+    monkeypatch.setenv("VLN_LVLM_GUIDED_JSON", "1")
+    monkeypatch.setenv("STRIVE_LLM_PARSE_FALLBACK", "0")
+    content = [{"type": "text", "text": "instance evidence"}]
+    image_bindings = {}
+    facts = {"observed_category": "frame", "visible_parts": ["border"],
+             "support_and_attachment": "wall", "visible_surface_content": "yellow artwork",
+             "visible_context": [], "uncertainties": ["partly visible"]}
+    observations = {str(i): facts for i in range(observation_count)}
+    for uid in observations:
+        image = {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}}
+        identity = {"candidate_uid": "candidate", "task_revision": 1, "observation_id": uid}
+        content.extend([{"type": "text", "text": json.dumps({
+            "role": "current_candidate_observation", "observation_identity": identity,
+            "bbox_xyxy_in_this_image": [0, 0, 4, 4]})}, image])
+        image_bindings[id(image)] = {"image_sha256": uid, "image_ref": uid + ".png"}
+    requests = []
+
+    def create(**kwargs):
+        requests.append(kwargs)
+        success = recover and len(requests) == 2
+        raw = json.dumps({"observations": observations}) if success else '{"observations":'
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=raw),
+            finish_reason="stop" if success else "length")])
+
+    client = SelfHostedOpenAICompatibleClient(base_url="http://fixture.invalid/v1", parse_retries=4,
+        client=SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create))))
+    verifier = FinalInstructionVerifier(vlm="self_hosted", evidence_dir=str(tmp_path / "images"))
+    if recover:
+        bound, comparison, relations, _ = verifier._observe_instance(
+            content, "candidate", 1, image_bindings, client, "fixture", False)
+        assert {uid: value["facts"] for uid, value in bound.items()} == observations
+        assert comparison is None and relations == []
+    else:
+        with pytest.raises(ValueError, match="token budget"):
+            verifier._observe_instance(content, "candidate", 1, image_bindings, client, "fixture", False)
+    budget = 256 + 768 * observation_count
+    assert [request["max_tokens"] for request in requests] == [budget, 2 * budget]
+    assert requests[1]["messages"][:-1] == requests[0]["messages"]
+    assert len(requests[0]["messages"][1]["content"]) == 2 * observation_count
+    assert counts()["calls"] == counts()["responses"] == {"instance_observer": 2}
+    errors = list((tmp_path / "model_requests").glob("error_*.json"))
+    assert len(errors) == (1 if recover else 2)
 
 
 def test_schema_injection_preserves_multimodal_content() -> None:

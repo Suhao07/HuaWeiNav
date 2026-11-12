@@ -14,8 +14,9 @@ from instruction_adapter.verifier import (
 
 
 def _scripted_response(request, verdict="unknown"):
-    assert request["parse_retries"] == 0
     if request["trace_label"] == "instance_observer":
+        # 观察器输出多实例结构化事实，授权一次格式重生成；终验只做一次判定，不重生成。
+        assert request["parse_retries"] == 1
         content = request["messages"][1]["content"]
         identities = [json.loads(item["text"])["observation_identity"]
                       for item in content if item["type"] == "text"]
@@ -25,8 +26,10 @@ def _scripted_response(request, verdict="unknown"):
             "visible_context": [], "uncertainties": []} for identity in identities})
     else:
         assert request["trace_label"] == "final_instruction_verifier"
-        assert all(item["type"] == "text" for item in request["messages"][1]["content"])
+        assert request["parse_retries"] == 0
+        assert any(item["type"] == "image_url" for item in request["messages"][1]["content"])
         parsed = request["response_format"](observed_category="chair", observed_structure="Seat, back and legs.",
+            interpretation_conflicts=[],
             predicate_judgments={"candidate_identity": {"verdict": verdict,
                 "reason": "Scripted instance evidence.", "supporting_observation_ids": ["now"]}})
     return types.SimpleNamespace(choices=[types.SimpleNamespace(message=types.SimpleNamespace(parsed=parsed))])
@@ -39,7 +42,7 @@ def test_visual_instance_descriptions_have_guided_output_bounds(field, limit):
 
     model = visual_verification_response_model(["candidate_identity"])
     assert model.model_json_schema()["properties"][field]["maxLength"] == limit
-    payload = {field: "x" * limit, "predicate_judgments": {
+    payload = {field: "x" * limit, "interpretation_conflicts": [], "predicate_judgments": {
         "candidate_identity": {"verdict": "unknown", "reason": "Instance is unresolved.",
                                "supporting_observation_ids": []}}}
     assert getattr(model.model_validate(payload), field) == "x" * limit
@@ -282,7 +285,16 @@ def test_final_request_separates_execution_history_from_visual_evidence(monkeypa
         assert all(token not in json.dumps(request["messages"][1]["content"]) for token in (
             "distance_to_object", "budget_exhausted", "semantic_satisfied", "bbox_verified", "0.99"))
     assert "find chair" not in json.dumps(observer["messages"])
-    assert "image_url" not in json.dumps(final["messages"])
+    content = final["messages"][1]["content"]
+    packet = next(value for item in content if item["type"] == "text"
+                  if "bound_observations" in (value := json.loads(item["text"])))
+    assert set(packet["bound_observations"]) == {"now"}
+    assert json.loads(content[1]["text"]) == {
+        "role": "current_candidate_observation", "image_kind": "current_rgb_with_bbox_path",
+        "observation_identity": {"candidate_uid": "u", "task_revision": 1, "observation_id": "now"},
+        "bbox_xyxy_in_this_image": [0, 0, 3, 3], "depth_support": None}
+    assert [item for item in content if item["type"] == "image_url"] == [
+        observer["messages"][1]["content"][1]]
 
 
 def test_visual_task_scopes_user_semantics_to_active_target():
@@ -327,6 +339,118 @@ def test_visual_projection_uses_declared_constraint_owner_and_runtime_delegation
     assert next_target["domain_predicates"][0]["relation"] == "on"
     assert next_target["domain_predicates"][0]["verifier"] == "vlm"
     assert next_target["visual_predicates"] == []
+
+
+@pytest.mark.parametrize("locked", [False, True, None])
+@pytest.mark.parametrize("verdict", ["true", "false", "unknown"])
+@pytest.mark.parametrize("multiple", [False, True])
+def test_original_visual_requirements_need_owner_authority_and_bound_evidence(monkeypatch, tmp_path, locked, verdict, multiple):
+    from instruction.contracts import TaskSpec, TargetSpec, ConstraintSpec
+    from instruction_adapter.task_compat import runtime_plan
+    import instruction_adapter.verifier as module
+
+    targets = [TargetSpec("surface", "surface", attributes={"material": "wood"})]
+    text = "Find a surface for writing while standing."
+    if multiple:
+        targets.append(TargetSpec("second", "surface", attributes={"material": "metal"}))
+        text = "Find a wooden surface for writing while standing, then a metal surface."
+    task = TaskSpec(text, tuple(targets), (
+        ConstraintSpec("use", "affordance", subject="surface", value="writing", verifier="vlm"),))
+    plan = runtime_plan(task)
+    original = plan.as_dict()
+    image = tmp_path / "current.png"
+    image.write_bytes(b"frame")
+    requests = []
+
+    def parse(**kwargs):
+        requests.append(kwargs)
+        if kwargs["trace_label"] == "instance_observer":
+            return _scripted_response(kwargs)
+        payload = json.loads(kwargs["messages"][1]["content"][0]["text"])
+        original_mode = locked is False
+        assert payload["verification_basis"] == ("original_instruction" if original_mode else "fixed_task")
+        ids = [predicate["id"] for predicate in payload["verification_predicates"]]
+        judgment = {"verdict": "true", "reason": "Scripted current support.",
+                    "supporting_observation_ids": ["now"]}
+        fields = {"predicate_judgments": {uid: dict(judgment) for uid in ids}}
+        if original_mode:
+            assert ids == ["candidate_identity"]
+            scope = payload["task"]["active_target"]
+            assert scope["id"] == "surface"
+            if multiple:
+                assert scope["compiled_scope_hint"] == {
+                    "id": "surface", "name": "surface", "attributes": {"material": "wood"}, "demand": {}}
+            else:
+                assert scope == {"id": "surface"}
+            assert payload["task"]["visual_predicates"] == []
+            fields["instruction_judgments"] = [{**judgment, "verdict": verdict,
+                "instruction_quote": "writing while standing", "requirement": "Supports writing while standing."}]
+        else:
+            assert ids == ["candidate_identity", "attribute:surface:material", "use"]
+            fields["predicate_judgments"]["attribute:surface:material"]["verdict"] = "false"
+        parsed = kwargs["response_format"](observed_category="surface", observed_structure="Raised horizontal top.",
+                                           interpretation_conflicts=[], **fields)
+        return types.SimpleNamespace(choices=[types.SimpleNamespace(message=types.SimpleNamespace(parsed=parsed))])
+
+    client = types.SimpleNamespace(beta=types.SimpleNamespace(chat=types.SimpleNamespace(
+        completions=types.SimpleNamespace(parse=parse))))
+    monkeypatch.setenv("STRIVE_FINAL_VERIFIER", "on")
+    monkeypatch.setenv("LLM_OFFLINE", "0")
+    monkeypatch.setattr(module, "get_client_and_model", lambda vlm: (client, "test"))
+    evidence = {"target_id": "surface", "current_rgb_with_bbox_path": str(image),
+                "geometry": {"bbox_xyxy": [0, 0, 3, 3]},
+                "observation_identity": {"candidate_uid": "u", "task_revision": 1, "observation_id": "now"},
+                "hard_stop_constraints": {"satisfied": True}}
+    if locked is not None:
+        evidence["interpretation_locked"] = locked
+    result = FinalInstructionVerifier().verify(task.raw_instruction, plan, CandidateInstance("u", "surface"), evidence)
+    assert [request["trace_label"] for request in requests] == ["instance_observer", "final_instruction_verifier"]
+    assert result.accepted == (locked is False and verdict == "true")
+    if locked is False:
+        assert result.diagnostics["predicate_judgments"]["instruction:0"]["verdict"] == verdict
+        if verdict != "true":
+            record = EvidenceStore().put(task.raw_instruction, "u", result)
+            assert "writing while standing" in record.reason
+            assert "Supports writing while standing." in record.reason
+            assert "Scripted current support." in record.reason
+    else:
+        assert result.decision == "reject_candidate"
+    assert plan.as_dict() == original
+
+
+def test_original_visual_requirements_without_current_image_remain_unknown(monkeypatch):
+    from instruction.contracts import TaskSpec, TargetSpec
+    from instruction_adapter.task_compat import runtime_plan
+    import instruction_adapter.verifier as module
+
+    monkeypatch.setenv("STRIVE_FINAL_VERIFIER", "on")
+    monkeypatch.setenv("LLM_OFFLINE", "0")
+    monkeypatch.setattr(module, "get_client_and_model", lambda _: pytest.fail("No image must mean zero model calls"))
+    task = TaskSpec("Find a desk for standing work.", (TargetSpec("desk", "desk"),))
+    result = FinalInstructionVerifier().verify(task.raw_instruction, runtime_plan(task), CandidateInstance("u", "desk"),
+                                                {"interpretation_locked": False})
+    assert not result.semantic_satisfied and not result.accepted
+    assert result.diagnostics["predicate_judgments"]["instruction:0"]["verdict"] == "unknown"
+
+
+def test_original_visual_schema_requires_nonempty_requirements():
+    from pydantic import ValidationError
+    from prompting.schemas import visual_verification_response_model
+
+    model = visual_verification_response_model(["candidate_identity"], original_instruction=True)
+    fields = list(model.model_fields)
+    assert fields[0] == "instruction_reading"
+    assert fields.index("instruction_judgments") < fields.index("predicate_judgments") < fields.index("confidence")
+    from prompting.schemas import InstructionRequirementJudgment, VisualPredicateJudgment
+    assert list(InstructionRequirementJudgment.model_fields) == [
+        "instruction_quote", "requirement", "reason", "supporting_observation_ids", "verdict"]
+    assert list(VisualPredicateJudgment.model_fields)[-1] == "verdict"
+    payload = {"interpretation_conflicts": [], "predicate_judgments": {"candidate_identity": {
+        "verdict": "unknown", "reason": "No current evidence.", "supporting_observation_ids": []}}}
+    with pytest.raises(ValidationError):
+        model.model_validate(payload)
+    with pytest.raises(ValidationError):
+        model.model_validate({**payload, "instruction_judgments": []})
 
 
 def test_current_stop_requires_distance_even_with_pinned_reference():

@@ -258,7 +258,17 @@ class GuidedPolicy:
         # 未进行关系复核的补拍结果不能清除已有关系缺口。
         if result.relation_outcomes or result.decision != "need_better_view":
             self.relation_outcomes[(self.revision, result.candidate_uid)] = result.relation_outcomes
+        if result.decision == "interpretation_conflict":
+            self.view_state.reset()
+            self.recovery_context = {"reason": result.decision, "candidate_uid": result.candidate_uid}
+            return "recovery"
         if result.decision == "reject_candidate":
+            # 原文复核由控制器触发，不依赖视觉验证器发现自身的解释错误。
+            if not self.tools.session.interpretation_locked:
+                self.view_state.reset()
+                self.recovery_context = {"reason": "rejected_candidate_review",
+                                         "candidate_uid": result.candidate_uid}
+                return "recovery"
             self.defer_candidate(result.decision)
             return "select"
         if result.decision in {"need_relation_check", "reject_relation"}:
@@ -307,6 +317,25 @@ class GuidedPolicy:
 
     def recover(self, reason, episode_idx=None):
         """Choose one untried executable action, or reselect after a task revision."""
+        if reason.get("reason") in {"interpretation_conflict", "rejected_candidate_review"}:
+            if self.tools.session.interpretation_locked:
+                self.record("interpretation_conflict", interpretation_locked=True, **reason)
+                return "interpretation_conflict"
+            if self.runtime.model_calls >= self.runtime.max_model_calls:
+                return "decision_budget_exhausted"
+            self.refresh_scene()
+            revision = self.revision
+            self.runtime.choose_recovery([], reason)
+            self.search_review_step = self.step
+            if self.revision != revision:
+                self.record("interpretation_changed", decision_source="agent_recovery", task_revision=self.revision)
+                return "select"
+            if reason["reason"] == "rejected_candidate_review":
+                self.defer_candidate("reject_candidate")
+                self.record("candidate_rejection_retained", decision_source="agent_recovery", task_revision=self.revision)
+                return "select"
+            self.record("interpretation_conflict", decision_source="agent_recovery", task_revision=self.revision)
+            return "interpretation_conflict"
         self.refresh_scene()
         _, _, rows = self.exploration_options(episode_idx)
         failed_index = reason.get("goal", {}).get("node_index")
@@ -392,7 +421,8 @@ def run_guided_loop(guided, execution):
                     return "search_exhausted"
             elif state == "recovery":
                 state = guided.recover(guided.recovery_context, execution.episode_idx)
-            if state in {"verified_finish", "search_exhausted", "decision_budget_exhausted", "episode_limit"}:
+            if state in {"verified_finish", "search_exhausted", "decision_budget_exhausted",
+                         "episode_limit", "interpretation_conflict"}:
                 if state == "verified_finish":
                     execution.finish_success()
                 return state

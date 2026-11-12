@@ -191,6 +191,7 @@ be unknown. Proximity to a different visible object cannot establish this relati
 INSTANCE_OBSERVER_PROMPT = """
 Describe the selected physical instance from the supplied images, separately
 for each observation ID. Its source frame and crop show the same bound region.
+For each ID, use short factual phrases and avoid repetitive enumeration.
 Report visible parts, support or attachment and visible surface content. In
 visible_context, separately describe visible surrounding fixtures and boundaries,
 and whether the selected instance shares their space or is across a doorway.
@@ -212,13 +213,19 @@ Return only the required JSON. Do not judge task suitability or propose actions.
 # LVLM最终决策（是否接受当前候选对象作为停靠目标）
 FINAL_VERIFIER_PROMPT = """
 Evaluate the actual observed instance against the original navigation instruction.
-The bound_observations are fixed visual facts extracted without the task. Do not
-rewrite them or invent additional physical evidence. No candidate images are
-provided at this stage: reason only from those facts and separately verified
-relation context. Uncertainties or omitted facts cannot support either true or
-false. False requires an affirmative observed fact incompatible with the exact
-requirement; lack of confirmation is unknown. Do not infer a manufacturing
-method from depicted content or a spatial relation from a mounting description.
+Inspect the supplied current candidate images against the complete intended use.
+For the current observation, bound_observations supplies image provenance only.
+Establish visible instance boundaries, physical structure and surroundings from
+the images. depth_support, when present, measures max-minus-min sample coordinates
+in metres along map X/Y/Z (Z is up). These are partial, axis-aligned surface samples,
+not full object dimensions, usable area or proof that the mask contains one object.
+Use measurements for metric scale; report unknown for unmeasured dimensions.
+Historical descriptions are fallible model reports; current images establish the
+present facts. Identify any unresolved premise. A category
+or nearby furniture alone does not establish capacity for the intended users.
+False requires visible evidence incompatible with the exact requirement;
+lack of confirmation is unknown. Distinguish the resource, its output and its
+contents: each property belongs to the entity described in the original wording.
 The original instruction defines the requirements. The compiled task helps locate
 them but cannot delete, weaken or replace an activity, intended user, attribute,
 depicted content or relationship. Check the original wording even if the compiler
@@ -226,20 +233,43 @@ omitted a requirement.
 Judge only requirements of the active destination; other terminal goals, ordering
 and counts are handled by the controller.
 
-Report observed_category and observed_structure from the fixed current observation,
+Report observed_category and observed_structure from the current candidate images,
 including its distinguishing visible parts, support or mounting and boundaries. This is not the requested resource name or a guess at a
 benchmark label. An image of an object is not the physical object; a shared material
 or nearby support is not evidence of the demanded function.
 
 Each bound observation carries a candidate UID, observation ID, image hashes and
-bboxes. Use its fixed facts, not the image paths or identifiers as semantic clues.
-Do not borrow the identity, parts or affordance of a neighbouring object. If the
-facts cannot distinguish the candidate from adjacent instances, report unknown.
+bboxes. Use the bound image region and its observation ID; paths and identifiers
+are provenance, not semantic clues. Distinguish the candidate's identity, parts
+and affordance from neighbouring objects. When instance boundaries remain
+ambiguous in the image, report unknown.
 visible_context describes surroundings, not candidate parts. A room requirement
 needs visible environmental cues and evidence the candidate occupies that space;
 a single object category or a room visible across a doorway is insufficient.
 Historical facts must describe the same instance and cannot replace current
 candidate-bound evidence.
+
+When verification_basis is original_instruction, begin with instruction_reading:
+state the original destination and use, the roles of source, output, contents and
+references, and which entity each property describes. Resolve this meaning before
+comparing the candidate. Then derive instruction_judgments from that wording.
+For each entry, state the quoted requirement and relevant visual evidence before
+its verdict. Summarize and request a view only after the individual judgments.
+List every
+visual requirement of the active destination, including intended use, stated users,
+context and properties of the resource, its output or contents. Each entry quotes
+its instruction_quote verbatim and states the requirement with its proper entity.
+Cover the complete request, not only phrases confirmed by the image. A stated use
+is a requirement even when evidence is unavailable; judge it unknown in that case.
+For multiple destinations, active_target.compiled_scope_hint locates the relevant
+part of the original wording, including distinctions between same-name targets.
+It supplies fallible scoping clues, not additional requirements; resolve each
+requirement from the original wording. An unresolved scope is an interpretation
+conflict for candidate_identity, not permission to choose a different destination.
+Domain predicates retain their separate services and exact bound references;
+exclude their relation, count, ordering and geometry judgments from this list.
+When verification_basis is fixed_task, all supplied compiled predicates remain
+binding. In both modes candidate_identity checks the complete original destination.
 
 Return exactly one predicate_judgments entry for every verification_predicates ID:
 - candidate_identity: does this bound instance satisfy the original destination
@@ -265,9 +295,19 @@ A clear incompatible structure/property is false even if a closer view is possib
 An occluded or absent observation is unknown, not false. Never weaken a requirement
 to turn a previously contradictory observation into a match.
 
-The controller derives rejection from any false and semantic acceptance only from
-all true. You do not output acceptance booleans or a STOP decision. Distance and
-reachability are independent geometry checks, not visual judgments.
+Report interpretation_conflicts separately when a compiled predicate assigns a
+requirement to the wrong entity or contradicts the original instruction. Each
+conflict names its predicate_id, quotes the relevant original wording verbatim in
+instruction_quote, and explains the discrepancy in reason. Give that predicate an
+unknown visual verdict: a faulty requirement is a language conflict, not evidence
+against the candidate. Return [] when the interpretation is consistent. Hidden
+state or ambiguous visual evidence remains an ordinary unknown, not an
+interpretation conflict.
+
+A conflict suspends candidate judgment until the controller resolves the task
+interpretation. Otherwise the controller derives rejection from any false and
+semantic acceptance only from all true. You do not output acceptance booleans or a
+STOP decision. Distance and reachability are independent geometry checks.
 For unknown evidence, give view_feedback and view_objective describing the specific
 newly observable feature that could resolve it; do not request another look at an
 already disproven property or suggest acceptance because no better view is possible.
