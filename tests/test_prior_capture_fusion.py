@@ -12,6 +12,12 @@ from mapping_utils.geometry import gpu_pointcloud_from_array
 from mapping_utils.representation import ObjectNode
 
 
+def word_tokenizer(captions, return_tensors):
+    """Count BERT-style tokens as whitespace words plus [CLS]/[SEP]."""
+    from types import SimpleNamespace
+    return SimpleNamespace(input_ids=SimpleNamespace(shape=(1, len(captions[0].split()) + 2)))
+
+
 def _entity(offset=0., score=.7):
     points = np.array([[x, y, z] for x in (0., .03) for y in (0., .03)
                        for z in (0., .03)], dtype=np.float32) + offset
@@ -285,6 +291,7 @@ assert 'cv_utils.sam' not in sys.modules and 'config_utils' not in sys.modules
         from types import SimpleNamespace
         detector = MMDINO_Grounded_SAM.__new__(MMDINO_Grounded_SAM)
         detector.sam_predictor = SimpleNamespace(set_image=lambda image: None)
+        detector.tokenizer, detector.max_text_tokens = word_tokenizer, 256
         detector.classes = ["chair", "table", "door", "window"]
         detector.initialize(target=None)
         detector.BOX_THRESHOLD = .2
@@ -304,6 +311,7 @@ assert 'cv_utils.sam' not in sys.modules and 'config_utils' not in sys.modules
         from types import SimpleNamespace
         detector = MMDINO_Grounded_SAM.__new__(MMDINO_Grounded_SAM)
         detector.sam_predictor = SimpleNamespace(set_image=lambda image: None)
+        detector.tokenizer, detector.max_text_tokens = word_tokenizer, 256
         detector.classes = ["table"]
         detector.initialize(target="chair")
         detector.BOX_THRESHOLD, detector.NMS_IOU_THRESHOLD = .2, .8
@@ -323,10 +331,10 @@ assert 'cv_utils.sam' not in sys.modules and 'config_utils' not in sys.modules
     def test_single_concept_vocabulary_has_one_nonempty_prompt(self):
         from cv_utils.sam import MMDINO_Grounded_SAM
         detector = MMDINO_Grounded_SAM.__new__(MMDINO_Grounded_SAM)
+        detector.tokenizer, detector.max_text_tokens = word_tokenizer, 256
         detector.classes = ["coffee machine"]
         detector.initialize(target=None)
         assert detector.TEXT_PROMPTs == ["coffee machine ."]
-        assert detector.split == 1
 
     def test_grounding_receives_bgr_while_rgb_input_stays_unchanged(self):
         from cv_utils.sam import MMDINO_Grounded_SAM

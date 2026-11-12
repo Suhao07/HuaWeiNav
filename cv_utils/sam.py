@@ -32,6 +32,8 @@ class MMDINO_Grounded_SAM:
                                    weights=GROUNDING_DINO_CHECKPOINT,
                                    device=self.DEVICE)
         self.grounding_model = inferencer
+        language = inferencer.model.language_model
+        self.tokenizer, self.max_text_tokens = language.tokenizer, language.max_tokens
 
     def _run_grounding(self, img, text_prompt):
         # segment 的图像协议为 RGB；MMDetection ndarray loader 接收 BGR，
@@ -78,31 +80,36 @@ class MMDINO_Grounded_SAM:
         self._update_vocabulary()
 
     def _update_vocabulary(self, target_list=None):
-        """Replace dynamic retrieval terms while retaining base labels and prompt order."""
+        """Pack the vocabulary into the fewest captions the text encoder accepts.
+
+        Grounding DINO scores each query against every phrase of one caption, so
+        the canonical use is a single caption holding the whole vocabulary; it is
+        only divided when the BERT token budget would be exceeded. 每个 caption
+        形如 ``"chair . table ."``，长度以 tokenizer 实际 token 数计量，而不是固定组数。
+
+        Args:
+            target_list: Dynamic retrieval terms appended after the base classes.
+        """
         classes = list(dict.fromkeys([*self.classes, *(target_list or ())]))
         if classes == self._prompt_classes:
             return
-        TEXT_PROMPTs = []
-        class_labels = []
-
-        class_num = len(classes)
-        if class_num == 0:
+        if not classes:
             raise ValueError("Detector vocabulary must contain at least one concept")
-        split = min(4, class_num)
-        step = class_num // split
-        start_and_end = [(i * step, (i + 1) * step if i < split - 1 else class_num)
-                         for i in range(split)]
-        for start, end in start_and_end:
-            TEXT_PROMPT = ""
-            class_labels.append(np.asarray(classes[start:end]))
-            for obj in classes[start:end]:
-                TEXT_PROMPT += f"{obj.lower()} . "
-            TEXT_PROMPT = TEXT_PROMPT.strip()
-            TEXT_PROMPTs.append(TEXT_PROMPT)
-        self.TEXT_PROMPTs = TEXT_PROMPTs
-        self.class_labels = class_labels
-        self.split = split
+        prompts, groups = [], []
+        for concept in classes:
+            phrase = f"{concept.lower()} ."
+            if prompts and self._token_count(f"{prompts[-1]} {phrase}") <= self.max_text_tokens:
+                prompts[-1] = f"{prompts[-1]} {phrase}"
+                groups[-1].append(concept)
+            else:
+                prompts.append(phrase)
+                groups.append([concept])
+        self.TEXT_PROMPTs = prompts
+        self.class_labels = [np.asarray(group) for group in groups]
         self._prompt_classes = classes
+
+    def _token_count(self, caption):
+        return self.tokenizer([caption], return_tensors="pt").input_ids.shape[1]
 
     def segment(self,
                 img,
@@ -113,7 +120,6 @@ class MMDINO_Grounded_SAM:
                 episode_step=-1):
         """Segment RGB using base classes, current retrieval terms and an optional target."""
         self._update_vocabulary(target_list)
-        self.sam_predictor.set_image(img)
         boxes = []
         confidences = []
         labels = []
@@ -126,11 +132,11 @@ class MMDINO_Grounded_SAM:
             target_mask = target_confidences >= self.TARGET_PRESENCE_THRESHOLD
 
         # do detection for all categories
-        for i in range(self.split):
-            predictions = self._run_grounding(img, self.TEXT_PROMPTs[i])
+        for prompt, prompt_labels in zip(self.TEXT_PROMPTs, self.class_labels):
+            predictions = self._run_grounding(img, prompt)
             boxes = boxes + predictions["bboxes"]
             confidences = confidences + predictions["scores"]
-            labels = labels + self.class_labels[i][predictions["labels"]].tolist()
+            labels = labels + prompt_labels[predictions["labels"]].tolist()
 
         boxes = torch.tensor(boxes).reshape(-1, 4)
         confidences = torch.tensor(confidences)
@@ -150,6 +156,10 @@ class MMDINO_Grounded_SAM:
                 C_confidences = target_confidences[target_mask]
 
         h, w, _ = img.shape
+
+        # SAM 的图像编码（ViT-H）只在存在待分割框时执行；无检测的视图直接返回。
+        if B_boxes.shape[0] > 0 or C_boxes.shape[0] > 0:
+            self.sam_predictor.set_image(img)
 
         # 词表检测为空时目标检测仍独立成立，目标框必须继续生成对应掩码。
         B_masks = torch.zeros((0, h, w))

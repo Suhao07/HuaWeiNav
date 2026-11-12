@@ -28,6 +28,11 @@ def methods(path, names, namespace):
     return namespace
 
 
+def word_tokenizer(captions, return_tensors):
+    """Count BERT-style tokens as whitespace words plus [CLS]/[SEP]."""
+    return NS(input_ids=NS(shape=(1, len(captions[0].split()) + 2)))
+
+
 @pytest.fixture
 def grounded_sam():
     """Load actual detector methods without importing or constructing model backends."""
@@ -43,6 +48,7 @@ def grounded_sam():
     detector.classes = ["chair", "table", "door", "window", "plant"]
     detector.BOX_THRESHOLD = .2
     detector.sam_model, detector.grounding_model = object(), object()
+    detector.tokenizer, detector.max_text_tokens = word_tokenizer, 256
     detector.sam_predictor = NS(set_image=Mock())
     detector._run_grounding = Mock(return_value={"bboxes": [], "scores": [], "labels": []})
     detector._predict_masks = Mock(side_effect=lambda image, boxes:
@@ -91,6 +97,36 @@ def test_live_detector_terms_replace_prompts_and_keep_historical_labels(grounded
     observe(["kettle"], base + ["kettle"])
     detector.segment(image)
     assert np.concatenate(detector.class_labels).tolist() == base
+
+
+def test_vocabulary_is_one_caption_until_the_text_token_budget_is_exceeded(grounded_sam):
+    detector, _ = grounded_sam
+    image = np.zeros((32, 32, 3), dtype=np.uint8)
+    detector.segment(image, target_list=["espresso machine"])
+    assert detector.TEXT_PROMPTs == ["chair . table . door . window . plant . espresso machine ."]
+    assert detector._run_grounding.call_count == 1
+    # "chair . table ." 是 4 个词 + 2 个特殊 token；预算 6 时第三个概念另起 caption。
+    detector.max_text_tokens, detector._prompt_classes = 6, None
+    detector._run_grounding.reset_mock()
+    detector.segment(image)
+    assert detector.TEXT_PROMPTs == ["chair . table .", "door . window .", "plant ."]
+    assert [group.tolist() for group in detector.class_labels] == [
+        ["chair", "table"], ["door", "window"], ["plant"]]
+    assert [call.args[1] for call in detector._run_grounding.call_args_list] == detector.TEXT_PROMPTs
+
+
+def test_sam_encodes_the_image_only_when_a_box_needs_a_mask(grounded_sam):
+    detector, _ = grounded_sam
+    image = np.zeros((32, 32, 3), dtype=np.uint8)
+    detector.segment(image, target="chair")
+    detector.sam_predictor.set_image.assert_not_called()
+    detector._run_grounding.side_effect = lambda image, prompt: (
+        {"bboxes": [[1., 1., 9., 9.]], "scores": [.9], "labels": [0]} if prompt == "chair"
+        else {"bboxes": [], "scores": [], "labels": []})
+    result = detector.segment(image, target="chair")
+    detector.sam_predictor.set_image.assert_called_once()
+    assert detector.sam_predictor.set_image.call_args.args[0] is image
+    assert result[6].shape == (1, 32, 32)
 
 
 @pytest.mark.parametrize("presence_score,expected_count", [(.49, 0), (.5, 1)])
@@ -935,7 +971,7 @@ def test_compiler_rejects_explicit_ids_that_hide_generated_predicates(predicate_
     from instruction.compiler import compile_parsed_instruction
     from prompting.schemas import ParsedInstruction
 
-    parsed = ParsedInstruction(targets=[{"id": "goal", "name": "cup", "attributes": {"color": "red"}}],
+    parsed = ParsedInstruction(targets=[{"id": "goal", "name": "cup", "attributes": {"color": "red"}, "demand": None}],
         constraints=[{"id": predicate_id, "type": "attribute", "subject": "goal",
                       "value": {"state": "clean"}, "hardness": "hard", "verifier": "vlm"}])
     result = compile_parsed_instruction("Find a clean red cup.", parsed, {"attribute"})
