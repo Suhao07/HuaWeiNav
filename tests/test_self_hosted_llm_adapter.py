@@ -195,7 +195,7 @@ def test_self_hosted_adapter_retries_invalid_json_and_validates_response() -> No
     assert "response_format" not in completions.requests[0]
 
 
-def test_self_hosted_adapter_falls_back_conservatively(monkeypatch) -> None:
+def test_self_hosted_adapter_propagates_exhaustion_despite_legacy_fallback_setting(monkeypatch) -> None:
     monkeypatch.setenv("STRIVE_LLM_PARSE_FALLBACK", "1")
     fake, completions = _fake_client(["service returned prose"] * 2)
     client = SelfHostedOpenAICompatibleClient(
@@ -204,16 +204,15 @@ def test_self_hosted_adapter_falls_back_conservatively(monkeypatch) -> None:
         client=fake,
     )
 
-    result = client.beta.chat.completions.parse(
-        model="strive-qwen-vl",
-        messages=[{"role": "user", "content": "verify"}],
-        response_format=_Decision,
-    )
+    with pytest.raises(ValueError):
+        client.beta.chat.completions.parse(
+            model="strive-qwen-vl",
+            messages=[{"role": "user", "content": "verify"}],
+            response_format=_Decision,
+        )
 
-    parsed = result.choices[0].message.parsed
-    assert parsed.satisfied is False
-    assert parsed.decision == "uncertain"
     assert len(completions.requests) == 2
+    assert counts()["total_calls"] == counts()["total_responses"] == 2
 
 
 def test_provider_factory_selects_self_hosted_client(monkeypatch) -> None:

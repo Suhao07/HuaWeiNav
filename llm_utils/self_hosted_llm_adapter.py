@@ -14,11 +14,10 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Iterable, Mapping, Optional
 
-from llm_utils.lvlm_call_tracker import record_response, record_request
+from llm_utils.lvlm_call_tracker import record_response, record_request, record_parse_error
 from llm_utils.structured_output import (
     StructuredOutputError,
     extract_json_object,
-    fallback_payload,
     inject_json_schema,
     validate_response_model,
 )
@@ -181,7 +180,8 @@ class _SelfHostedParsedChat:
             response_format: Pydantic response model class.
             **kwargs: Supported generation options, VLN ``trace_label``, and
                 ``parse_retries`` overriding the configured repair budget.
-                Zero disables both repair calls and conservative fallback.
+                Zero disables repair calls.
+                ``on_retry`` charges the caller's budget before each additional request.
 
         Returns:
             Completion-like object whose message exposes ``parsed`` and raw
@@ -190,7 +190,7 @@ class _SelfHostedParsedChat:
         Raises:
             StructuredOutputError: If response validation fails with zero retries.
             Exception: Transport errors propagate unchanged. Validation errors
-                propagate after retries when conservative fallback is disabled.
+                propagate after the repair budget is exhausted.
         """
 
         trace_label = str(
@@ -199,6 +199,7 @@ class _SelfHostedParsedChat:
             or "self_hosted_parse"
         )
         parse_retries = max(0, int(kwargs.pop("parse_retries", self.parse_retries)))
+        on_retry = kwargs.pop("on_retry", None)
         normalized = inject_json_schema(messages, response_format)
         json_schema = _response_json_schema(response_format) if _guided_json_enabled() else None
         fields = _response_json_schema(response_format)["properties"]
@@ -207,7 +208,9 @@ class _SelfHostedParsedChat:
 
         generation_kwargs = _generation_kwargs(kwargs)
         for attempt in range(parse_retries + 1):
-            request_messages = normalized if attempt == 0 else _repair_messages(normalized, last_content)
+            if attempt and on_retry is not None:
+                on_retry()
+            request_messages = normalized if attempt == 0 else _repair_messages(normalized)
             started = time.perf_counter()
             if json_schema is not None:
                 generation_kwargs["extra_body"] = {"guided_json": json_schema}
@@ -247,6 +250,7 @@ class _SelfHostedParsedChat:
                     raise ValueError("Response must contain model fields as a JSON instance")
                 parsed = validate_response_model(response_format, payload)
             except ValueError as exc:
+                record_parse_error(request_id, exc, attempt=attempt + 1)
                 last_error = exc
                 if attempt >= parse_retries:
                     break
@@ -256,12 +260,7 @@ class _SelfHostedParsedChat:
         assert last_error is not None
         if parse_retries == 0:
             raise StructuredOutputError(str(last_error), raw_content=last_content) from last_error
-        if not _fallback_enabled():
-            raise last_error
-
-        # 解析失败只能得到保守结果，不能因为 fallback 进入 ACCEPT/STOP。
-        parsed = validate_response_model(response_format, fallback_payload(response_format))
-        return _parsed_completion(parsed, last_content)
+        raise last_error
 
 
 def _generation_kwargs(values: Mapping[str, Any]) -> dict[str, Any]:
@@ -327,23 +326,19 @@ def _message_text(completion: Any) -> str:
     return str(content or "")
 
 
-def _repair_messages(messages: list[dict[str, Any]], content: str) -> list[dict[str, Any]]:
+def _repair_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Regenerate from the same complete observation and candidate context."""
 
-    # 重试修复输出协议，任务、候选 UID 与视觉证据保持原样。
-    repaired = [dict(message) for message in messages]
-    if content:
-        repaired.append({"role": "assistant", "content": content})
-    repaired.append(
-        {
-            "role": "user",
-            "content": (
-                "The previous response did not satisfy the required JSON schema. "
-                "Return only one corrected JSON object. Do not add explanation."
-            ),
-        }
-    )
-    return repaired
+    # 不回灌截断的重复文本，避免将退化输出变成下一次生成的示例。
+    return [*messages, {
+        "role": "user",
+        "content": (
+            "The previous response did not complete the required JSON schema. "
+            "Regenerate one complete corrected JSON object from the same observation. "
+            "Keep field explanations brief and non-repetitive, preserve uncertainty, "
+            "and include every required field. Return only JSON."
+        ),
+    }]
 
 
 def _parsed_completion(parsed: Any, content: str) -> Any:
@@ -352,14 +347,3 @@ def _parsed_completion(parsed: Any, content: str) -> Any:
     return SimpleNamespace(
         choices=[SimpleNamespace(message=SimpleNamespace(parsed=parsed, content=content))]
     )
-
-
-def _fallback_enabled() -> bool:
-    """Return whether structured failures should yield conservative output."""
-
-    return os.getenv("STRIVE_LLM_PARSE_FALLBACK", "0").lower() not in {
-        "0",
-        "false",
-        "no",
-        "off",
-    }

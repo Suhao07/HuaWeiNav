@@ -134,6 +134,7 @@ class _TracingParsedCompletions:
 
         ``parse_retries`` overrides the repair budget; zero raises
         StructuredOutputError with the provider's invalid response content.
+        ``on_retry`` charges the caller's budget before each additional request.
         重新生成只恢复请求协议，输入观测保持不变。两次校验失败后传播
         原始异常。截断与损坏JSON共享这一次预算；超时、鉴权和拒绝直接传播。
         """
@@ -143,6 +144,7 @@ class _TracingParsedCompletions:
 
         trace_label = kwargs.pop("trace_label", "parse")
         parse_retries = max(0, int(kwargs.pop("parse_retries", 1)))
+        on_retry = kwargs.pop("on_retry", None)
         local_schema = kwargs["model"].startswith("doubao-")
         if local_schema:
             # 导航默认采用直接回答；显式请求仍可为复杂任务开启思考。
@@ -154,6 +156,8 @@ class _TracingParsedCompletions:
         original_messages = list(kwargs["messages"])
         retry_of = None
         for attempt in range(parse_retries + 1):
+            if attempt and on_retry is not None:
+                on_retry()
             request_id = record_request(
                 str(trace_label), model=kwargs["model"], messages=kwargs["messages"],
                 response_format=kwargs["response_format"],

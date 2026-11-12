@@ -176,6 +176,7 @@ class AgentRuntime:
             "understand_instruction.md", "search.md", "active_observation.md", "recovery.md", "completion.md",
         ))
         self.decision_context = (
+            "Keep reason fields concise and non-repetitive, within 240 characters each. "
             "Use the original instruction, task contract, authoritative progress, stored verification "
             "records and recent events. Verification records are past judgments scoped to their "
             "task revision, predicate, object pair and observation dependencies, not assertions "
@@ -247,11 +248,7 @@ class AgentRuntime:
         choice_type = self._response_type("FrontierChoice", messages,
             frontier_uid=(Literal[tuple(option["frontier_uid"] for option in options)], ...),
             reason=(str, ...))
-        self.model_calls += 1
-        completion = self.client.beta.chat.completions.parse(
-            model=self.model, temperature=0.0, parse_retries=0, response_format=choice_type,
-            trace_label="navigation_agent", messages=messages,
-        )
+        completion = self._parse_choice(messages, choice_type)
         choice = completion.choices[0].message.parsed
         revision, updates = self._apply_decision_updates(choice, source_snapshot, messages)
         selected = None if revision else choice.frontier_uid
@@ -280,11 +277,7 @@ class AgentRuntime:
         choice_type = self._response_type("RecoveryChoice", messages,
             action_uid=(Literal[tuple(option["action_uid"] for option in options)], ...),
             reason=(str, ...))
-        self.model_calls += 1
-        completion = self.client.beta.chat.completions.parse(
-            model=self.model, temperature=0.0, parse_retries=0, response_format=choice_type,
-            trace_label="navigation_agent", messages=messages,
-        )
+        completion = self._parse_choice(messages, choice_type)
         choice = completion.choices[0].message.parsed
         revision, updates = self._apply_decision_updates(choice, source_snapshot, messages)
         selected = None if revision else choice.action_uid
@@ -294,6 +287,20 @@ class AgentRuntime:
                         "interpretation_changed": bool(revision and revision["interpretation_changed"]),
                         "interpretation_result": revision})
         return selected
+
+    def _count_model_call(self):
+        if self.model_calls >= self.max_model_calls:
+            raise RuntimeError("Agent decision-model budget exhausted")
+        self.model_calls += 1
+
+    def _parse_choice(self, messages, response_format):
+        self._count_model_call()
+        return self.client.beta.chat.completions.parse(
+            model=self.model, temperature=0.0, response_format=response_format,
+            trace_label="navigation_agent", messages=messages, max_tokens=1024,
+            parse_retries=min(1, self.max_model_calls - self.model_calls),
+            on_retry=self._count_model_call,
+        )
 
     def step(self):
         """Execute a single proposal and return its recorded tool outcome.

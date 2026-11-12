@@ -62,12 +62,18 @@ def test_invalid_json_is_saved_before_validation_and_retried_once(tmp_path, monk
             {"message": {"content": content}, "finish_reason": "stop"}]}), parse=parse)
     adapter = _TracingParsedCompletions(SimpleNamespace(with_raw_response=SimpleNamespace(parse=request)))
     messages = [{"role": "user", "content": "same frozen observation"}]
+    retry_counts = []
+    on_retry = lambda: retry_counts.append(counts()["total_calls"])
     if recover:
-        result = adapter.parse(model="test", messages=messages, response_format=ParsedVerification)
+        result = adapter.parse(model="test", messages=messages, response_format=ParsedVerification,
+                               on_retry=on_retry)
         assert result.choices[0].message.parsed.observed_category == ""
     else:
         with pytest.raises(ValidationError):
-            adapter.parse(model="test", messages=messages, response_format=ParsedVerification)
+            adapter.parse(model="test", messages=messages, response_format=ParsedVerification,
+                          on_retry=on_retry)
+    assert retry_counts == [1]
+    assert all("on_retry" not in request for request in requests)
     assert len(requests) == 2 and requests[1]['messages'][:-1] == messages
     assert len(messages) == 1
     assert len(list(tmp_path.glob('error_*.json'))) == (1 if recover else 2)

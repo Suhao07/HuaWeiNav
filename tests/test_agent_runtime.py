@@ -82,6 +82,64 @@ def model_calls(calls):
     return (client, "replay-model"), requests
 
 
+@pytest.mark.parametrize("mode", ["frontier", "recovery"])
+@pytest.mark.parametrize("failure_kind", ["length", "schema"])
+@pytest.mark.parametrize("budget,recover", [(1, True), (2, True), (2, False)])
+def test_guided_format_retry_charges_each_request(monkeypatch, tmp_path, mode, failure_kind, budget, recover):
+    from llm_utils.lvlm_call_tracker import counts, reset_counts
+    from llm_utils.self_hosted_llm_adapter import SelfHostedOpenAICompatibleClient
+
+    tools = make_tools(monkeypatch)
+    monkeypatch.setenv("VLN_LVLM_GUIDED_JSON", "1")
+    monkeypatch.setenv("STRIVE_LLM_PARSE_FALLBACK", "1")
+    trace_dir = tmp_path / "requests"
+    monkeypatch.setenv("STRIVE_LVLM_TRACE_DIR", str(trace_dir))
+    reset_counts()
+    requests = []
+    valid = {**decision_payload(mode), "search_updates": [], "interpretation_update": None}
+    uid_key = "frontier_uid" if mode == "frontier" else "action_uid"
+    invalid = ('{"reason":"' + "Repeat this explanation. " * 100 if failure_kind == "length"
+               else json.dumps({**valid, uid_key: "option:unlisted"}))
+
+    def create(**kwargs):
+        requests.append(kwargs)
+        assert runtime.model_calls == len(requests)
+        schema = kwargs["extra_body"]["guided_json"]
+        assert "maxLength" not in schema["properties"]["reason"]
+        success = recover and len(requests) == 2
+        return SimpleNamespace(choices=[SimpleNamespace(
+            message=SimpleNamespace(content=json.dumps(valid) if success else invalid),
+            finish_reason="length" if not success and failure_kind == "length" else "stop")])
+
+    client = SelfHostedOpenAICompatibleClient(base_url="http://fixture.invalid/v1", parse_retries=4,
+        client=SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create))))
+    runtime = AgentRuntime(tools, tmp_path / "events.jsonl", max_model_calls=budget,
+                           client_model=(client, "fixture"))
+
+    if budget == 2 and recover:
+        selected = decision_call(runtime, mode)
+        assert selected == valid[uid_key]
+        assert runtime.history[-1]["call_index"] == 2
+    else:
+        with pytest.raises(ValueError):
+            decision_call(runtime, mode)
+        assert runtime.history == []
+    assert runtime.model_calls == len(requests) == budget
+    assert counts()["calls"] == counts()["responses"] == {"navigation_agent": budget}
+    assert len(list(trace_dir.glob("error_*.json"))) == (1 if recover else budget)
+    assert all("on_retry" not in request for request in requests)
+    assert requests[0]["max_tokens"] == 1024
+    if budget == 2:
+        assert requests[1]["max_tokens"] == (2048 if failure_kind == "length" else 1024)
+        assert requests[1]["messages"][:-1] == requests[0]["messages"]
+        assert invalid not in json.dumps(requests[1]["messages"])
+    with pytest.raises(RuntimeError, match="budget"):
+        decision_call(runtime, mode)
+    assert len(requests) == budget
+    assert tools.motion.controller.sent == [] and not tools.session.progress.completed
+    reset_counts()
+
+
 @pytest.mark.parametrize("initial_calls", [0, 2])
 def test_tool_loop_moves_verifies_and_finishes_from_domain_state(monkeypatch, tmp_path, initial_calls):
     tools = make_tools(monkeypatch)
@@ -1697,7 +1755,7 @@ def test_invalid_predicate_binding_retains_task_progress_and_evidence(
     assert ("missing target reference" if binding == "missing" else
             "unbound target reference 'demand:drying-resource'") in feedback["reason"]
     assert len(requests) == runtime.model_calls == 1 < runtime.max_model_calls
-    assert requests[0]["parse_retries"] == 0  # Rejection does not start a repair loop.
+    assert requests[0]["parse_retries"] == (0 if mode == "step" else 1)
     assert session.spec is original and session.plan is plan and session.progress is progress
     assert dict(original.targets[0].attributes) == {"shape": "flat"}
     assert session.verification_ledger is ledger and session.snapshot is snapshot
