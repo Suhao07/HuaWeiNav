@@ -497,9 +497,12 @@ def _concept_match_batch_limit() -> int:
 
 
 def _should_cache_label_match(record: ConceptMatchRecord) -> bool:
-    """仅缓存明确类别判断，未知身份仍允许后续补证。"""
-    return bool(record.observed_label and record.matches_concept is not None
-                and record.source in ("llm_batch", "exact"))
+    """批处理判决只依赖 instruction + concept + 标签，未知(null)也是该标签的最终答案。
+
+    实例身份的补证由带图像的终验完成，不靠重复询问同一标签；预筛/离线记录
+    不是判决，留待地图更新后再问。
+    """
+    return bool(record.observed_label and record.source in ("llm_batch", "exact"))
 
 
 def _retrieval_compatible(concept: ConceptQuery, observed_label: str) -> bool:

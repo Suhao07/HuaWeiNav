@@ -241,7 +241,7 @@ def test_unknown_without_compatibility_evidence_is_not_a_candidate(monkeypatch, 
 
 
 @pytest.mark.parametrize("method", ["match_object", "match_many"])
-def test_unknown_can_be_reconsidered_without_a_cached_false_identity(monkeypatch, method):
+def test_unknown_identity_is_not_cached_as_false(monkeypatch, method):
     from instruction_adapter.concept_matcher import RuntimeConceptMatcher
     from instruction_adapter.contracts import ConceptQuery
     calls = _scripted_concept_client(monkeypatch, [
@@ -256,13 +256,18 @@ def test_unknown_can_be_reconsidered_without_a_cached_false_identity(monkeypatch
         result = getattr(matcher, method)(raw_instruction="find mug", concept=ConceptQuery(
             "goal", "mug", terminal=True), **args)
         return result[0] if method == "match_many" else result
-    assert match().matches_concept is None
-    assert not matcher.label_cache
-    assert match().matches_concept is True
-    assert match().matches_concept is True
-    assert len(calls) == 2
+    first = match()
+    assert first.matches_concept is None and first.candidate_eligible
     if method == "match_many":
+        # 标签级批判决与实例无关：同标签的未知判决复用，不再重复询问。
         obj.uid = "another-instance"
+        again = match()
+        assert again.matches_concept is None and again.candidate_eligible
+        assert again.object_uid == "another-instance"
+        assert len(calls) == 1
+    else:
+        assert not matcher.label_cache
+        assert match().matches_concept is True
         assert match().matches_concept is True
         assert len(calls) == 2
 
