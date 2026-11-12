@@ -6,6 +6,7 @@ from typing import Any
 
 from instruction.contracts import RELATION_CONSTRAINT_TYPES, resolve_target_reference
 from instruction_adapter.ontology import normalize_term
+from planning.mode_policy import is_anchor_first_relation_search
 from scene.contracts import ObjectNodeSnapshot, SemanticMapSnapshot
 
 
@@ -147,18 +148,25 @@ def query_candidates(plan, progress, snapshot: SemanticMapSnapshot, evidence, *,
             result.concept_debug.extend({"source": "prior_map_target_annotation", "candidate_uid": a.candidate.uid,
                                          **a.metadata.get("prior_map", {})} for a in annotations)
         result.candidates.sort(key=lambda c: (prior_scores.get(c.obj.uid, 0), c.confidence), reverse=True)
-        result.reason = "Observed target candidates for instance and constraint verification"
-        return result
-
-    for concept in anchor_concepts(plan):
+    anchors = []
+    concepts = (anchor_concepts(plan, terminals[0]) if progress.task.ordered else anchor_concepts(plan))
+    for concept in concepts:
         rows = records(concept)
         for obj in objects:
             row = rows.get(obj.uid)
             if (row is not None and row.candidate_eligible and obj.uid not in deferred_uids
                     and not anchor_ledger.is_blocked(raw, concept.id, obj.uid)):
-                result.candidates.append(CandidateMatch(obj, concept.id, concept.name, "anchor", row.confidence, row.as_dict()))
-    result.candidates.sort(key=lambda c: c.confidence, reverse=True)
-    result.reason = "Search from a relation anchor" if result.candidates else "No eligible observed candidate"
+                anchors.append(CandidateMatch(obj, concept.id, concept.name, "anchor", row.confidence, row.as_dict()))
+    anchors.sort(key=lambda c: c.confidence, reverse=True)
+    # 保留两类候选，使参照物到达后的查询仍能看到待验证的终点。
+    result.candidates = (anchors + result.candidates if is_anchor_first_relation_search(plan)
+                         else result.candidates + anchors)
+    if not result.candidates:
+        result.reason = "No eligible observed candidate"
+    elif result.selected.role == "anchor":
+        result.reason = "Search from a relation anchor"
+    else:
+        result.reason = "Observed target candidates for instance and constraint verification"
     return result
 
 

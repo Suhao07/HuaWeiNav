@@ -142,10 +142,11 @@ def _relation_plan():
 
 @pytest.mark.parametrize("label", ["mug", "container"])
 @pytest.mark.parametrize("anchor_status", ["missing", "available", "searched_no_terminal_found"])
-def test_target_can_approach_without_unsearched_anchor_but_does_not_complete(monkeypatch, label, anchor_status):
+def test_relation_query_retains_target_and_prioritizes_unsearched_anchor_without_completion(
+        monkeypatch, label, anchor_status):
     monkeypatch.setenv("LLM_OFFLINE", "1")
-    target = ObjectNodeSnapshot("target", label, (1., 0., 0.), 0.1)
-    anchor = ObjectNodeSnapshot("anchor", "work desk", (2., 0., 0.), 0.9)
+    target = ObjectNodeSnapshot("target", label, (1., 0., 0.), 0.9)
+    anchor = ObjectNodeSnapshot("anchor", "work desk", (2., 0., 0.), 0.1)
     objects = (target,) if anchor_status == "missing" else (target, anchor)
     snapshot = SemanticMapSnapshot(1, Pose3D((0., 0., 0.)), objects=objects)
     plan = _relation_plan()
@@ -153,14 +154,19 @@ def test_target_can_approach_without_unsearched_anchor_but_does_not_complete(mon
     if anchor_status == "searched_no_terminal_found":
         session.anchor_search_ledger.mark(raw_instruction=plan.raw_instruction, concept_id="desk",
                                           anchor_uid="anchor", status=anchor_status)
-    before = deepcopy(snapshot), session.progress.as_dict(), session.anchor_search_ledger.as_dict()
+    before = deepcopy((snapshot, session.progress.as_dict(), session.anchor_search_ledger.as_dict()))
+    result = query_scene(session)
+    expected = [(anchor, "anchor"), (target, "target")] if anchor_status == "available" else [(target, "target")]
+    assert [(c.obj, c.role) for c in result.candidates] == expected
     selection = select_target_candidate_from_snapshot(snapshot, plan=plan, context=session)
-    assert selection.result.obj is target
-    assert selection.result.selection_role == "target"
-    assert selection.result.skipped_objs == []
+    assert selection.result.obj is expected[0][0]
+    assert selection.result.selection_role == expected[0][1]
+    assert selection.result.skipped_objs == result.skipped_objs == []
     intent = selection.to_navigation_intent()
-    assert intent.mode.value == "go_to_object" and not intent.stop_allowed
+    assert intent.mode.value == ("go_to_anchor" if anchor_status == "available" else "go_to_object")
+    assert not intent.stop_allowed
     assert not session.progress.completed
+    assert not session.verification_ledger.records
     assert (snapshot, session.progress.as_dict(), session.anchor_search_ledger.as_dict()) == before
     if anchor_status != "missing":
         row = session.concept_matcher.match_many(raw_instruction=plan.raw_instruction,
@@ -179,18 +185,86 @@ def test_deferred_terminal_allows_anchor_search_without_semantic_rejection(monke
         session.progress.mode = "better_view_for_verified_pair"
         session.progress.pending_verified_pair = {"candidate_uid": target.uid, "target_id": "goal"}
     before = deepcopy(session.snapshot), deepcopy(session.progress.as_dict())
-    assert query_scene(session).selected.obj is target
+    first = query_scene(session)
+    expected = [(target, "target")] if pin_target else [(anchor, "anchor"), (target, "target")]
+    assert [(c.obj, c.role) for c in first.candidates] == expected
+    if pin_target:
+        assert {row["concept_id"] for row in first.concept_debug} == {"goal"}
     result = query_scene(session, deferred_uids={target.uid})
-    assert result.selected.obj is anchor and result.selected.role == "anchor"
+    assert [(c.obj, c.role) for c in result.candidates] == [(anchor, "anchor")]
+    assert result.selected.obj is anchor
     assert result.skipped_objs == [{"uid": target.uid, "target_id": "goal",
                                    "skip_reason": "waiting_for_relevant_evidence"}]
     assert not query_scene(session, deferred_uids={target.uid, anchor.uid}).candidates
+    assert not session.anchor_search_ledger.records
     session.anchor_search_ledger.mark(raw_instruction=session.plan.raw_instruction,
         concept_id="desk", anchor_uid=anchor.uid, status="searched_no_terminal_found")
+    ledger_before = deepcopy(session.anchor_search_ledger.as_dict())
     assert not query_scene(session, deferred_uids={target.uid}).candidates
     assert query_scene(session).selected.obj is target
+    assert session.anchor_search_ledger.as_dict() == ledger_before
     assert (session.snapshot, session.progress.as_dict()) == before
+    assert not session.progress.completed
     assert not session.verification_ledger.records
+
+
+@pytest.mark.parametrize("include_anchor", [False, True])
+def test_terminal_priority_is_unchanged_without_relation_search(monkeypatch, include_anchor):
+    from planning.mode_policy import is_anchor_first_relation_search
+
+    monkeypatch.setenv("LLM_OFFLINE", "1")
+    target = ObjectNodeSnapshot("target", "mug", (1., 0., 0.), 0.1)
+    anchor = ObjectNodeSnapshot("anchor", "work desk", (2., 0., 0.), 0.9)
+    plan = InstructionPlan("Find a mug", targets=[TargetQuery("goal", "mug")], valid=True)
+    if include_anchor:
+        plan.targets.append(TargetQuery("desk", "work desk", role="anchor", terminal=False))
+    session = TaskSession(SemanticMapSnapshot(1, Pose3D((0., 0., 0.)), objects=(target, anchor)), plan)
+    before = deepcopy((session.snapshot, session.spec.as_dict(), session.plan.as_dict(), session.progress.as_dict()))
+    assert not is_anchor_first_relation_search(session.plan)
+    result = query_scene(session)
+    expected = [(target, "target"), (anchor, "anchor")] if include_anchor else [(target, "target")]
+    assert [(c.obj, c.role) for c in result.candidates] == expected
+    assert result.selected.obj is target
+    assert not session.progress.completed
+    assert not session.verification_ledger.records
+    assert not session.anchor_search_ledger.records
+    assert (session.snapshot, session.spec.as_dict(), session.plan.as_dict(), session.progress.as_dict()) == before
+
+
+@pytest.mark.parametrize("ordered", [False, True])
+@pytest.mark.parametrize("active_index", [0, 1])
+def test_ordered_query_limits_anchors_and_terminals_to_active_target(monkeypatch, ordered, active_index):
+    from instruction_adapter.contracts import ExecutionPolicy
+    from planning.mode_policy import is_anchor_first_relation_search
+
+    monkeypatch.setenv("LLM_OFFLINE", "1")
+    plan = InstructionPlan("Find two mugs on the desk, then a lamp near the shelf", targets=[
+        TargetQuery("mugs", "mug", min_count=2), TargetQuery("light", "lamp"),
+        TargetQuery("desk", "desk", role="anchor", terminal=False),
+        TargetQuery("shelf", "shelf", role="anchor", terminal=False)], constraints=[
+        Constraint("spatial", subject="mugs", relation="on", object="desk", hardness="hard"),
+        Constraint("spatial", subject="shelf", relation="near", object="light", hardness="hard")],
+        execution=ExecutionPolicy(ordered=ordered), valid=True)
+    objects = (ObjectNodeSnapshot("mug-1", "mug", (1., 0., 0.), 0.9),
+               ObjectNodeSnapshot("lamp-1", "lamp", (2., 0., 0.), 0.8),
+               ObjectNodeSnapshot("desk-1", "desk", (3., 0., 0.), 0.7),
+               ObjectNodeSnapshot("shelf-1", "shelf", (4., 0., 0.), 0.6))
+    session = TaskSession(SemanticMapSnapshot(1, Pose3D((0., 0., 0.)), objects=objects), plan)
+    session.progress.active_target_index = active_index
+    before = deepcopy((session.snapshot, session.spec.as_dict(), session.plan.as_dict(), session.progress.as_dict()))
+    assert is_anchor_first_relation_search(session.plan)
+    result = query_scene(session)
+    expected = [("desk-1", "desk", "anchor"), ("shelf-1", "shelf", "anchor"),
+                ("mug-1", "mugs", "target"), ("lamp-1", "light", "target")]
+    if ordered:
+        expected = [expected[active_index], expected[active_index + 2]]
+    assert [(c.obj.uid, c.target_id, c.role) for c in result.candidates] == expected
+    assert all(c.obj is session.snapshot.object_by_uid(c.obj.uid) for c in result.candidates)
+    assert result.skipped_objs == []
+    assert not session.progress.completed
+    assert not session.verification_ledger.records
+    assert not session.anchor_search_ledger.records
+    assert (session.snapshot, session.spec.as_dict(), session.plan.as_dict(), session.progress.as_dict()) == before
 
 
 def test_broad_target_is_unknown_candidate_without_relabeling_unrelated_objects(monkeypatch):
@@ -208,7 +282,16 @@ def test_broad_target_is_unknown_candidate_without_relabeling_unrelated_objects(
     assert snapshot == before and result.selected.obj.label == "container"
 
 
-def test_broad_anchor_can_be_inspected_and_search_memory_only_blocks_repeat_search(monkeypatch):
+@pytest.mark.parametrize("status,evidence,blocked", [
+    ("searched_no_terminal_found", {}, True),
+    ("rejected_as_wrong_anchor", {}, True),
+    ("search_incomplete", {"panorama_complete": False}, False),
+    ("terminal_candidate_available", {}, False),
+    ("terminal_candidate_available", {"panorama_complete": False}, False),
+    ("terminal_candidate_available", {"panorama_complete": True}, True),
+])
+def test_broad_anchor_can_be_inspected_and_search_memory_only_blocks_repeat_search(
+        monkeypatch, status, evidence, blocked):
     monkeypatch.setenv("LLM_OFFLINE", "1")
     anchor = ObjectNodeSnapshot("anchor", "table", (2., 0., 0.), 0.8)
     unrelated = ObjectNodeSnapshot("unrelated", "wall", (3., 0., 0.), 0.9)
@@ -221,15 +304,24 @@ def test_broad_anchor_can_be_inspected_and_search_memory_only_blocks_repeat_sear
     assert first.selected.record["verdict"] == "unknown"
     assert first.selected.record["terminal_eligible"] is False
     session.anchor_search_ledger.mark(raw_instruction=plan.raw_instruction, concept_id="desk",
-                                      anchor_uid="anchor", status="searched_no_terminal_found")
-    assert not query_scene(session).candidates
+                                      anchor_uid="anchor", status=status, evidence=evidence)
+    before = deepcopy((session.progress.as_dict(), session.anchor_search_ledger.as_dict()))
+    assert session.anchor_search_ledger.is_blocked(plan.raw_instruction, "desk", anchor.uid) is blocked
+    assert [c.obj.uid for c in query_scene(session).candidates] == ([] if blocked else [anchor.uid])
     new_target = ObjectNodeSnapshot("target", "container", (1., 0., 0.), 0.8)
     session.snapshot = SemanticMapSnapshot(2, snapshot.robot_pose, objects=(anchor, unrelated, new_target))
-    assert query_scene(session).selected.obj is new_target
+    expected = [(new_target, "target")] if blocked else [(anchor, "anchor"), (new_target, "target")]
+    assert [(c.obj, c.role) for c in query_scene(session).candidates] == expected
     another_anchor = ObjectNodeSnapshot("another-anchor", "table", (4., 0., 0.), 0.8)
     session.snapshot = SemanticMapSnapshot(3, snapshot.robot_pose, objects=(anchor, another_anchor, unrelated))
-    assert query_scene(session).selected.obj is another_anchor
+    observed_before = deepcopy(session.snapshot)
+    assert [c.obj.uid for c in query_scene(session).candidates] == (
+        [another_anchor.uid] if blocked else [anchor.uid, another_anchor.uid])
+    assert session.snapshot == observed_before
     assert session.snapshot.object_by_uid("anchor") is anchor
+    assert (session.progress.as_dict(), session.anchor_search_ledger.as_dict()) == before
+    assert not session.progress.completed
+    assert not session.verification_ledger.records
 
 
 def test_confirmed_identity_can_approach_without_terminal_eligibility(monkeypatch):
@@ -239,10 +331,13 @@ def test_confirmed_identity_can_approach_without_terminal_eligibility(monkeypatc
     row = ConceptMatchRecord("instruction", "goal", obj.uid, obj.label,
                              matches_concept=True, candidate_eligible=True,
                              terminal_eligible=False)
-    matcher = SimpleNamespace(match_many=lambda **kwargs: [row])
+    matcher = SimpleNamespace(match_many=lambda **kwargs: [row] if kwargs["concept"].id == "goal" else [])
     session = TaskSession(SemanticMapSnapshot(1, Pose3D((0., 0., 0.)), objects=(obj,)),
                           _relation_plan(), concept_matcher=matcher)
-    assert query_scene(session).selected.obj is obj
+    result = query_scene(session)
+    assert [(c.obj, c.role) for c in result.candidates] == [(obj, "target")]
+    assert result.selected.obj is obj
+    assert result.selected.record["terminal_eligible"] is False
     assert not session.progress.completed
 
 
@@ -562,7 +657,7 @@ def test_relation_precheck_outcomes_preserve_direction_and_verdict(monkeypatch, 
         assert not session.verification_ledger.is_hard_rejected(plan.raw_instruction, target.uid)
         assert not apply_verification(session.progress, session.spec.targets[0], candidate_from_object(target), result, evidence)
         assert not session.progress.target_progress["goal"].rejected_candidate_uids
-        assert query_scene(session).selected.obj is target
+        assert [c.obj for c in query_scene(session).candidates if c.role == "target"] == [target]
 
 
 def test_relation_precheck_keeps_all_predicates_and_conflicting_false(monkeypatch):
@@ -634,7 +729,7 @@ def test_relation_precheck_keeps_alternative_pairs_without_candidate_rejection(m
     assert not session.verification_ledger.is_hard_rejected(session.plan.raw_instruction, objects[0].uid)
     assert not apply_verification(session.progress, session.spec.targets[0], candidate_from_object(objects[0]), result, {})
     assert not session.progress.target_progress["goal"].rejected_candidate_uids
-    assert query_scene(session).selected.obj is objects[0]
+    assert [c.obj for c in query_scene(session).candidates if c.role == "target"] == [objects[0]]
     assert service.verify.call_count == 2
 
 

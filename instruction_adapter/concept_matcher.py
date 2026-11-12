@@ -432,7 +432,9 @@ class AnchorSearchLedger:
 
     def is_blocked(self, raw_instruction: str, concept_id: str, anchor_uid: str) -> bool:
         record = self.get(raw_instruction, concept_id, anchor_uid)
-        return bool(record and record.status in ("searched_no_terminal_found", "rejected_as_wrong_anchor"))
+        return bool(record and (
+            record.status in ("searched_no_terminal_found", "rejected_as_wrong_anchor")
+            or (record.status == "terminal_candidate_available" and record.evidence.get("panorama_complete"))))
 
     def mark(
         self,
