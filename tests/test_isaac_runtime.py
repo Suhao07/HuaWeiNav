@@ -29,6 +29,8 @@ def offline_only(monkeypatch):
                    "llm_utils.cognav_llm_adapter"):
         monkeypatch.setattr(f"{module}.get_client_and_model",
                             Mock(side_effect=AssertionError("unexpected real model construction")))
+    # 概念匹配同样声明离线边界：replay 只验证几何与调度，不允许暗中回落到真实模型。
+    monkeypatch.setenv("LLM_OFFLINE", "1")
     monkeypatch.setattr("urllib.request.urlopen",
                         Mock(side_effect=AssertionError("unexpected network request")))
     monkeypatch.setattr("backends.isaac.runtime.IsaacObservationMap",
