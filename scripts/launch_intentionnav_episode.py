@@ -331,6 +331,7 @@ def main():
     parser.add_argument("--image", default="strive-hm3d:local")
     parser.add_argument("--max-moves", type=int, default=30)
     parser.add_argument("--max-model-calls", type=int, default=60)
+    parser.add_argument("--policy-timeout-s", type=int, default=7200)
     parser.add_argument("--decision-owner", choices=("baseline_guided",), default="baseline_guided")
     parser.add_argument("--search-review-moves", type=int, default=10)
     parser.add_argument("--output", type=Path)
@@ -344,8 +345,8 @@ def main():
         args.selection_id = "SEL_001"
     if args.renderer_gpu is not None and args.renderer_gpu < 0:
         parser.error("renderer-gpu must be nonnegative")
-    if min(args.max_moves, args.max_model_calls, args.search_review_moves) < 1:
-        parser.error("episode budgets must be positive")
+    if min(args.max_moves, args.max_model_calls, args.search_review_moves, args.policy_timeout_s) < 1:
+        parser.error("episode budgets and timeout must be positive")
     if min(args.sim_gpu, args.policy_gpu) < 0:
         parser.error("physical GPU indices must be nonnegative")
     if not all(1 <= port <= 65535 for port in (args.port, args.model_port)) or args.port == args.model_port:
@@ -405,6 +406,7 @@ def main():
               "requested_devices": {"simulator": simulator_gpu, "policy": policy_gpu},
               "evaluation_binding": binding, "mode_equivalence": MODE_EQUIVALENCE,
               "task_spec_sha256": args.task_spec_sha256,
+              "policy_timeout_s": args.policy_timeout_s,
               "motion_semantics": "freemap_checked_kinematic_camera_not_dynamic_robot"}
     try:
         print(f"RUN_ROOT={output}", flush=True)
@@ -519,11 +521,12 @@ def main():
                        "requested_devices": result["requested_devices"],
                        "public_episode_sha256": public_hash, "evaluation_binding": binding,
                        "server_command": server_cmd, "policy_command": docker,
-                       "policy_env_names": sorted(settings),
+                       "policy_env_names": sorted(settings), "policy_timeout_s": args.policy_timeout_s,
                        "policy_mounts_exclude_dataset_and_scene": True})
             policy_started = True
             with (output / "policy.log").open("w") as policy_log:
-                process = subprocess.run(docker, env=env, stdout=policy_log, stderr=subprocess.STDOUT, timeout=7200)
+                process = subprocess.run(docker, env=env, stdout=policy_log, stderr=subprocess.STDOUT,
+                                         timeout=args.policy_timeout_s)
             policy_finished = True
             result["policy_exit_code"] = process.returncode
             if process.returncode != 0:

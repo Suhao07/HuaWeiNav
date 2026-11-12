@@ -783,6 +783,7 @@ def launcher_case(dataset, fake_official, monkeypatch):
         assets=assets, consumers=[], events=[], snapshot_writes=[], public_supplied=False,
         mutate_source=False, server_exit=None, mutate_ready=lambda ready: None,
         mutate_policy=lambda policy: None, mutate_policy_gpu=lambda receipt: None, review_moves=10,
+        policy_timeout_s=7200,
         simulator_gpu={"physical_index": 7, "uuid": "GPU-00112233-4455-6677-8899-aabbccddeeff",
                        "pci_bus_id": "00000000:E1:00.0"},
         policy_gpu={"physical_index": 5, "uuid": "GPU-10213243-5465-7687-98a9-bacbdcedfe0f",
@@ -909,7 +910,7 @@ def launcher_case(dataset, fake_official, monkeypatch):
             assert option(command, "--device") == "cuda:0"
             assert option(command, "--gpus") == f"device={case.policy_gpu['uuid']}"
             assert kwargs["env"]["CUDA_VISIBLE_DEVICES"] == case.policy_gpu["uuid"]
-            assert kwargs["timeout"] == 7200
+            assert kwargs["timeout"] == case.policy_timeout_s
             assert kwargs["env"]["VLN_LVLM_API_KEY"] == environment["VLN_LVLM_API_KEY"]
             public = consume(command)
             final = list(public["start_position"])
@@ -1365,12 +1366,14 @@ def test_launcher_golden_protocol_preserves_dataset_selection(launcher_case, dat
 
 
 @pytest.mark.parametrize("renderer_gpu", [None, 0, 3])
-def test_launcher_forwards_renderer_and_policy_review_options(launcher_case, renderer_gpu):
+@pytest.mark.parametrize("policy_timeout_s", [7200, 86400])
+def test_launcher_forwards_renderer_and_policy_review_options(launcher_case, renderer_gpu, policy_timeout_s):
     """Keep the Vulkan hint separate from physical CUDA and forward policy budgets."""
     case = launcher_case
     case.review_moves = 4
+    case.policy_timeout_s = policy_timeout_s
     args = ["--decision-owner", "baseline_guided", "--search-review-moves", "4",
-            "--max-moves", "500", "--max-model-calls", "60"]
+            "--max-moves", "500", "--max-model-calls", "60", "--policy-timeout-s", str(policy_timeout_s)]
     if renderer_gpu is not None:
         args += ["--renderer-gpu", str(renderer_gpu)]
     case.invoke(*args)
@@ -1390,6 +1393,7 @@ def test_launcher_forwards_renderer_and_policy_review_options(launcher_case, ren
         assert policy_command.count(flag) == 1
         assert policy_command[policy_command.index(flag) + 1] == value
     assert "--renderer-gpu" not in policy_command
+    assert case.execution["policy_timeout_s"] == case.run_result["policy_timeout_s"] == policy_timeout_s
 
 
 @pytest.mark.parametrize("style", ["formal", "natural"])
@@ -1712,6 +1716,7 @@ def test_launcher_stop_evidence_required_before_scoring(launcher_case, failure):
 @pytest.mark.parametrize("args", [("--port", "0"), ("--port", "65536"), ("--model-port", "-1"),
                                   ("--port", "18182"), ("--sim-gpu", "-1"), ("--max-moves", "0"),
                                   ("--renderer-gpu", "-1"), ("--search-review-moves", "0"),
+                                  ("--policy-timeout-s", "0"), ("--policy-timeout-s", "-1"),
                                   ("--decision-owner", "guided_loop")])
 def test_launcher_invalid_resources_fail_before_processes(launcher_case, args):
     with pytest.raises(SystemExit):
