@@ -7,6 +7,10 @@ import math
 from pathlib import Path
 import threading
 
+import numpy as np
+
+from backends.isaac.freemap import FreemapWalkability
+
 
 MAX_BODY_BYTES = 16 * 1024
 MAX_MOVE_DISTANCE = 1.7
@@ -73,7 +77,7 @@ def validate_command(request):
         raise CommandError("command must be an object with an action")
     action = request["action"]
     fields = {"observe": set(), "look": {"yaw"}, "viewpoints": {"position"},
-              "paths": {"positions"}, "walkability_xy": {"positions"}, "paths_xy": {"pairs"},
+              "paths": {"positions"}, "freemap": set(), "paths_xy": {"pairs"},
               "move": {"position", "yaw", "max_distance"}, "STOP": set(),
               "finish": set(), "shutdown": set()}
     if action not in fields:
@@ -83,14 +87,13 @@ def validate_command(request):
     result = {"action": action}
     if action in {"move", "viewpoints"}:
         result["position"] = finite_vector(request.get("position"), "position")
-    if action in {"paths", "walkability_xy"}:
+    if action == "paths":
         positions = request.get("positions")
-        size = 3 if action == "paths" else 2
         if not isinstance(positions, list) or len(positions) > 256:
             raise CommandError("positions must be an array of at most 256 coordinate arrays")
         if any(not isinstance(position, list) for position in positions):
             raise CommandError("positions must contain coordinate arrays")
-        result["positions"] = [finite_vector(position, "position", size) for position in positions]
+        result["positions"] = [finite_vector(position, "position") for position in positions]
     if action == "paths_xy":
         pairs = request.get("pairs")
         if not isinstance(pairs, list) or len(pairs) > 256:
@@ -117,50 +120,19 @@ class FreemapPlanner:
 
     def __init__(self, walkable_map):
         self.wm = walkable_map
-        self.axes = [tuple(float(v) for v in walkable_map.x_coords),
-                     tuple(float(v) for v in walkable_map.y_coords)]
-        self.edges = []
-        spacings = []
-        for axis in self.axes:
-            if len(axis) < 2 or not all(math.isfinite(v) for v in axis):
-                raise ValueError("freemap axes must have at least two finite coordinates")
-            diffs = [b - a for a, b in zip(axis, axis[1:])]
-            if not (all(d > 0 for d in diffs) or all(d < 0 for d in diffs)):
-                raise ValueError("freemap axes must be strictly monotonic")
-            values = sorted(axis)
-            self.edges.append([values[0] - (values[1] - values[0]) / 2,
-                               *[(a + b) / 2 for a, b in zip(values, values[1:])],
-                               values[-1] + (values[-1] - values[-2]) / 2])
-            spacings.extend(abs(d) for d in diffs)
-        if walkable_map.grid.shape != (len(self.axes[1]), len(self.axes[0])):
-            raise ValueError("freemap grid shape disagrees with coordinates")
-        if not all(value in (0, 1) for row in walkable_map.grid for value in row):
-            raise ValueError("freemap grid must be binary")
-        self.sample_step = min(spacings) / 2
+        self.walkability = FreemapWalkability(walkable_map.x_coords, walkable_map.y_coords,
+                                              walkable_map.grid)
+        self.edges = [edges.tolist() for edges in self.walkability.edges]
+        self.sample_step = self.walkability.min_spacing / 2
         self._edge_cache = {}
 
-    def _indices(self, value, dimension):
-        edges = self.edges[dimension]
-        if not math.isfinite(value) or value < edges[0] or value > edges[-1]:
-            return []
-        # Closed-cell supercover: touching an obstacle edge/corner is blocked.
-        low = max(0, bisect_left(edges, value - 1e-10) - 1)
-        high = min(len(edges) - 2, bisect_right(edges, value + 1e-10) - 1)
-        indices = range(low, high + 1)
-        if self.axes[dimension][0] > self.axes[dimension][-1]:
-            return [len(edges) - 2 - i for i in indices]
-        return list(indices)
-
     def is_walkable(self, point):
-        """Require in-bounds official walkability and all touched binary cells."""
-        x, y = point
-        cols, rows = self._indices(x, 0), self._indices(y, 1)
-        return bool(cols and rows and self.wm.is_walkable(x, y)
-                    and all(self.wm.grid[r, c] == 1 for r in rows for c in cols))
+        """Closed-cell supercover walkability of one XY point (see FreemapWalkability)."""
+        return self.walkability.is_walkable(point)
 
     def segment_is_clear(self, start, end):
         """Check half-cell samples plus every crossed cell and boundary exactly."""
-        if not self.is_walkable(start) or not self.is_walkable(end):
+        if not (self.is_walkable(start) and self.is_walkable(end)):
             return False
         length = math.dist(start, end)
         count = max(1, math.ceil(length / self.sample_step))
@@ -174,9 +146,9 @@ class FreemapPlanner:
                 times.add((edge - start[dimension]) / delta)
         ordered = sorted(times)
         # Midpoints catch arbitrarily short passages through a blocked cell.
-        samples = ordered + [(a + b) / 2 for a, b in zip(ordered, ordered[1:])]
-        return all(self.is_walkable(tuple(a + (b - a) * t for a, b in zip(start, end)))
-                   for t in samples)
+        samples = np.array(ordered + [(a + b) / 2 for a, b in zip(ordered, ordered[1:])])
+        start, end = np.asarray(start, dtype=float), np.asarray(end, dtype=float)
+        return bool(self.walkability.mask(start + (end - start) * samples[:, None]).all())
 
     @staticmethod
     def path_length(path):
@@ -317,10 +289,12 @@ class IsaacEnvironment:
                 result = self._viewpoints(command["position"])
             elif action == "paths":
                 result = self._paths(command["positions"])
-            elif action == "walkability_xy":
-                result = {"geometry_domain": "freemap_xy", "results": [
-                    {"position": position, "walkable": self.planner.is_walkable(position)}
-                    for position in command["positions"]]}
+            elif action == "freemap":
+                walkability = self.planner.walkability
+                result = {"geometry_domain": "freemap_xy",
+                          "x_coords": walkability.axes[0].tolist(),
+                          "y_coords": walkability.axes[1].tolist(),
+                          "grid": walkability.grid.tolist()}
             elif action == "paths_xy":
                 result = self._paths_xy(command["pairs"])
             elif action == "move":

@@ -6,6 +6,8 @@ from types import SimpleNamespace
 import numpy as np
 from PIL import Image
 
+from backends.isaac.freemap import FreemapWalkability
+
 
 class IsaacMapperQueries:
     """Project queries onto freemap XY; never certify three-dimensional support."""
@@ -13,8 +15,22 @@ class IsaacMapperQueries:
     domain = "freemap_xy"
 
     def __init__(self, client, camera_position):
+        """Fetch the static freemap once so walkability is a local lookup for the episode.
+
+        Args:
+            client: 仿真进程命令客户端，需支持 freemap 与 paths_xy 动作。
+            camera_position: 初始相机世界坐标 (x, y, z)。
+
+        Raises:
+            ValueError: freemap 响应域不符或栅格几何不合法。
+        """
         self.client = client
         self.camera_position = np.array(camera_position, dtype=float, copy=True)
+        response = client.command("freemap")
+        if not isinstance(response, dict) or response.get("geometry_domain") != self.domain:
+            raise ValueError("Invalid freemap response")
+        self.walkability = FreemapWalkability(response.get("x_coords"), response.get("y_coords"),
+                                              response.get("grid"))
 
     def _query(self, action, field, values, batch_size):
         rows = []
@@ -34,13 +50,7 @@ class IsaacMapperQueries:
             points = points.reshape(0, 3)
         if points.ndim != 2 or points.shape[1] != 3:
             raise ValueError('Expected an N by 3 point array')
-        points = points[:, :2].tolist()
-        rows = self._query("walkability_xy", "positions", points, 256)
-        for point, row in zip(points, rows):
-            if (not isinstance(row, dict) or row.get("position") != point
-                    or type(row.get("walkable")) is not bool):
-                raise ValueError("Invalid walkability result")
-        return np.array([row["walkable"] for row in rows], dtype=bool)
+        return self.walkability.mask(points[:, :2])
 
     def paths(self, pairs):
         pairs = [{key: np.asarray(pair[key], dtype=float)[:2].tolist()

@@ -151,10 +151,12 @@ def test_isaac_queries_use_same_planner_and_batch_http(tmp_path):
     bridge = bridge_at(tmp_path, FakeMap(grid, np.arange(9), np.arange(5)), FakeEnv((1, 2, 1.5)))
     client = MemoryClient(bridge)
     query = IsaacMapperQueries(client, [1., 2., 1.5])
+    assert [row["action"] for row in client.commands] == ["freemap"]
     trace, explored = bridge._trajectory.read_bytes(), list(bridge.planner.wm.explored_positions)
     points = np.array([[1, 2, -5], [7, 2, 10], [4, 2, 1.5], [100, 2, 1.5]] * 200, dtype=float)
     assert query.navigable_mask(points).tolist() == [True, True, False, False] * 200
-    assert [len(row['positions']) for row in client.commands] == [256, 256, 256, 32]
+    assert query.navigable_mask(points).tolist() == [bridge.planner.is_walkable(p[:2]) for p in points]
+    assert len(client.commands) == 1
     assert not query.path_exists([1, 2, 0], [7, 2, 0])
     assert query.distance_from_agent([7, 2, 0]) == math.inf
     query.camera_position = np.array([6., 2., 9.])
@@ -170,27 +172,29 @@ def test_isaac_queries_use_same_planner_and_batch_http(tmp_path):
     assert query.navigable_mask(np.empty((0, 3))).tolist() == [] and query.paths([]) == []
 
 
-@pytest.mark.parametrize("mutation", ["domain", "count", "echo", "bool", "path", "length"])
+FREEMAP = {"geometry_domain": "freemap_xy", "x_coords": [0., 1., 2.], "y_coords": [0., 1.],
+           "grid": [[1, 1, 1], [1, 0, 1]]}
+
+
+@pytest.mark.parametrize("mutation", ["domain", "missing_grid", "shape", "values", "axis",
+                                      "path", "length"])
 def test_untrusted_query_responses_are_rejected(mutation):
     def respond(action, **kwargs):
-        if action == "walkability_xy":
-            row = {"position": [1., 2.], "walkable": True}
-        else:
-            row = {"start": [1., 2.], "end": [2., 2.], "path": [[1., 2.], [2., 2.]], "path_length": 1.}
-        result = {"geometry_domain": "freemap_xy", "results": [row]}
-        if mutation == "domain": result["geometry_domain"] = "navmesh"
-        if mutation == "count": result["results"] = []
-        if mutation == "echo": row["position"] = [2., 2.]
-        if mutation == "bool": row["walkable"] = 1
+        if action == "freemap":
+            result = {**FREEMAP, "grid": [list(row) for row in FREEMAP["grid"]]}
+            if mutation == "domain": result["geometry_domain"] = "navmesh"
+            if mutation == "missing_grid": del result["grid"]
+            if mutation == "shape": result["grid"].append([1, 1, 1])
+            if mutation == "values": result["grid"][0][0] = 2
+            if mutation == "axis": result["x_coords"] = [0., 2., 1.]
+            return result
+        row = {"start": [1., 2.], "end": [2., 2.], "path": [[1., 2.], [2., 2.]], "path_length": 1.}
         if mutation == "path": row["path"][0] = [1.1, 2.]
         if mutation == "length": row["path_length"] = 2.
-        return result
-    query = IsaacMapperQueries(NS(command=respond), [1, 2, 1.5])
+        return {"geometry_domain": "freemap_xy", "results": [row]}
     with pytest.raises(ValueError):
-        if mutation in {"path", "length"}:
-            query.path_exists([1, 2, 1.5], [2, 2, 1.5])
-        else:
-            query.navigable_mask([[1, 2, 1.5]])
+        query = IsaacMapperQueries(NS(command=respond), [1, 2, 1.5])
+        query.path_exists([1, 2, 1.5], [2, 2, 1.5])
 
 
 @pytest.mark.parametrize("field,value", [("depth_convention", "range"), ("depth_unit", "mm"),
@@ -216,7 +220,8 @@ def test_mapper_receives_true_pose_dimensions_and_explicit_height_band(monkeypat
         def initialize(self, position, rotation, env): seen.update(initial=(position, rotation, env))
         def update(self, *args): seen['update'] = args
     monkeypatch.setitem(sys.modules, "mapper_with_process_obs", NS(Instruct_Mapper=Mapper))
-    bridge = IsaacMapper(packet, NS(), perceiver=object(), save_dir=tmp_path, device="cpu:0",
+    bridge = IsaacMapper(packet, NS(command=lambda action: FREEMAP), perceiver=object(),
+                         save_dir=tmp_path, device="cpu:0",
                          floor_world_z=.08, ceiling_world_z=1.68)
     kwargs = seen["kwargs"]
     assert kwargs["floor_height"] == pytest.approx(-1.42)
@@ -234,12 +239,9 @@ def test_mapper_receives_true_pose_dimensions_and_explicit_height_band(monkeypat
 
 @pytest.mark.parametrize('points', [[[1, 2], [3, 4], [5, 6]], [1, 2, 3], np.zeros((2, 3, 3))])
 def test_query_does_not_reshape_malformed_point_batches(points):
-    from unittest.mock import Mock
-    client = NS(command=Mock(side_effect=AssertionError('No malformed requests')))
-    query = IsaacMapperQueries(client, [0, 0, 1.5])
+    query = IsaacMapperQueries(NS(command=lambda action: FREEMAP), [0, 0, 1.5])
     with pytest.raises(ValueError, match='N by 3'):
         query.navigable_mask(points)
-    client.command.assert_not_called()
     assert query.navigable_mask([]).tolist() == []
 
 

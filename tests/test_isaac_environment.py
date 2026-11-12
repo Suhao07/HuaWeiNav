@@ -11,6 +11,7 @@ import pytest
 
 from backends.isaac.environment import (CommandError, FreemapPlanner, IsaacEnvironment,
                                         MAX_BODY_BYTES, decode_json)
+from backends.isaac.freemap import FreemapWalkability
 from scripts import serve_intentionnav as server
 
 
@@ -169,21 +170,59 @@ def test_xy_queries_are_pose_independent_and_do_not_certify_height(tmp_path):
     pairs = [{"start": positions[0], "end": positions[1]},
              {"start": [6., 2.], "end": positions[1]},
              {"start": [6., 2.], "end": [6., 2.]}]
-    walkability = bridge.command({"action": "walkability_xy", "positions": positions})
+    freemap = bridge.command({"action": "freemap"})
     paths = bridge.command({"action": "paths_xy", "pairs": pairs})
-    assert walkability["geometry_domain"] == paths["geometry_domain"] == "freemap_xy"
-    assert [row["position"] for row in walkability["results"]] == positions
-    assert [row["walkable"] for row in walkability["results"]] == [True, True, False, False]
+    assert freemap["geometry_domain"] == paths["geometry_domain"] == "freemap_xy"
+    assert freemap == {"geometry_domain": "freemap_xy", "x_coords": list(range(9)),
+                       "y_coords": list(range(5)), "grid": wm.grid.tolist()}
+    assert json.loads(json.dumps(freemap)) == freemap
+    assert FreemapWalkability(**{k: v for k, v in freemap.items() if k != "geometry_domain"}
+                              ).mask(positions).tolist() == [True, True, False, False]
     assert paths["results"][0] == {**pairs[0], "path": [], "path_length": None}
     assert paths["results"][1] == {**pairs[1], "path": [[6., 2.], [7., 2.]], "path_length": 1.}
     assert paths["results"][2]["path_length"] == 0
     env.position = [-100., -100., 9.]
     env.yaw = 2.1
-    assert bridge.command({"action": "walkability_xy", "positions": positions}) == walkability
+    assert bridge.command({"action": "freemap"}) == freemap
     assert bridge.command({"action": "paths_xy", "pairs": pairs}) == paths
     assert bridge._trajectory.read_bytes() == before
     assert wm.explored_positions == explored
     assert env.calls == []
+
+
+def test_local_walkability_matches_closed_cell_supercover_on_every_axis_order():
+    """Vectorised lookup must equal the brute-force closed-cell definition and official centers."""
+    rng = np.random.default_rng(0)
+    for reverse_x, reverse_y in [(False, False), (True, False), (False, True), (True, True)]:
+        wm = FakeMap(rng.integers(0, 2, size=(7, 11)), np.linspace(-1, 1.5, 11), np.linspace(0, 1.2, 7))
+        if reverse_x:
+            wm.x_coords, wm.grid = wm.x_coords[::-1], wm.grid[:, ::-1]
+        if reverse_y:
+            wm.y_coords, wm.grid = wm.y_coords[::-1], wm.grid[::-1, :]
+        planner = FreemapPlanner(wm)
+        xs, ys = (np.sort(wm.x_coords), np.sort(wm.y_coords))
+        x_edges, y_edges = planner.edges
+        corners = np.array([[x, y] for x in x_edges for y in y_edges])
+        centers = np.array([[x, y] for x in wm.x_coords for y in wm.y_coords])
+        points = np.concatenate([centers, corners, corners + 1e-11, corners - 1e-11,
+                                 rng.uniform(-2, 3, size=(500, 2)),
+                                 [[np.nan, 0.5], [np.inf, 0.5], [0.5, -np.inf]]])
+
+        def reference(x, y):
+            if not (x_edges[0] <= x <= x_edges[-1] and y_edges[0] <= y <= y_edges[-1]):
+                return False
+            for col, cx in enumerate(xs):
+                for row, cy in enumerate(ys):
+                    if (x_edges[col] - 1e-10 <= x <= x_edges[col + 1] + 1e-10
+                            and y_edges[row] - 1e-10 <= y <= y_edges[row + 1] + 1e-10
+                            and not wm.grid[wm.world_to_cell(cx, cy)]):
+                        return False
+            return True
+
+        expected = [reference(x, y) for x, y in points]
+        assert planner.walkability.mask(points).tolist() == expected
+        assert [planner.is_walkable(point) for point in points] == expected
+        assert expected[:len(centers)] == [bool(wm.grid[wm.world_to_cell(*point)]) for point in centers]
 
 
 def test_xy_paths_preserve_existing_motion_queries_without_snapping(tmp_path):
@@ -205,11 +244,8 @@ def test_xy_paths_preserve_existing_motion_queries_without_snapping(tmp_path):
 
 
 @pytest.mark.parametrize("command", [
-    {"action": "walkability_xy"},
-    {"action": "walkability_xy", "positions": [[0., 0., 1.5]]},
-    {"action": "walkability_xy", "positions": [[True, 0.]]},
-    {"action": "walkability_xy", "positions": [[0., float("nan")]]},
-    {"action": "walkability_xy", "positions": [[0., 0.]] * 257},
+    {"action": "freemap", "positions": [[0., 0.]]},
+    {"action": "walkability_xy", "positions": [[0., 0.]]},
     {"action": "paths_xy", "pairs": None},
     {"action": "paths_xy", "pairs": [{"start": [0., 0.]}]},
     {"action": "paths_xy", "pairs": [{"start": [0., 0.], "end": [1., 1.], "snap": True}]},
@@ -227,14 +263,11 @@ def test_xy_queries_reject_invalid_inputs_before_journaling(tmp_path, command):
     assert bridge.env.calls == []
 
 
-@pytest.mark.parametrize("action,field,value", [
-    ("walkability_xy", "positions", [0., 0.]),
-    ("paths_xy", "pairs", {"start": [-.5, 0.], "end": [-.5, 0.]}),
-])
-def test_xy_query_empty_and_maximum_batches(tmp_path, action, field, value):
+def test_xy_path_query_empty_and_maximum_batches(tmp_path):
     bridge = bridge_at(tmp_path)
-    assert bridge.command({"action": action, field: []}) == {"geometry_domain": "freemap_xy", "results": []}
-    result = bridge.command({"action": action, field: [value] * 256})
+    assert bridge.command({"action": "paths_xy", "pairs": []}) == {"geometry_domain": "freemap_xy", "results": []}
+    pair = {"start": [-.5, 0.], "end": [-.5, 0.]}
+    result = bridge.command({"action": "paths_xy", "pairs": [pair] * 256})
     assert len(result["results"]) == 256
     assert all(row == result["results"][0] for row in result["results"])
     assert bridge.env.calls == []
